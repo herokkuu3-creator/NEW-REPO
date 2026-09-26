@@ -47,6 +47,22 @@ export async function notifyRunFinished(n: RunNotification): Promise<void> {
   }
 }
 
+/**
+ * Session-expired alert — the entry point of the /renew flow. Kept separate
+ * from notifyRunFinished so the message can carry the renewal instructions
+ * instead of a generic "attention needed".
+ */
+export async function notifySessionExpired(): Promise<void> {
+  const lines = [
+    '🔑 LeetCode session expired',
+    '',
+    "The stored cookies are no longer accepted — the daily run cannot start until the session is renewed.",
+    '',
+    'Send /renew to this bot and follow the steps — it takes about 2 minutes from your phone, no redeploy needed.',
+  ];
+  await sendTelegramMessage(lines.join('\n'));
+}
+
 /** Minimal escaping — we send plain text, so only guard against confusing the API. */
 function escape(s: string): string {
   return s.replace(/[\r\n]+/g, ' ').trim();

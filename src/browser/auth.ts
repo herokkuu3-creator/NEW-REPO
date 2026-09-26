@@ -75,6 +75,7 @@ export async function establishAuthenticatedSession(): Promise<AuthOutcome> {
     await backupStorageState(primary.session.context);
     await setSystemState(SystemKeys.authStatus, 'ok');
     await setSystemState(SystemKeys.authUsername, primary.username);
+    await setSystemState(SystemKeys.authNotifiedAt, ''); // re-arm the expiry alert
     return { ok: true, ...primary };
   }
 
@@ -91,6 +92,7 @@ export async function establishAuthenticatedSession(): Promise<AuthOutcome> {
     await backupStorageState(fallback.session.context);
     await setSystemState(SystemKeys.authStatus, 'ok');
     await setSystemState(SystemKeys.authUsername, fallback.username);
+    await setSystemState(SystemKeys.authNotifiedAt, ''); // re-arm the expiry alert
     logger.warn(
       'authenticated via storageState — re-run `npm run auth:setup` when the session eventually expires',
     );

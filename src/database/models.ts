@@ -65,6 +65,7 @@ export async function latestRun(): Promise<DailyRunRecord | null> {
 export const SystemKeys = {
   authStatus: 'authStatus', // 'ok' | 'authentication_required' | 'unknown'
   authUsername: 'authUsername',
+  authNotifiedAt: 'authNotifiedAt', // YYYY-MM-DD of the last session-expired alert (dedupe)
   lastError: 'lastError',
   lastRunSummary: 'lastRunSummary',
   storageState: 'storageStateJson', // Playwright storageState snapshot (DB-persisted)

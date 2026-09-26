@@ -50,7 +50,7 @@ function attachLogCapture(page: Page, sink: string[]): void {
  * /dev/shm, no sandbox). `--single-process` is available as an escape hatch
  * via CHROMIUM_SINGLE_PROCESS=true but is off by default (stability first).
  */
-function buildLaunchArgs(): string[] {
+export function buildLaunchArgs(): string[] {
   const args = [
     '--disable-dev-shm-usage', // small /dev/shm in containers
     '--no-sandbox', // required in most container environments

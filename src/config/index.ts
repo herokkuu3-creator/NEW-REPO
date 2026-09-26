@@ -79,6 +79,12 @@ const envSchema = z.object({
 
   TELEGRAM_BOT_TOKEN: z.string().default(''),
   TELEGRAM_CHAT_ID: z.string().default(''),
+  // Command bot (long polling): /renew refreshes the session from cookies you
+  // paste, /status reports state. On by default whenever Telegram is configured.
+  TELEGRAM_COMMANDS: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined ? true : v.toLowerCase() === 'true')),
 
   PORT: intFromString(3001),
   SETUP_TOKEN: z.string().min(8, 'SETUP_TOKEN must be at least 8 characters'),
@@ -121,7 +127,7 @@ export type Config = Readonly<{
   };
   transport: 'api' | 'browser';
   submission: { autoSubmit: boolean };
-  telegram: { botToken: string; chatId: string; enabled: boolean };
+  telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean };
   api: { port: number; setupToken: string };
   logLevel: z.infer<typeof envSchema>['LOG_LEVEL'];
 }>;
@@ -176,6 +182,7 @@ function loadConfig(): Config {
       botToken: env.TELEGRAM_BOT_TOKEN,
       chatId: env.TELEGRAM_CHAT_ID,
       enabled: env.TELEGRAM_BOT_TOKEN.length > 0 && env.TELEGRAM_CHAT_ID.length > 0,
+      commands: env.TELEGRAM_COMMANDS,
     },
     api: { port: env.PORT, setupToken: env.SETUP_TOKEN },
     logLevel: env.LOG_LEVEL,

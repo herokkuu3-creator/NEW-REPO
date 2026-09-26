@@ -90,6 +90,7 @@ All variables are validated with Zod at boot; the process refuses to start on in
 | `LEETCODE_LANGUAGE` | `cpp` | `cpp` (default — matches walkccc) · `javascript` · `typescript` · `python3` |
 | `AUTO_SUBMIT` | `false` | `false` = fill editor only; `true` = submit automatically |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Notifications (optional but recommended — it's your alerting on a headless free service) |
+| `TELEGRAM_COMMANDS` | `true` | Command bot: `/renew` session renewal, `/status` (§11). Only your `TELEGRAM_CHAT_ID` is answered |
 | `SETUP_TOKEN` | — (required) | Bearer token protecting `/admin/*` endpoints |
 | `PORT` | `3001` | HTTP port — **Render sets this automatically**; leave it alone there |
 | `LOG_LEVEL` | `info` | Pino level |
@@ -214,16 +215,33 @@ Duplicate protection (unchanged from the original design): before any work, the 
 
 `AUTO_SUBMIT=true`: additionally clicks Submit, captures the submission id from the network response, polls the judge via GraphQL, and classifies the verdict: `ACCEPTED`, `WRONG_ANSWER`, `TIME_LIMIT_EXCEEDED`, `MEMORY_LIMIT_EXCEEDED`, `COMPILE_ERROR`, `RUNTIME_ERROR`, `UNKNOWN`. Anything but `ACCEPTED` ends in `SUBMISSION_REJECTED`.
 
-## 11. Authentication expiration recovery
+## 11. Session expiry & renewal (Telegram `/renew`)
 
-LeetCode sessions eventually expire. When profile and storageState both fail verification:
+LeetCode sessions eventually expire. When the profile and storageState both fail verification, the run ends as `AUTHENTICATION_REQUIRED` and the bot sends a **🔑 session-expired alert** (at most once per day — repeated triggers don't spam you).
 
-1. The run ends as `AUTHENTICATION_REQUIRED`; `/health` shows it; Telegram notifies you.
-2. Locally: `npm run auth:setup` (the same profile dir is reused, so you usually just re-confirm the login).
-3. Re-upload: the one `curl` from §5. No redeploy, no disk, no shell.
-4. `POST /admin/run-now`, or wait for the next scheduled trigger.
+Renewal takes ~2 minutes, entirely from Telegram — no redeploy, no shell:
 
-Note the auto-healing property: because every *successful* run re-saves a fresh storageState to Postgres, cookie rotation is captured continuously — manual re-uploads are only needed when the session truly dies.
+1. Send **`/renew`** to your bot — it replies with the steps.
+2. Collect the cookies from a browser where leetcode.com shows you **logged in**:
+   - **Android:** install **Kiwi Browser** (Chromium-based, supports extensions) → install the **Cookie-Editor** extension → log into leetcode.com → open Cookie-Editor → **Export** → paste the JSON into the chat (long export? send it as a `.txt`/`.json` **file** — Telegram splits pasted text at ~4000 chars and corrupts JSON).
+   - **Desktop Chrome:** log into leetcode.com → `F12` → Application → Cookies → `https://leetcode.com` → send one line: `LEETCODE_SESSION=<value>; csrftoken=<value>`.
+   - A full Playwright storageState JSON also works.
+3. The bot **validates the cookies against LeetCode first** — a bad paste never overwrites the stored credential — then saves them to Postgres, confirms the signed-in username, and **automatically starts today's run**.
+
+Why the browser-extension dance on mobile: `LEETCODE_SESSION` is an **HttpOnly** cookie — no JavaScript on the page (bookmarklets included) can read it, and mobile Chrome has no cookie viewer. Kiwi + Cookie-Editor is the phone-friendly path; desktop DevTools is the other.
+
+Other bot commands: `/status` (auth state + last run), `/help`, `/cancel`. The bot only answers messages from your `TELEGRAM_CHAT_ID`; everyone else is ignored. Long polling needs no webhook setup and works on the free web service as-is; disable with `TELEGRAM_COMMANDS=false`.
+
+No Telegram? The same renewal is an API call:
+
+```bash
+curl -X POST -H "Authorization: Bearer <SETUP_TOKEN>" \
+     -H "Content-Type: application/json" \
+     -d '{"cookies":"LEETCODE_SESSION=...; csrftoken=..."}' \
+     https://<service>.onrender.com/admin/renew-session   # 200 = renewed, 422 = rejected (reason in body)
+```
+
+The legacy path (`npm run auth:setup` locally + `POST /admin/storage-state`) keeps working unchanged. Auto-healing still applies: every *successful* run re-saves a fresh storageState to Postgres, so manual renewal is only needed when the session truly dies.
 
 ## 12. Cloudflare verification handling
 
@@ -271,15 +289,17 @@ src/
 ├── config/                  # Zod-validated env config
 ├── logger.ts                # Pino with secret redaction
 ├── browser/                 # playwright (512MB-tuned), auth, sessionCheck,
-│                            # cloudflareDetector, diagnostics
+│                            # cloudflareDetector, diagnostics,
+│                            # cookiePayload + sessionRenewal (/renew flow)
 ├── leetcode/                # graphql, dailyChallenge, parser, editor, submission, selectors
 ├── ai/                      # provider abstraction, gemini, openai, solver loop, prompts
 ├── solutions/               # walkccc.me C++ solution fetcher (default source)
 ├── validator/               # pipeline, testcase generator, per-language runners
 ├── database/                # prisma client, models, DB-backed storageState store
 ├── scheduler/dailyWorker.ts # the daily pipeline + state machine
-├── notifications/           # telegram (text + photo) + notifier
-└── api/health.ts            # GET /health, POST /admin/run-now, POST /admin/storage-state
+├── notifications/           # telegram (text + photo), telegramBot (/renew commands), notifier
+└── api/health.ts            # GET /health, POST /admin/run-now,
+                             # POST /admin/storage-state, POST /admin/renew-session
 scripts/auth-setup.ts        # npm run auth:setup
 scripts/run-now.ts           # npm run run:now
 tests/                       # vitest suites

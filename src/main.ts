@@ -3,6 +3,7 @@ import { logger } from './logger';
 import { connectDatabase, disconnectDatabase } from './database/prisma';
 import { isRunInProgress, startScheduler, triggerRun } from './scheduler/dailyWorker';
 import { startHealthServer } from './api/health';
+import { startTelegramBot } from './notifications/telegramBot';
 
 /**
  * Entry point. The process is a long-lived Background Worker:
@@ -38,10 +39,12 @@ async function main(): Promise<void> {
 
   const app = await startHealthServer({ triggerRun, isRunInProgress });
   const stopScheduler = startScheduler();
+  const stopTelegramBot = startTelegramBot();
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'shutting down');
     stopScheduler();
+    stopTelegramBot();
     await app.close().catch(() => undefined);
     await disconnectDatabase().catch(() => undefined);
     process.exit(0);

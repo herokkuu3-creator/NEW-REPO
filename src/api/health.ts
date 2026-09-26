@@ -9,6 +9,7 @@ import {
   latestRun,
   saveStorageStateToDb,
 } from '../database/models';
+import { applySessionRenewal } from '../browser/sessionRenewal';
 
 /**
  * Health + minimal admin API.
@@ -118,6 +119,39 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
       cookies: parsed.data.cookies.length,
       origins: parsed.data.origins.length,
     });
+  });
+
+  /**
+   * Session renewal without Telegram — same validate-then-save logic the
+   * /renew bot command uses. Body: { "cookies": "<header string | Cookie-
+   * Editor JSON array | storageState object>" }, or a raw storageState body.
+   *
+   *   curl -X POST -H "Authorization: Bearer $SETUP_TOKEN" \
+   *        -H "Content-Type: application/json" \
+   *        -d '{"cookies":"LEETCODE_SESSION=...; csrftoken=..."}' \
+   *        https://<service>.onrender.com/admin/renew-session
+   *
+   * The cookies are validated against LeetCode BEFORE anything is stored, so
+   * a bad payload can never clobber the working credential. 200 = renewed,
+   * 422 = rejected (the error explains why). After a 200, trigger the run
+   * with POST /admin/run-now.
+   */
+  app.post('/admin/renew-session', async (req, reply) => {
+    if (!requireAdmin(req.headers.authorization)) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    const body = req.body as unknown;
+    let payload: string;
+    if (typeof body === 'string') {
+      payload = body;
+    } else if (body && typeof body === 'object' && typeof (body as { cookies?: unknown }).cookies === 'string') {
+      payload = (body as { cookies: string }).cookies;
+    } else {
+      payload = JSON.stringify(body ?? {});
+    }
+    const result = await applySessionRenewal(payload);
+    logger.info({ ok: result.ok }, 'session renewal attempted via admin API');
+    return reply.code(result.ok ? 200 : 422).send(result);
   });
 
   const port = config.api.port;

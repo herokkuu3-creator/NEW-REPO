@@ -7,6 +7,7 @@ import {
   createRun,
   findRunByDate,
   finalizeRun,
+  getSystemState,
   setSystemState,
   SystemKeys,
   updateRun,
@@ -27,7 +28,7 @@ import { solveProblem } from '../ai/solver';
 import { fetchWalkcccSolution, signatureMatchesStarter, WalkcccError } from '../solutions/walkccc';
 import { ensureLanguage, openProblemPage, setEditorCode } from '../leetcode/editor';
 import { submitCurrentEditor } from '../leetcode/submission';
-import { notifyRunFinished } from '../notifications/notifier';
+import { notifyRunFinished, notifySessionExpired } from '../notifications/notifier';
 
 /**
  * The daily pipeline. Every invocation ends in EXACTLY ONE terminal state,
@@ -106,6 +107,9 @@ export async function executeDailyRun(reason: string): Promise<RunState> {
     if (!auth.ok) {
       run = await upsertPlaceholderRun(today);
       await finalize(run, auth.reason, { error: humanMessage(auth.reason) });
+      if (auth.reason === 'AUTHENTICATION_REQUIRED') {
+        await maybeNotifySessionExpired(today);
+      }
       return auth.reason;
     }
     session = auth.session;
@@ -455,10 +459,26 @@ async function finalize(
   logger.info({ date: updated.date, state }, 'run finalized');
 }
 
+/**
+ * Session-expired alert, deduped to at most one Telegram message per day —
+ * repeated /admin/run-now pokes must not spam the chat. The flag is cleared
+ * whenever a session authenticates successfully (auth.ts) or is renewed.
+ */
+async function maybeNotifySessionExpired(today: string): Promise<void> {
+  try {
+    const lastNotified = await getSystemState(SystemKeys.authNotifiedAt);
+    if (lastNotified === today) return;
+    await setSystemState(SystemKeys.authNotifiedAt, today);
+    await notifySessionExpired();
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'session-expired notification failed');
+  }
+}
+
 function humanMessage(reason: string): string {
   switch (reason) {
     case 'AUTHENTICATION_REQUIRED':
-      return 'Stored session expired or missing. Re-run `npm run auth:setup` locally and upload the new storageState to POST /admin/storage-state.';
+      return 'Stored session expired or missing. Send /renew to the Telegram bot to refresh it from your phone, or re-run `npm run auth:setup` locally and upload the new storageState to POST /admin/storage-state.';
     case 'CLOUDFLARE_VERIFICATION_REQUIRED':
       return 'LeetCode returned a bot-challenge response to the API. Try TRANSPORT=api, or complete verification in a normal browser and re-upload storageState.';
     default:
