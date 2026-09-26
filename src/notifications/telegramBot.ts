@@ -3,6 +3,7 @@ import { logger } from '../logger';
 import { sendTelegramMessage } from './telegram';
 import { getAllSystemState, latestRun } from '../database/models';
 import { applySessionRenewal } from '../browser/sessionRenewal';
+import { renewalUrl } from '../browser/remoteBrowser';
 import { triggerRun } from '../scheduler/dailyWorker';
 
 /**
@@ -57,26 +58,28 @@ const HELP_TEXT = [
   '/help — this message',
 ].join('\n');
 
-const RENEW_INSTRUCTIONS = [
-  '🔄 LeetCode session renewal',
+const RENEW_FALLBACK_HINT = [
   '',
-  'The session cookie (LEETCODE_SESSION) is HttpOnly, so plain mobile Chrome cannot show it. Pick ONE way to collect the cookies from a browser where leetcode.com shows you LOGGED IN:',
-  '',
-  '📱 From your Android phone:',
-  '1. Install Kiwi Browser (Chromium-based, supports extensions)',
-  '2. In Kiwi, install the "Cookie-Editor" extension',
-  '3. In Kiwi, log into leetcode.com',
-  '4. On leetcode.com open Cookie-Editor → Export — the JSON is copied',
-  '5. Paste it here. Long export? Send it as a .txt / .json FILE instead (paste gets split by Telegram)',
-  '',
-  '💻 From desktop Chrome:',
-  '1. Log into leetcode.com',
-  '2. F12 → Application → Cookies → https://leetcode.com',
-  '3. Send me one line exactly like this (your two values):',
-  'LEETCODE_SESSION=<value>; csrftoken=<value>',
-  '',
-  'I also accept a full Playwright storageState JSON. Once received I verify the session with LeetCode, store it, and start today\'s run automatically. /cancel anytime.',
+  'Prefer not to use the page? You can also paste cookies here in any of these forms and I will validate them:',
+  '• LEETCODE_SESSION=<value>; csrftoken=<value>',
+  '• a Cookie-Editor JSON export (long ones: send as a .txt/.json file)',
+  '• a full Playwright storageState JSON',
 ].join('\n');
+
+async function renewInstructions(): Promise<string> {
+  const link = await renewalUrl().catch(() => null);
+  const lines = [
+    '🔄 LeetCode session renewal',
+    '',
+    '👉 Tap this link — it opens a live browser page already on the LeetCode sign-in screen:',
+    link ?? '(could not build the link — is PUBLIC_URL / RENDER_EXTERNAL_URL set?)',
+    '',
+    'Sign in inside that page exactly like you normally would. If a "verify you are human" check appears, just complete it yourself — it is your own login. The moment LeetCode recognizes you, I save the new cookies automatically, confirm here, and start today\'s run.',
+    '',
+    'The link is single-use and expires after one renewal. Nothing to install.',
+  ];
+  return lines.join('\n') + '\n' + RENEW_FALLBACK_HINT;
+}
 
 export function startTelegramBot(): () => void {
   if (!config.telegram.enabled || !config.telegram.commands) {
@@ -138,7 +141,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         await reply(HELP_TEXT);
         return;
       case '/renew':
-        await reply(RENEW_INSTRUCTIONS);
+        await reply(await renewInstructions());
         return;
       case '/status':
         await reply(await statusText());

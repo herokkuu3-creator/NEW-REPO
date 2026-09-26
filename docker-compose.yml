@@ -46,6 +46,7 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TELEGRAM_COMMANDS: ${TELEGRAM_COMMANDS:-true}
       SETUP_TOKEN: ${SETUP_TOKEN:-local-dev-token}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:3001}
       PORT: "3001"
       LOG_LEVEL: info
     volumes:

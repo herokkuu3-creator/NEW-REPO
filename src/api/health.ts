@@ -10,6 +10,8 @@ import {
   saveStorageStateToDb,
 } from '../database/models';
 import { applySessionRenewal } from '../browser/sessionRenewal';
+import { setRenewalCallback } from '../browser/remoteBrowser';
+import { registerRenewalRoutes } from './renewalRoutes';
 
 /**
  * Health + minimal admin API.
@@ -40,6 +42,15 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
 
   const requireAdmin = (authorization: string | undefined): boolean =>
     authorization === `Bearer ${config.api.setupToken}`;
+
+  // /renew — the human sign-in page (streamed remote browser). A successful
+  // sign-in there saves the cookies and immediately recovers today's run.
+  setRenewalCallback((username) => {
+    void hooks.triggerRun('session-renewal').then((r) =>
+      logger.info({ username, started: r.started }, 'renewal complete — run recovery attempted'),
+    );
+  });
+  registerRenewalRoutes(app);
 
   app.get('/health', async () => {
     const [sys, last] = await Promise.all([getAllSystemState(), latestRun()]);

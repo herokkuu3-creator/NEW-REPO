@@ -66,6 +66,7 @@ export const SystemKeys = {
   authStatus: 'authStatus', // 'ok' | 'authentication_required' | 'unknown'
   authUsername: 'authUsername',
   authNotifiedAt: 'authNotifiedAt', // YYYY-MM-DD of the last session-expired alert (dedupe)
+  renewalToken: 'renewalToken', // secret that authorizes the /renew remote-browser page
   lastError: 'lastError',
   lastRunSummary: 'lastRunSummary',
   storageState: 'storageStateJson', // Playwright storageState snapshot (DB-persisted)

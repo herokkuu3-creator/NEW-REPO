@@ -77,7 +77,7 @@ export async function triggerRun(reason: string): Promise<RunTriggerResult> {
 }
 
 export async function executeDailyRun(reason: string): Promise<RunState> {
-  const forceRun = reason === 'admin-api';
+  const forceRun = reason === 'admin-api' || reason === 'session-renewal';
   if (runInProgress) {
     logger.warn({ reason }, 'run skipped — already in progress');
     return RunState.PENDING;

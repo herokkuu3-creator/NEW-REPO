@@ -88,6 +88,11 @@ const envSchema = z.object({
 
   PORT: intFromString(3001),
   SETUP_TOKEN: z.string().min(8, 'SETUP_TOKEN must be at least 8 characters'),
+  // Public base URL of the service, used to build the /renew sign-in link in
+  // Telegram alerts. Render sets RENDER_EXTERNAL_URL automatically, so on
+  // Render nothing needs configuring; set PUBLIC_URL only for a custom domain.
+  PUBLIC_URL: z.string().default(''),
+  RENDER_EXTERNAL_URL: z.string().default(''),
 
   LOG_LEVEL: z
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace'])
@@ -128,7 +133,7 @@ export type Config = Readonly<{
   transport: 'api' | 'browser';
   submission: { autoSubmit: boolean };
   telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean };
-  api: { port: number; setupToken: string };
+  api: { port: number; setupToken: string; publicUrl: string };
   logLevel: z.infer<typeof envSchema>['LOG_LEVEL'];
 }>;
 
@@ -184,7 +189,12 @@ function loadConfig(): Config {
       enabled: env.TELEGRAM_BOT_TOKEN.length > 0 && env.TELEGRAM_CHAT_ID.length > 0,
       commands: env.TELEGRAM_COMMANDS,
     },
-    api: { port: env.PORT, setupToken: env.SETUP_TOKEN },
+    api: {
+      port: env.PORT,
+      setupToken: env.SETUP_TOKEN,
+      publicUrl:
+        env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || `http://localhost:${env.PORT}`,
+    },
     logLevel: env.LOG_LEVEL,
   });
 }

@@ -1,5 +1,6 @@
 import { RunState } from '../database/models';
 import { sendTelegramMessage, sendTelegramPhoto } from './telegram';
+import { renewalUrl } from '../browser/remoteBrowser';
 
 /**
  * Notification composition. Channel-agnostic interface at the top,
@@ -53,13 +54,23 @@ export async function notifyRunFinished(n: RunNotification): Promise<void> {
  * instead of a generic "attention needed".
  */
 export async function notifySessionExpired(): Promise<void> {
+  const link = await renewalUrl().catch(() => null);
   const lines = [
     '🔑 LeetCode session expired',
     '',
-    "The stored cookies are no longer accepted — the daily run cannot start until the session is renewed.",
+    'The stored cookies are no longer accepted — the daily run cannot start until you sign in again.',
     '',
-    'Send /renew to this bot and follow the steps — it takes about 2 minutes from your phone, no redeploy needed.',
   ];
+  if (link) {
+    lines.push(
+      '👉 Tap to sign in (opens a live browser, ~2 min from your phone):',
+      link,
+      '',
+      'Sign in inside that page; the moment LeetCode recognizes you, the new cookies are saved automatically and today\'s run starts.',
+    );
+  } else {
+    lines.push('Send /renew to get a fresh sign-in link.');
+  }
   await sendTelegramMessage(lines.join('\n'));
 }
 
