@@ -1,0 +1,175 @@
+import { z } from 'zod';
+
+/**
+ * Central configuration. Every environment variable is parsed and validated
+ * here exactly once — the rest of the codebase consumes a typed Config object
+ * and never touches process.env directly.
+ */
+
+const boolFromString = z
+  .string()
+  .optional()
+  .transform((v) => (v ?? '').toLowerCase() === 'true');
+
+const intFromString = (fallback: number) =>
+  z
+    .string()
+    .optional()
+    .transform((v) => {
+      const n = Number.parseInt(v ?? '', 10);
+      return Number.isFinite(n) ? n : fallback;
+    });
+
+const optionalNumber = z
+  .string()
+  .optional()
+  .transform((v) => {
+    if (v === undefined || v.trim() === '') return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+  });
+
+const envSchema = z.object({
+  DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
+
+  BROWSER_PROFILE_PATH: z.string().default('./local-auth/browser-profile'),
+  STORAGE_STATE_PATH: z.string().default('./local-auth/storage-state.json'),
+  HEADLESS: boolFromString,
+  DIAGNOSTICS_DIR: z.string().default('./diagnostics'),
+  CHROMIUM_SINGLE_PROCESS: boolFromString,
+
+  DAILY_RUN_HOUR: intFromString(9).pipe(z.number().int().min(0).max(23)),
+  DAILY_RUN_MINUTE: intFromString(0).pipe(z.number().int().min(0).max(59)),
+  TIMEZONE: z.string().default('Asia/Kolkata'),
+  RUN_ON_BOOT: boolFromString,
+
+  LLM_PROVIDER: z.string().default('gemini'),
+  // LLM_API_KEY is the generic name; GEMINI_API_KEY is accepted as a
+  // fallback so a Google AI Studio key can be pasted under either name.
+  LLM_API_KEY: z.string().default(''),
+  GEMINI_API_KEY: z.string().default(''),
+  LLM_MODEL: z.string().default('gemini-3.5-flash'),
+  LLM_BASE_URL: z.string().default(''),
+  LLM_TIMEOUT_MS: intFromString(120_000),
+  LLM_MAX_TOKENS: intFromString(8192),
+  LLM_REASONING_EFFORT: z
+    .enum(['minimal', 'low', 'medium', 'high', 'none'])
+    .optional(),
+  LLM_TEMPERATURE: optionalNumber,
+  MAX_SOLUTION_RETRIES: intFromString(3).pipe(z.number().int().min(0).max(10)),
+  LEETCODE_LANGUAGE: z
+    .enum(['cpp', 'javascript', 'typescript', 'python3'])
+    .default('cpp'),
+
+  // --- Solution source -----------------------------------------------------
+  // 'walkccc' (default): fetch the curated C++ solution from walkccc.me —
+  // no LLM key required. 'llm': generate with an LLM (LLM_PROVIDER etc.).
+  SOLUTION_SOURCE: z.enum(['walkccc', 'llm']).default('walkccc'),
+  WALKCCC_BASE_URL: z.string().default('https://walkccc.me/LeetCode'),
+
+  AUTO_SUBMIT: boolFromString,
+
+  TELEGRAM_BOT_TOKEN: z.string().default(''),
+  TELEGRAM_CHAT_ID: z.string().default(''),
+
+  PORT: intFromString(3001),
+  SETUP_TOKEN: z.string().min(8, 'SETUP_TOKEN must be at least 8 characters'),
+
+  LOG_LEVEL: z
+    .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace'])
+    .default('info'),
+});
+
+export type Config = Readonly<{
+  databaseUrl: string;
+  browser: {
+    profilePath: string;
+    storageStatePath: string;
+    headless: boolean;
+    diagnosticsDir: string;
+    chromiumSingleProcess: boolean;
+  };
+  schedule: {
+    hour: number;
+    minute: number;
+    timezone: string;
+    runOnBoot: boolean;
+  };
+  llm: {
+    provider: string;
+    apiKey: string;
+    model: string;
+    baseUrl: string;
+    timeoutMs: number;
+    maxTokens: number;
+    reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'none';
+    temperature?: number;
+    maxSolutionRetries: number;
+    language: 'cpp' | 'javascript' | 'typescript' | 'python3';
+  };
+  solution: {
+    source: 'walkccc' | 'llm';
+    walkcccBaseUrl: string;
+  };
+  submission: { autoSubmit: boolean };
+  telegram: { botToken: string; chatId: string; enabled: boolean };
+  api: { port: number; setupToken: string };
+  logLevel: z.infer<typeof envSchema>['LOG_LEVEL'];
+}>;
+
+function loadConfig(): Config {
+  const parsed = envSchema.safeParse(process.env);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((i) => `  - ${i.path.join('.')}: ${i.message}`)
+      .join('\n');
+    // No logger here yet — config loads before pino is constructed.
+    console.error(`Invalid environment configuration:\n${issues}`);
+    process.exit(1);
+  }
+  const env = parsed.data;
+
+  const headlessDefault = process.env.HEADLESS;
+  return Object.freeze({
+    databaseUrl: env.DATABASE_URL,
+    browser: {
+      profilePath: env.BROWSER_PROFILE_PATH,
+      storageStatePath: env.STORAGE_STATE_PATH,
+      headless: headlessDefault === undefined ? true : env.HEADLESS,
+      diagnosticsDir: env.DIAGNOSTICS_DIR,
+      chromiumSingleProcess: env.CHROMIUM_SINGLE_PROCESS,
+    },
+    schedule: {
+      hour: env.DAILY_RUN_HOUR,
+      minute: env.DAILY_RUN_MINUTE,
+      timezone: env.TIMEZONE,
+      runOnBoot: env.RUN_ON_BOOT,
+    },
+    llm: {
+      provider: env.LLM_PROVIDER,
+      apiKey: env.LLM_API_KEY || env.GEMINI_API_KEY,
+      model: env.LLM_MODEL,
+      baseUrl: env.LLM_BASE_URL,
+      timeoutMs: env.LLM_TIMEOUT_MS,
+      maxTokens: env.LLM_MAX_TOKENS,
+      reasoningEffort: env.LLM_REASONING_EFFORT,
+      temperature: env.LLM_TEMPERATURE,
+      maxSolutionRetries: env.MAX_SOLUTION_RETRIES,
+      language: env.LEETCODE_LANGUAGE,
+    },
+    solution: {
+      source: env.SOLUTION_SOURCE,
+      walkcccBaseUrl: env.WALKCCC_BASE_URL,
+    },
+    submission: { autoSubmit: env.AUTO_SUBMIT },
+    telegram: {
+      botToken: env.TELEGRAM_BOT_TOKEN,
+      chatId: env.TELEGRAM_CHAT_ID,
+      enabled: env.TELEGRAM_BOT_TOKEN.length > 0 && env.TELEGRAM_CHAT_ID.length > 0,
+    },
+    api: { port: env.PORT, setupToken: env.SETUP_TOKEN },
+    logLevel: env.LOG_LEVEL,
+  });
+}
+
+export const config = loadConfig();

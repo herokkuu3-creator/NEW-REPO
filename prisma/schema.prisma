@@ -1,0 +1,54 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// One row per daily-challenge execution. `date` is the LeetCode daily
+/// challenge date (YYYY-MM-DD in TIMEZONE) and is unique, which makes
+/// duplicate submissions impossible even across worker restarts.
+model DailyRun {
+  id               String    @id @default(cuid())
+  date             String    @unique // YYYY-MM-DD (configured timezone)
+  problemSlug      String
+  title            String
+  difficulty       String
+  language         String
+  solution         String?   @db.Text
+  submissionId     String?
+  submissionStatus String?
+  runtime          String?
+  memory           String?
+  state            RunState
+  error            String?   @db.Text
+  attempts         Int       @default(0)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([state])
+  @@index([createdAt])
+}
+
+/// Small key/value store for cross-restart system state:
+/// auth status, last error, last run summary — powers GET /health.
+model SystemState {
+  key       String   @id
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt
+}
+
+enum RunState {
+  PENDING
+  AUTHENTICATION_REQUIRED
+  CLOUDFLARE_VERIFICATION_REQUIRED
+  DAILY_PROBLEM_NOT_FOUND
+  PROBLEM_PARSE_FAILED
+  LLM_ERROR
+  SOLUTION_VALIDATION_FAILED
+  SUBMISSION_ERROR
+  SUBMISSION_REJECTED
+  SUCCESS
+}

@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "lib": ["ES2022", "DOM"],
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": false,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["node_modules", "dist", "tests", "local-auth"]
+}

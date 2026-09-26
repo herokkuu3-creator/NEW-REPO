@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Authenticated browser artifacts — NEVER commit
+local-auth/
+browser-profile/
+storage-state.json
+storageState.json
+
+# Runtime diagnostics (may contain page HTML / screenshots)
+diagnostics/
+*.png
+!docs/**/*.png
+
+# Logs
+logs/
+*.log
+
+# Prisma local db
+*.db
+*.db-journal
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

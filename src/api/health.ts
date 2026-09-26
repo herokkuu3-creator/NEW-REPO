@@ -1,0 +1,127 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import Fastify, { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { config } from '../config';
+import { logger } from '../logger';
+import {
+  getAllSystemState,
+  latestRun,
+  saveStorageStateToDb,
+} from '../database/models';
+
+/**
+ * Health + minimal admin API.
+ *
+ *   GET  /health        — unauthenticated liveness + last-run + auth status
+ *   POST /admin/run-now — manual trigger, protected by SETUP_TOKEN (Bearer)
+ *
+ * No cookies, tokens, or secrets are ever exposed in responses.
+ */
+
+export interface ApiHooks {
+  triggerRun: (reason: string) => Promise<{ started: boolean; message: string }>;
+  isRunInProgress: () => boolean;
+}
+
+/** Shape of a Playwright storageState file — validated, never logged. */
+const storageStateSchema = z.object({
+  cookies: z.array(z.record(z.unknown())),
+  origins: z.array(z.record(z.unknown())),
+});
+
+export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstance> {
+  const app = Fastify({
+    logger: false, // pino is our logger; fastify's would double-log
+    trustProxy: true,
+    bodyLimit: 16 * 1024 * 1024, // storageState uploads can exceed the 1MB default
+  });
+
+  const requireAdmin = (authorization: string | undefined): boolean =>
+    authorization === `Bearer ${config.api.setupToken}`;
+
+  app.get('/health', async () => {
+    const [sys, last] = await Promise.all([getAllSystemState(), latestRun()]);
+    return {
+      status: 'ok',
+      service: 'leetcode-daily-agent',
+      now: new Date().toISOString(),
+      runInProgress: hooks.isRunInProgress(),
+      authentication: {
+        status: sys['authStatus'] ?? 'unknown',
+        username: sys['authUsername'] ?? null,
+      },
+      lastRun: last
+        ? {
+            date: last.date,
+            problemSlug: last.problemSlug,
+            title: last.title,
+            state: last.state,
+            submissionStatus: last.submissionStatus,
+            runtime: last.runtime,
+            memory: last.memory,
+            createdAt: last.createdAt.toISOString(),
+          }
+        : null,
+      lastError: sys['lastError'] ?? null,
+    };
+  });
+
+  const runNowBodySchema = z.object({}).passthrough();
+
+  app.post('/admin/run-now', async (req, reply) => {
+    if (!requireAdmin(req.headers.authorization)) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    runNowBodySchema.parse(req.body ?? {});
+    const result = await hooks.triggerRun('admin-api');
+    return reply.code(result.started ? 202 : 409).send(result);
+  });
+
+  /**
+   * Upload / refresh the storageState credential.
+   *
+   * Render's free tier has NO shell access and NO persistent disk, so this
+   * endpoint is how the authenticated session gets onto the service:
+   *   curl -X POST -H "Authorization: Bearer $SETUP_TOKEN" \
+   *        -H "Content-Type: application/json" \
+   *        --data-binary @local-auth/storage-state.json \
+   *        https://<service>.onrender.com/admin/storage-state
+   *
+   * The snapshot is stored in Postgres (durable across restarts and
+   * spin-downs) and mirrored to the filesystem path when writable.
+   * The content is NEVER logged.
+   */
+  app.post('/admin/storage-state', async (req, reply) => {
+    if (!requireAdmin(req.headers.authorization)) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    const parsed = storageStateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: 'invalid storageState payload — expected a Playwright storageState JSON object',
+      });
+    }
+    const json = JSON.stringify(parsed.data);
+    await saveStorageStateToDb(json);
+    try {
+      const target = config.browser.storageStatePath;
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, json);
+    } catch {
+      // Ephemeral/read-only filesystem is fine — the DB copy is authoritative.
+    }
+    logger.info({ cookies: parsed.data.cookies.length }, 'storageState updated via admin API');
+    return reply.send({
+      ok: true,
+      stored: 'database',
+      cookies: parsed.data.cookies.length,
+      origins: parsed.data.origins.length,
+    });
+  });
+
+  const port = config.api.port;
+  await app.listen({ port, host: '0.0.0.0' });
+  logger.info({ port }, 'health server listening');
+  return app;
+}

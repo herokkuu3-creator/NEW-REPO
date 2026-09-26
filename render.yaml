@@ -1,0 +1,95 @@
+# Render Blueprint — LeetCode Daily Agent (FREE TIER edition)
+#
+# Verified against https://render.com/docs/free (Sept 2026):
+#   - Free tier supports ONLY: web services, Postgres, Key Value, static sites.
+#     Background Workers and Cron Jobs are PAID-only — so this service is a
+#     FREE WEB SERVICE that happens to run a scheduler.
+#   - Free web services CANNOT attach persistent disks and have NO shell
+#     access — the storageState credential therefore lives in Postgres and is
+#     uploaded via POST /admin/storage-state (see DEPLOYMENT.md §7).
+#   - Free web services spin down after 15 idle minutes and have an ephemeral
+#     filesystem — all durable state is in Postgres. Keep-alive pings from a
+#     free external monitor (cron-job.org) keep the service awake inside the
+#     750 free instance-hours/month budget (24×31 = 744 < 750); alternatively
+#     let it sleep and have the external cron trigger POST /admin/run-now.
+#   - Free Postgres: 1 GB, EXPIRES 30 DAYS after creation (14-day grace).
+#     For a permanent free database, point DATABASE_URL at a free external
+#     Postgres (e.g. Neon) instead — DEPLOYMENT.md §13.
+#
+# LLM: NOT required by default — solutions are fetched from walkccc.me
+# (SOLUTION_SOURCE=walkccc). GEMINI_API_KEY below is only needed if you switch
+# SOLUTION_SOURCE to llm.
+#
+# Provisions: ONE free web service (single instance — free tier cannot scale
+# anyway) + one free Postgres database.
+
+services:
+  - type: web
+    name: leetcode-daily-agent
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: leetcode-agent-db
+          property: connectionString
+      # No persistent disk on free tier — these live on the ephemeral
+      # filesystem; the durable copies are in Postgres.
+      - key: BROWSER_PROFILE_PATH
+        value: /tmp/browser-profile
+      - key: STORAGE_STATE_PATH
+        value: /tmp/storage-state.json
+      - key: DIAGNOSTICS_DIR
+        value: /tmp/diagnostics
+      - key: HEADLESS
+        value: "true"
+      # 512MB instance: V8 heap is capped inside Chromium via launch flags;
+      # raise this escape hatch only if you see Chromium OOM crashes.
+      - key: CHROMIUM_SINGLE_PROCESS
+        value: "false"
+      - key: DAILY_RUN_HOUR
+        value: "9"
+      - key: DAILY_RUN_MINUTE
+        value: "0"
+      - key: TIMEZONE
+        value: Asia/Kolkata
+      - key: RUN_ON_BOOT
+        value: "true" # covers cold starts triggered by an external cron ping
+      - key: LEETCODE_LANGUAGE
+        value: cpp
+      - key: AUTO_SUBMIT
+        value: "false"
+      # --- Solution source ---------------------------------------------------
+      # walkccc (default): fetch curated C++ solutions from walkccc.me — no LLM
+      # key needed. Set to "llm" to generate with an LLM instead.
+      - key: SOLUTION_SOURCE
+        value: walkccc
+      - key: WALKCCC_BASE_URL
+        value: https://walkccc.me/LeetCode
+      # --- LLM: only used when SOLUTION_SOURCE=llm ---------------------------
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: LLM_MODEL
+        value: gemini-3.5-flash
+      - key: LLM_MAX_TOKENS
+        value: "8192"
+      # Only set this if you switch SOLUTION_SOURCE to llm:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: SETUP_TOKEN
+        sync: false # long random string; protects /admin/* endpoints
+      - key: MAX_SOLUTION_RETRIES
+        value: "3"
+      - key: LOG_LEVEL
+        value: info
+
+databases:
+  - name: leetcode-agent-db
+    databaseName: leetcode_agent
+    plan: free # 1 GB, expires 30 days after creation — see DEPLOYMENT.md §13
