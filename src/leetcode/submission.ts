@@ -92,7 +92,7 @@ export async function submitCurrentEditor(
   const submissionId = await submissionIdPromise.catch((err) => {
     logger.warn(
       { err: err instanceof Error ? err.message : String(err) },
-      'could not capture submission id from network â€” will try result panel',
+      'could not capture submission ID from the network - will try the result panel',
     );
     return null;
   });
@@ -193,7 +193,7 @@ async function pollSubmissionResult(page: Page, submissionId: string): Promise<S
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
-        'submission poll failed â€” retrying',
+        'submission polling failed - retrying',
       );
     }
   }
@@ -265,4 +265,3 @@ async function scrapeNear(page: Page, selectors: readonly string[]): Promise<str
   }
   return null;
 }
-

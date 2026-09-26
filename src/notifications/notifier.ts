@@ -23,8 +23,8 @@ export interface RunNotification {
 export async function notifyRunFinished(n: RunNotification): Promise<void> {
   const success = n.state === RunState.SUCCESS;
   const header = success
-    ? 'âœ… LeetCode Daily Challenge Completed'
-    : 'âš ï¸ LeetCode Daily Challenge â€” Attention Needed';
+    ? 'LeetCode Daily Challenge Completed'
+    : 'LeetCode Daily Challenge: Attention Needed';
 
   const lines = [
     header,
@@ -43,7 +43,7 @@ export async function notifyRunFinished(n: RunNotification): Promise<void> {
 
   await sendTelegramMessage(lines.join('\n'));
   if (n.screenshotPath) {
-    await sendTelegramPhoto(n.screenshotPath, `${n.state} â€” ${n.title}`);
+    await sendTelegramPhoto(n.screenshotPath, `${n.state}: ${n.title}`);
   }
 }
 
@@ -56,12 +56,12 @@ export async function notifySessionExpired(): Promise<void> {
   await sendTelegramMessage([
     'LeetCode session expired',
     '',
-    'Android renewal - no computer is required.',
+    'Android renewal: no computer is required.',
     '',
     'Open Lemur Browser on Android -> sign in to LeetCode -> open the LeetCode Session Capture extension -> capture/download leetcode-session.json -> send that file here in Telegram.',
     '',
     'I will validate the session, save it securely, and start today\'s run automatically.',
-  ].join('\\n'));
+  ].join('\n'));
 }
 
 /** Minimal escaping â€” we send plain text, so only guard against confusing the API. */

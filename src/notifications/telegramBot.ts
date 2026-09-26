@@ -49,16 +49,16 @@ interface TgUpdate {
 }
 
 const HELP_TEXT = [
-  'ðŸ¤– LeetCode Daily Agent',
+  'LeetCode Daily Agent',
   '',
-  '/renew â€” refresh an expired LeetCode session (cookies from your own browser)',
-  '/status â€” auth state + last run',
-  '/cancel â€” abort a renewal in progress',
-  '/help â€” this message',
+  '/renew - refresh an expired LeetCode session (cookies from your own browser)',
+  '/status - show authentication status and the last run',
+  '/cancel - cancel a renewal in progress',
+  '/help - show this message',
 ].join('\n');
 
 const RENEW_INSTRUCTIONS = [
-  'LeetCode session renewal - Android only',
+  'LeetCode session renewal: Android only',
   '',
   'No computer is required.',
   '',
@@ -70,7 +70,7 @@ const RENEW_INSTRUCTIONS = [
   '6. Send leetcode-session.json to this Telegram bot as a document.',
   '',
   'I will validate the session with LeetCode before replacing the stored session. If valid, I save it and start today\'s run automatically.',
-].join('\\n');
+  ].join('\n');
 
 export function startTelegramBot(): () => void {
   if (!config.telegram.enabled || !config.telegram.commands) {
@@ -83,7 +83,7 @@ export function startTelegramBot(): () => void {
   void (async () => {
     // A leftover webhook makes getUpdates fail with HTTP 409 â€” drop it once.
     await tgApi('deleteWebhook', { drop_pending_updates: true }).catch((err) =>
-      logger.warn({ err: errText(err) }, 'telegram deleteWebhook failed â€” continuing anyway'),
+      logger.warn({ err: errText(err) }, 'Telegram deleteWebhook failed - continuing anyway'),
     );
     logger.info('telegram command bot polling started (/renew, /status, /help)');
 
@@ -105,7 +105,7 @@ export function startTelegramBot(): () => void {
         }
       } catch (err) {
         if (stopped) break;
-        logger.warn({ err: errText(err) }, 'telegram polling error â€” retrying in 5s');
+        logger.warn({ err: errText(err) }, 'Telegram polling error - retrying in 5 seconds');
         await sleep(5_000);
       }
     }
@@ -138,7 +138,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         await reply(await statusText());
         return;
       case '/cancel':
-        await reply('Nothing is pending on my side â€” whenever you are ready, send /renew and then the cookies.');
+        await reply('No renewal is currently in progress. When you are ready, send /renew and then the cookies.');
         return;
       default:
         await reply('Unknown command. Available: /renew, /status, /cancel, /help');
@@ -156,38 +156,38 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     return;
   }
   if (!looksLikeCookiePayload(payload)) {
-    await reply('That does not look like cookies â€” send /renew for the step-by-step instructions.');
+    await reply('That does not look like a cookie export. Send /renew for step-by-step instructions.');
     return;
   }
 
-  await reply('â³ Validating the new session with LeetCodeâ€¦');
+  await reply('Validating the new session with LeetCode...');
   const result = await applySessionRenewal(payload);
 
   if (!result.ok) {
-    await reply(`âŒ Renewal failed\n\n${result.error}\n\nSend /renew to see the steps again.`);
+    await reply(`Session renewal failed.\n\n${result.error}\n\nSend /renew to see the steps again.`);
     return;
   }
 
   // Session restored â€” immediately recover today's run if it failed/was skipped.
   const trigger = await triggerRun('session-renewal');
   const followUp = trigger.started
-    ? "Today's challenge run is starting now â€” I will report the result here."
+    ? "Today's challenge run is starting now. I will report the result here."
     : `Today's run was not started: ${trigger.message}`;
   await reply(
-    `âœ… Session renewed â€” signed in as ${result.username} (${result.cookieCount} cookies, ${result.format}).\n\n${followUp}`,
+    `Session renewed. Signed in as ${result.username} (${result.cookieCount} cookies, ${result.format}).\n\n${followUp}`,
   );
 }
 
 async function statusText(): Promise<string> {
   const [sys, last] = await Promise.all([getAllSystemState(), latestRun()]);
   const lines = [
-    'ðŸ“Š Agent status',
+    'Agent status',
     '',
     `Auth: ${sys['authStatus'] ?? 'unknown'}${sys['authUsername'] ? ` (${sys['authUsername']})` : ''}`,
   ];
   if (last) {
     lines.push(
-      `Last run: ${last.date} Â· ${last.title} Â· ${last.state}${last.submissionStatus ? ` (${last.submissionStatus})` : ''}`,
+      `Last run: ${last.date} - ${last.title} - ${last.state}${last.submissionStatus ? ` (${last.submissionStatus})` : ''}`,
     );
   } else {
     lines.push('Last run: none yet');
