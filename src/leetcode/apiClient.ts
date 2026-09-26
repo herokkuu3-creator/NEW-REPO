@@ -147,10 +147,12 @@ export class LeetCodeApi {
     const res = await this.request.post(`${ORIGIN}/problems/${params.slug}/submit/`, {
       headers: {
         'x-csrftoken': token,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
         Origin: ORIGIN,
-        Referer: `${ORIGIN}/problems/${params.slug}/`,
+        Referer: `${ORIGIN}/problems/${params.slug}/submissions/`,
       },
-      form: {
+      data: {
         lang: params.lang,
         question_id: params.questionId,
         typed_code: params.code,
@@ -161,7 +163,11 @@ export class LeetCodeApi {
     const status = res.status();
     const text = await res.text();
     if (status !== 200) {
-      throw new LeetCodeHttpError(`submit HTTP ${status}`, status);
+      const detail = text.replace(/\s+/g, ' ').trim().slice(0, 300);
+      throw new LeetCodeHttpError(
+        `submit HTTP ${status}${detail ? `: ${detail}` : ''}`,
+        status,
+      );
     }
 
     let json: unknown;
