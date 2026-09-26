@@ -3,7 +3,7 @@ import { sendTelegramMessage, sendTelegramPhoto } from './telegram';
 
 /**
  * Notification composition. Channel-agnostic interface at the top,
- * Telegram implementation below — add email/Slack here later.
+ * Telegram implementation below â€” add email/Slack here later.
  */
 
 export interface RunNotification {
@@ -23,8 +23,8 @@ export interface RunNotification {
 export async function notifyRunFinished(n: RunNotification): Promise<void> {
   const success = n.state === RunState.SUCCESS;
   const header = success
-    ? '✅ LeetCode Daily Challenge Completed'
-    : '⚠️ LeetCode Daily Challenge — Attention Needed';
+    ? 'âœ… LeetCode Daily Challenge Completed'
+    : 'âš ï¸ LeetCode Daily Challenge â€” Attention Needed';
 
   const lines = [
     header,
@@ -43,27 +43,26 @@ export async function notifyRunFinished(n: RunNotification): Promise<void> {
 
   await sendTelegramMessage(lines.join('\n'));
   if (n.screenshotPath) {
-    await sendTelegramPhoto(n.screenshotPath, `${n.state} — ${n.title}`);
+    await sendTelegramPhoto(n.screenshotPath, `${n.state} â€” ${n.title}`);
   }
 }
 
 /**
- * Session-expired alert — the entry point of the /renew flow. Kept separate
+ * Session-expired alert â€” the entry point of the /renew flow. Kept separate
  * from notifyRunFinished so the message can carry the renewal instructions
  * instead of a generic "attention needed".
  */
 export async function notifySessionExpired(): Promise<void> {
-  const lines = [
-    '🔑 LeetCode session expired',
+  await sendTelegramMessage([
+    'ðŸ”‘ LeetCode session expired',
     '',
-    "The stored cookies are no longer accepted — the daily run cannot start until you sign in again.",
+    'On Android: sign in to LeetCode in Chrome, open Termux in the agent folder, and run `npm run capture`.',
     '',
-    'Send /renew for the 2-minute fix (one script run from any computer or Android phone — no cookie copying).',
-  ];
-  await sendTelegramMessage(lines.join('\n'));
+    'It creates Download/leetcode-session.json. Send that file here in Telegram; I validate it, save the session, and start today\'s run.',
+  ].join('\n'));
 }
 
-/** Minimal escaping — we send plain text, so only guard against confusing the API. */
+/** Minimal escaping â€” we send plain text, so only guard against confusing the API. */
 function escape(s: string): string {
   return s.replace(/[\r\n]+/g, ' ').trim();
 }

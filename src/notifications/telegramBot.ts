@@ -6,23 +6,23 @@ import { applySessionRenewal } from '../browser/sessionRenewal';
 import { triggerRun } from '../scheduler/dailyWorker';
 
 /**
- * Telegram command bot — the interactive half of session renewal.
+ * Telegram command bot â€” the interactive half of session renewal.
  *
  * Long polling (getUpdates), so it needs NO public webhook setup and works
  * on Render's free web service as-is. Commands:
  *
- *   /renew   — step-by-step instructions, then paste/upload the cookies
- *   /status  — auth state + last run
- *   /help    — command list
- *   /cancel  — abort a renewal in progress
+ *   /renew   â€” step-by-step instructions, then paste/upload the cookies
+ *   /status  â€” auth state + last run
+ *   /help    â€” command list
+ *   /cancel  â€” abort a renewal in progress
  *
- * Security: messages from ANY chat other than TELEGRAM_CHAT_ID are ignored —
+ * Security: messages from ANY chat other than TELEGRAM_CHAT_ID are ignored â€”
  * the bot token is semi-public (anyone can message the bot), the chat ID is
  * the access control. Cookie payloads are validated against LeetCode before
  * anything is stored, and are never logged or echoed back.
  *
  * Large exports: Telegram splits pasted text at ~4096 characters, which
- * corrupts JSON — so Cookie-Editor exports can also be sent as .txt/.json
+ * corrupts JSON â€” so Cookie-Editor exports can also be sent as .txt/.json
  * FILE attachments (handled via getFile + download).
  */
 
@@ -49,18 +49,18 @@ interface TgUpdate {
 }
 
 const HELP_TEXT = [
-  '🤖 LeetCode Daily Agent',
+  'ðŸ¤– LeetCode Daily Agent',
   '',
-  '/renew — refresh an expired LeetCode session (cookies from your own browser)',
-  '/status — auth state + last run',
-  '/cancel — abort a renewal in progress',
-  '/help — this message',
+  '/renew â€” refresh an expired LeetCode session (cookies from your own browser)',
+  '/status â€” auth state + last run',
+  '/cancel â€” abort a renewal in progress',
+  '/help â€” this message',
 ].join('\n');
 
 const RENEW_INSTRUCTIONS = [
-  '🔄 LeetCode session renewal (~2 minutes)',
+  'ðŸ”„ LeetCode session renewal (~2 minutes)',
   '',
-  'The reliable way — sign in from YOUR OWN browser (Cloudflare trusts it, unlike the server):',
+  'The reliable way â€” sign in from YOUR OWN browser (Cloudflare trusts it, unlike the server):',
   '',
   'On any computer (Windows/Mac/Linux) OR an Android phone with the Termux app:',
   '',
@@ -69,11 +69,11 @@ const RENEW_INSTRUCTIONS = [
   '3. Run the capture:',
   '   AGENT_URL=https://<your-service>.onrender.com SETUP_TOKEN=<your-token> npm run capture',
   '',
-  'A normal Chrome window opens on the LeetCode sign-in page. Sign in like always — any "verify you are human" check is yours to complete, it is your own browser. The script detects the sign-in by itself, uploads the session to the service, and today\'s run starts automatically. Nothing to copy or paste.',
+  'A normal Chrome window opens on the LeetCode sign-in page. Sign in like always â€” any "verify you are human" check is yours to complete, it is your own browser. The script detects the sign-in by itself, uploads the session to the service, and today\'s run starts automatically. Nothing to copy or paste.',
   '',
-  'Alternative: paste cookies here — LEETCODE_SESSION=...; csrftoken=..., a Cookie-Editor export, or a storageState JSON (long ones as a .txt/.json file) — and I will validate them.',
+  'Alternative: paste cookies here â€” LEETCODE_SESSION=...; csrftoken=..., a Cookie-Editor export, or a storageState JSON (long ones as a .txt/.json file) â€” and I will validate them.',
   '',
-  '/status — current state · /cancel — nothing pending is ever held',
+  '/status â€” current state Â· /cancel â€” nothing pending is ever held',
 ].join('\n');
 
 export function startTelegramBot(): () => void {
@@ -85,9 +85,9 @@ export function startTelegramBot(): () => void {
   let stopped = false;
 
   void (async () => {
-    // A leftover webhook makes getUpdates fail with HTTP 409 — drop it once.
+    // A leftover webhook makes getUpdates fail with HTTP 409 â€” drop it once.
     await tgApi('deleteWebhook', { drop_pending_updates: true }).catch((err) =>
-      logger.warn({ err: errText(err) }, 'telegram deleteWebhook failed — continuing anyway'),
+      logger.warn({ err: errText(err) }, 'telegram deleteWebhook failed â€” continuing anyway'),
     );
     logger.info('telegram command bot polling started (/renew, /status, /help)');
 
@@ -109,7 +109,7 @@ export function startTelegramBot(): () => void {
         }
       } catch (err) {
         if (stopped) break;
-        logger.warn({ err: errText(err) }, 'telegram polling error — retrying in 5s');
+        logger.warn({ err: errText(err) }, 'telegram polling error â€” retrying in 5s');
         await sleep(5_000);
       }
     }
@@ -142,7 +142,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         await reply(await statusText());
         return;
       case '/cancel':
-        await reply('Nothing is pending on my side — whenever you are ready, send /renew and then the cookies.');
+        await reply('Nothing is pending on my side â€” whenever you are ready, send /renew and then the cookies.');
         return;
       default:
         await reply('Unknown command. Available: /renew, /status, /cancel, /help');
@@ -160,38 +160,38 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     return;
   }
   if (!looksLikeCookiePayload(payload)) {
-    await reply('That does not look like cookies — send /renew for the step-by-step instructions.');
+    await reply('That does not look like cookies â€” send /renew for the step-by-step instructions.');
     return;
   }
 
-  await reply('⏳ Validating the new session with LeetCode…');
+  await reply('â³ Validating the new session with LeetCodeâ€¦');
   const result = await applySessionRenewal(payload);
 
   if (!result.ok) {
-    await reply(`❌ Renewal failed\n\n${result.error}\n\nSend /renew to see the steps again.`);
+    await reply(`âŒ Renewal failed\n\n${result.error}\n\nSend /renew to see the steps again.`);
     return;
   }
 
-  // Session restored — immediately recover today's run if it failed/was skipped.
+  // Session restored â€” immediately recover today's run if it failed/was skipped.
   const trigger = await triggerRun('session-renewal');
   const followUp = trigger.started
-    ? "Today's challenge run is starting now — I will report the result here."
+    ? "Today's challenge run is starting now â€” I will report the result here."
     : `Today's run was not started: ${trigger.message}`;
   await reply(
-    `✅ Session renewed — signed in as ${result.username} (${result.cookieCount} cookies, ${result.format}).\n\n${followUp}`,
+    `âœ… Session renewed â€” signed in as ${result.username} (${result.cookieCount} cookies, ${result.format}).\n\n${followUp}`,
   );
 }
 
 async function statusText(): Promise<string> {
   const [sys, last] = await Promise.all([getAllSystemState(), latestRun()]);
   const lines = [
-    '📊 Agent status',
+    'ðŸ“Š Agent status',
     '',
     `Auth: ${sys['authStatus'] ?? 'unknown'}${sys['authUsername'] ? ` (${sys['authUsername']})` : ''}`,
   ];
   if (last) {
     lines.push(
-      `Last run: ${last.date} · ${last.title} · ${last.state}${last.submissionStatus ? ` (${last.submissionStatus})` : ''}`,
+      `Last run: ${last.date} Â· ${last.title} Â· ${last.state}${last.submissionStatus ? ` (${last.submissionStatus})` : ''}`,
     );
   } else {
     lines.push('Last run: none yet');

@@ -1,44 +1,44 @@
 {
-  "name": "leetcode-daily-agent",
-  "version": "1.0.0",
-  "description": "Autonomous LeetCode Daily Challenge assistant running as a Render Background Worker with an authenticated persistent Chromium session.",
-  "private": true,
-  "license": "UNLICENSED",
-  "type": "commonjs",
-  "engines": {
-    "node": ">=22.0.0"
-  },
-  "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/src/main.js",    
-    "dev": "tsx watch src/main.ts",
-    "auth:setup": "tsx scripts/auth-setup.ts",
-    "capture": "tsx scripts/capture-session.ts",
-    "capture:android": "tsx scripts/capture-session.ts --android",
-    "run:now": "tsx scripts/run-now.ts",
-    "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate deploy",
-    "prisma:migrate:dev": "prisma migrate dev",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "lint": "tsc --noEmit",
-    "postinstall": "prisma generate"
-  },
-  "dependencies": {
-    "@prisma/client": "^5.22.0",
-    "fastify": "^4.28.1",
-    "node-cron": "^3.0.3",
-    "openai": "^4.73.0",
-    "pino": "^9.5.0",
-    "playwright": "^1.63.0",
-    "zod": "^3.23.8"
-  },
-  "devDependencies": {
-    "@types/node": "^22.9.0",
-    "@types/node-cron": "^3.0.11",
-    "prisma": "^5.22.0",
-    "tsx": "^4.19.2",
-    "typescript": "^5.6.3",
-    "vitest": "^2.1.4"
-  }
+    "name":  "leetcode-daily-agent",
+    "version":  "1.0.0",
+    "description":  "Autonomous LeetCode Daily Challenge assistant running as a Render Background Worker with an authenticated persistent Chromium session.",
+    "private":  true,
+    "license":  "UNLICENSED",
+    "type":  "commonjs",
+    "engines":  {
+                    "node":  "\u003e=22.0.0"
+                },
+    "scripts":  {
+                    "build":  "tsc -p tsconfig.json",
+                    "start":  "node dist/src/main.js",
+                    "dev":  "tsx watch src/main.ts",
+                    "auth:setup":  "tsx scripts/auth-setup.ts",
+                    "capture":  "node scripts/capture-session-android.mjs",
+                    "capture:android":  "node scripts/capture-session-android.mjs",
+                    "run:now":  "tsx scripts/run-now.ts",
+                    "prisma:generate":  "prisma generate",
+                    "prisma:migrate":  "prisma migrate deploy",
+                    "prisma:migrate:dev":  "prisma migrate dev",
+                    "test":  "vitest run",
+                    "test:watch":  "vitest",
+                    "lint":  "tsc --noEmit",
+                    "postinstall":  "prisma generate"
+                },
+    "dependencies":  {
+                         "@prisma/client":  "^5.22.0",
+                         "fastify":  "^4.28.1",
+                         "node-cron":  "^3.0.3",
+                         "openai":  "^4.73.0",
+                         "pino":  "^9.5.0",
+                         "playwright":  "^1.63.0",
+                         "zod":  "^3.23.8"
+                     },
+    "devDependencies":  {
+                            "@types/node":  "^22.9.0",
+                            "@types/node-cron":  "^3.0.11",
+                            "prisma":  "^5.22.0",
+                            "tsx":  "^4.19.2",
+                            "typescript":  "^5.6.3",
+                            "vitest":  "^2.1.4"
+                        }
 }

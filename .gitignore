@@ -4,12 +4,12 @@ node_modules/
 # Build output
 dist/
 
-# Secrets — NEVER commit
+# Secrets â€” NEVER commit
 .env
 .env.*
 !.env.example
 
-# Authenticated browser artifacts — NEVER commit
+# Authenticated browser artifacts â€” NEVER commit
 local-auth/
 browser-profile/
 storage-state.json
@@ -36,3 +36,7 @@ logs/
 .leetcode-daily-agent/
 
 local-auth/chrome-capture-profile/
+
+# Android Chrome session capture output
+leetcode-session.json
+android-capture/
