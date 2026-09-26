@@ -1,4 +1,4 @@
-import { Page } from 'playwright';
+﻿import { Page } from 'playwright';
 import { z } from 'zod';
 import { SELECTORS } from './selectors';
 import { leetcodeGraphQL } from './graphql';
@@ -6,8 +6,8 @@ import { logger } from '../logger';
 
 /**
  * Submission flow (Playwright only):
- *   click Submit → capture the submission id from the network response →
- *   poll submissionDetails via GraphQL until the judge finishes → classify.
+ *   click Submit â†’ capture the submission id from the network response â†’
+ *   poll submissionDetails via GraphQL until the judge finishes â†’ classify.
  *
  * The module only runs when AUTO_SUBMIT=true; the orchestrator decides that.
  */
@@ -63,7 +63,7 @@ const SUBMISSION_DETAILS_QUERY = `
   }
 `;
 
-/** LeetCode judge status codes → our classification. */
+/** LeetCode judge status codes â†’ our classification. */
 const STATUS_CODE_MAP: Record<number, SubmissionClassification> = {
   10: 'ACCEPTED',
   11: 'WRONG_ANSWER',
@@ -92,7 +92,7 @@ export async function submitCurrentEditor(
   const submissionId = await submissionIdPromise.catch((err) => {
     logger.warn(
       { err: err instanceof Error ? err.message : String(err) },
-      'could not capture submission id from network — will try result panel',
+      'could not capture submission id from network â€” will try result panel',
     );
     return null;
   });
@@ -193,7 +193,7 @@ async function pollSubmissionResult(page: Page, submissionId: string): Promise<S
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
-        'submission poll failed — retrying',
+        'submission poll failed â€” retrying',
       );
     }
   }
@@ -239,6 +239,11 @@ async function readResultPanel(page: Page): Promise<SubmissionResult> {
   };
 }
 
+
+/** Maps a LeetCode judge status code to our classification. */
+export function classifyStatusCode(code: number): SubmissionClassification {
+  return STATUS_CODE_MAP[code] ?? 'UNKNOWN';
+}
 export function classifyStatusText(text: string): SubmissionClassification {
   const t = text.toLowerCase();
   if (t.includes('accepted')) return 'ACCEPTED';
@@ -260,3 +265,4 @@ async function scrapeNear(page: Page, selectors: readonly string[]): Promise<str
   }
   return null;
 }
+

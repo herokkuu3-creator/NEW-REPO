@@ -24,6 +24,9 @@ export interface ParsedProblem {
   slug: string;
   title: string;
   difficulty: string;
+  /** Internal LeetCode id (required by the submit endpoint). */
+  questionId: string | null;
+  /** Visible frontend number (e.g. "15"). */
   frontendId: string;
   /** Plain-text statement (HTML stripped) */
   descriptionText: string;
@@ -53,6 +56,7 @@ export function parseProblem(raw: RawQuestionData, language: string): ParsedProb
     slug: raw.slug,
     title: raw.title,
     difficulty: raw.difficulty,
+    questionId: raw.questionId ?? null,
     frontendId: raw.frontendId,
     descriptionText,
     descriptionHtml: raw.contentHtml,

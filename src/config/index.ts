@@ -67,6 +67,14 @@ const envSchema = z.object({
   SOLUTION_SOURCE: z.enum(['walkccc', 'llm']).default('walkccc'),
   WALKCCC_BASE_URL: z.string().default('https://walkccc.me/LeetCode'),
 
+  // --- Transport -----------------------------------------------------------
+  // 'api' (default): drive LeetCode's own GraphQL/submit endpoints through the
+  //   browser context's request API. Never loads an HTML page, which is what
+  //   invites Cloudflare's interstitial on datacenter IPs.
+  // 'browser': navigate the UI with Playwright (fills the editor; requires the
+  //   HTML pages to load unchallenged).
+  TRANSPORT: z.enum(['api', 'browser']).default('api'),
+
   AUTO_SUBMIT: boolFromString,
 
   TELEGRAM_BOT_TOKEN: z.string().default(''),
@@ -111,6 +119,7 @@ export type Config = Readonly<{
     source: 'walkccc' | 'llm';
     walkcccBaseUrl: string;
   };
+  transport: 'api' | 'browser';
   submission: { autoSubmit: boolean };
   telegram: { botToken: string; chatId: string; enabled: boolean };
   api: { port: number; setupToken: string };
@@ -161,6 +170,7 @@ function loadConfig(): Config {
       source: env.SOLUTION_SOURCE,
       walkcccBaseUrl: env.WALKCCC_BASE_URL,
     },
+    transport: env.TRANSPORT,
     submission: { autoSubmit: env.AUTO_SUBMIT },
     telegram: {
       botToken: env.TELEGRAM_BOT_TOKEN,

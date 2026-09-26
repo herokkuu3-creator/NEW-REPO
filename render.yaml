@@ -68,6 +68,11 @@ services:
         value: walkccc
       - key: WALKCCC_BASE_URL
         value: https://walkccc.me/LeetCode
+      # api = drive LeetCode's GraphQL + submit endpoints (no HTML page loads,
+      # so Cloudflare's page-level challenge is not triggered). This is the
+      # setting that makes the service work from Render's datacenter IP.
+      - key: TRANSPORT
+        value: api
       # --- LLM: only used when SOLUTION_SOURCE=llm ---------------------------
       - key: LLM_PROVIDER
         value: gemini
@@ -92,5 +97,4 @@ services:
 databases:
   - name: leetcode-agent-db
     databaseName: leetcode_agent
-    region: frankfurt
     plan: free # 1 GB, expires 30 days after creation — see DEPLOYMENT.md §13

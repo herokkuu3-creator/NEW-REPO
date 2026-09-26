@@ -1,12 +1,13 @@
-import { Page } from 'playwright';
 import { z } from 'zod';
 import { logger } from '../logger';
-import { leetcodeGraphQL } from '../leetcode/graphql';
+import { LeetCodeApi } from '../leetcode/apiClient';
 
 /**
- * Session verification. Primary signal is the `userStatus` GraphQL query —
- * far more stable than any DOM selector. The /profile navigation doubles as
- * the warm-up navigation requested by the architecture spec.
+ * Session verification — API-only.
+ *
+ * Deliberately performs NO page navigation: navigating to an HTML page is
+ * what invites Cloudflare's interstitial on datacenter IPs, and the GraphQL
+ * endpoint answers the same question without it.
  */
 
 const userStatusSchema = z.object({
@@ -32,16 +33,9 @@ export interface SessionCheckResult {
   username?: string;
 }
 
-export async function checkSession(page: Page): Promise<SessionCheckResult> {
-  // Warm-up navigation to an authenticated surface (also verifies the page
-  // actually loads — a network failure here means nothing else will work).
-  await page.goto('https://leetcode.com/profile', {
-    waitUntil: 'domcontentloaded',
-    timeout: 60_000,
-  });
-
+export async function checkSession(api: LeetCodeApi): Promise<SessionCheckResult> {
   try {
-    const data = await leetcodeGraphQL(page, USER_STATUS_QUERY, {}, userStatusSchema);
+    const data = await api.graphql(USER_STATUS_QUERY, {}, userStatusSchema);
     if (data.userStatus.isSignedIn && data.userStatus.username) {
       logger.info({ username: data.userStatus.username }, 'session authenticated');
       return { authenticated: true, username: data.userStatus.username };

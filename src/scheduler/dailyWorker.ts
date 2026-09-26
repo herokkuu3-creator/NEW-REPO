@@ -20,6 +20,7 @@ import {
   fetchDailyChallenge,
   fetchQuestionData,
 } from '../leetcode/dailyChallenge';
+import { LeetCodeApi, looksLikeChallenge } from '../leetcode/apiClient';
 import { parseProblem, ProblemParseError } from '../leetcode/parser';
 import { createLLMProvider } from '../ai/provider';
 import { solveProblem } from '../ai/solver';
@@ -32,6 +33,12 @@ import { notifyRunFinished } from '../notifications/notifier';
  * The daily pipeline. Every invocation ends in EXACTLY ONE terminal state,
  * persisted to PostgreSQL. Duplicate submissions are structurally
  * impossible: the unique `date` row is created before any submission work.
+ *
+ * Two transports:
+ *   TRANSPORT=api (default) — every LeetCode interaction goes through its
+ *     GraphQL + submit endpoints. No HTML page is ever loaded, which is what
+ *     keeps the run clear of Cloudflare's page-level interstitial.
+ *   TRANSPORT=browser — navigate the UI with Playwright (fills the editor).
  */
 
 let runInProgress = false;
@@ -81,7 +88,10 @@ export async function executeDailyRun(reason: string): Promise<RunState> {
   try {
     pruneDiagnostics();
     const today = todayInTimezone();
-    logger.info({ today, reason, timezone: config.schedule.timezone }, 'daily run starting');
+    logger.info(
+      { today, reason, timezone: config.schedule.timezone, transport: config.transport },
+      'daily run starting',
+    );
 
     // --- 0) Duplicate guard -------------------------------------------------
     const existing = await findRunByDate(today);
@@ -90,7 +100,7 @@ export async function executeDailyRun(reason: string): Promise<RunState> {
       return existing.state;
     }
 
-    // --- 1) Authenticate -----------------------------------------------------
+    // --- 1) Authenticate (API-only session check, no page navigation) --------
     const auth = await establishAuthenticatedSession();
     if (!auth.ok) {
       run = await upsertPlaceholderRun(today);
@@ -98,12 +108,12 @@ export async function executeDailyRun(reason: string): Promise<RunState> {
       return auth.reason;
     }
     session = auth.session;
-    const page = session.page;
+    const api = auth.api;
 
     // --- 2) Locate today's daily challenge ----------------------------------
     let daily;
     try {
-      daily = await fetchDailyChallenge(page);
+      daily = await fetchDailyChallenge(api);
     } catch (err) {
       if (err instanceof DailyProblemNotFoundError) {
         run = await upsertPlaceholderRun(today);
@@ -111,6 +121,13 @@ export async function executeDailyRun(reason: string): Promise<RunState> {
           error: 'LeetCode returned no active daily challenge',
         });
         return RunState.DAILY_PROBLEM_NOT_FOUND;
+      }
+      if (looksLikeChallenge(err)) {
+        run = await upsertPlaceholderRun(today);
+        await finalize(run, RunState.CLOUDFLARE_VERIFICATION_REQUIRED, {
+          error: `LeetCode blocked the API request: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        return RunState.CLOUDFLARE_VERIFICATION_REQUIRED;
       }
       throw err;
     }
@@ -139,120 +156,42 @@ export async function executeDailyRun(reason: string): Promise<RunState> {
       attempts: { increment: 1 },
     });
 
-    if (await guardCloudflare(session, run)) return RunState.CLOUDFLARE_VERIFICATION_REQUIRED;
-
     // --- 3) Fetch + parse the problem ---------------------------------------
     let problem;
     try {
-      const raw = await fetchQuestionData(page, daily.slug);
+      const raw = await fetchQuestionData(api, daily.slug);
       problem = parseProblem(raw, config.llm.language);
     } catch (err) {
       if (err instanceof ProblemParseError) {
         await finalize(run, RunState.PROBLEM_PARSE_FAILED, { error: err.message });
         return RunState.PROBLEM_PARSE_FAILED;
       }
+      if (looksLikeChallenge(err)) {
+        await finalize(run, RunState.CLOUDFLARE_VERIFICATION_REQUIRED, {
+          error: `LeetCode blocked the problem request: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        return RunState.CLOUDFLARE_VERIFICATION_REQUIRED;
+      }
       throw err;
     }
 
     // --- 4) Obtain the solution (walkccc fetch by default; LLM on opt-in) ---
-    let solutionCode: string;
-    if (config.solution.source === 'walkccc') {
-      try {
-        const sol = await fetchWalkcccSolution(problem.frontendId);
-        // Guard: walkccc's method name must match LeetCode's C++ starter, or
-        // the submission is a guaranteed compile error.
-        if (!signatureMatchesStarter(sol.code, problem)) {
-          await finalize(run, RunState.SOLUTION_VALIDATION_FAILED, {
-            solution: sol.code,
-            error:
-              'walkccc solution signature does not match the LeetCode C++ starter for this problem — flagged for review instead of submitting broken code',
-          });
-          return RunState.SOLUTION_VALIDATION_FAILED;
-        }
-        solutionCode = sol.code;
-        logger.info({ sourceUrl: sol.sourceUrl }, 'solution obtained from walkccc');
-      } catch (err) {
-        if (err instanceof WalkcccError) {
-          await finalize(run, RunState.SOLUTION_VALIDATION_FAILED, { error: err.message });
-          return RunState.SOLUTION_VALIDATION_FAILED;
-        }
-        throw err;
-      }
-    } else {
-      const llm = createLLMProvider();
-      const solved = await solveProblem(
-        llm,
-        problem,
-        config.llm.language,
-        config.llm.maxSolutionRetries,
-      );
-      if (!solved.ok) {
-        const state =
-          solved.reason === 'LLM_ERROR' ? RunState.LLM_ERROR : RunState.SOLUTION_VALIDATION_FAILED;
-        await finalize(run, state, {
-          error: solved.reason === 'LLM_ERROR' ? solved.error : solved.lastReport,
-          solution: solved.reason === 'SOLUTION_VALIDATION_FAILED' ? solved.lastCode : undefined,
-        });
-        return state;
-      }
-      solutionCode = solved.code;
-    }
+    const solution = await obtainSolution(problem, run);
+    if (!solution.ok) return solution.state;
+    const solutionCode = solution.code;
 
     run = await updateRun(run.id, { solution: solutionCode });
 
-    // --- 5) Open problem page, verify slug + language, fill editor ----------
-    await openProblemPage(page, daily.slug);
-    if (await guardCloudflare(session, run)) return RunState.CLOUDFLARE_VERIFICATION_REQUIRED;
-
-    const languageOk = await ensureLanguage(page, config.llm.language);
-    if (!languageOk) {
-      logger.warn({ language: config.llm.language }, 'could not confirm language selection');
-    }
-    await setEditorCode(page, solutionCode);
-
-    // --- 6) Submit (only when AUTO_SUBMIT=true) ------------------------------
-    if (!config.submission.autoSubmit) {
-      logger.info('AUTO_SUBMIT=false — editor filled, not submitting');
-      await finalize(run, RunState.SUCCESS, {
-        submissionStatus: 'EDITOR_FILLED (AUTO_SUBMIT=false)',
-      });
-      return RunState.SUCCESS;
+    // --- 5) Apply the solution ----------------------------------------------
+    if (config.transport === 'api') {
+      return await submitViaApi(api, problem, solutionCode, run);
     }
 
-    let result;
-    try {
-      result = await submitCurrentEditor(page, problem.frontendId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await captureDiagnostics(page, 'submission-error', session.browserLogs);
-      await finalize(run, RunState.SUBMISSION_ERROR, { error: msg });
-      return RunState.SUBMISSION_ERROR;
-    }
-
-    if (result.classification === 'ACCEPTED') {
-      await finalize(run, RunState.SUCCESS, {
-        submissionId: result.submissionId,
-        submissionStatus: result.statusDisplay,
-        runtime: result.runtime,
-        memory: result.memory,
-      });
-      return RunState.SUCCESS;
-    }
-
-    // Judge ran but rejected — record exactly what happened for the operator.
-    await captureDiagnostics(page, `rejected-${result.classification.toLowerCase()}`, session.browserLogs);
-    await finalize(run, RunState.SUBMISSION_REJECTED, {
-      submissionId: result.submissionId,
-      submissionStatus: result.statusDisplay,
-      runtime: result.runtime,
-      memory: result.memory,
-      error: `judge verdict: ${result.rawStatusMsg}`,
-    });
-    return RunState.SUBMISSION_REJECTED;
+    return await submitViaBrowser(session, problem, solutionCode, run);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ err: msg }, 'daily run failed with unexpected error');
-    if (session) {
+    if (session && config.transport === 'browser') {
       await captureDiagnostics(session.page, 'unexpected-error', session.browserLogs);
     }
     if (run) {
@@ -267,18 +206,204 @@ export async function executeDailyRun(reason: string): Promise<RunState> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Solution acquisition
+// ---------------------------------------------------------------------------
+
+type SolutionResult =
+  | { ok: true; code: string }
+  | { ok: false; state: RunState };
+
+async function obtainSolution(
+  problem: ReturnType<typeof parseProblem>,
+  run: DailyRunRecord,
+): Promise<SolutionResult> {
+  if (config.solution.source === 'walkccc') {
+    try {
+      const sol = await fetchWalkcccSolution(problem.frontendId);
+      // Guard: walkccc's method name must match LeetCode's C++ starter, or the
+      // submission is a guaranteed compile error.
+      if (!signatureMatchesStarter(sol.code, problem)) {
+        await finalize(run, RunState.SOLUTION_VALIDATION_FAILED, {
+          solution: sol.code,
+          error:
+            'walkccc solution signature does not match the LeetCode C++ starter for this problem — flagged for review instead of submitting broken code',
+        });
+        return { ok: false, state: RunState.SOLUTION_VALIDATION_FAILED };
+      }
+      logger.info({ sourceUrl: sol.sourceUrl }, 'solution obtained from walkccc');
+      return { ok: true, code: sol.code };
+    } catch (err) {
+      if (err instanceof WalkcccError) {
+        await finalize(run, RunState.SOLUTION_VALIDATION_FAILED, { error: err.message });
+        return { ok: false, state: RunState.SOLUTION_VALIDATION_FAILED };
+      }
+      throw err;
+    }
+  }
+
+  const llm = createLLMProvider();
+  const solved = await solveProblem(
+    llm,
+    problem,
+    config.llm.language,
+    config.llm.maxSolutionRetries,
+  );
+  if (solved.ok) return { ok: true, code: solved.code };
+
+  const state =
+    solved.reason === 'LLM_ERROR' ? RunState.LLM_ERROR : RunState.SOLUTION_VALIDATION_FAILED;
+  await finalize(run, state, {
+    error: solved.reason === 'LLM_ERROR' ? solved.error : solved.lastReport,
+    solution: solved.reason === 'SOLUTION_VALIDATION_FAILED' ? solved.lastCode : undefined,
+  });
+  return { ok: false, state };
+}
+
+// ---------------------------------------------------------------------------
+// Transport: API (default)
+// ---------------------------------------------------------------------------
+
+async function submitViaApi(
+  api: LeetCodeApi,
+  problem: ReturnType<typeof parseProblem>,
+  code: string,
+  run: DailyRunRecord,
+): Promise<RunState> {
+  if (!config.submission.autoSubmit) {
+    // There is no editor to fill over the API — the only state-changing call is
+    // a submission. Respect the safety default and stop before it.
+    logger.warn(
+      'TRANSPORT=api with AUTO_SUBMIT=false — the solution was produced and validated but NOT submitted (the API has no "fill editor only" step). Set AUTO_SUBMIT=true to submit.',
+    );
+    await finalize(run, RunState.SUCCESS, {
+      submissionStatus: 'SOLVED_NOT_SUBMITTED (TRANSPORT=api, AUTO_SUBMIT=false)',
+    });
+    return RunState.SUCCESS;
+  }
+
+  if (!problem.questionId) {
+    await finalize(run, RunState.SUBMISSION_ERROR, {
+      error:
+        'LeetCode did not return the internal questionId required by the submit endpoint — cannot submit',
+    });
+    return RunState.SUBMISSION_ERROR;
+  }
+
+  try {
+    const submissionId = await api.submitSolution({
+      slug: problem.slug,
+      questionId: problem.questionId,
+      lang: config.llm.language,
+      code,
+    });
+    const result = await api.awaitSubmission(submissionId);
+
+    if (result.classification === 'ACCEPTED') {
+      await finalize(run, RunState.SUCCESS, {
+        submissionId: result.submissionId,
+        submissionStatus: result.statusDisplay,
+        runtime: result.runtime,
+        memory: result.memory,
+      });
+      return RunState.SUCCESS;
+    }
+
+    await finalize(run, RunState.SUBMISSION_REJECTED, {
+      submissionId: result.submissionId,
+      submissionStatus: result.statusDisplay,
+      runtime: result.runtime,
+      memory: result.memory,
+      error: `judge verdict: ${result.rawStatusMsg}`,
+    });
+    return RunState.SUBMISSION_REJECTED;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (looksLikeChallenge(err)) {
+      await finalize(run, RunState.CLOUDFLARE_VERIFICATION_REQUIRED, {
+        error: `LeetCode blocked the submission request: ${msg}`,
+      });
+      return RunState.CLOUDFLARE_VERIFICATION_REQUIRED;
+    }
+    await finalize(run, RunState.SUBMISSION_ERROR, { error: msg });
+    return RunState.SUBMISSION_ERROR;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Transport: browser (Playwright UI)
+// ---------------------------------------------------------------------------
+
+async function submitViaBrowser(
+  session: BrowserSession,
+  problem: ReturnType<typeof parseProblem>,
+  code: string,
+  run: DailyRunRecord,
+): Promise<RunState> {
+  const page = session.page;
+
+  await openProblemPage(page, problem.slug);
+  if (await guardCloudflare(session, run)) return RunState.CLOUDFLARE_VERIFICATION_REQUIRED;
+
+  const languageOk = await ensureLanguage(page, config.llm.language);
+  if (!languageOk) {
+    logger.warn({ language: config.llm.language }, 'could not confirm language selection');
+  }
+  await setEditorCode(page, code);
+
+  if (!config.submission.autoSubmit) {
+    logger.info('AUTO_SUBMIT=false — editor filled, not submitting');
+    await finalize(run, RunState.SUCCESS, {
+      submissionStatus: 'EDITOR_FILLED (AUTO_SUBMIT=false)',
+    });
+    return RunState.SUCCESS;
+  }
+
+  let result;
+  try {
+    result = await submitCurrentEditor(page, problem.frontendId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await captureDiagnostics(page, 'submission-error', session.browserLogs);
+    await finalize(run, RunState.SUBMISSION_ERROR, { error: msg });
+    return RunState.SUBMISSION_ERROR;
+  }
+
+  if (result.classification === 'ACCEPTED') {
+    await finalize(run, RunState.SUCCESS, {
+      submissionId: result.submissionId,
+      submissionStatus: result.statusDisplay,
+      runtime: result.runtime,
+      memory: result.memory,
+    });
+    return RunState.SUCCESS;
+  }
+
+  await captureDiagnostics(page, `rejected-${result.classification.toLowerCase()}`, session.browserLogs);
+  await finalize(run, RunState.SUBMISSION_REJECTED, {
+    submissionId: result.submissionId,
+    submissionStatus: result.statusDisplay,
+    runtime: result.runtime,
+    memory: result.memory,
+    error: `judge verdict: ${result.rawStatusMsg}`,
+  });
+  return RunState.SUBMISSION_REJECTED;
+}
+
 /**
- * Cloudflare guard: detection only. On any verification page, capture a
- * diagnostics bundle and finalize the run as CLOUDFLARE_VERIFICATION_REQUIRED.
- * Returns true when the run must stop.
+ * Cloudflare guard for the browser transport: detection only. On any
+ * verification page, capture a diagnostics bundle and stop the run.
  */
 async function guardCloudflare(session: BrowserSession, run: DailyRunRecord): Promise<boolean> {
   const kind = await detectVerificationPage(session.page);
   if (!kind) return false;
   const bundle = await captureDiagnostics(session.page, `cloudflare-${kind}`, session.browserLogs);
-  await finalize(run, RunState.CLOUDFLARE_VERIFICATION_REQUIRED, {
-    error: `Cloudflare verification page detected (${kind}). Manual verification required.`,
-  }, bundle?.screenshotPath);
+  await finalize(
+    run,
+    RunState.CLOUDFLARE_VERIFICATION_REQUIRED,
+    { error: `Cloudflare verification page detected (${kind}). Manual verification required.` },
+    bundle?.screenshotPath,
+  );
   return true;
 }
 
@@ -302,12 +427,15 @@ async function finalize(
   screenshotPath?: string | null,
 ): Promise<void> {
   const updated = await finalizeRun(run.id, state, extra);
-  await setSystemState(SystemKeys.lastRunSummary, JSON.stringify({
-    date: updated.date,
-    slug: updated.problemSlug,
-    state: updated.state,
-    at: updated.updatedAt.toISOString(),
-  }));
+  await setSystemState(
+    SystemKeys.lastRunSummary,
+    JSON.stringify({
+      date: updated.date,
+      slug: updated.problemSlug,
+      state: updated.state,
+      at: updated.updatedAt.toISOString(),
+    }),
+  );
   if (state !== RunState.SUCCESS && updated.error) {
     await setSystemState(SystemKeys.lastError, updated.error);
   }
@@ -329,9 +457,9 @@ async function finalize(
 function humanMessage(reason: string): string {
   switch (reason) {
     case 'AUTHENTICATION_REQUIRED':
-      return 'Stored session expired or missing. Re-run `npm run auth:setup` locally and re-upload the profile to the Render disk.';
+      return 'Stored session expired or missing. Re-run `npm run auth:setup` locally and upload the new storageState to POST /admin/storage-state.';
     case 'CLOUDFLARE_VERIFICATION_REQUIRED':
-      return 'LeetCode presented a verification page. Open the service, complete verification manually, and refresh the stored profile.';
+      return 'LeetCode returned a bot-challenge response to the API. Try TRANSPORT=api, or complete verification in a normal browser and re-upload storageState.';
     default:
       return reason;
   }

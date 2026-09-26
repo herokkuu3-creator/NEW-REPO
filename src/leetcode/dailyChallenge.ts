@@ -1,10 +1,9 @@
-import { Page } from 'playwright';
 import { z } from 'zod';
-import { leetcodeGraphQL } from './graphql';
+import { LeetCodeApi } from './apiClient';
 import { logger } from '../logger';
 
 /**
- * Daily Challenge discovery — network/API first, no crawling.
+ * Daily Challenge discovery — GraphQL only, no crawling and no page loads.
  *
  * The worker queries ONLY the daily-challenge endpoint and the single
  * question it points to. Nothing else on the site is touched.
@@ -28,6 +27,7 @@ const dailySchema = z.object({
 
 const questionSchema = z.object({
   question: z.object({
+    questionId: z.string(),
     questionFrontendId: z.string(),
     title: z.string(),
     titleSlug: z.string(),
@@ -57,9 +57,12 @@ const DAILY_QUERY = `
   }
 `;
 
+// questionId is LeetCode's INTERNAL id — required by the submit endpoint, and
+// not the same thing as the visible frontend number.
 const QUESTION_QUERY = `
   query questionData($titleSlug: String!) {
     question(titleSlug: $titleSlug) {
+      questionId
       questionFrontendId
       title
       titleSlug
@@ -83,6 +86,8 @@ export interface DailyChallengeInfo {
 }
 
 export interface RawQuestionData {
+  /** Internal LeetCode id, used by the submit endpoint. */
+  questionId?: string | null;
   frontendId: string;
   title: string;
   slug: string;
@@ -101,8 +106,8 @@ export class DailyProblemNotFoundError extends Error {
 }
 
 /** Returns today's daily challenge pointer, or throws DailyProblemNotFoundError. */
-export async function fetchDailyChallenge(page: Page): Promise<DailyChallengeInfo> {
-  const data = await leetcodeGraphQL(page, DAILY_QUERY, {}, dailySchema);
+export async function fetchDailyChallenge(api: LeetCodeApi): Promise<DailyChallengeInfo> {
+  const data = await api.graphql(DAILY_QUERY, {}, dailySchema);
   const node = data.activeDailyCodingChallengeQuestion;
   if (!node) {
     throw new DailyProblemNotFoundError();
@@ -124,8 +129,11 @@ export async function fetchDailyChallenge(page: Page): Promise<DailyChallengeInf
 }
 
 /** Fetches the full problem payload for one slug — exactly one question, no crawl. */
-export async function fetchQuestionData(page: Page, slug: string): Promise<RawQuestionData> {
-  const data = await leetcodeGraphQL(page, QUESTION_QUERY, { titleSlug: slug }, questionSchema);
+export async function fetchQuestionData(
+  api: LeetCodeApi,
+  slug: string,
+): Promise<RawQuestionData> {
+  const data = await api.graphql(QUESTION_QUERY, { titleSlug: slug }, questionSchema);
   const q = data.question;
 
   let metaData: Record<string, unknown> | null = null;
@@ -138,6 +146,7 @@ export async function fetchQuestionData(page: Page, slug: string): Promise<RawQu
   }
 
   return {
+    questionId: q.questionId,
     frontendId: q.questionFrontendId,
     title: q.title,
     slug: q.titleSlug,

@@ -37,6 +37,7 @@ services:
       LEETCODE_LANGUAGE: cpp
       AUTO_SUBMIT: "false"
       SOLUTION_SOURCE: walkccc
+      TRANSPORT: api
       # Only needed when SOLUTION_SOURCE=llm:
       LLM_PROVIDER: gemini
       LLM_MODEL: gemini-3.5-flash
