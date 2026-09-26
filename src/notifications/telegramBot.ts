@@ -58,23 +58,19 @@ const HELP_TEXT = [
 ].join('\n');
 
 const RENEW_INSTRUCTIONS = [
-  'ðŸ”„ LeetCode session renewal (~2 minutes)',
+  'LeetCode session renewal - Android only',
   '',
-  'The reliable way â€” sign in from YOUR OWN browser (Cloudflare trusts it, unlike the server):',
+  'No computer is required.',
   '',
-  'On any computer (Windows/Mac/Linux) OR an Android phone with the Termux app:',
+  '1. Open Lemur Browser on your Android phone.',
+  '2. Open https://leetcode.com/ and sign in normally.',
+  '3. Open the LeetCode Session Capture extension.',
+  '4. Tap the capture button.',
+  '5. Save or download leetcode-session.json.',
+  '6. Send leetcode-session.json to this Telegram bot as a document.',
   '',
-  '1. Get the repo:  git clone <your-repo-url> && cd NEW-REPO',
-  '2. Install:  npm install && npx playwright install chromium',
-  '3. Run the capture:',
-  '   AGENT_URL=https://<your-service>.onrender.com SETUP_TOKEN=<your-token> npm run capture',
-  '',
-  'A normal Chrome window opens on the LeetCode sign-in page. Sign in like always â€” any "verify you are human" check is yours to complete, it is your own browser. The script detects the sign-in by itself, uploads the session to the service, and today\'s run starts automatically. Nothing to copy or paste.',
-  '',
-  'Alternative: paste cookies here â€” LEETCODE_SESSION=...; csrftoken=..., a Cookie-Editor export, or a storageState JSON (long ones as a .txt/.json file) â€” and I will validate them.',
-  '',
-  '/status â€” current state Â· /cancel â€” nothing pending is ever held',
-].join('\n');
+  'I will validate the session with LeetCode before replacing the stored session. If valid, I save it and start today\'s run automatically.',
+].join('\\n');
 
 export function startTelegramBot(): () => void {
   if (!config.telegram.enabled || !config.telegram.commands) {

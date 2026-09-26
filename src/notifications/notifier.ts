@@ -54,12 +54,14 @@ export async function notifyRunFinished(n: RunNotification): Promise<void> {
  */
 export async function notifySessionExpired(): Promise<void> {
   await sendTelegramMessage([
-    'ðŸ”‘ LeetCode session expired',
+    'LeetCode session expired',
     '',
-    'On Android: sign in to LeetCode in Chrome, open Termux in the agent folder, and run `npm run capture`.',
+    'Android renewal - no computer is required.',
     '',
-    'It creates Download/leetcode-session.json. Send that file here in Telegram; I validate it, save the session, and start today\'s run.',
-  ].join('\n'));
+    'Open Lemur Browser on Android -> sign in to LeetCode -> open the LeetCode Session Capture extension -> capture/download leetcode-session.json -> send that file here in Telegram.',
+    '',
+    'I will validate the session, save it securely, and start today\'s run automatically.',
+  ].join('\\n'));
 }
 
 /** Minimal escaping â€” we send plain text, so only guard against confusing the API. */
