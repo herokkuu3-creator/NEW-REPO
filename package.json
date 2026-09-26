@@ -13,6 +13,8 @@
     "start": "node dist/src/main.js",    
     "dev": "tsx watch src/main.ts",
     "auth:setup": "tsx scripts/auth-setup.ts",
+    "capture": "tsx scripts/capture-session.ts",
+    "capture:android": "tsx scripts/capture-session.ts --android",
     "run:now": "tsx scripts/run-now.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy",

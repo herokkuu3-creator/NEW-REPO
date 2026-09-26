@@ -9,9 +9,7 @@ import {
   latestRun,
   saveStorageStateToDb,
 } from '../database/models';
-import { applySessionRenewal } from '../browser/sessionRenewal';
-import { setRenewalCallback } from '../browser/remoteBrowser';
-import { registerRenewalRoutes } from './renewalRoutes';
+import { applySessionRenewal, applyStorageStateDirect } from '../browser/sessionRenewal';
 
 /**
  * Health + minimal admin API.
@@ -42,15 +40,6 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
 
   const requireAdmin = (authorization: string | undefined): boolean =>
     authorization === `Bearer ${config.api.setupToken}`;
-
-  // /renew — the human sign-in page (streamed remote browser). A successful
-  // sign-in there saves the cookies and immediately recovers today's run.
-  setRenewalCallback((username) => {
-    void hooks.triggerRun('session-renewal').then((r) =>
-      logger.info({ username, started: r.started }, 'renewal complete — run recovery attempted'),
-    );
-  });
-  registerRenewalRoutes(app);
 
   app.get('/health', async () => {
     const [sys, last] = await Promise.all([getAllSystemState(), latestRun()]);
@@ -130,6 +119,42 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
       cookies: parsed.data.cookies.length,
       origins: parsed.data.origins.length,
     });
+  });
+
+  /**
+   * The endpoint scripts/capture-session.ts uploads to after a successful
+   * LOCAL sign-in. Body: a raw Playwright storageState JSON. The session is
+   * re-validated against LeetCode BEFORE anything is stored (a bad upload
+   * can never clobber the working credential), and a successful upload
+   * immediately triggers today's run — recovery is one script run.
+   *
+   *   200 { ok, username, cookieCount, runStarted }  — renewed
+   *   422 { ok: false, error }                        — rejected (reason in body)
+   */
+  app.post('/admin/upload-session', async (req, reply) => {
+    if (!requireAdmin(req.headers.authorization)) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    const parsed = storageStateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        ok: false,
+        error: 'expected a Playwright storageState JSON object ({ cookies: [...], origins: [...] })',
+      });
+    }
+    const result = await applyStorageStateDirect(
+      parsed.data as unknown as Parameters<typeof applyStorageStateDirect>[0],
+    );
+    if (!result.ok) {
+      logger.warn({ error: result.error }, 'uploaded session rejected by validation');
+      return reply.code(422).send(result);
+    }
+    const trigger = await hooks.triggerRun('session-renewal');
+    logger.info(
+      { username: result.username, cookies: result.cookieCount, runStarted: trigger.started },
+      'session uploaded from local capture — run recovery attempted',
+    );
+    return reply.send({ ...result, runStarted: trigger.started, runMessage: trigger.message });
   });
 
   /**

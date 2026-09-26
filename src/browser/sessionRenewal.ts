@@ -7,7 +7,7 @@ import { saveStorageStateToDb, setSystemState, SystemKeys } from '../database/mo
 import { LeetCodeApi, looksLikeChallenge } from '../leetcode/apiClient';
 import { buildLaunchArgs } from './playwright';
 import { checkSession } from './sessionCheck';
-import { parseCookiePayload } from './cookiePayload';
+import { parseCookiePayload, StorageStateShape } from './cookiePayload';
 
 /**
  * Session renewal — the apply half of the /renew flow.
@@ -28,7 +28,23 @@ export type RenewalOutcome =
 export async function applySessionRenewal(raw: string): Promise<RenewalOutcome> {
   const parsed = parseCookiePayload(raw);
   if (!parsed.ok) return parsed;
+  return validateAndSave(parsed.storageState, parsed.format);
+}
 
+/**
+ * Direct path for scripts/capture-session.ts: the caller already holds a
+ * Playwright storageState object — no parsing needed, same validate-then-save.
+ */
+export async function applyStorageStateDirect(
+  storageState: StorageStateShape,
+): Promise<RenewalOutcome> {
+  return validateAndSave(storageState, 'storageState upload');
+}
+
+async function validateAndSave(
+  storageState: StorageStateShape,
+  format: string,
+): Promise<RenewalOutcome> {
   let browser: Browser | undefined;
   try {
     browser = await chromium.launch({
@@ -37,8 +53,8 @@ export async function applySessionRenewal(raw: string): Promise<RenewalOutcome> 
     });
     const context = await browser.newContext({
       storageState: {
-        cookies: parsed.storageState.cookies,
-        origins: parsed.storageState.origins,
+        cookies: storageState.cookies,
+        origins: storageState.origins,
       },
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
@@ -56,7 +72,7 @@ export async function applySessionRenewal(raw: string): Promise<RenewalOutcome> 
     }
 
     // Validated — now persist (Postgres is the durable store on free tier).
-    const json = JSON.stringify(parsed.storageState);
+    const json = JSON.stringify(storageState);
     await saveStorageStateToDb(json);
     try {
       const target = config.browser.storageStatePath;
@@ -72,14 +88,14 @@ export async function applySessionRenewal(raw: string): Promise<RenewalOutcome> 
     await setSystemState(SystemKeys.authNotifiedAt, '');
 
     logger.info(
-      { username: check.username, cookies: parsed.storageState.cookies.length, format: parsed.format },
+      { username: check.username, cookies: storageState.cookies.length, format: format },
       'session renewed from user-supplied cookies',
     );
     return {
       ok: true,
       username: check.username,
-      cookieCount: parsed.storageState.cookies.length,
-      format: parsed.format,
+      cookieCount: storageState.cookies.length,
+      format: format,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
