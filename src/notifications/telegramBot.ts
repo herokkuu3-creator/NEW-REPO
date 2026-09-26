@@ -4,7 +4,8 @@ import { logger } from '../logger';
 import { sendTelegramMessage } from './telegram';
 import { getAllSystemState, latestRun } from '../database/models';
 import { listAccounts } from '../database/accounts';
-import { applySessionRenewal } from '../browser/sessionRenewal';
+import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
+import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { triggerRun } from '../scheduler/dailyWorker';
 
 /**
@@ -53,8 +54,10 @@ interface TgUpdate {
 const HELP_TEXT = [
   'LeetCode Daily Agent',
   '',
-  '/renew - refresh the default/sole account session (cookies from your own browser)',
-  '/renew <label> - renew (or create) the named account from the cookies you send next',
+  'Just send cookie .json files (one per account) — each file is added as an account named after its LeetCode username; a file for a user that already exists overrides that account.',
+  '',
+  '/renew - how to capture the cookie file on Android',
+  '/renew <label> - store the NEXT file under this exact label',
   '/accounts - list every account with its cookie status',
   '/status - show authentication status and the last run',
   '/cancel - cancel a renewal in progress',
@@ -71,9 +74,9 @@ const RENEW_INSTRUCTIONS = [
   '3. Open the LeetCode Session Capture extension.',
   '4. Tap the capture button.',
   '5. Save or download leetcode-session.json.',
-  '6. Send leetcode-session.json to this Telegram bot as a document.',
+  '6. Send the .json file to this Telegram bot as a document.',
   '',
-  'I will validate the session with LeetCode before replacing the stored session. If valid, I save it and start today\'s run automatically.',
+  'Multiple accounts: send one .json file per account, one after another. Each file is stored immediately (a new user = new account, a known user = cookies overridden), then checked with LeetCode. Once the uploads stop, today\'s run starts for all accounts.',
   ].join('\n');
 
 export function startTelegramBot(): () => void {
@@ -142,7 +145,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
           await reply(RENEW_INSTRUCTIONS);
           return;
         }
-        if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$/.test(arg)) {
+        if (!ACCOUNT_LABEL_RE.test(arg)) {
           await reply('Labels may contain letters, digits, dot, dash and underscore (max 32 characters). Try again, e.g. /renew main');
           return;
         }
@@ -166,42 +169,80 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     }
   }
 
-  // Non-command message: a cookie payload (pasted text or an uploaded file).
+  // Non-command message: a cookie payload (pasted text or an uploaded .json/.txt file).
   let payload = text;
-  if (!payload && msg.document) {
+  let fileName: string | undefined;
+  if (msg.document) {
+    fileName = msg.document.file_name;
     payload = await downloadDocument(msg.document);
   }
   if (!payload) {
-    await reply('Send /renew to refresh the LeetCode session, or /status for the current state.');
+    await reply('Send a cookie .json file (or paste the cookies) to add an account. /accounts lists them.');
     return;
   }
-  if (!looksLikeCookiePayload(payload)) {
-    await reply('That does not look like a cookie export. Send /renew for step-by-step instructions.');
-    return;
-  }
-
-  const label = pendingRenewalLabel;
+  const result = await processCookieMessage(payload, {
+    label: pendingRenewalLabel,
+    fileName,
+  });
   pendingRenewalLabel = undefined;
-  await reply(
-    label
-      ? `Validating the new session for the "${label}" account with LeetCode...`
-      : 'Validating the new session with LeetCode...',
-  );
-  const result = await applySessionRenewal(payload, label);
+  await reply(result.text);
+  if (result.stored) scheduleBatchRun();
+}
 
-  if (!result.ok) {
-    await reply(`Session renewal failed.\n\n${result.error}\n\nSend /renew to see the steps again.`);
-    return;
+export interface CookieMessageResult {
+  /** true when the cookies were stored (added or overridden). */
+  stored: boolean;
+  text: string;
+}
+
+/**
+ * Handles one cookie message (file or text) — exported for tests. Every
+ * message is ingested independently, so sending several files in a row adds
+ * one account per LeetCode user, and a file for an already-known user
+ * overrides that account's cookies.
+ */
+export async function processCookieMessage(
+  payload: string,
+  opts: { label?: string; fileName?: string; validator?: Validator } = {},
+): Promise<CookieMessageResult> {
+  if (!looksLikeCookiePayload(payload)) {
+    return {
+      stored: false,
+      text: 'That does not look like a cookie export. Send the .json file from the capture extension (or /help).',
+    };
   }
+  const result = await ingestCookiePayload(payload, opts);
+  if (!result.ok) {
+    return { stored: false, text: `${opts.fileName ? `${opts.fileName}: ` : ''}${describeIngest(result)}` };
+  }
+  const total = (await listAccounts()).length;
+  return {
+    stored: true,
+    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}\n\nAccounts stored: ${total}. Send more files to add more — /accounts lists them.`,
+  };
+}
 
-  // Session restored â€” immediately recover today's run if it failed/was skipped.
-  const trigger = await triggerRun('session-renewal');
-  const followUp = trigger.started
-    ? "Today's challenge run is starting now. I will report the result here."
-    : `Today's run was not started: ${trigger.message}`;
-  await reply(
-    `${label ? `Account "${label}" renewed` : 'Session renewed'}. Signed in as ${result.username} (${result.cookieCount} cookies, ${result.format}).\n\n${followUp}`,
-  );
+/**
+ * Several files usually arrive back-to-back: wait until the uploads go quiet,
+ * then run the daily challenge ONCE for all accounts (instead of one run per
+ * file, which the in-progress guard would mostly reject anyway).
+ */
+const BATCH_RUN_DELAY_MS = 30_000;
+let batchRunTimer: NodeJS.Timeout | undefined;
+
+function scheduleBatchRun(): void {
+  if (batchRunTimer) clearTimeout(batchRunTimer);
+  batchRunTimer = setTimeout(() => {
+    batchRunTimer = undefined;
+    void (async () => {
+      const trigger = await triggerRun('session-renewal');
+      await reply(
+        trigger.started
+          ? "Uploads received. Running today's challenge for all accounts now — the report follows here."
+          : `Today's run was not started: ${trigger.message}`,
+      );
+    })().catch((err) => logger.warn({ err: errText(err) }, 'batch run trigger failed'));
+  }, BATCH_RUN_DELAY_MS);
 }
 
 /** Pending /renew <label> target — consumed by the next cookie payload. */

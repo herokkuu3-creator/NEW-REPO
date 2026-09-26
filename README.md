@@ -342,11 +342,30 @@ next run classifies each account as ACTIVE or EXPIRED and reports it. The
 `cookies` field also accepts a Cookie-Editor JSON export or a storageState
 object (the same three formats as the Telegram /renew flow).
 
-Telegram bot:
+Telegram bot — just send cookie `.json` files (the capture-extension export),
+one per account, back to back:
 
-    /renew            renew the default/sole account
-    /renew <label>    renew (or create) the named account from the next payload
+- each file is stored IMMEDIATELY, keyed by the LeetCode username read from
+  its LEETCODE_SESSION token: a new user = a new account, a user that already
+  exists = that account's cookies are overridden
+- then each file is checked with LeetCode and marked ACTIVE / EXPIRED /
+  NOT VERIFIED YET (a failed or blocked check never loses the cookies)
+- 30 s after the last upload, today's run starts once for all accounts
+
+Commands:
+
+    /renew            how to capture the cookie file on Android
+    /renew <label>    store the NEXT file under this exact label
     /accounts         list every account with its cookie status
+
+`POST /admin/accounts` follows the same rules: `label` is optional (defaults to
+the username), and the body can also be the raw capture `.json` file itself
+(`--data-binary @leetcode-session.json`).
+
+Note on EXPIRED right after upload: LEETCODE_SESSION embeds the IP it was
+captured from. If LeetCode reports a freshly captured session "signed out"
+from the server, it is binding the session to your phone's network — the
+account is kept and re-checked on every run.
 
 ### Reports
 

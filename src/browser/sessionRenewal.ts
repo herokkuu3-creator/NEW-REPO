@@ -33,7 +33,14 @@ export type RenewalOutcome =
   | { ok: false; error: string };
 
 /** Outcome of validating a storageState against LeetCode — no side effects. */
-export type ValidationOutcome = { ok: true; username: string } | { ok: false; error: string };
+export type ValidationOutcome =
+  | { ok: true; username: string }
+  | {
+      ok: false;
+      error: string;
+      /** 'signed-out' = LeetCode answered "not signed in"; 'blocked'/'error' = the check itself failed. */
+      reason: 'signed-out' | 'blocked' | 'error';
+    };
 
 const NOT_SIGNED_IN_ERROR =
   'LeetCode did NOT recognize these cookies (session signed out). Copy them from a browser where leetcode.com actually shows you logged in, and make sure the LEETCODE_SESSION value was copied in full.';
@@ -65,7 +72,14 @@ export async function validateCookiesAgainstLeetcode(
     await context.close().catch(() => undefined);
 
     if (!check.authenticated || !check.username) {
-      return { ok: false, error: NOT_SIGNED_IN_ERROR };
+      if (check.cause === 'query-failed') {
+        return {
+          ok: false,
+          reason: 'blocked',
+          error: 'the LeetCode check request failed (network or bot protection)',
+        };
+      }
+      return { ok: false, reason: 'signed-out', error: NOT_SIGNED_IN_ERROR };
     }
     return { ok: true, username: check.username };
   } catch (err) {
@@ -73,11 +87,12 @@ export async function validateCookiesAgainstLeetcode(
     if (looksLikeChallenge(err)) {
       return {
         ok: false,
+        reason: 'blocked',
         error: `LeetCode served a bot challenge while validating (${msg}). The cookies may still be fine — wait a few minutes and send them again.`,
       };
     }
     logger.warn({ err: msg }, 'cookie validation failed');
-    return { ok: false, error: `validation failed: ${msg}` };
+    return { ok: false, reason: 'error', error: `validation failed: ${msg}` };
   } finally {
     if (browser) await browser.close().catch(() => undefined);
   }

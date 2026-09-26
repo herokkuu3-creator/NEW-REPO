@@ -18,14 +18,12 @@ import {
   getAccountByLabel,
   listAccounts,
   parseStoredStorageState,
-  saveAccount,
 } from '../database/accounts';
 import {
   applySessionRenewal,
   applyStorageStateDirect,
-  validateCookiesAgainstLeetcode,
 } from '../browser/sessionRenewal';
-import { parseCookiePayload, ParseResult, StorageStateShape } from '../browser/cookiePayload';
+import { ingestCookiePayload } from '../accounts/ingest';
 
 /**
  * Health + minimal admin API.
@@ -253,9 +251,11 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
     );
 
   const addAccountSchema = z.object({
-    label: accountLabelSchema,
+    // Optional: without a label the account is keyed by the LeetCode username
+    // read from the session token (same user again = override).
+    label: accountLabelSchema.optional(),
     cookies: z.unknown(),
-    validate: z.boolean().optional(), // default true — verify against LeetCode first
+    validate: z.boolean().optional(), // default true — live LeetCode check after storing
   });
 
   app.post('/admin/accounts', async (req, reply) => {
@@ -268,77 +268,24 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
         .code(400)
         .send({ ok: false, error: body.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ') });
     }
-    const label = body.data.label;
-    const validate = body.data.validate !== false;
 
-    // Accept the same three formats as the Telegram /renew flow: a cookie
-    // header string, a Cookie-Editor JSON array, or a storageState object.
-    let cookies: ParseResult;
-    const raw = body.data.cookies;
-    if (typeof raw === 'string') {
-      cookies = parseCookiePayload(raw);
-    } else if (raw && typeof raw === 'object') {
-      const direct = storageStateSchema.safeParse(raw);
-      if (direct.success) {
-        cookies = {
-          ok: true,
-          storageState: direct.data as unknown as StorageStateShape,
-          format: 'storageState JSON',
-        };
-      } else {
-        cookies = parseCookiePayload(JSON.stringify(raw));
-      }
-    } else {
-      cookies = {
-        ok: false,
-        error:
-          'the cookies field is required — a cookie string, a Cookie-Editor export, or a storageState JSON',
-      };
+    // Accept the same formats as Telegram: a cookie header string, a
+    // Cookie-Editor JSON array, or a storageState object — or a raw
+    // storageState body with no wrapper at all.
+    const raw = body.data.cookies === undefined ? req.body : body.data.cookies;
+    const payload = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
+    const result = await ingestCookiePayload(payload, {
+      label: body.data.label,
+      validate: body.data.validate !== false,
+    });
+    if (!result.ok) {
+      return reply.code(400).send(result);
     }
-    if (!cookies.ok) {
-      return reply.code(400).send({ ok: false, label, error: cookies.error });
-    }
-
-    const json = JSON.stringify(cookies.storageState);
-    const cookieCount = cookies.storageState.cookies.length;
-
-    if (validate) {
-      // Validate-then-store: a bad payload can never clobber an account.
-      const validation = await validateCookiesAgainstLeetcode(cookies.storageState);
-      if (!validation.ok) {
-        logger.warn({ label, error: validation.error }, 'account cookies rejected by validation');
-        return reply.code(422).send({ ok: false, label, error: validation.error });
-      }
-      await saveAccount(label, json, {
-        username: validation.username,
-        status: AccountStatus.ACTIVE,
-      });
-      logger.info(
-        { label, username: validation.username, cookies: cookieCount },
-        'account added/updated via admin API (validated)',
-      );
-      const trigger = await hooks.triggerRun('session-renewal');
-      return reply.send({
-        ok: true,
-        label,
-        username: validation.username,
-        cookieCount,
-        validated: true,
-        runStarted: trigger.started,
-        runMessage: trigger.message,
-      });
-    }
-
-    // Bulk-seeding without validation: stored as UNKNOWN — the next run
-    // classifies every account as ACTIVE or EXPIRED and reports it.
-    await saveAccount(label, json);
-    logger.info({ label, cookies: cookieCount }, 'account stored unvalidated via admin API');
+    const trigger = result.status === AccountStatus.EXPIRED ? null : await hooks.triggerRun('session-renewal');
     return reply.send({
-      ok: true,
-      label,
-      cookieCount,
-      validated: false,
-      note: 'stored unvalidated — the next run classifies it as ACTIVE or EXPIRED',
+      ...result,
+      runStarted: trigger?.started ?? false,
+      runMessage: trigger?.message ?? 'not started — the account is expired',
     });
   });
 
