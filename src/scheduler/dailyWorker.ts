@@ -76,6 +76,7 @@ export async function triggerRun(reason: string): Promise<RunTriggerResult> {
 }
 
 export async function executeDailyRun(reason: string): Promise<RunState> {
+  const forceRun = reason === 'admin-api';
   if (runInProgress) {
     logger.warn({ reason }, 'run skipped — already in progress');
     return RunState.PENDING;
@@ -95,7 +96,7 @@ export async function executeDailyRun(reason: string): Promise<RunState> {
 
     // --- 0) Duplicate guard -------------------------------------------------
     const existing = await findRunByDate(today);
-    if (existing && (existing.state === RunState.SUCCESS || existing.state === RunState.PENDING)) {
+    if (!forceRun && existing && (existing.state === RunState.SUCCESS || existing.state === RunState.PENDING)) {
       logger.info({ today, state: existing.state }, 'today already handled — skipping');
       return existing.state;
     }
@@ -134,7 +135,7 @@ export async function executeDailyRun(reason: string): Promise<RunState> {
 
     // Re-check duplication against the actual slug (belt and suspenders).
     const existingAfterFetch = await findRunByDate(today);
-    if (existingAfterFetch?.state === RunState.SUCCESS) {
+    if (!forceRun && existingAfterFetch?.state === RunState.SUCCESS) {
       logger.info({ today }, 'already completed — skipping');
       return RunState.SUCCESS;
     }
