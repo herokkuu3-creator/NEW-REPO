@@ -1,7 +1,7 @@
 import { APIRequestContext, BrowserContext } from 'playwright';
 import { z } from 'zod';
 import { logger } from '../logger';
-import { classifyStatusCode, SubmissionClassification } from './submission';
+import { classifyStatusCode, classifyStatusText, SubmissionClassification } from './submission';
 
 /**
  * LeetCode API client — same-origin requests through the browser context's
@@ -73,6 +73,43 @@ const SUBMISSION_DETAILS_QUERY = `
   }
 `;
 
+const submissionListSchema = z.object({
+  submissionList: z.object({
+    submissions: z.array(
+      z.object({
+        id: z.union([z.number(), z.string()]),
+        statusDisplay: z.string().nullable().optional(),
+        runtime: z.string().nullable().optional(),
+        memory: z.string().nullable().optional(),
+        isPending: z.boolean().nullable().optional(),
+      }),
+    ),
+  }).nullable(),
+});
+
+const SUBMISSION_LIST_QUERY = `
+  query submissions(
+    $offset: Int!
+    $limit: Int!
+    $lastKey: String
+    $questionSlug: String!
+  ) {
+    submissionList(
+      offset: $offset
+      limit: $limit
+      lastKey: $lastKey
+      questionSlug: $questionSlug
+    ) {
+      submissions {
+        id
+        statusDisplay
+        runtime
+        memory
+        isPending
+      }
+    }
+  }
+`;
 const JUDGE_PENDING_CODES = new Set([0, 1, 2, 3, 5]);
 
 export class LeetCodeApi {
@@ -185,12 +222,17 @@ export class LeetCodeApi {
   }
 
   /** Polls the judge until it reaches a terminal verdict. */
-  async awaitSubmission(submissionId: string, timeoutMs = 60_000): Promise<SubmissionOutcome> {
+  async awaitSubmission(
+    submissionId: string,
+    slug: string,
+    timeoutMs = 180_000,
+  ): Promise<SubmissionOutcome> {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = 'PENDING';
 
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 2_000));
+
       const data = await this.graphql(
         SUBMISSION_DETAILS_QUERY,
         { submissionId: Number(submissionId) },
@@ -199,28 +241,77 @@ export class LeetCodeApi {
 
       const d = data?.submissionDetails;
       if (!d) continue;
+
       if (JUDGE_PENDING_CODES.has(d.statusCode)) {
         lastStatus = d.statusDisplay ?? lastStatus;
         continue;
       }
 
+      const statusDisplay = d.statusDisplay ?? lastStatus;
+      const classification = classifyStatusCode(d.statusCode);
+
+      // LeetCode may temporarily report "Internal Error" from
+      // submissionDetails even though the submission has already completed.
+      // Verify the exact submission in submission history before declaring
+      // the run rejected.
+      if (classification === 'UNKNOWN' || /internal error/i.test(statusDisplay)) {
+        const history = await this.findSubmissionInHistory(submissionId, slug);
+
+        if (history) {
+          const historyClassification = classifyStatusText(history.statusDisplay);
+
+          if (historyClassification !== 'UNKNOWN') {
+            const outcome: SubmissionOutcome = {
+              submissionId,
+              classification: historyClassification,
+              statusDisplay: history.statusDisplay,
+              runtime: history.runtime != null ? `${history.runtime} ms` : null,
+              memory: history.memory != null ? `${history.memory} MB` : null,
+              rawStatusMsg: history.statusDisplay,
+            };
+
+            logger.info(
+              {
+                submissionId,
+                classification: outcome.classification,
+                statusDisplay: outcome.statusDisplay,
+                source: 'submissionList',
+              },
+              'judge result confirmed from submission history',
+            );
+
+            return outcome;
+          }
+        }
+
+        lastStatus = statusDisplay;
+        logger.warn(
+          { submissionId, statusCode: d.statusCode, statusDisplay },
+          'uncertain judge status - continuing to poll',
+        );
+        continue;
+      }
+
       const outcome: SubmissionOutcome = {
         submissionId,
-        classification: classifyStatusCode(d.statusCode),
-        statusDisplay: d.statusDisplay ?? lastStatus,
+        classification,
+        statusDisplay,
         runtime: d.runtimeDisplay ?? (d.runtime != null ? `${d.runtime} ms` : null),
         memory: d.memoryDisplay ?? (d.memory != null ? `${d.memory} MB` : null),
-        rawStatusMsg: d.statusDisplay ?? `statusCode=${d.statusCode}`,
+        rawStatusMsg: statusDisplay,
       };
+
       logger.info(
         {
           submissionId,
           classification: outcome.classification,
+          statusDisplay: outcome.statusDisplay,
           runtime: outcome.runtime,
           memory: outcome.memory,
         },
         'judge finished',
       );
+
       return outcome;
     }
 
@@ -230,7 +321,50 @@ export class LeetCodeApi {
       statusDisplay: lastStatus,
       runtime: null,
       memory: null,
-      rawStatusMsg: 'judge polling timed out',
+      rawStatusMsg: 'judge polling timed out after 180s',
     };
+  }
+
+  private async findSubmissionInHistory(
+    submissionId: string,
+    slug: string,
+  ): Promise<{
+    statusDisplay: string;
+    runtime: string | null;
+    memory: string | null;
+  } | null> {
+    try {
+      const data = await this.graphql(
+        SUBMISSION_LIST_QUERY,
+        {
+          offset: 0,
+          limit: 20,
+          lastKey: null,
+          questionSlug: slug,
+        },
+        submissionListSchema,
+      );
+
+      const row = data.submissionList?.submissions.find(
+        (item) => String(item.id) === String(submissionId),
+      );
+
+      if (!row || !row.statusDisplay) return null;
+
+      return {
+        statusDisplay: row.statusDisplay,
+        runtime: row.runtime ?? null,
+        memory: row.memory ?? null,
+      };
+    } catch (err) {
+      logger.warn(
+        {
+          submissionId,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        'submission history lookup failed',
+      );
+      return null;
+    }
   }
 }

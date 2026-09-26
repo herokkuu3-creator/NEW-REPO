@@ -302,7 +302,7 @@ async function submitViaApi(
       lang: config.llm.language,
       code,
     });
-    const result = await api.awaitSubmission(submissionId);
+    const result = await api.awaitSubmission(submissionId, problem.slug);
 
     if (result.classification === 'ACCEPTED') {
       await finalize(run, RunState.SUCCESS, {
