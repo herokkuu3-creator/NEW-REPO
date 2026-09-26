@@ -5,6 +5,7 @@ import path from 'node:path';
 import { config } from '../config';
 import { logger } from '../logger';
 import { loadStorageStateFromDb, saveStorageStateToDb } from '../database/models';
+import { StorageStateShape } from './cookiePayload';
 
 /**
  * Browser lifecycle management.
@@ -144,6 +145,51 @@ export async function launchWithStorageState(): Promise<BrowserSession | null> {
     logger.error(
       { err: err instanceof Error ? err.message : String(err) },
       'failed to launch from storageState',
+    );
+    return null;
+  }
+}
+
+/**
+ * Mode 3 (multi-account): build a fresh context from an IN-MEMORY
+ * storageState object — the per-account credential coming straight from an
+ * Account row in Postgres. Nothing touches the shared profile or the legacy
+ * snapshot paths, so accounts are fully isolated from each other.
+ */
+export async function launchWithStorageStateObject(
+  state: StorageStateShape,
+  label: string,
+): Promise<BrowserSession | null> {
+  try {
+    const browser = await chromium.launch({
+      headless: config.browser.headless,
+      args: buildLaunchArgs(),
+    });
+    const context = await browser.newContext({
+      storageState: {
+        cookies: state.cookies,
+        origins: state.origins,
+      },
+      viewport: { width: 1366, height: 900 },
+      locale: 'en-US',
+    });
+    const browserLogs: string[] = [];
+    const page = await openPageWithCapture(context, browserLogs);
+    logger.info({ label }, 'launched context from account storageState');
+    return {
+      context,
+      page,
+      mode: 'storage-state',
+      browserLogs,
+      close: async () => {
+        await context.close();
+        await browser.close();
+      },
+    };
+  } catch (err) {
+    logger.error(
+      { label, err: err instanceof Error ? err.message : String(err) },
+      'failed to launch context from account storageState',
     );
     return null;
   }

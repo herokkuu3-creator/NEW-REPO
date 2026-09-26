@@ -17,6 +17,7 @@ export const TERMINAL_STATES: ReadonlySet<RunState> = new Set([
 ]);
 
 export interface DailyRunCreateInput {
+  accountId: string; // owning account — one row per account per day
   date: string; // YYYY-MM-DD in configured timezone
   problemSlug: string;
   title: string;
@@ -27,12 +28,16 @@ export interface DailyRunCreateInput {
 export type DailyRunRecord = Prisma.DailyRunGetPayload<Record<string, never>>;
 
 /**
- * Returns today's run if it exists. Used before any processing to make
- * duplicate submissions impossible — even across restarts or double-fires
- * of the cron trigger, the unique `date` constraint is the backstop.
+ * Returns today's run for this account if it exists. Used before any
+ * processing to make duplicate submissions impossible — even across
+ * restarts or double-fires of the cron trigger, the unique
+ * (accountId, date) constraint is the backstop.
  */
-export async function findRunByDate(date: string): Promise<DailyRunRecord | null> {
-  return prisma.dailyRun.findUnique({ where: { date } });
+export async function findRunByDate(
+  accountId: string,
+  date: string,
+): Promise<DailyRunRecord | null> {
+  return prisma.dailyRun.findUnique({ where: { accountId_date: { accountId, date } } });
 }
 
 export async function createRun(input: DailyRunCreateInput): Promise<DailyRunRecord> {
@@ -69,7 +74,8 @@ export const SystemKeys = {
   renewalToken: 'renewalToken', // secret that authorizes the /renew remote-browser page
   lastError: 'lastError',
   lastRunSummary: 'lastRunSummary',
-  storageState: 'storageStateJson', // Playwright storageState snapshot (DB-persisted)
+  lastReport: 'lastMultiRunReport', // JSON RunReport of the latest multi-account batch
+  storageState: 'storageStateJson', // Playwright storageState snapshot (DB-persisted, legacy single-session)
 } as const;
 
 /**

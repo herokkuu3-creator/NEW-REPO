@@ -4,12 +4,28 @@ import Fastify, { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config';
 import { logger } from '../logger';
+import { AccountStatus } from '@prisma/client';
 import {
   getAllSystemState,
+  getSystemState,
   latestRun,
   saveStorageStateToDb,
+  SystemKeys,
 } from '../database/models';
-import { applySessionRenewal, applyStorageStateDirect } from '../browser/sessionRenewal';
+import {
+  AccountRecord,
+  deleteAccountByLabel,
+  getAccountByLabel,
+  listAccounts,
+  parseStoredStorageState,
+  saveAccount,
+} from '../database/accounts';
+import {
+  applySessionRenewal,
+  applyStorageStateDirect,
+  validateCookiesAgainstLeetcode,
+} from '../browser/sessionRenewal';
+import { parseCookiePayload, ParseResult, StorageStateShape } from '../browser/cookiePayload';
 
 /**
  * Health + minimal admin API.
@@ -31,6 +47,31 @@ const storageStateSchema = z.object({
   origins: z.array(z.record(z.unknown())),
 });
 
+/** Account rows WITHOUT the secret — the only shape /admin/accounts returns. */
+function safeAccountView(a: AccountRecord) {
+  const parsed = parseStoredStorageState(a.storageState);
+  return {
+    label: a.label,
+    username: a.username,
+    status: a.status,
+    cookieCount: parsed.ok ? parsed.state.cookies.length : 0,
+    lastCheckedAt: a.lastCheckedAt?.toISOString() ?? null,
+    lastRunAt: a.lastRunAt?.toISOString() ?? null,
+    lastResult: a.lastResult,
+    lastError: a.lastError,
+    createdAt: a.createdAt.toISOString(),
+  };
+}
+
+function safeJson(raw: string | undefined | null): unknown {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstance> {
   const app = Fastify({
     logger: false, // pino is our logger; fastify's would double-log
@@ -42,7 +83,7 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
     authorization === `Bearer ${config.api.setupToken}`;
 
   app.get('/health', async () => {
-    const [sys, last] = await Promise.all([getAllSystemState(), latestRun()]);
+    const [sys, last, accounts] = await Promise.all([getAllSystemState(), latestRun(), listAccounts()]);
     return {
       status: 'ok',
       service: 'leetcode-daily-agent',
@@ -52,6 +93,13 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
         status: sys['authStatus'] ?? 'unknown',
         username: sys['authUsername'] ?? null,
       },
+      accounts: {
+        total: accounts.length,
+        active: accounts.filter((a) => a.status === AccountStatus.ACTIVE).length,
+        expired: accounts.filter((a) => a.status === AccountStatus.EXPIRED).length,
+        items: accounts.map(safeAccountView),
+      },
+      lastReport: safeJson(sys[SystemKeys.lastReport]),
       lastRun: last
         ? {
             date: last.date,
@@ -188,6 +236,140 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
     const result = await applySessionRenewal(payload);
     logger.info({ ok: result.ok }, 'session renewal attempted via admin API');
     return reply.code(result.ok ? 200 : 422).send(result);
+  });
+
+  // --- Multi-account management ---------------------------------------------
+  //
+  //   POST   /admin/accounts       — add/update an account from cookies
+  //   GET    /admin/accounts       — list accounts (labels + status, NO secrets)
+  //   DELETE /admin/accounts/:label — remove an account
+  //   GET    /admin/report         — the latest multi-account run report
+
+  const accountLabelSchema = z
+    .string()
+    .regex(
+      /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$/,
+      'label must match [a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}',
+    );
+
+  const addAccountSchema = z.object({
+    label: accountLabelSchema,
+    cookies: z.unknown(),
+    validate: z.boolean().optional(), // default true — verify against LeetCode first
+  });
+
+  app.post('/admin/accounts', async (req, reply) => {
+    if (!requireAdmin(req.headers.authorization)) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    const body = addAccountSchema.safeParse(req.body ?? {});
+    if (!body.success) {
+      return reply
+        .code(400)
+        .send({ ok: false, error: body.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ') });
+    }
+    const label = body.data.label;
+    const validate = body.data.validate !== false;
+
+    // Accept the same three formats as the Telegram /renew flow: a cookie
+    // header string, a Cookie-Editor JSON array, or a storageState object.
+    let cookies: ParseResult;
+    const raw = body.data.cookies;
+    if (typeof raw === 'string') {
+      cookies = parseCookiePayload(raw);
+    } else if (raw && typeof raw === 'object') {
+      const direct = storageStateSchema.safeParse(raw);
+      if (direct.success) {
+        cookies = {
+          ok: true,
+          storageState: direct.data as unknown as StorageStateShape,
+          format: 'storageState JSON',
+        };
+      } else {
+        cookies = parseCookiePayload(JSON.stringify(raw));
+      }
+    } else {
+      cookies = {
+        ok: false,
+        error:
+          'the cookies field is required — a cookie string, a Cookie-Editor export, or a storageState JSON',
+      };
+    }
+    if (!cookies.ok) {
+      return reply.code(400).send({ ok: false, label, error: cookies.error });
+    }
+
+    const json = JSON.stringify(cookies.storageState);
+    const cookieCount = cookies.storageState.cookies.length;
+
+    if (validate) {
+      // Validate-then-store: a bad payload can never clobber an account.
+      const validation = await validateCookiesAgainstLeetcode(cookies.storageState);
+      if (!validation.ok) {
+        logger.warn({ label, error: validation.error }, 'account cookies rejected by validation');
+        return reply.code(422).send({ ok: false, label, error: validation.error });
+      }
+      await saveAccount(label, json, {
+        username: validation.username,
+        status: AccountStatus.ACTIVE,
+      });
+      logger.info(
+        { label, username: validation.username, cookies: cookieCount },
+        'account added/updated via admin API (validated)',
+      );
+      const trigger = await hooks.triggerRun('session-renewal');
+      return reply.send({
+        ok: true,
+        label,
+        username: validation.username,
+        cookieCount,
+        validated: true,
+        runStarted: trigger.started,
+        runMessage: trigger.message,
+      });
+    }
+
+    // Bulk-seeding without validation: stored as UNKNOWN — the next run
+    // classifies every account as ACTIVE or EXPIRED and reports it.
+    await saveAccount(label, json);
+    logger.info({ label, cookies: cookieCount }, 'account stored unvalidated via admin API');
+    return reply.send({
+      ok: true,
+      label,
+      cookieCount,
+      validated: false,
+      note: 'stored unvalidated — the next run classifies it as ACTIVE or EXPIRED',
+    });
+  });
+
+  app.get('/admin/accounts', async (req, reply) => {
+    if (!requireAdmin(req.headers.authorization)) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    const accounts = await listAccounts();
+    return { total: accounts.length, accounts: accounts.map(safeAccountView) };
+  });
+
+  app.delete('/admin/accounts/:label', async (req, reply) => {
+    if (!requireAdmin(req.headers.authorization)) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    const { label } = req.params as { label: string };
+    const existing = await getAccountByLabel(label);
+    if (!existing) {
+      return reply.code(404).send({ ok: false, error: `no account named "${label}"` });
+    }
+    await deleteAccountByLabel(label);
+    logger.info({ label }, 'account deleted via admin API');
+    return reply.send({ ok: true, label, deleted: true });
+  });
+
+  app.get('/admin/report', async (req, reply) => {
+    if (!requireAdmin(req.headers.authorization)) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    const raw = await getSystemState(SystemKeys.lastReport);
+    return { report: safeJson(raw) };
   });
 
   const port = config.api.port;

@@ -318,3 +318,56 @@ Dockerfile · render.yaml · docker-compose.yml
 ## If you ever move to a paid tier
 
 The code is already dual-mode: attach a persistent disk at `/var/data`, set `BROWSER_PROFILE_PATH=/var/data/browser-profile` and `STORAGE_STATE_PATH=/var/data/storage-state.json`, upload the profile via the paid tier's shell, and the persistent-profile path takes over automatically with the DB storageState as its fallback.
+
+## 12. Multi-account (multiple cookies)
+
+The agent manages ANY NUMBER of LeetCode accounts. Each account is one row in
+the `Account` table: a label you choose, its own cookies (a Playwright
+storageState JSON), and its own per-day run row. Every trigger (cron, boot,
+admin API, manual) processes every account in sequence and finishes with ONE
+aggregated report.
+
+### Adding accounts
+
+Admin API (by default the cookies are validated against LeetCode before being
+stored — a bad payload can never clobber an account):
+
+    curl -X POST -H "Authorization: Bearer $SETUP_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"label":"main","cookies":"LEETCODE_SESSION=...; csrftoken=..."}' \
+      https://<service>.onrender.com/admin/accounts
+
+Bulk-seed without validation (`"validate": false`): stored as UNKNOWN, and the
+next run classifies each account as ACTIVE or EXPIRED and reports it. The
+`cookies` field also accepts a Cookie-Editor JSON export or a storageState
+object (the same three formats as the Telegram /renew flow).
+
+Telegram bot:
+
+    /renew            renew the default/sole account
+    /renew <label>    renew (or create) the named account from the next payload
+    /accounts         list every account with its cookie status
+
+### Reports
+
+    GET /admin/report   — the latest multi-account report (JSON)
+    GET /admin/accounts — every account: label, username, status, last run
+
+Telegram receives one summary per daily run, one line per account:
+
+    LeetCode Daily Report — 2026-09-26
+    3 account(s): 2 solved, 1 expired
+
+    [OK] main (userA) — Accepted · 45 ms · 9.2 MB
+    [OK] alt (userB) — Accepted · 52 ms · 9.4 MB
+    [EXPIRED] test3 — session expired — re-upload fresh cookies for this account
+
+### Expired cookies
+
+Expired cookies never stop the run: the account is marked EXPIRED, reported
+in the expired bucket, and the remaining accounts are processed normally.
+Renew an expired account with /renew <label> or POST /admin/accounts; delete
+one with DELETE /admin/accounts/<label>.
+
+Upgrade note: a pre-multi-account deployment keeps working — its stored
+session is seeded into a `default` account on the first run.

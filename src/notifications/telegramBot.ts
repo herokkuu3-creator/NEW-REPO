@@ -1,7 +1,9 @@
+import { AccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
 import { sendTelegramMessage } from './telegram';
 import { getAllSystemState, latestRun } from '../database/models';
+import { listAccounts } from '../database/accounts';
 import { applySessionRenewal } from '../browser/sessionRenewal';
 import { triggerRun } from '../scheduler/dailyWorker';
 
@@ -51,7 +53,9 @@ interface TgUpdate {
 const HELP_TEXT = [
   'LeetCode Daily Agent',
   '',
-  '/renew - refresh an expired LeetCode session (cookies from your own browser)',
+  '/renew - refresh the default/sole account session (cookies from your own browser)',
+  '/renew <label> - renew (or create) the named account from the cookies you send next',
+  '/accounts - list every account with its cookie status',
   '/status - show authentication status and the last run',
   '/cancel - cancel a renewal in progress',
   '/help - show this message',
@@ -131,17 +135,33 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/help':
         await reply(HELP_TEXT);
         return;
-      case '/renew':
-        await reply(RENEW_INSTRUCTIONS);
+      case '/renew': {
+        const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
+        if (!arg) {
+          pendingRenewalLabel = undefined;
+          await reply(RENEW_INSTRUCTIONS);
+          return;
+        }
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$/.test(arg)) {
+          await reply('Labels may contain letters, digits, dot, dash and underscore (max 32 characters). Try again, e.g. /renew main');
+          return;
+        }
+        pendingRenewalLabel = arg;
+        await reply(`Renewing the "${arg}" account. Send its cookie export (text or file) in your next message. /cancel aborts.`);
+        return;
+      }
+      case '/accounts':
+        await reply(await accountsText());
         return;
       case '/status':
         await reply(await statusText());
         return;
       case '/cancel':
-        await reply('No renewal is currently in progress. When you are ready, send /renew and then the cookies.');
+        pendingRenewalLabel = undefined;
+        await reply('No renewal is in progress. When you are ready, send /renew (or /renew <label>) and then the cookies.');
         return;
       default:
-        await reply('Unknown command. Available: /renew, /status, /cancel, /help');
+        await reply('Unknown command. Available: /renew, /renew <label>, /accounts, /status, /cancel, /help');
         return;
     }
   }
@@ -160,8 +180,14 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     return;
   }
 
-  await reply('Validating the new session with LeetCode...');
-  const result = await applySessionRenewal(payload);
+  const label = pendingRenewalLabel;
+  pendingRenewalLabel = undefined;
+  await reply(
+    label
+      ? `Validating the new session for the "${label}" account with LeetCode...`
+      : 'Validating the new session with LeetCode...',
+  );
+  const result = await applySessionRenewal(payload, label);
 
   if (!result.ok) {
     await reply(`Session renewal failed.\n\n${result.error}\n\nSend /renew to see the steps again.`);
@@ -174,15 +200,38 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     ? "Today's challenge run is starting now. I will report the result here."
     : `Today's run was not started: ${trigger.message}`;
   await reply(
-    `Session renewed. Signed in as ${result.username} (${result.cookieCount} cookies, ${result.format}).\n\n${followUp}`,
+    `${label ? `Account "${label}" renewed` : 'Session renewed'}. Signed in as ${result.username} (${result.cookieCount} cookies, ${result.format}).\n\n${followUp}`,
   );
 }
 
+/** Pending /renew <label> target — consumed by the next cookie payload. */
+let pendingRenewalLabel: string | undefined;
+
+async function accountsText(): Promise<string> {
+  const accounts = await listAccounts();
+  if (accounts.length === 0) {
+    return 'No accounts configured yet. Send /renew (or /renew <label>) with your cookies, or use POST /admin/accounts.';
+  }
+  const lines = [`Accounts: ${accounts.length}`, ''];
+  for (const a of accounts) {
+    const who = a.username ? ` (${a.username})` : '';
+    const when = a.lastRunAt
+      ? `, last run ${a.lastRunAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`
+      : '';
+    lines.push(`- ${a.label}${who}: ${a.status}${when}`);
+    if (a.lastError) lines.push(`  error: ${a.lastError.slice(0, 150)}`);
+  }
+  return lines.join('\n');
+}
+
 async function statusText(): Promise<string> {
-  const [sys, last] = await Promise.all([getAllSystemState(), latestRun()]);
+  const [sys, last, accounts] = await Promise.all([getAllSystemState(), latestRun(), listAccounts()]);
+  const active = accounts.filter((a) => a.status === AccountStatus.ACTIVE).length;
+  const expired = accounts.filter((a) => a.status === AccountStatus.EXPIRED).length;
   const lines = [
     'Agent status',
     '',
+    `Accounts: ${accounts.length}${accounts.length ? ` (${active} active, ${expired} expired)` : ''}`,
     `Auth: ${sys['authStatus'] ?? 'unknown'}${sys['authUsername'] ? ` (${sys['authUsername']})` : ''}`,
   ];
   if (last) {

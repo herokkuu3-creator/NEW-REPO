@@ -7,12 +7,35 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-/// One row per daily-challenge execution. `date` is the LeetCode daily
-/// challenge date (YYYY-MM-DD in TIMEZONE) and is unique, which makes
-/// duplicate submissions impossible even across worker restarts.
+/// One row per cookie-set ("account") the agent manages. The storageState
+/// JSON is the credential (stored in Postgres — the durable store on
+/// Render's free tier) and is a SECRET: never expose it through the API.
+/// username/status are refreshed on every run.
+model Account {
+  id            String        @id @default(cuid())
+  label         String        @unique // user-chosen name, e.g. "main"
+  storageState  String        @db.Text // Playwright storageState JSON
+  username      String? // discovered from LeetCode's userStatus query
+  status        AccountStatus @default(UNKNOWN)
+  lastCheckedAt DateTime? // last session check
+  lastRunAt     DateTime? // last attempt at the daily challenge
+  lastResult    String? // last RunState value for this account
+  lastError     String?       @db.Text
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  runs          DailyRun[]
+
+  @@index([status])
+}
+
+/// One row per account per daily-challenge execution. (accountId, date) is
+/// unique, which makes duplicate submissions impossible even across worker
+/// restarts — independently for every account.
 model DailyRun {
   id               String    @id @default(cuid())
-  date             String    @unique // YYYY-MM-DD (configured timezone)
+  accountId        String
+  account          Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  date             String // YYYY-MM-DD (configured timezone)
   problemSlug      String
   title            String
   difficulty       String
@@ -28,6 +51,8 @@ model DailyRun {
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
+  @@unique([accountId, date])
+  @@index([date])
   @@index([state])
   @@index([createdAt])
 }
@@ -51,4 +76,14 @@ enum RunState {
   SUBMISSION_ERROR
   SUBMISSION_REJECTED
   SUCCESS
+}
+
+/// Per-account cookie health. UNKNOWN = stored but not yet verified;
+/// ACTIVE = verified signed-in on the last run; EXPIRED = LeetCode reported
+/// the session signed out; DISABLED = user paused this account.
+enum AccountStatus {
+  UNKNOWN
+  ACTIVE
+  EXPIRED
+  DISABLED
 }

@@ -31,6 +31,14 @@ const USER_STATUS_QUERY = `
 export interface SessionCheckResult {
   authenticated: boolean;
   username?: string;
+  /**
+   * Only when authenticated === false:
+   *   'signed-out'   — LeetCode ANSWERED the query and reports the session
+   *                    logged out: a reliable expiry signal.
+   *   'query-failed' — the request itself failed (network error, Cloudflare
+   *                    403): NOT proof of expiry, must not mark a cookie expired.
+   */
+  cause?: 'signed-out' | 'query-failed';
 }
 
 export async function checkSession(api: LeetCodeApi): Promise<SessionCheckResult> {
@@ -41,12 +49,12 @@ export async function checkSession(api: LeetCodeApi): Promise<SessionCheckResult
       return { authenticated: true, username: data.userStatus.username };
     }
     logger.info('session check: not signed in');
-    return { authenticated: false };
+    return { authenticated: false, cause: 'signed-out' };
   } catch (err) {
     logger.warn(
       { err: err instanceof Error ? err.message : String(err) },
       'session check query failed — treating as unauthenticated',
     );
-    return { authenticated: false };
+    return { authenticated: false, cause: 'query-failed' };
   }
 }

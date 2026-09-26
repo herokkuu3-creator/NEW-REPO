@@ -1,4 +1,5 @@
 import { RunState } from '../database/models';
+import { formatReportForTelegram, RunReport } from '../scheduler/report';
 import { sendTelegramMessage, sendTelegramPhoto } from './telegram';
 
 /**
@@ -67,4 +68,14 @@ export async function notifySessionExpired(): Promise<void> {
 /** Minimal escaping â€” we send plain text, so only guard against confusing the API. */
 function escape(s: string): string {
   return s.replace(/[\r\n]+/g, ' ').trim();
+}
+
+/**
+ * Multi-account daily report — ONE summary message for the whole batch,
+ * replacing the per-run notifications of the single-account era. Silent for
+ * an empty batch (nothing ran) and when Telegram is not configured.
+ */
+export async function notifyMultiRunReport(report: RunReport): Promise<void> {
+  if (report.totals.accounts === 0) return;
+  await sendTelegramMessage(formatReportForTelegram(report));
 }
