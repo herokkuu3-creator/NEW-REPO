@@ -81,7 +81,7 @@ const submissionListSchema = z.object({
         statusDisplay: z.string().nullable().optional(),
         runtime: z.string().nullable().optional(),
         memory: z.string().nullable().optional(),
-        isPending: z.boolean().nullable().optional(),
+        isPending: z.union([z.boolean(), z.string()]).nullable().optional(),
       }),
     ),
   }).nullable(),
@@ -230,8 +230,11 @@ export class LeetCodeApi {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = 'PENDING';
 
+    let firstPoll = true;
+
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 2_000));
+      await new Promise((r) => setTimeout(r, firstPoll ? 5_000 : 2_000));
+      firstPoll = false;
 
       const data = await this.graphql(
         SUBMISSION_DETAILS_QUERY,
