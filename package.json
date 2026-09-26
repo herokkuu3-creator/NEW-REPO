@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/main.js",
+    "start": "node dist/src/main.js",    
     "dev": "tsx watch src/main.ts",
     "auth:setup": "tsx scripts/auth-setup.ts",
     "run:now": "tsx scripts/run-now.ts",
