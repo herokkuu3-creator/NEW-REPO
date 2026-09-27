@@ -82,8 +82,8 @@ describe('summarizeReport', () => {
     expect(summarizeReport(reportOf(solved, { ...solved, label: 'x' }))).toBe(
       '2 account(s): 2 solved',
     );
-    expect(summarizeReport(reportOf(solved, expired, failed))).toBe(
-      '3 account(s): 1 solved, 1 expired, 1 failed',
+    expect(summarizeReport(reportOf(solved, expired, rejected, failed))).toBe(
+      '4 account(s): 1 solved, 1 expired, 1 rejected, 1 failed',
     );
   });
 });
