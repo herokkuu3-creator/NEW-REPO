@@ -56,8 +56,8 @@ function reportOf(...outcomes: AccountOutcome[]) {
 
 describe('buildReport', () => {
   it('counts the totals from mixed outcomes', () => {
-    const report = reportOf(solved, expired, failed, skipped, { ...solved, label: 'fifth' });
-    expect(report.totals).toEqual({ accounts: 5, solved: 2, failed: 1, expired: 1, skipped: 1 });
+    const report = reportOf(solved, expired, failed, rejected, skipped);
+    expect(report.totals).toEqual({ accounts: 5, solved: 1, failed: 1, expired: 1, rejected: 1, skipped: 1 });
     expect(report.accounts).toHaveLength(5);
   });
 
@@ -72,7 +72,7 @@ describe('buildReport', () => {
 
   it('produces a valid zero report when no accounts are configured', () => {
     const report = reportOf();
-    expect(report.totals).toEqual({ accounts: 0, solved: 0, failed: 0, expired: 0, skipped: 0 });
+    expect(report.totals).toEqual({ accounts: 0, solved: 0, failed: 0, expired: 0, rejected: 0, skipped: 0 });
     expect(summarizeReport(report)).toBe('no accounts configured');
   });
 });
@@ -90,7 +90,7 @@ describe('summarizeReport', () => {
 
 describe('formatReportForTelegram', () => {
   it('renders one line per account with the right markers', () => {
-    const text = formatReportForTelegram(reportOf(solved, expired, rejected, skipped));
+    const text = formatReportForTelegram(reportOf(solved, expired, rejected, failed, skipped));
     expect(text).toContain('LeetCode Daily Report — 2026-09-26');
     expect(text).toContain('[OK] main (userA) — Accepted · 45 ms · 9.2 MB');
     expect(text).toContain('[EXPIRED] second (userB) — session expired');
