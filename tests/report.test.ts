@@ -35,6 +35,14 @@ const failed: AccountOutcome = {
   error: 'judge verdict: Wrong Answer',
 };
 
+
+const rejected: AccountOutcome = {
+  label: 'fifth',
+  username: 'userC',
+  kind: 'rejected',
+  error: 'LeetCode rejected the transferred session',
+};
+
 const skipped: AccountOutcome = {
   label: 'fourth',
   kind: 'skipped',
@@ -82,10 +90,11 @@ describe('summarizeReport', () => {
 
 describe('formatReportForTelegram', () => {
   it('renders one line per account with the right markers', () => {
-    const text = formatReportForTelegram(reportOf(solved, expired, failed, skipped));
+    const text = formatReportForTelegram(reportOf(solved, expired, rejected, skipped));
     expect(text).toContain('LeetCode Daily Report — 2026-09-26');
     expect(text).toContain('[OK] main (userA) — Accepted · 45 ms · 9.2 MB');
     expect(text).toContain('[EXPIRED] second (userB) — session expired');
+    expect(text).toContain('[REJECTED] fifth (userC) — LeetCode rejected the transferred session');
     expect(text).toContain('[FAIL] third — SUBMISSION_REJECTED: judge verdict: Wrong Answer');
     expect(text).toContain('[SKIP] fourth — already handled today');
   });
@@ -96,7 +105,7 @@ describe('formatReportForTelegram', () => {
   });
 
   it('never leaks cookie material into the message', () => {
-    const text = formatReportForTelegram(reportOf(solved, expired, failed, skipped));
+    const text = formatReportForTelegram(reportOf(solved, expired, rejected, failed, skipped));
     expect(text).not.toMatch(/LEETCODE_SESSION/);
     expect(text).not.toMatch(/csrftoken/);
   });
