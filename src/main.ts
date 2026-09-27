@@ -1,7 +1,13 @@
 import { config } from './config';
 import { logger } from './logger';
 import { connectDatabase, disconnectDatabase } from './database/prisma';
-import { isRunInProgress, startScheduler, triggerRun } from './scheduler/dailyWorker';
+import {
+  isRunInProgress,
+  runSubmissionNow,
+  startScheduler,
+  triggerRun,
+  TRIGGER_SUBMISSION_REASON,
+} from './scheduler/dailyWorker';
 import { startHealthServer } from './api/health';
 import { startTelegramBot } from './notifications/telegramBot';
 
@@ -37,7 +43,11 @@ async function main(): Promise<void> {
 
   await connectDatabase();
 
-  const app = await startHealthServer({ triggerRun, isRunInProgress });
+  const app = await startHealthServer({
+    triggerRun,
+    isRunInProgress,
+    runSubmission: () => runSubmissionNow(TRIGGER_SUBMISSION_REASON),
+  });
   const stopScheduler = startScheduler();
   const stopTelegramBot = startTelegramBot();
 

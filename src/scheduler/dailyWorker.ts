@@ -32,8 +32,14 @@ import {
 import { LeetCodeApi, looksLikeChallenge } from '../leetcode/apiClient';
 import { parseProblem, ProblemParseError } from '../leetcode/parser';
 import { createLLMProvider } from '../ai/provider';
-import { solveProblem } from '../ai/solver';
-import { fetchWalkcccSolution, signatureMatchesStarter, WalkcccError } from '../solutions/walkccc';
+import { solveProblem, SolveResult } from '../ai/solver';
+import {
+  fetchWalkcccSolution,
+  signatureMatchesStarter,
+  WalkcccError,
+  WalkcccSolution,
+} from '../solutions/walkccc';
+import { SolutionCache } from '../solutions/solutionCache';
 import { ensureLanguage, openProblemPage, setEditorCode } from '../leetcode/editor';
 import { submitCurrentEditor } from '../leetcode/submission';
 import { notifyMultiRunReport } from '../notifications/notifier';
@@ -97,9 +103,41 @@ export async function triggerRun(reason: string): Promise<RunTriggerResult> {
   return { started: true, message: `run triggered (${reason})` };
 }
 
+/** Reason used by POST /triggerSubmission (re-submits for every account). */
+export const TRIGGER_SUBMISSION_REASON = 'trigger-submission';
+
 /** Reasons that override the per-account per-day dedupe (re-attempt failed rows). */
 function isForceReason(reason: string): boolean {
-  return reason === 'admin-api' || reason === 'session-renewal' || reason === 'manual-cli';
+  return (
+    reason === 'admin-api' ||
+    reason === 'session-renewal' ||
+    reason === 'manual-cli' ||
+    reason === TRIGGER_SUBMISSION_REASON
+  );
+}
+
+/**
+ * Runs the full multi-account submission synchronously and returns the
+ * report (one outcome per account). Used by POST /triggerSubmission.
+ * Returns null when another run is already in progress.
+ */
+export async function runSubmissionNow(reason: string): Promise<RunReport | null> {
+  if (runInProgress) return null;
+  return executeDailyRun(reason);
+}
+
+/**
+ * The daily question is identical for every account, so its solution is
+ * fetched ONCE and shared (see SolutionCache for the exact semantics).
+ */
+const walkcccCache = new SolutionCache<WalkcccSolution>();
+const llmCache = new SolutionCache<string>();
+
+/** Thrown inside the LLM cache producer so a failed solve is not cached. */
+class LlmSolveFailed extends Error {
+  constructor(public readonly result: Extract<SolveResult, { ok: false }>) {
+    super('LLM solve failed');
+  }
 }
 
 export async function executeDailyRun(reason: string): Promise<RunReport> {
@@ -360,9 +398,16 @@ async function obtainSolution(
   account: AccountRecord,
   username: string,
 ): Promise<SolutionResult> {
+  const cacheKey = {
+    date: run.date,
+    questionId: `${problem.frontendId}:${problem.slug}`,
+    language: config.llm.language,
+    source: config.solution.source,
+  };
+
   if (config.solution.source === 'walkccc') {
     try {
-      const sol = await fetchWalkcccSolution(problem.frontendId);
+      const sol = await walkcccCache.get(cacheKey, () => fetchWalkcccSolution(problem.frontendId));
       // Guard: walkccc's method name must match LeetCode's C++ starter, or the
       // submission is a guaranteed compile error.
       if (!signatureMatchesStarter(sol.code, problem)) {
@@ -402,13 +447,19 @@ async function obtainSolution(
     }
   }
 
-  const llm = createLLMProvider();
-  const solved = await solveProblem(
-    llm,
-    problem,
-    config.llm.language,
-    config.llm.maxSolutionRetries,
-  );
+  let solved: SolveResult;
+  try {
+    const code = await llmCache.get(cacheKey, async () => {
+      const llm = createLLMProvider();
+      const r = await solveProblem(llm, problem, config.llm.language, config.llm.maxSolutionRetries);
+      if (!r.ok) throw new LlmSolveFailed(r);
+      return r.code;
+    });
+    solved = { ok: true, code, attempts: 0 };
+  } catch (err) {
+    if (!(err instanceof LlmSolveFailed)) throw err;
+    solved = err.result;
+  }
   if (solved.ok) return { ok: true, code: solved.code };
 
   const state =
@@ -639,6 +690,7 @@ async function finishRun(
     username,
     kind: solved ? 'solved' : 'failed',
     state,
+    submissionId: updated.submissionId ?? null,
     submissionStatus: updated.submissionStatus,
     runtime: updated.runtime,
     memory: updated.memory,

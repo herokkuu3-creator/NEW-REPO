@@ -24,12 +24,15 @@ import {
   applyStorageStateDirect,
 } from '../browser/sessionRenewal';
 import { ingestCookiePayload } from '../accounts/ingest';
+import { RunReport, summarizeReport } from '../scheduler/report';
 
 /**
  * Health + minimal admin API.
  *
  *   GET  /health        — unauthenticated liveness + last-run + auth status
  *   POST /admin/run-now — manual trigger, protected by SETUP_TOKEN (Bearer)
+ *   POST /triggerSubmission — re-submit the daily question for every account
+ *                          and return one result per account (Bearer)
  *
  * No cookies, tokens, or secrets are ever exposed in responses.
  */
@@ -37,6 +40,8 @@ import { ingestCookiePayload } from '../accounts/ingest';
 export interface ApiHooks {
   triggerRun: (reason: string) => Promise<{ started: boolean; message: string }>;
   isRunInProgress: () => boolean;
+  /** Runs the submission for every account and resolves with the report (null = run already in progress). */
+  runSubmission: () => Promise<RunReport | null>;
 }
 
 /** Shape of a Playwright storageState file — validated, never logged. */
@@ -68,6 +73,31 @@ function safeJson(raw: string | undefined | null): unknown {
   } catch {
     return null;
   }
+}
+
+/** Response body of POST /triggerSubmission — one entry per account, no secrets. */
+export function formatSubmissionResponse(report: RunReport) {
+  return {
+    ok: true,
+    date: report.date,
+    reason: report.reason,
+    startedAt: report.startedAt,
+    finishedAt: report.finishedAt,
+    summary: summarizeReport(report),
+    totals: report.totals,
+    accounts: report.accounts.map((a) => ({
+      label: a.label,
+      username: a.username ?? null,
+      status: a.kind,
+      success: a.kind === 'solved',
+      state: a.state ?? null,
+      submissionId: a.submissionId ?? null,
+      verdict: a.submissionStatus ?? null,
+      runtime: a.runtime ?? null,
+      memory: a.memory ?? null,
+      error: a.error ?? null,
+    })),
+  };
 }
 
 export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstance> {
@@ -123,6 +153,41 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
     runNowBodySchema.parse(req.body ?? {});
     const result = await hooks.triggerRun('admin-api');
     return reply.code(result.started ? 202 : 409).send(result);
+  });
+
+  /**
+   * Re-submits today's daily question for EVERY account and waits for the
+   * judge on each, then answers with a separate result per account:
+   *
+   *   curl -X POST -H "Authorization: Bearer $SETUP_TOKEN" \
+   *        https://<service>.onrender.com/triggerSubmission
+   *
+   *   200 { ok, date, summary, totals, accounts: [{ label, username, status, ... }] }
+   *   409 { ok: false, error }  — a run is already in progress
+   *
+   * Overrides the per-day dedupe (like /admin/run-now), so accounts already
+   * solved today are submitted again. The solution is fetched once and
+   * shared by all accounts.
+   */
+  app.post('/triggerSubmission', async (req, reply) => {
+    if (!requireAdmin(req.headers.authorization)) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    if (hooks.isRunInProgress()) {
+      return reply.code(409).send({ ok: false, error: 'a run is already in progress — try again when it finishes' });
+    }
+    let report: RunReport | null;
+    try {
+      report = await hooks.runSubmission();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ err: msg }, 'triggerSubmission failed');
+      return reply.code(500).send({ ok: false, error: msg });
+    }
+    if (!report) {
+      return reply.code(409).send({ ok: false, error: 'a run is already in progress — try again when it finishes' });
+    }
+    return reply.send(formatSubmissionResponse(report));
   });
 
   /**

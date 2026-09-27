@@ -19,6 +19,8 @@ export interface AccountOutcome {
   kind: AccountOutcomeKind;
   /** RunState value when a run row was written (e.g. SUBMISSION_REJECTED). */
   state?: string;
+  /** LeetCode submission id, when a submission was made. */
+  submissionId?: string | null;
   submissionStatus?: string | null;
   runtime?: string | null;
   memory?: string | null;
