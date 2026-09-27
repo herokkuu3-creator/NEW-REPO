@@ -21,8 +21,9 @@ import { triggerRun } from '../scheduler/dailyWorker';
  *
  * Security: messages from ANY chat other than TELEGRAM_CHAT_ID are ignored â€”
  * the bot token is semi-public (anyone can message the bot), the chat ID is
- * the access control. Cookie payloads are validated against LeetCode before
- * anything is stored, and are never logged or echoed back.
+ * the access control. Cookie payloads are parsed and stored immediately; live
+ * LeetCode validation is deferred to the daily run. Cookie values are never
+ * logged or echoed back.
  *
  * Large exports: Telegram splits pasted text at ~4096 characters, which
  * corrupts JSON â€” so Cookie-Editor exports can also be sent as .txt/.json
@@ -269,10 +270,11 @@ async function statusText(): Promise<string> {
   const [sys, last, accounts] = await Promise.all([getAllSystemState(), latestRun(), listAccounts()]);
   const active = accounts.filter((a) => a.status === AccountStatus.ACTIVE).length;
   const expired = accounts.filter((a) => a.status === AccountStatus.EXPIRED).length;
+  const rejected = accounts.filter((a) => a.status === AccountStatus.REJECTED).length;
   const lines = [
     'Agent status',
     '',
-    `Accounts: ${accounts.length}${accounts.length ? ` (${active} active, ${expired} expired)` : ''}`,
+    `Accounts: ${accounts.length}${accounts.length ? ` (${active} active, ${expired} expired, ${rejected} rejected)` : ''}`,
     `Auth: ${sys['authStatus'] ?? 'unknown'}${sys['authUsername'] ? ` (${sys['authUsername']})` : ''}`,
   ];
   if (last) {

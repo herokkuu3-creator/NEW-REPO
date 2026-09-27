@@ -9,7 +9,7 @@
  * run results.
  */
 
-export type AccountOutcomeKind = 'solved' | 'failed' | 'expired' | 'skipped';
+export type AccountOutcomeKind = 'solved' | 'failed' | 'expired' | 'rejected' | 'skipped';
 
 export interface AccountOutcome {
   /** The account label (user-chosen, e.g. "main"). */
@@ -68,6 +68,7 @@ export function summarizeReport(report: RunReport): string {
   if (t.accounts === 0) return 'no accounts configured';
   const parts: string[] = [`${t.solved} solved`];
   if (t.expired > 0) parts.push(`${t.expired} expired`);
+  if (t.rejected > 0) parts.push(`${t.rejected} rejected`);
   if (t.failed > 0) parts.push(`${t.failed} failed`);
   if (t.skipped > 0) parts.push(`${t.skipped} skipped`);
   return `${t.accounts} account(s): ${parts.join(', ')}`;
@@ -105,7 +106,10 @@ export function formatReportForTelegram(report: RunReport): string {
         break;
       }
       case 'expired':
-        lines.push(`[EXPIRED] ${who} — ${firstLine(o.error) ?? 'session expired — re-upload fresh cookies for this account'}`);
+        lines.push(`[EXPIRED] ${who} — ${firstLine(o.error) ?? 'session token itself is expired — re-capture fresh cookies'}`);
+        break;
+      case 'rejected':
+        lines.push(`[REJECTED] ${who} — ${firstLine(o.error) ?? 'LeetCode rejected the transferred session; token expiry is not established'}`);
         break;
       case 'failed': {
         const detail = firstLine(o.error);

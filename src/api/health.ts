@@ -255,7 +255,7 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
     // read from the session token (same user again = override).
     label: accountLabelSchema.optional(),
     cookies: z.unknown(),
-    validate: z.boolean().optional(), // default true — live LeetCode check after storing
+    validate: z.boolean().optional(), // default false — live check is deferred to the daily run
   });
 
   app.post('/admin/accounts', async (req, reply) => {
@@ -276,7 +276,7 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
     const payload = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
     const result = await ingestCookiePayload(payload, {
       label: body.data.label,
-      validate: body.data.validate !== false,
+      validate: body.data.validate === true,
     });
     if (!result.ok) {
       return reply.code(400).send(result);

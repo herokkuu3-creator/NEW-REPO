@@ -38,25 +38,25 @@ suite('Telegram cookie files -> accounts (real DB)', async () => {
   });
 
   it('keeps adding one account per file, for different users', async () => {
-    const r1 = await processCookieMessage(fresh('alice', 'a1'), { fileName: 'lc_26Sept_4179.json', validator: signedIn('alice') });
-    const r2 = await processCookieMessage(fresh('bob', 'b1'), { fileName: 'lc_26Sept_3700.json', validator: signedIn('bob') });
-    const r3 = await processCookieMessage(fresh('carol', 'c1'), { fileName: 'lc_26Sept_5075.json', validator: blocked });
+    const r1 = await processCookieMessage(fresh('alice', 'a1'), { fileName: 'lc_26Sept_4179.json' });
+    const r2 = await processCookieMessage(fresh('bob', 'b1'), { fileName: 'lc_26Sept_3700.json' });
+    const r3 = await processCookieMessage(fresh('carol', 'c1'), { fileName: 'lc_26Sept_5075.json' });
     expect([r1.stored, r2.stored, r3.stored]).toEqual([true, true, true]);
     expect(r1.text).toContain('Added new account: alice');
     expect(r3.text).toContain('NOT VERIFIED YET');
 
     const accounts = await listAccounts();
     expect(accounts.map((a) => [a.label, a.username, a.status])).toEqual([
-      ['alice', 'alice', 'ACTIVE'],
-      ['bob', 'bob', 'ACTIVE'],
+      ['alice', 'alice', 'UNKNOWN'],
+      ['bob', 'bob', 'UNKNOWN'],
       ['carol', 'carol', 'UNKNOWN'],
     ]);
     expect(r3.text).toContain('Accounts stored: 3');
   });
 
   it('overrides the cookies when the same user sends a new file', async () => {
-    await processCookieMessage(fresh('alice', 'OLD'), { validator: signedIn('alice') });
-    const r = await processCookieMessage(fresh('alice', 'NEW'), { validator: signedIn('alice') });
+    await processCookieMessage(fresh('alice', 'OLD'));
+    const r = await processCookieMessage(fresh('alice', 'NEW'));
     expect(r.text).toContain('Updated account (old cookies overridden): alice');
 
     const accounts = await listAccounts();
@@ -71,25 +71,40 @@ suite('Telegram cookie files -> accounts (real DB)', async () => {
   it('overrides a legacy "default" account that belongs to the same user', async () => {
     const { saveAccount } = await import('../src/database/accounts');
     await saveAccount('default', fresh('alice', 'OLD'), { username: 'alice' });
-    await processCookieMessage(fresh('alice', 'NEW'), { validator: signedIn('alice') });
+    await processCookieMessage(fresh('alice', 'NEW'));
     const accounts = await listAccounts();
     expect(accounts.map((a) => a.label)).toEqual(['default']);
   });
 
-  it('STORES the file even when LeetCode says signed out — marked EXPIRED, not rejected', async () => {
-    const r = await processCookieMessage(fresh('chris_grif', 'x'), { fileName: 'lc_26Sept_4179.json', validator: signedOut });
+  it('stores the file when LeetCode says signed out — marked REJECTED, not EXPIRED', async () => {
+    const r = await processCookieMessage(fresh('chris_grif', 'x'), { fileName: 'lc_26Sept_4179.json', validate: true, validator: signedOut });
     expect(r.stored).toBe(true);
-    expect(r.text).toContain('Status: EXPIRED');
+    expect(r.text).toContain('Status: SESSION REJECTED');
     const [a] = await listAccounts();
     expect(a?.label).toBe('chris_grif');
-    expect(a?.status).toBe('EXPIRED');
+    expect(a?.status).toBe('REJECTED');
   });
 
+
+
+  it('does not call LeetCode during a normal Telegram upload', async () => {
+    let called = false;
+    const r = await processCookieMessage(fresh('deferred_user', 'fresh'), {
+      validator: async () => {
+        called = true;
+        return { ok: false as const, reason: 'signed-out' as const, error: 'signed out' };
+      },
+    });
+    expect(r.stored).toBe(true);
+    expect(called).toBe(false);
+    expect(r.text).toContain('Status: NOT VERIFIED YET');
+    expect((await listAccounts())[0]?.status).toBe('UNKNOWN');
+  });
   it('marks an already-expired token EXPIRED without calling LeetCode', async () => {
     let called = false;
     const expiredJson = captureExport(fakeSession({ username: 'old', refreshed_at: NOW - 3_000_000, _session_expiry: 1_209_600 }));
     const r = await processCookieMessage(expiredJson, {
-      validator: async () => {
+      validate: true, validator: async () => {
         called = true;
         return { ok: true, username: 'old' };
       },
@@ -100,7 +115,7 @@ suite('Telegram cookie files -> accounts (real DB)', async () => {
   });
 
   it('an explicit /renew <label> stores under that label', async () => {
-    await processCookieMessage(fresh('alice', 'x'), { label: 'main', validator: signedIn('alice') });
+    await processCookieMessage(fresh('alice', 'x'), { label: 'main' });
     expect((await listAccounts()).map((a) => a.label)).toEqual(['main']);
   });
 

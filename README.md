@@ -226,7 +226,7 @@ Renewal takes ~2 minutes, entirely from Telegram — no redeploy, no shell:
    - **Android:** install **Kiwi Browser** (Chromium-based, supports extensions) → install the **Cookie-Editor** extension → log into leetcode.com → open Cookie-Editor → **Export** → paste the JSON into the chat (long export? send it as a `.txt`/`.json` **file** — Telegram splits pasted text at ~4000 chars and corrupts JSON).
    - **Desktop Chrome:** log into leetcode.com → `F12` → Application → Cookies → `https://leetcode.com` → send one line: `LEETCODE_SESSION=<value>; csrftoken=<value>`.
    - A full Playwright storageState JSON also works.
-3. The bot **validates the cookies against LeetCode first** — a bad paste never overwrites the stored credential — then saves them to Postgres, confirms the signed-in username, and **automatically starts today's run**.
+3. The bot **stores the captured cookies immediately** and does not classify them as expired during upload. The daily run performs the live check from the agent server.
 
 Why the browser-extension dance on mobile: `LEETCODE_SESSION` is an **HttpOnly** cookie — no JavaScript on the page (bookmarklets included) can read it, and mobile Chrome has no cookie viewer. Kiwi + Cookie-Editor is the phone-friendly path; desktop DevTools is the other.
 
@@ -241,7 +241,7 @@ curl -X POST -H "Authorization: Bearer <SETUP_TOKEN>" \
      https://<service>.onrender.com/admin/renew-session   # 200 = renewed, 422 = rejected (reason in body)
 ```
 
-The legacy path (`npm run auth:setup` locally + `POST /admin/storage-state`) keeps working unchanged. Auto-healing still applies: every *successful* run re-saves a fresh storageState to Postgres, so manual renewal is only needed when the session truly dies.
+The legacy path (`npm run auth:setup` locally + `POST /admin/storage-state`) keeps working unchanged. A live signed-out response from the agent server is reported separately as `REJECTED`; only the session token's own known expiry is classified as `EXPIRED`. Auto-healing still applies: every *successful* run re-saves a fresh storageState to Postgres.
 
 ## 12. Cloudflare verification handling
 
@@ -322,50 +322,45 @@ The code is already dual-mode: attach a persistent disk at `/var/data`, set `BRO
 ## 12. Multi-account (multiple cookies)
 
 The agent manages ANY NUMBER of LeetCode accounts. Each account is one row in
-the `Account` table: a label you choose, its own cookies (a Playwright
-storageState JSON), and its own per-day run row. Every trigger (cron, boot,
-admin API, manual) processes every account in sequence and finishes with ONE
-aggregated report.
+the `Account` table: a label, its own cookies (a Playwright storageState JSON),
+and its own per-day run row. Every trigger processes every account in sequence.
 
 ### Adding accounts
 
-Admin API (by default the cookies are validated against LeetCode before being
-stored — a bad payload can never clobber an account):
+Admin API:
 
     curl -X POST -H "Authorization: Bearer $SETUP_TOKEN" \
       -H "Content-Type: application/json" \
       -d '{"label":"main","cookies":"LEETCODE_SESSION=...; csrftoken=..."}' \
       https://<service>.onrender.com/admin/accounts
 
-Bulk-seed without validation (`"validate": false`): stored as UNKNOWN, and the
-next run classifies each account as ACTIVE or EXPIRED and reports it. The
-`cookies` field also accepts a Cookie-Editor JSON export or a storageState
-object (the same three formats as the Telegram /renew flow).
+Uploads are stored immediately by default. Use `"validate": true` only when
+you explicitly want an immediate live LeetCode check. The `cookies` field also
+accepts a Cookie-Editor JSON export or a storageState object.
 
-Telegram bot — just send cookie `.json` files (the capture-extension export),
-one per account, back to back:
+Telegram bot — send cookie `.json` files from the capture extension, one per
+account, back to back:
 
-- each file is stored IMMEDIATELY, keyed by the LeetCode username read from
-  its LEETCODE_SESSION token: a new user = a new account, a user that already
-  exists = that account's cookies are overridden
-- then each file is checked with LeetCode and marked ACTIVE / EXPIRED /
-  NOT VERIFIED YET (a failed or blocked check never loses the cookies)
-- 30 s after the last upload, today's run starts once for all accounts
+- each file is stored IMMEDIATELY, keyed by the LeetCode username read from its
+  session token
+- a new user creates an account
+- a known user overrides that account's cookies
+- the upload is initially `NOT VERIFIED YET`
+- after the uploads stop, today's run checks all accounts from the agent server
 
-Commands:
+### Session status
 
-    /renew            how to capture the cookie file on Android
-    /renew <label>    store the NEXT file under this exact label
-    /accounts         list every account with its cookie status
+The statuses intentionally distinguish three different situations:
 
-`POST /admin/accounts` follows the same rules: `label` is optional (defaults to
-the username), and the body can also be the raw capture `.json` file itself
-(`--data-binary @leetcode-session.json`).
+- `ACTIVE` — the agent successfully authenticated the account.
+- `EXPIRED` — the session token's own known expiry has passed.
+- `REJECTED` — LeetCode explicitly rejected the transferred session from the
+  agent server. This does **not** by itself prove that the token has expired.
+- `UNKNOWN` — no live check has been completed, or the check could not establish
+  the session state.
 
-Note on EXPIRED right after upload: LEETCODE_SESSION embeds the IP it was
-captured from. If LeetCode reports a freshly captured session "signed out"
-from the server, it is binding the session to your phone's network — the
-account is kept and re-checked on every run.
+A `REJECTED` account is never deleted and its cookies are never discarded.
+Other accounts continue processing normally.
 
 ### Reports
 
@@ -374,19 +369,16 @@ account is kept and re-checked on every run.
 
 Telegram receives one summary per daily run, one line per account:
 
-    LeetCode Daily Report — 2026-09-26
-    3 account(s): 2 solved, 1 expired
+    LeetCode Daily Report — 2026-09-27
+    3 account(s): 2 solved, 1 rejected
 
     [OK] main (userA) — Accepted · 45 ms · 9.2 MB
     [OK] alt (userB) — Accepted · 52 ms · 9.4 MB
-    [EXPIRED] test3 — session expired — re-upload fresh cookies for this account
+    [REJECTED] test3 (userC) — LeetCode rejected the transferred session
 
 ### Expired cookies
 
-Expired cookies never stop the run: the account is marked EXPIRED, reported
-in the expired bucket, and the remaining accounts are processed normally.
-Renew an expired account with /renew <label> or POST /admin/accounts; delete
-one with DELETE /admin/accounts/<label>.
-
-Upgrade note: a pre-multi-account deployment keeps working — its stored
-session is seeded into a `default` account on the first run.
+An account is marked `EXPIRED` only when the stored session's own expiry is
+known to have passed. Expired accounts never stop the run; the remaining
+accounts are processed normally. Renew an account with `/renew <label>` or
+upload a fresh capture for that username.
