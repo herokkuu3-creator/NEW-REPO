@@ -47,7 +47,7 @@ export interface IngestOptions {
   label?: string;
   /** Uploaded file name — label fallback when no username is readable. */
   fileName?: string;
-  /** false = store without the live LeetCode check (status from the token only). */
+  /** true = perform an immediate live check. Normal uploads leave this false. */
   validate?: boolean;
   /** Injected in tests; defaults to the real browser-based check. */
   validator?: Validator;
@@ -74,6 +74,8 @@ export async function ingestStorageState(
   );
 
   // 1) STORE first — new label = add, existing label = override the cookies.
+  // Normal capture uploads do NOT perform a Render-side live check. This keeps
+  // a cross-network session rejection from being misreported as token expiry.
   const account = await saveAccount(label, JSON.stringify(state), {
     username: identity.username,
     status: AccountStatus.UNKNOWN,
@@ -121,9 +123,9 @@ export async function ingestStorageState(
   }
   if (v.reason === 'signed-out') {
     const detail =
-      'LeetCode reports this session signed out — it is expired/logged out, or LeetCode only accepts it from the network (IP) where it was captured';
-    await patchAccount(account.id, { status: AccountStatus.EXPIRED, lastError: detail, checked: true });
-    return { ...base, username: identity.username ?? null, status: AccountStatus.EXPIRED, detail };
+      'LeetCode rejected this transferred session from the agent server — this does not by itself prove that the token has expired';
+    await patchAccount(account.id, { status: AccountStatus.REJECTED, lastError: detail, checked: true });
+    return { ...base, username: identity.username ?? null, status: AccountStatus.REJECTED, detail };
   }
   const detail = `could not verify right now (${v.error}) — stored; the next daily run re-checks it`;
   await patchAccount(account.id, { lastError: detail, checked: true });
@@ -136,6 +138,12 @@ export function describeIngest(r: IngestResult): string {
   const who = r.username ? ` (${r.username})` : '';
   const verb = r.created ? 'Added new account' : 'Updated account (old cookies overridden)';
   const status =
-    r.status === AccountStatus.ACTIVE ? 'ACTIVE' : r.status === AccountStatus.EXPIRED ? 'EXPIRED' : 'NOT VERIFIED YET';
+    r.status === AccountStatus.ACTIVE
+      ? 'ACTIVE'
+      : r.status === AccountStatus.EXPIRED
+        ? 'EXPIRED'
+        : r.status === AccountStatus.REJECTED
+          ? 'SESSION REJECTED'
+          : 'NOT VERIFIED YET';
   return `${verb}: ${r.label}${who}\nStatus: ${status} — ${r.detail}\nCookies: ${r.cookieCount} (${r.format})`;
 }
