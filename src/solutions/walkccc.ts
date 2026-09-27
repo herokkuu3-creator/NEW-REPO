@@ -33,6 +33,18 @@ export interface WalkcccProblem extends WalkcccSolution {
   title: string | null;
 }
 
+/**
+ * The raw page. `code` is null when the page exists but has no C++ solution —
+ * premium problems show a locked notice, SQL problems have no C++ — while the
+ * slug still resolves, so callers can ask LeetCode what the question is.
+ */
+export interface WalkcccPage {
+  code: string | null;
+  sourceUrl: string;
+  slug: string | null;
+  title: string | null;
+}
+
 const FETCH_TIMEOUT_MS = 15_000;
 const USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -40,8 +52,11 @@ const USER_AGENT =
 export async function fetchWalkcccSolution(
   questionFrontendId: string,
 ): Promise<WalkcccSolution> {
-  const { code, sourceUrl } = await fetchWalkcccPage(questionFrontendId);
-  return { code, sourceUrl };
+  const page = await fetchWalkcccPage(questionFrontendId);
+  if (!page.code) {
+    throw new WalkcccError(`could not extract a C++ solution from ${page.sourceUrl}`);
+  }
+  return { code: page.code, sourceUrl: page.sourceUrl };
 }
 
 /**
@@ -54,16 +69,18 @@ export async function fetchWalkcccProblem(questionNumber: number | string): Prom
   if (!page.slug) {
     throw new WalkcccError(`could not find the LeetCode problem link on ${page.sourceUrl}`);
   }
+  if (!page.code) {
+    throw new WalkcccError(`could not extract a C++ solution from ${page.sourceUrl}`);
+  }
   return { code: page.code, sourceUrl: page.sourceUrl, slug: page.slug, title: page.title };
 }
 
-async function fetchWalkcccPage(
-  questionFrontendId: string,
-): Promise<WalkcccSolution & { slug: string | null; title: string | null }> {
+/** One walkccc page — never fails for a missing solution, only for a missing page. */
+export async function fetchWalkcccPage(questionNumber: number | string): Promise<WalkcccPage> {
   const base = config.solution.walkcccBaseUrl.replace(/\/+$/, '');
-  const url = `${base}/problems/${encodeURIComponent(questionFrontendId)}/`;
+  const url = `${base}/problems/${encodeURIComponent(String(questionNumber))}/`;
 
-  logger.info({ url, questionFrontendId }, 'fetching solution from walkccc');
+  logger.info({ url, questionNumber }, 'fetching solution from walkccc');
 
   const res = await fetch(url, {
     headers: { 'User-Agent': USER_AGENT, Accept: 'text/html' },
@@ -73,7 +90,7 @@ async function fetchWalkcccPage(
 
   if (res.status === 404) {
     throw new WalkcccError(
-      `no walkccc page for problem ${questionFrontendId} — the problem is too new, or is a premium problem walkccc does not cover`,
+      `no walkccc page for problem ${questionNumber} — the problem is too new, or is a premium problem walkccc does not cover`,
     );
   }
   if (!res.ok) {
@@ -82,15 +99,10 @@ async function fetchWalkcccPage(
 
   const html = await res.text();
   const code = extractCppSolution(html);
-  if (!code) {
-    throw new WalkcccError(
-      `could not extract a C++ solution from ${url} — the page layout likely changed`,
-    );
-  }
 
-  logger.info({ url, codeLength: code.length }, 'walkccc C++ solution extracted');
+  logger.info({ url, hasSolution: Boolean(code), codeLength: code?.length ?? 0 }, 'walkccc page fetched');
   const link = extractProblemLink(html);
-  return { code, sourceUrl: url, slug: link?.slug ?? null, title: link?.title ?? null };
+  return { code: code ?? null, sourceUrl: url, slug: link?.slug ?? null, title: link?.title ?? null };
 }
 
 /** The LeetCode problem a walkccc page is about, from its title link. Exposed for testing. */

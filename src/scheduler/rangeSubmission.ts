@@ -4,7 +4,7 @@ import { AccountRecord, getAccountById, listEnabledAccounts, parseStoredStorageS
 import { LeetCodeApi, looksLikeChallenge, SubmissionOutcome } from '../leetcode/apiClient';
 import { fetchQuestionData, RawQuestionData } from '../leetcode/dailyChallenge';
 import { checkSession, SessionCheckResult } from '../browser/sessionCheck';
-import { fetchWalkcccProblem, signatureMatchesStarter, WalkcccError, WalkcccProblem } from '../solutions/walkccc';
+import { fetchWalkcccPage, signatureMatchesStarter, WalkcccError, WalkcccPage } from '../solutions/walkccc';
 import { ParsedProblem } from '../leetcode/parser';
 import { isRunInProgress } from './dailyWorker';
 import { config } from '../config';
@@ -74,7 +74,7 @@ export function rangeSize(r: QuestionRange): number {
 // Results
 // ---------------------------------------------------------------------------
 
-export type QuestionStatus = 'accepted' | 'failed' | 'error';
+export type QuestionStatus = 'accepted' | 'failed' | 'error' | 'premium';
 
 export interface QuestionResult {
   number: number;
@@ -100,7 +100,7 @@ export interface AccountRangeResult {
 }
 
 export function countResults(results: QuestionResult[]): Record<QuestionStatus, number> {
-  const c = { accepted: 0, failed: 0, error: 0 };
+  const c = { accepted: 0, failed: 0, error: 0, premium: 0 };
   for (const r of results) c[r.status]++;
   return c;
 }
@@ -125,7 +125,8 @@ export interface RangeDeps {
   listAccounts(): Promise<AccountRecord[]>;
   getAccount(id: string): Promise<AccountRecord | null>;
   openSession(account: AccountRecord): Promise<RangeSession>;
-  getSolution(questionNumber: number): Promise<WalkcccProblem>;
+  /** The walkccc page for a question number: the slug (and often the solution). */
+  getPage(questionNumber: number): Promise<WalkcccPage>;
   notify(text: string): Promise<void>;
   /** Resolves after `ms`, or early (without throwing) when `signal` aborts. */
   sleep(ms: number, signal: AbortSignal): Promise<void>;
@@ -224,7 +225,7 @@ export async function startRangeJob(
     currentLabel: null,
     currentQuestion: null,
     doneInAccount: 0,
-    counts: { accepted: 0, failed: 0, error: 0 },
+    counts: { accepted: 0, failed: 0, error: 0, premium: 0 },
     startedAt: deps.now(),
     cancelling: false,
     pausedReason: null,
@@ -243,7 +244,7 @@ export async function startRangeJob(
         info.currentLabel = account.label;
         info.currentQuestion = null;
         info.doneInAccount = 0;
-        info.counts = { accepted: 0, failed: 0, error: 0 };
+        info.counts = { accepted: 0, failed: 0, error: 0, premium: 0 };
 
         const result = await runAccountRange(account, range, deps, info, abort.signal, i + 1, accounts.length);
         all.push(result);
@@ -435,32 +436,37 @@ async function solveOne(
     blocked,
   });
 
-  // 1) walkccc solution + slug (shared across accounts; no LeetCode request).
-  let sol: WalkcccProblem;
+  // 1) The walkccc page resolves the slug (shared across accounts; no LeetCode request).
+  let page: WalkcccPage;
   try {
-    sol = await deps.getSolution(n);
+    page = await deps.getPage(n);
   } catch (e) {
     if (e instanceof WalkcccError && /no walkccc page/i.test(e.message)) {
-      return err('no walkccc solution', false);
+      return err('no walkccc page', false);
     }
     return err(`walkccc: ${shortErr(e)}`, false);
   }
+  if (!page.slug) return err('walkccc page has no LeetCode link', false);
 
   try {
-    // 2) The question (internal id + C++ starter).
-    const q = await api.question(sol.slug);
-    if (!q.questionId) return err('LeetCode returned no question id');
-    const cpp = q.codeSnippets.find((s) => s.langSlug === 'cpp');
-    if (!cpp) {
-      return err(q.codeSnippets.length === 0 ? 'premium-only question' : 'no C++ for this question');
+    // 2) The question — the premium/locked check comes FIRST: locked questions
+    //    are skipped before touching the solution, the editor or the judge.
+    const q = await api.question(page.slug);
+    if (q.isPaidOnly) {
+      logger.info({ question: n, slug: page.slug }, 'range question is premium-locked - skipping');
+      return { outcome: { number: n, status: 'premium' }, touchedLeetCode: true, blocked: false };
     }
-    if (!signatureMatchesStarter(sol.code, { starterCode: cpp.code } as ParsedProblem)) {
+    if (!q.questionId) return err('LeetCode returned no question id');
+    if (!page.code) return err('no walkccc C++ solution for this question');
+    const cpp = q.codeSnippets.find((s) => s.langSlug === 'cpp');
+    if (!cpp) return err('no C++ for this question');
+    if (!signatureMatchesStarter(page.code, { starterCode: cpp.code } as ParsedProblem)) {
       return err('walkccc signature does not match');
     }
 
     // 3) Submit + wait for the judge.
-    const submissionId = await api.submit({ slug: sol.slug, questionId: q.questionId, lang: 'cpp', code: sol.code });
-    const verdict = await api.awaitResult(submissionId, sol.slug);
+    const submissionId = await api.submit({ slug: page.slug, questionId: q.questionId, lang: 'cpp', code: page.code });
+    const verdict = await api.awaitResult(submissionId, page.slug);
     if (verdict.classification === 'ACCEPTED') {
       return { outcome: { number: n, status: 'accepted', submissionId }, touchedLeetCode: true, blocked: false };
     }
@@ -515,10 +521,14 @@ export function formatAccountRangeSummary(r: AccountRangeResult, index: number, 
   const c = countResults(r.results);
   const failed = r.results.filter((x) => x.status === 'failed');
   const errors = r.results.filter((x) => x.status === 'error');
+  const premium = r.results.filter((x) => x.status === 'premium');
   const lines = [head, '', `✅ Accepted: ${c.accepted}`, `❌ Failed: ${c.failed}`];
   if (failed.length) {
     // Group by verdict: "Wrong Answer: #212, #218"
     for (const [verdict, ns] of groupBy(failed)) lines.push(`   • ${verdict}: ${numberList(ns)}`);
+  }
+  if (premium.length) {
+    lines.push(`🔒 Premium (locked): ${premium.length} — ${numberList(premium.map((x) => x.number))}`);
   }
   lines.push(`⚠️ Error: ${c.error}`);
   if (errors.length) {
@@ -550,12 +560,13 @@ export function formatRangeJobFinished(
   cancelled: boolean,
   elapsedMs: number,
 ): string {
-  const sum = { accepted: 0, failed: 0, error: 0 };
+  const sum = { accepted: 0, failed: 0, error: 0, premium: 0 };
   for (const r of results) {
     const c = countResults(r.results);
     sum.accepted += c.accepted;
     sum.failed += c.failed;
     sum.error += c.error;
+    sum.premium += c.premium;
   }
   const head = cancelled
     ? `🛑 Question-range job cancelled (#${range.from}–#${range.to})`
@@ -563,7 +574,7 @@ export function formatRangeJobFinished(
   return [
     head,
     `👥 Accounts processed: ${results.length}/${totalAccounts}`,
-    `✅ ${sum.accepted} accepted · ❌ ${sum.failed} failed · ⚠️ ${sum.error} errors`,
+    `✅ ${sum.accepted} accepted · ❌ ${sum.failed} failed · ⚠️ ${sum.error} errors${sum.premium ? ` · 🔒 ${sum.premium} premium` : ''}`,
     `⏱️ Total time: ${formatDuration(elapsedMs)}`,
   ].join('\n');
 }
@@ -574,7 +585,7 @@ export function formatRangeJobStatus(j: RangeJobInfo, now: number): string {
     `⏳ Question-range job in progress (#${j.range.from}–#${j.range.to})`,
     `👤 Account ${j.accountIndex}/${j.accountLabels.length}: ${j.currentLabel ?? '—'}`,
     `📍 ${j.doneInAccount}/${size} done${j.currentQuestion ? ` — now on #${j.currentQuestion}` : ''}`,
-    `✅ ${j.counts.accepted} · ❌ ${j.counts.failed} · ⚠️ ${j.counts.error}`,
+    `✅ ${j.counts.accepted} · ❌ ${j.counts.failed} · ⚠️ ${j.counts.error}${j.counts.premium ? ` · 🔒 ${j.counts.premium}` : ''}`,
     `⏱️ Running for ${formatDuration(now - j.startedAt)}`,
   ];
   if (j.pausedReason) lines.push(`⏸️ Paused: ${j.pausedReason}`);
@@ -643,13 +654,13 @@ async function openRequestSession(account: AccountRecord): Promise<RangeSession>
  * "no page for this number" — are kept; transient network errors are not.
  */
 export class RangeSolutionCache {
-  private readonly entries = new Map<number, Promise<WalkcccProblem>>();
+  private readonly entries = new Map<number, Promise<WalkcccPage>>();
   constructor(
-    private readonly fetcher: (n: number) => Promise<WalkcccProblem> = fetchWalkcccProblem,
+    private readonly fetcher: (n: number) => Promise<WalkcccPage> = fetchWalkcccPage,
     private readonly maxEntries = MAX_RANGE_SIZE,
   ) {}
 
-  get(n: number): Promise<WalkcccProblem> {
+  get(n: number): Promise<WalkcccPage> {
     const hit = this.entries.get(n);
     if (hit) return hit;
     const p = this.fetcher(n);
@@ -695,7 +706,7 @@ export function defaultRangeDeps(notify: (text: string) => Promise<void> = async
     listAccounts: listEnabledAccounts,
     getAccount: getAccountById,
     openSession: openRequestSession,
-    getSolution: (n) => sharedCache.get(n),
+    getPage: (n) => sharedCache.get(n),
     notify,
     sleep: abortableSleep,
     isDailyRunInProgress: isRunInProgress,

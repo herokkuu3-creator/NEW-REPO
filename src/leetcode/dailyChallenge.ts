@@ -38,6 +38,7 @@ const questionSchema = z.object({
     codeSnippets: z
       .array(z.object({ lang: z.string(), langSlug: z.string(), code: z.string() }))
       .nullable(),
+    isPaidOnly: z.boolean(),
   }),
 });
 
@@ -67,6 +68,7 @@ const QUESTION_QUERY = `
       title
       titleSlug
       difficulty
+      isPaidOnly
       content
       exampleTestcases
       metaData
@@ -88,6 +90,8 @@ export interface DailyChallengeInfo {
 export interface RawQuestionData {
   /** Internal LeetCode id, used by the submit endpoint. */
   questionId?: string | null;
+  /** True for premium-locked questions — they cannot be submitted without premium. */
+  isPaidOnly: boolean;
   frontendId: string;
   title: string;
   slug: string;
@@ -147,6 +151,7 @@ export async function fetchQuestionData(
 
   return {
     questionId: q.questionId,
+    isPaidOnly: q.isPaidOnly,
     frontendId: q.questionFrontendId,
     title: q.title,
     slug: q.titleSlug,

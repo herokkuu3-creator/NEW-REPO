@@ -74,7 +74,7 @@ const job = (over: Partial<RangeJobInfo> = {}): RangeJobInfo => ({
   currentLabel: 'a1',
   currentQuestion: 205,
   doneInAccount: 5,
-  counts: { accepted: 3, failed: 1, error: 1 },
+  counts: { accepted: 3, failed: 1, error: 1, premium: 0 },
   startedAt: 900_000,
   cancelling: false,
   pausedReason: null,

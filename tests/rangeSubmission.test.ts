@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AccountRecord } from '../src/database/accounts';
 import { LeetCodeHttpError } from '../src/leetcode/apiClient';
-import { WalkcccError, WalkcccProblem } from '../src/solutions/walkccc';
+import { WalkcccError, WalkcccPage } from '../src/solutions/walkccc';
 import {
   countResults,
   estimateAccountMs,
@@ -26,7 +26,7 @@ import {
 
 const acc = (id: string, label = id): AccountRecord =>
   ({ id, label, username: label, status: 'ACTIVE', storageState: '{}' }) as unknown as AccountRecord;
-const sol = (n: number): WalkcccProblem => ({
+const sol = (n: number): WalkcccPage => ({
   // contains the fake starter's method name ("main") so the signature guard passes
   code: 'class Solution { public: int main() { return 0; } };',
   sourceUrl: 'u',
@@ -45,6 +45,7 @@ function makeSession(verdict: (n: number) => Verdict, log: string[]): RangeSessi
         const premium = verdict(n) === 'premium';
         return {
           questionId: String(n),
+          isPaidOnly: premium,
           frontendId: String(n),
           title: `T${n}`,
           slug,
@@ -84,7 +85,7 @@ function makeDeps(session: RangeSession, accounts: AccountRecord[], overrides: P
     listAccounts: async () => accounts,
     getAccount: async (id) => accounts.find((a) => a.id === id) ?? null,
     openSession: async () => session,
-    getSolution: async (n) => sol(n),
+    getPage: async (n) => sol(n),
     notify: async (text) => void notes.push(text),
     sleep: async (ms, signal) => {
       sleeps.push(ms);
@@ -132,7 +133,7 @@ describe('range engine', () => {
     const r = await startRangeJob({ from: 200, to: 202 }, 'a1', deps);
     expect(r.started).toBe(true);
     const results = await r.done;
-    expect(countResults(results[0]!.results)).toEqual({ accepted: 3, failed: 0, error: 0 });
+    expect(countResults(results[0]!.results)).toEqual({ accepted: 3, failed: 0, error: 0, premium: 0 });
     expect(sleeps).toEqual([30_000, 30_000]);
     expect(results[0]!.notAttempted).toEqual([]);
     expect(results[0]!.fatal).toBeUndefined();
@@ -167,8 +168,8 @@ describe('range engine', () => {
     expect(s).toContain('✅ Accepted: 1');
     expect(s).toContain('❌ Failed: 1');
     expect(s).toContain('• Wrong Answer: #201');
-    expect(s).toContain('⚠️ Error: 2');
-    expect(s).toContain('• premium-only question: #202');
+    expect(s).toContain('🔒 Premium (locked): 1 — #202');
+    expect(s).toContain('⚠️ Error: 1');
     expect(s).toContain('• blocked by LeetCode: #203');
     expect(s).toMatch(/⏱️ Took /);
   });
@@ -246,6 +247,32 @@ describe('range engine', () => {
     const r = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
     await r.done;
     expect(sleeps).toEqual([1_000]);
+  });
+
+  it('premium-locked questions (1500-style) are skipped directly: no submit, Premium not Error', async () => {
+    const log: string[] = [];
+    // 1500/1501-style: the walkccc page exists but holds a locked notice, no C++.
+    const page = (n: number): WalkcccPage => (n <= 1501 ? { ...sol(n), code: null } : sol(n));
+    const session = makeSession(() => 'premium', log);
+    const { deps } = makeDeps(session, [acc('broZEdex')], { getPage: async (n) => page(n) });
+    const r = await startRangeJob({ from: 1500, to: 1502 }, 'broZEdex', deps);
+    const results = await r.done;
+    expect(countResults(results[0]!.results)).toEqual({ accepted: 0, failed: 0, error: 0, premium: 3 });
+    expect(log).toEqual(['closed']); // nothing reached the judge
+    const s = formatAccountRangeSummary(results[0]!, 1, 1);
+    expect(s).toContain('🔒 Premium (locked): 3 — #1500, #1501, #1502');
+    expect(s).toContain('⚠️ Error: 0');
+    expect(s).not.toContain('⚠️ Error: 3');
+  });
+
+  it('a FREE question with no walkccc C++ solution stays an error (not premium)', async () => {
+    const log: string[] = [];
+    const session = makeSession(() => 'accepted', log);
+    const { deps } = makeDeps(session, [acc('a1')], { getPage: async (n) => ({ ...sol(n), code: null }) });
+    const r = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
+    const results = await r.done;
+    expect(results[0]!.results[0]).toMatchObject({ status: 'error', detail: 'no walkccc C++ solution for this question' });
+    expect(log).toEqual(['closed']);
   });
 
   it('reports an unusable session as fatal without submitting anything', async () => {
