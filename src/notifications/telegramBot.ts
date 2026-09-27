@@ -269,10 +269,11 @@ async function statusText(): Promise<string> {
   const [sys, last, accounts] = await Promise.all([getAllSystemState(), latestRun(), listAccounts()]);
   const active = accounts.filter((a) => a.status === AccountStatus.ACTIVE).length;
   const expired = accounts.filter((a) => a.status === AccountStatus.EXPIRED).length;
+  const rejected = accounts.filter((a) => a.status === AccountStatus.REJECTED).length;
   const lines = [
     'Agent status',
     '',
-    `Accounts: ${accounts.length}${accounts.length ? ` (${active} active, ${expired} expired)` : ''}`,
+    `Accounts: ${accounts.length}${accounts.length ? ` (${active} active, ${expired} expired, ${rejected} rejected)` : ''}`,
     `Auth: ${sys['authStatus'] ?? 'unknown'}${sys['authUsername'] ? ` (${sys['authUsername']})` : ''}`,
   ];
   if (last) {
