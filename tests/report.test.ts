@@ -91,21 +91,22 @@ describe('summarizeReport', () => {
 describe('formatReportForTelegram', () => {
   it('renders one line per account with the right markers', () => {
     const text = formatReportForTelegram(reportOf(solved, expired, rejected, failed, skipped));
-    expect(text).toContain('LeetCode Daily Report — 2026-09-26');
-    expect(text).toContain('[OK] main (userA) — Accepted · 45 ms · 9.2 MB');
-    expect(text).toContain('[EXPIRED] second (userB) — session expired');
-    expect(text).toContain('[REJECTED] fifth (userC) — LeetCode rejected the transferred session');
-    expect(text).toContain('[FAIL] third — SUBMISSION_REJECTED: judge verdict: Wrong Answer');
-    expect(text).toContain('[SKIP] fourth — already handled today');
+    expect(text).toContain('🤖 LeetCode Daily Agent — 📅 2026-09-26');
+    expect(text).toContain('✅ main (userA) — Accepted · 45 ms · 9.2 MB');
+    expect(text).toContain('⏰ second (userB) — session expired');
+    expect(text).toContain('🚫 fifth (userC) — LeetCode rejected the transferred session');
+    expect(text).toContain('❌ third — SUBMISSION_REJECTED: judge verdict: Wrong Answer');
+    expect(text).toContain('⏭️ fourth — already handled today');
   });
 
   it('shows the label without a username when none is known', () => {
     const text = formatReportForTelegram(reportOf({ ...expired, username: null }));
-    expect(text).toContain('[EXPIRED] second — ');
+    expect(text).toContain('⏰ second — ');
   });
 
   it('never leaks cookie material into the message', () => {
     const text = formatReportForTelegram(reportOf(solved, expired, rejected, failed, skipped));
+    expect(text).toContain('🤖 LeetCode Daily Agent — 📅');
     expect(text).not.toMatch(/LEETCODE_SESSION/);
     expect(text).not.toMatch(/csrftoken/);
   });

@@ -24,22 +24,22 @@ export interface RunNotification {
 export async function notifyRunFinished(n: RunNotification): Promise<void> {
   const success = n.state === RunState.SUCCESS;
   const header = success
-    ? 'LeetCode Daily Challenge Completed'
-    : 'LeetCode Daily Challenge: Attention Needed';
+    ? '🎉 LeetCode Daily Challenge Completed'
+    : '⚠️ LeetCode Daily Challenge: Attention Needed';
 
   const lines = [
     header,
     '',
-    `Problem: ${escape(n.title)}`,
-    `Difficulty: ${escape(n.difficulty)}`,
-    `Language: ${escape(n.language)}`,
-    `Status: ${escape(n.submissionStatus ?? n.state)}`,
+    `📌 Problem: ${escape(n.title)}`,
+    `🎯 Difficulty: ${escape(n.difficulty)}`,
+    `💻 Language: ${escape(n.language)}`,
+    `📊 Status: ${escape(n.submissionStatus ?? n.state)}`,
   ];
-  if (n.runtime) lines.push(`Runtime: ${escape(n.runtime)}`);
-  if (n.memory) lines.push(`Memory: ${escape(n.memory)}`);
-  lines.push(`URL: https://leetcode.com/problems/${n.slug}/`);
+  if (n.runtime) lines.push(`⏱️ Runtime: ${escape(n.runtime)}`);
+  if (n.memory) lines.push(`🧠 Memory: ${escape(n.memory)}`);
+  lines.push(`🔗 URL: https://leetcode.com/problems/${n.slug}/`);
   if (!success && n.error) {
-    lines.push('', `Detail: ${escape(n.error.slice(0, 500))}`);
+    lines.push('', `❗ Detail: ${escape(n.error.slice(0, 500))}`);
   }
 
   await sendTelegramMessage(lines.join('\n'));
@@ -55,13 +55,13 @@ export async function notifyRunFinished(n: RunNotification): Promise<void> {
  */
 export async function notifySessionExpired(): Promise<void> {
   await sendTelegramMessage([
-    'LeetCode session expired',
+    '⏰ LeetCode session expired',
     '',
-    'Android renewal: no computer is required.',
+    '📱 Android renewal: no computer is required.',
     '',
-    'Open Lemur Browser on Android -> sign in to LeetCode -> open the LeetCode Session Capture extension -> capture/download leetcode-session.json -> send that file here in Telegram.',
+    '1️⃣ Open Lemur Browser on Android -> sign in to LeetCode\n2️⃣ Open the LeetCode Session Capture extension -> capture/download leetcode-session.json\n3️⃣ Send that file here in Telegram',
     '',
-    'I will validate the session, save it securely, and start today\'s run automatically.',
+    '✅ I will validate the session, save it securely, and start today\'s run automatically.',
   ].join('\n'));
 }
 

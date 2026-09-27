@@ -50,6 +50,10 @@ export async function listEnabledAccounts(): Promise<AccountRecord[]> {
   });
 }
 
+export async function getAccountById(id: string): Promise<AccountRecord | null> {
+  return prisma.account.findUnique({ where: { id } });
+}
+
 export async function getAccountByLabel(label: string): Promise<AccountRecord | null> {
   return prisma.account.findUnique({ where: { label } });
 }

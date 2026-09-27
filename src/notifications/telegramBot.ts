@@ -22,6 +22,19 @@ import {
 } from '../scheduler/dailyWorker';
 import { formatAccountMessage, summarizeReport } from '../scheduler/report';
 import { humanLocal } from '../time';
+import {
+  cancelRangeJob,
+  currentRangeJob,
+  defaultRangeDeps,
+  estimateAccountMs,
+  formatDuration,
+  formatRangeJobStatus,
+  parseQuestionRange,
+  QuestionRange,
+  rangeSize,
+  startRangeJob,
+  StartRangeResult,
+} from '../scheduler/rangeSubmission';
 
 /**
  * Telegram command bot â€” the interactive half of session renewal.
@@ -75,32 +88,40 @@ interface TgUpdate {
 }
 
 const HELP_TEXT = [
-  'LeetCode Daily Agent',
+  '🤖 LeetCode Daily Agent',
   '',
-  'Just send cookie .json files (one per account) — each file is added as an account named after its LeetCode username; a file for a user that already exists overrides that account.',
+  '📎 Just send cookie .json files (one per account) — each file is added as an account named after its LeetCode username; a file for a user that already exists overrides that account.',
   '',
-  '/renew - how to capture the cookie file on Android',
-  '/renew <label> - store the NEXT file under this exact label',
-  '/accounts - list every account with its cookie status',
-  '/triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
-  '/removesession - list every account with a Remove button (tap to delete that account\'s session)',
-  '/removeallsessions - delete the sessions of ALL accounts (asks for confirmation)',
-  '/status - show authentication status and the last run',
-  '/cancel - cancel a renewal in progress',
-  '/help - show this message',
+  '🍪 Sessions',
+  '🔄 /renew - how to capture the cookie file on Android',
+  '🏷️ /renew <label> - store the NEXT file under this exact label',
+  '👥 /accounts - list every account with its cookie status',
+  '🗑️ /removesession - list every account with a Remove button (tap to delete that account\'s session)',
+  '🧹 /removeallsessions - delete the sessions of ALL accounts (asks for confirmation)',
+  '',
+  '🚀 Submissions',
+  '⚡ /triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
+  '🎯 /questionrangesubmission 200-400 - submit every question in a range (pick one account or All)',
+  '📍 /rangestatus - progress of the running range job',
+  '🛑 /cancelrange - stop the running range job',
+  '',
+  'ℹ️ Info',
+  '📊 /status - show authentication status and the last run',
+  '❌ /cancel - cancel a renewal in progress',
+  '❓ /help - show this message',
 ].join('\n');
 
 const RENEW_INSTRUCTIONS = [
-  'LeetCode session renewal: Android only',
+  '📱 LeetCode session renewal: Android only',
   '',
-  'No computer is required.',
+  '👍 No computer is required.',
   '',
-  '1. Open Lemur Browser on your Android phone.',
-  '2. Open https://leetcode.com/ and sign in normally.',
-  '3. Open the LeetCode Session Capture extension.',
-  '4. Tap the capture button.',
-  '5. Save or download leetcode-session.json.',
-  '6. Send the .json file to this Telegram bot as a document.',
+  '1️⃣ Open Lemur Browser on your Android phone.',
+  '2️⃣ Open https://leetcode.com/ and sign in normally.',
+  '3️⃣ Open the LeetCode Session Capture extension.',
+  '4️⃣ Tap the capture button.',
+  '5️⃣ Save or download leetcode-session.json.',
+  '6️⃣ Send the .json file to this Telegram bot as a document.',
   '',
   'Multiple accounts: send one .json file per account, one after another. Each file is stored immediately (a new user = new account, a known user = cookies overridden), then checked with LeetCode. Once the uploads stop, today\'s run starts for all accounts.',
   ].join('\n');
@@ -253,6 +274,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
         if (!arg) {
           pendingRenewalLabel = undefined;
+          pendingRangePrompt = false;
           await reply(RENEW_INSTRUCTIONS);
           return;
         }
@@ -261,7 +283,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
           return;
         }
         pendingRenewalLabel = arg;
-        await reply(`Renewing the "${arg}" account. Send its cookie export (text or file) in your next message. /cancel aborts.`);
+        await reply(`🏷️ Renewing the "${arg}" account. Send its cookie export (text or file) in your next message. /cancel aborts.`);
         return;
       }
       case '/accounts':
@@ -283,14 +305,42 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/removeallsession':
         await handleRemoveAllSessions();
         return;
+      case '/questionrangesubmission':
+      case '/question_range_submission':
+      case '/rangesubmission':
+        pendingRangePrompt = false;
+        await handleQuestionRangeCommand(text.split(/\s+/).slice(1).join(' '));
+        return;
+      case '/cancelrange':
+      case '/cancel_range':
+      case '/stoprange':
+        pendingRangePrompt = false;
+        await handleCancelRange();
+        return;
+      case '/rangestatus':
+      case '/range_status':
+        await handleRangeStatus();
+        return;
       case '/cancel':
         pendingRenewalLabel = undefined;
-        await reply('No renewal is in progress. When you are ready, send /renew (or /renew <label>) and then the cookies.');
+        pendingRangePrompt = false;
+        await reply(
+          currentRangeJob()
+            ? '❌ No renewal is in progress. To stop the question-range job, send /cancelrange.'
+            : '❌ No renewal is in progress. When you are ready, send /renew (or /renew <label>) and then the cookies.',
+        );
         return;
       default:
-        await reply('Unknown command. Available: /renew, /renew <label>, /accounts, /status, /triggersubmission, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /status, /triggersubmission, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
+  }
+
+  // Reply to "/questionrangesubmission" without a range: the next "200-400" message.
+  if (pendingRangePrompt && !msg.document && /^\s*#?\d/.test(text)) {
+    pendingRangePrompt = false;
+    await handleQuestionRangeCommand(text);
+    return;
   }
 
   // Non-command message: a cookie payload (pasted text or an uploaded .json/.txt file).
@@ -301,7 +351,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     payload = await downloadDocument(msg.document);
   }
   if (!payload) {
-    await reply('Send a cookie .json file (or paste the cookies) to add an account. /accounts lists them.');
+    await reply('📎 Send a cookie .json file (or paste the cookies) to add an account. /accounts lists them.');
     return;
   }
   const result = await processCookieMessage(payload, {
@@ -332,7 +382,7 @@ export async function processCookieMessage(
   if (!looksLikeCookiePayload(payload)) {
     return {
       stored: false,
-      text: 'That does not look like a cookie export. Send the .json file from the capture extension (or /help).',
+      text: '⚠️ That does not look like a cookie export. Send the .json file from the capture extension (or /help).',
     };
   }
   const result = await ingestCookiePayload(payload, opts);
@@ -342,7 +392,7 @@ export async function processCookieMessage(
   const total = (await listAccounts()).length;
   return {
     stored: true,
-    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}\n\nAccounts stored: ${total}. Send more files to add more — /accounts lists them.`,
+    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}\n\n📊 Accounts stored: ${total}. Send more files to add more — /accounts lists them.`,
   };
 }
 
@@ -362,8 +412,8 @@ function scheduleBatchRun(): void {
       const trigger = await triggerRun('session-renewal');
       await reply(
         trigger.started
-          ? "Uploads received. Running today's challenge for all accounts now — the report follows here."
-          : `Today's run was not started: ${trigger.message}`,
+          ? "📨 Uploads received. Running today's challenge for all accounts now — the report follows here."
+          : `⚠️ Today's run was not started: ${trigger.message}`,
       );
     })().catch((err) => logger.warn({ err: errText(err) }, 'batch run trigger failed'));
   }, BATCH_RUN_DELAY_MS);
@@ -382,24 +432,24 @@ export async function handleTriggerSubmission(
   inProgress: () => boolean = isRunInProgress,
 ): Promise<{ done: Promise<void> } | null> {
   if (inProgress()) {
-    await reply('A run is already in progress — wait for its report, then send /triggersubmission again.');
+    await reply('🚧 A run is already in progress — wait for its report, then send /triggersubmission again.');
     return null;
   }
-  await reply("Submitting today's daily question for all accounts — you'll get one message per account.");
+  await reply("🚀 Submitting today's daily question for all accounts — you'll get one message per account.");
   const done = (async () => {
     const report = await runner(TRIGGER_SUBMISSION_REASON, {
       onAccountOutcome: (outcome, index, total) => reply(formatAccountMessage(outcome, index, total)),
     });
     if (!report) {
-      await reply('Not started: another run began at the same moment. Send /triggersubmission again after it finishes.');
+      await reply('⏳ Not started: another run began at the same moment. Send /triggersubmission again after it finishes.');
     } else if (report.totals.accounts === 0) {
-      await reply('No accounts configured — send cookie files first (/renew).');
+      await reply('📭 No accounts configured — send cookie files first (/renew).');
     } else {
       logger.info({ summary: summarizeReport(report) }, 'telegram /triggersubmission finished');
     }
   })().catch(async (err) => {
     logger.warn({ err: errText(err) }, '/triggersubmission failed');
-    await reply(`/triggersubmission failed: ${errText(err)}`).catch(() => undefined);
+    await reply(`⚠️ /triggersubmission failed: ${errText(err)}`).catch(() => undefined);
   });
   // Wrapped in an object: returning the promise itself from an async function
   // would make the caller wait for the whole run and block the poll loop.
@@ -425,7 +475,7 @@ export interface RemovalDeps {
   answer: (callbackId: string, text?: string) => Promise<void>;
 }
 
-const RUN_BUSY_TEXT = 'A run is in progress right now - wait for its report, then try again (removing an account mid-run would break it).';
+const RUN_BUSY_TEXT = '🚧 A run is in progress right now - wait for its report, then try again (removing an account mid-run would break it).';
 
 const defaultRemovalDeps: RemovalDeps = {
   listAccounts,
@@ -462,12 +512,12 @@ function accountName(a: AccountRecord): string {
 /** The session list + one "Remove" button per account. */
 export function buildRemoveSessionView(accounts: AccountRecord[]): { text: string; buttons: InlineButton[][] } {
   if (accounts.length === 0) {
-    return { text: 'No sessions stored - nothing to remove.', buttons: [] };
+    return { text: '📭 No sessions stored - nothing to remove.', buttons: [] };
   }
-  const lines = [`Sessions stored: ${accounts.length}`, 'Tap an account to remove its session:', ''];
+  const lines = [`🗂️ Sessions stored: ${accounts.length}`, '👇 Tap an account to remove its session:', ''];
   accounts.forEach((a, i) => lines.push(`${i + 1}. ${accountName(a)} - ${a.status}`));
-  const buttons = accounts.map((a) => [{ text: `Remove ${accountName(a)}`.slice(0, 60), callback_data: `rm:${a.id}` }]);
-  buttons.push([{ text: 'Done', callback_data: 'rm:done' }]);
+  const buttons = accounts.map((a) => [{ text: `🗑️ Remove ${accountName(a)}`.slice(0, 60), callback_data: `rm:${a.id}` }]);
+  buttons.push([{ text: '✅ Done', callback_data: 'rm:done' }]);
   return { text: lines.join('\n'), buttons };
 }
 
@@ -484,19 +534,23 @@ export async function handleRemoveAllSessions(deps: RemovalDeps = defaultRemoval
   }
   await deps.send(
     [
-      `Remove ALL ${accounts.length} session(s)? This deletes every account's cookies and run history and cannot be undone:`,
+      `⚠️ Remove ALL ${accounts.length} session(s)? This deletes every account's cookies and run history and cannot be undone:`,
       '',
-      ...accounts.map((a) => `- ${accountName(a)}`),
+      ...accounts.map((a) => `▪️ ${accountName(a)}`),
     ].join('\n'),
     [[
-      { text: `Yes, remove all ${accounts.length}`, callback_data: 'rmall:yes' },
+      { text: `🔥 Yes, remove all ${accounts.length}`, callback_data: 'rmall:yes' },
       { text: 'Cancel', callback_data: 'rmall:no' },
     ]],
   );
 }
 
-/** Handles a tap on one of the inline buttons above. */
-export async function handleCallbackQuery(q: TgCallbackQuery, deps: RemovalDeps = defaultRemovalDeps): Promise<void> {
+/** Handles a tap on one of the inline buttons above (rm:* and qr:*). */
+export async function handleCallbackQuery(
+  q: TgCallbackQuery,
+  deps: RemovalDeps = defaultRemovalDeps,
+  ui: RangeUiDeps = defaultRangeUiDeps,
+): Promise<void> {
   const chatId = q.message?.chat.id;
   const messageId = q.message?.message_id;
   // Same access control as commands: only the configured chat.
@@ -507,9 +561,14 @@ export async function handleCallbackQuery(q: TgCallbackQuery, deps: RemovalDeps 
   }
   const data = q.data ?? '';
 
+  if (data.startsWith('qr:')) {
+    await handleRangeButton(chatId, messageId, q.id, data, deps, ui);
+    return;
+  }
+
   if (data === 'rm:done' || data === 'rmall:no') {
     await deps.answer(q.id, data === 'rmall:no' ? 'Cancelled' : undefined);
-    await deps.edit(chatId, messageId, data === 'rmall:no' ? 'Cancelled - no sessions were removed.' : 'Done.');
+    await deps.edit(chatId, messageId, data === 'rmall:no' ? '❌ Cancelled - no sessions were removed.' : '✅ Done.');
     return;
   }
 
@@ -526,7 +585,7 @@ export async function handleCallbackQuery(q: TgCallbackQuery, deps: RemovalDeps 
     await deps.edit(
       chatId,
       messageId,
-      `Removed all sessions (${removed} account(s)). Send cookie .json files to add accounts again.`,
+      `🧹 Removed all sessions (${removed} account(s)). Send cookie .json files to add accounts again.`,
     );
     return;
   }
@@ -542,10 +601,10 @@ export async function handleCallbackQuery(q: TgCallbackQuery, deps: RemovalDeps 
     }
     let text: string;
     if (!target || !(await deps.deleteAccountById(id))) {
-      text = 'That account was already removed.';
+      text = '🤷 That account was already removed.';
     } else {
       logger.info({ label: target.label }, 'account session removed via Telegram');
-      text = `Removed ${accountName(target)}`;
+      text = `✅ Removed ${accountName(target)}`;
     }
     const remaining = await deps.listAccounts();
     if (remaining.length === 0) await deps.clearLegacySession().catch(() => undefined);
@@ -559,22 +618,165 @@ export async function handleCallbackQuery(q: TgCallbackQuery, deps: RemovalDeps 
   await deps.answer(q.id);
 }
 
+// ---------------------------------------------------------------------------
+// Question-range submission (/questionrangesubmission 200-400)
+// ---------------------------------------------------------------------------
+
+/** true after "/questionrangesubmission" with no range: the next "200-400" message is the range. */
+let pendingRangePrompt = false;
+
+const RANGE_GAP_MS = 30_000;
+
+/** Wiring for the range UI — injectable for tests. */
+export interface RangeUiDeps {
+  start: (range: QuestionRange, target: string | 'all') => Promise<StartRangeResult>;
+  current: typeof currentRangeJob;
+  cancel: typeof cancelRangeJob;
+  now: () => number;
+}
+
+const defaultRangeUiDeps: RangeUiDeps = {
+  start: (range, target) => startRangeJob(range, target, defaultRangeDeps(reply)),
+  current: currentRangeJob,
+  cancel: cancelRangeJob,
+  now: () => Date.now(),
+};
+
+/** Account picker: one button per account, then "All accounts" and Cancel. */
+export function buildRangePicker(
+  range: QuestionRange,
+  accounts: AccountRecord[],
+): { text: string; buttons: InlineButton[][] } {
+  const size = rangeSize(range);
+  const tag = `${range.from}-${range.to}`;
+  const text = [
+    `🎯 Question range #${range.from}–#${range.to} (${size} question${size === 1 ? '' : 's'})`,
+    '',
+    '👇 Pick the account to run it on:',
+    `⏳ Estimated ~${formatDuration(estimateAccountMs(range, RANGE_GAP_MS))} per account (30 s break between questions)`,
+  ].join('\n');
+  const buttons: InlineButton[][] = accounts.map((a) => [
+    { text: `👤 ${accountName(a)}`.slice(0, 60), callback_data: `qr:${tag}:${a.id}` },
+  ]);
+  buttons.push([{ text: `👥 All accounts (${accounts.length}, one by one)`, callback_data: `qr:${tag}:all` }]);
+  buttons.push([{ text: '✖️ Cancel', callback_data: 'qr:x' }]);
+  return { text, buttons };
+}
+
+export async function handleQuestionRangeCommand(
+  arg: string,
+  deps: RemovalDeps = defaultRemovalDeps,
+  ui: RangeUiDeps = defaultRangeUiDeps,
+): Promise<void> {
+  const running = ui.current();
+  if (running) {
+    await deps.send(`🚧 A question-range process is already in progress.\n\n${formatRangeJobStatus(running, ui.now())}`);
+    return;
+  }
+  if (!arg.trim()) {
+    pendingRangePrompt = true;
+    await deps.send('🎯 Which questions? Send the range, e.g. 200-400\n(or in one go: /questionrangesubmission 200-400)');
+    return;
+  }
+  const parsed = parseQuestionRange(arg);
+  if (!parsed.ok) {
+    await deps.send(`⚠️ ${parsed.error}\nExample: /questionrangesubmission 200-400`);
+    return;
+  }
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    await deps.send('📭 No accounts configured — send cookie .json files first (/renew).');
+    return;
+  }
+  const picker = buildRangePicker(parsed.range, accounts);
+  await deps.send(picker.text, picker.buttons);
+}
+
+async function handleRangeButton(
+  chatId: number | string,
+  messageId: number,
+  callbackId: string,
+  data: string,
+  deps: RemovalDeps,
+  ui: RangeUiDeps = defaultRangeUiDeps,
+): Promise<void> {
+  if (data === 'qr:x') {
+    await deps.answer(callbackId, 'Cancelled');
+    await deps.edit(chatId, messageId, '✖️ Question-range submission cancelled — nothing was started.');
+    return;
+  }
+  const m = /^qr:(\d+)-(\d+):(.+)$/.exec(data);
+  const parsed = m ? parseQuestionRange(`${m[1]}-${m[2]}`) : null;
+  if (!m || !parsed || !parsed.ok) {
+    await deps.answer(callbackId, 'This button is no longer valid');
+    return;
+  }
+  const result = await ui.start(parsed.range, m[3]!);
+  if (!result.started) {
+    if (result.reason === 'busy') {
+      await deps.answer(callbackId, 'A range process is already running');
+      await deps.send(`🚧 A question-range process is already in progress.\n\n${formatRangeJobStatus(result.job, ui.now())}`);
+    } else {
+      await deps.answer(callbackId, 'Account not found');
+      await deps.edit(
+        chatId,
+        messageId,
+        result.reason === 'no-accounts'
+          ? '📭 No accounts configured — send cookie .json files first.'
+          : '🔍 That account no longer exists — send /questionrangesubmission again.',
+      );
+    }
+    return;
+  }
+  const { range } = parsed;
+  const names = result.accounts.map((a) => accountName(a));
+  await deps.answer(callbackId, 'Started 🚀');
+  await deps.edit(
+    chatId,
+    messageId,
+    [
+      `🚀 Started: questions #${range.from}–#${range.to} (${rangeSize(range)})`,
+      `👥 ${names.length === 1 ? `Account: ${names[0]}` : `Accounts (one by one): ${names.join(', ')}`}`,
+      `⏳ ~${formatDuration(estimateAccountMs(range, RANGE_GAP_MS) * names.length)} in total — 30 s break between questions`,
+      '',
+      '📬 You get a summary after each account.',
+      '📍 /rangestatus shows progress · 🛑 /cancelrange stops it',
+    ].join('\n'),
+  );
+}
+
+export async function handleCancelRange(ui: RangeUiDeps = defaultRangeUiDeps): Promise<void> {
+  const job = ui.current();
+  if (!job || !ui.cancel()) {
+    await reply('🤷 No question-range process is running.');
+    return;
+  }
+  await reply(
+    `🛑 Cancelling the question-range job (#${job.range.from}–#${job.range.to})…\nIt stops right after the current question — the summary for ${job.currentLabel ?? 'the current account'} follows.`,
+  );
+}
+
+export async function handleRangeStatus(ui: RangeUiDeps = defaultRangeUiDeps): Promise<void> {
+  const job = ui.current();
+  await reply(job ? formatRangeJobStatus(job, ui.now()) : '💤 No question-range process is running. Start one with /questionrangesubmission 200-400');
+}
+
 /** Pending /renew <label> target — consumed by the next cookie payload. */
 let pendingRenewalLabel: string | undefined;
 
 async function accountsText(): Promise<string> {
   const accounts = await listAccounts();
   if (accounts.length === 0) {
-    return 'No accounts configured yet. Send /renew (or /renew <label>) with your cookies, or use POST /admin/accounts.';
+    return '📭 No accounts configured yet. Send /renew (or /renew <label>) with your cookies, or use POST /admin/accounts.';
   }
-  const lines = [`Accounts: ${accounts.length}`, ''];
+  const lines = [`👥 Accounts: ${accounts.length}`, ''];
   for (const a of accounts) {
     const who = a.username ? ` (${a.username})` : '';
     const when = a.lastRunAt
       ? `, last run ${humanLocal(a.lastRunAt)}`
       : '';
-    lines.push(`- ${a.label}${who}: ${a.status}${when}`);
-    if (a.lastError) lines.push(`  error: ${a.lastError.slice(0, 150)}`);
+    lines.push(`▪️ ${a.label}${who}: ${a.status}${when}`);
+    if (a.lastError) lines.push(`  ⚠️ error: ${a.lastError.slice(0, 150)}`);
   }
   return lines.join('\n');
 }
@@ -585,19 +787,19 @@ async function statusText(): Promise<string> {
   const expired = accounts.filter((a) => a.status === AccountStatus.EXPIRED).length;
   const rejected = accounts.filter((a) => a.status === AccountStatus.REJECTED).length;
   const lines = [
-    'Agent status',
+    '📊 Agent status',
     '',
-    `Accounts: ${accounts.length}${accounts.length ? ` (${active} active, ${expired} expired, ${rejected} rejected)` : ''}`,
-    `Auth: ${sys['authStatus'] ?? 'unknown'}${sys['authUsername'] ? ` (${sys['authUsername']})` : ''}`,
+    `👥 Accounts: ${accounts.length}${accounts.length ? ` (${active} active, ${expired} expired, ${rejected} rejected)` : ''}`,
+    `🔐 Auth: ${sys['authStatus'] ?? 'unknown'}${sys['authUsername'] ? ` (${sys['authUsername']})` : ''}`,
   ];
   if (last) {
     lines.push(
-      `Last run: ${last.date} - ${last.title} - ${last.state}${last.submissionStatus ? ` (${last.submissionStatus})` : ''}`,
+      `🕹️ Last run: ${last.date} - ${last.title} - ${last.state}${last.submissionStatus ? ` (${last.submissionStatus})` : ''}`,
     );
   } else {
-    lines.push('Last run: none yet');
+    lines.push('🕹️ Last run: none yet');
   }
-  if (sys['lastError']) lines.push(`Last error: ${sys['lastError'].slice(0, 300)}`);
+  if (sys['lastError']) lines.push(`❗ Last error: ${sys['lastError'].slice(0, 300)}`);
   return lines.join('\n');
 }
 

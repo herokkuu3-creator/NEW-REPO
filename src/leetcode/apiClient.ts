@@ -175,7 +175,7 @@ export interface AwaitSubmissionOptions {
 export class LeetCodeApi {
   private readonly request: APIRequestContext;
 
-  constructor(private readonly context: BrowserContext) {
+  constructor(private readonly context: Pick<BrowserContext, 'request' | 'cookies'>) {
     this.request = context.request;
   }
 

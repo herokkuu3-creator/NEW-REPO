@@ -96,15 +96,15 @@ function firstLine(s: string | null | undefined): string | undefined {
 
 /**
  * Plain-text Telegram rendering of the report. One line per account:
- *   [OK] main (userA) — Accepted · 45 ms · 9.2 MB
- *   [EXPIRED] second — session expired — re-upload fresh cookies
- *   [FAIL] third — SUBMISSION_REJECTED: judge verdict: Wrong Answer
- *   [SKIP] fourth — already handled today
+ *   ✅ main (userA) — Accepted · 45 ms · 9.2 MB
+ *   ⏰ second — session expired — re-upload fresh cookies
+ *   ❌ third — SUBMISSION_REJECTED: judge verdict: Wrong Answer
+ *   ⏭️ fourth — already handled today
  */
 export function formatReportForTelegram(report: RunReport): string {
   const lines = [
-    `LeetCode Daily Report — ${report.date}`,
-    summarizeReport(report),
+    `🤖 LeetCode Daily Agent — 📅 ${report.date}`,
+    `📊 ${summarizeReport(report)}`,
     '',
   ];
   for (const o of report.accounts) {
@@ -121,18 +121,18 @@ export function formatOutcomeLine(o: AccountOutcome): string {
       const parts = [o.submissionStatus ?? 'done'];
       if (o.runtime) parts.push(o.runtime);
       if (o.memory) parts.push(o.memory);
-      return `[OK] ${who} — ${parts.filter(Boolean).join(' · ')}`;
+      return `✅ ${who} — ${parts.filter(Boolean).join(' · ')}`;
     }
     case 'expired':
-      return `[EXPIRED] ${who} — ${firstLine(o.error) ?? 'session token itself is expired — re-capture fresh cookies'}`;
+      return `⏰ ${who} — ${firstLine(o.error) ?? 'session token itself is expired — re-capture fresh cookies'}`;
     case 'rejected':
-      return `[REJECTED] ${who} — ${firstLine(o.error) ?? 'LeetCode rejected the transferred session; token expiry is not established'}`;
+      return `🚫 ${who} — ${firstLine(o.error) ?? 'LeetCode rejected the transferred session; token expiry is not established'}`;
     case 'failed': {
       const detail = firstLine(o.error);
-      return `[FAIL] ${who} — ${o.state ?? 'error'}${detail ? `: ${detail}` : ''}`;
+      return `❌ ${who} — ${o.state ?? 'error'}${detail ? `: ${detail}` : ''}`;
     }
     case 'skipped':
-      return `[SKIP] ${who} — ${firstLine(o.error) ?? 'already handled today'}`;
+      return `⏭️ ${who} — ${firstLine(o.error) ?? 'already handled today'}`;
   }
 }
 
@@ -143,7 +143,7 @@ export function formatOutcomeLine(o: AccountOutcome): string {
  *   Submission ID: 2154720128
  */
 export function formatAccountMessage(o: AccountOutcome, index: number, total: number): string {
-  const lines = [`Account ${index}/${total} — ${formatOutcomeLine(o)}`];
-  if (o.submissionId) lines.push(`Submission ID: ${o.submissionId}`);
+  const lines = [`👤 Account ${index}/${total} — ${formatOutcomeLine(o)}`];
+  if (o.submissionId) lines.push(`🆔 Submission ID: ${o.submissionId}`);
   return lines.join('\n');
 }

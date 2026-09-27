@@ -68,10 +68,10 @@ describe('/removesession', () => {
     expect(sent[0]!.text).toMatch(/Sessions stored: 3/);
     expect(sent[0]!.text).toMatch(/3\. main \(thor_77\) - ACTIVE/);
     expect(sent[0]!.buttons).toEqual([
-      [{ text: 'Remove broZEdex', callback_data: 'rm:id1' }],
-      [{ text: 'Remove dom4429', callback_data: 'rm:id2' }],
-      [{ text: 'Remove main (thor_77)', callback_data: 'rm:id3' }],
-      [{ text: 'Done', callback_data: 'rm:done' }],
+      [{ text: '🗑️ Remove broZEdex', callback_data: 'rm:id1' }],
+      [{ text: '🗑️ Remove dom4429', callback_data: 'rm:id2' }],
+      [{ text: '🗑️ Remove main (thor_77)', callback_data: 'rm:id3' }],
+      [{ text: '✅ Done', callback_data: 'rm:done' }],
     ]);
   });
 
@@ -83,10 +83,10 @@ describe('/removesession', () => {
   it('tapping Remove deletes ONLY that account and refreshes the list', async () => {
     await tap('rm:id2');
     expect(store.map((a) => a.label)).toEqual(['broZEdex', 'main']);
-    expect(answers.at(-1)).toEqual({ id: 'cb-rm:id2', text: 'Removed dom4429' });
+    expect(answers.at(-1)).toEqual({ id: 'cb-rm:id2', text: '✅ Removed dom4429' });
     const e = edits.at(-1)!;
     expect(e.messageId).toBe(42);
-    expect(e.text).toMatch(/^Removed dom4429\n\nSessions stored: 2/);
+    expect(e.text).toMatch(/^✅ Removed dom4429\n\n🗂️ Sessions stored: 2/);
     expect(e.buttons!.map((r) => r[0]!.callback_data)).toEqual(['rm:id1', 'rm:id3', 'rm:done']);
     expect(legacyCleared).toBe(0);
   });
@@ -95,7 +95,7 @@ describe('/removesession', () => {
     await tap('rm:id2');
     await tap('rm:id2');
     expect(store).toHaveLength(2);
-    expect(answers.at(-1)!.text).toBe('That account was already removed.');
+    expect(answers.at(-1)!.text).toBe('🤷 That account was already removed.');
   });
 
   it('removing the last account also clears the legacy session copy', async () => {
@@ -116,14 +116,14 @@ describe('/removesession', () => {
 
   it('Done closes the list', async () => {
     await tap('rm:done');
-    expect(edits.at(-1)!.text).toBe('Done.');
+    expect(edits.at(-1)!.text).toBe('✅ Done.');
     expect(store).toHaveLength(3);
   });
 
   it('no accounts → friendly message, no buttons', async () => {
     store = [];
     await handleRemoveSession(deps);
-    expect(sent[0]).toEqual({ text: 'No sessions stored - nothing to remove.', buttons: undefined });
+    expect(sent[0]).toEqual({ text: '📭 No sessions stored - nothing to remove.', buttons: undefined });
   });
 });
 
@@ -132,8 +132,9 @@ describe('/removeallsessions', () => {
     await handleRemoveAllSessions(deps);
     expect(store).toHaveLength(3);
     expect(sent[0]!.text).toMatch(/Remove ALL 3 session/);
+    expect(sent[0]!.text).toMatch(/^⚠️ /);
     expect(sent[0]!.buttons).toEqual([[
-      { text: 'Yes, remove all 3', callback_data: 'rmall:yes' },
+      { text: '🔥 Yes, remove all 3', callback_data: 'rmall:yes' },
       { text: 'Cancel', callback_data: 'rmall:no' },
     ]]);
   });
@@ -142,13 +143,13 @@ describe('/removeallsessions', () => {
     await tap('rmall:yes');
     expect(store).toHaveLength(0);
     expect(legacyCleared).toBe(1);
-    expect(edits.at(-1)!.text).toMatch(/Removed all sessions \(3 account/);
+    expect(edits.at(-1)!.text).toMatch(/🧹 Removed all sessions \(3 account/);
   });
 
   it('cancel removes nothing', async () => {
     await tap('rmall:no');
     expect(store).toHaveLength(3);
-    expect(edits.at(-1)!.text).toMatch(/Cancelled/);
+    expect(edits.at(-1)!.text).toMatch(/❌ Cancelled/);
   });
 
   it('refuses while a run is in progress', async () => {

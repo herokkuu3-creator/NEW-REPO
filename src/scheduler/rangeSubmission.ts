@@ -1,0 +1,729 @@
+import { request as playwrightRequest } from 'playwright';
+import { logger } from '../logger';
+import { AccountRecord, getAccountById, listEnabledAccounts, parseStoredStorageState } from '../database/accounts';
+import { LeetCodeApi, looksLikeChallenge, SubmissionOutcome } from '../leetcode/apiClient';
+import { fetchQuestionData, RawQuestionData } from '../leetcode/dailyChallenge';
+import { checkSession, SessionCheckResult } from '../browser/sessionCheck';
+import { fetchWalkcccProblem, signatureMatchesStarter, WalkcccError, WalkcccProblem } from '../solutions/walkccc';
+import { ParsedProblem } from '../leetcode/parser';
+import { isRunInProgress } from './dailyWorker';
+import { config } from '../config';
+
+/**
+ * Question-range submission (Telegram /questionrangesubmission 200-400).
+ *
+ * For each selected account — strictly ONE account at a time, and one
+ * question at a time — every question number in the range is solved with
+ * walkccc's C++ solution (the page is looked up by the plain question number)
+ * and submitted through LeetCode's own API.
+ *
+ * Staying clear of Cloudflare:
+ *   - API only: no HTML page of leetcode.com is ever loaded (same path as the
+ *     daily run), and no Chromium is launched — one lightweight HTTP session
+ *     per account, reused for the whole range.
+ *   - A fixed pause (default 30s) after every question that touched LeetCode.
+ *   - 403 / 429 / HTML-instead-of-JSON ("blocked") answers are never pushed
+ *     through: the SAME question is retried after an exponential back-off
+ *     (1, 2, 4 min). Several blocked questions in a row trigger one long
+ *     cool-down; if LeetCode is still blocking after that, the account is
+ *     stopped early (remaining questions are reported, not hammered).
+ *   - While the daily run is in progress the range pauses, so the two never
+ *     submit at the same time.
+ *
+ * Only one range job can exist at a time; a second request is refused with
+ * the current progress. /cancelrange stops it (immediately during a pause,
+ * or right after the question that is being judged).
+ */
+
+// ---------------------------------------------------------------------------
+// Range parsing
+// ---------------------------------------------------------------------------
+
+export const MAX_QUESTION_NUMBER = 9999;
+export const MAX_RANGE_SIZE = 1000;
+
+export interface QuestionRange {
+  from: number;
+  to: number;
+}
+
+export type RangeParse = { ok: true; range: QuestionRange } | { ok: false; error: string };
+
+/** Accepts "200-400", "200 - 400", "200–400", "200 to 400", or a single "200". */
+export function parseQuestionRange(input: string): RangeParse {
+  const m = /^\s*#?(\d{1,5})\s*(?:(?:-|–|—|to|\.\.)\s*#?(\d{1,5}))?\s*$/i.exec(input ?? '');
+  if (!m) return { ok: false, error: 'Send the range as two question numbers, e.g. 200-400' };
+  const from = Number(m[1]);
+  const to = m[2] === undefined ? from : Number(m[2]);
+  if (from < 1 || to < 1) return { ok: false, error: 'Question numbers start at 1.' };
+  if (from > MAX_QUESTION_NUMBER || to > MAX_QUESTION_NUMBER) {
+    return { ok: false, error: `Question numbers go up to ${MAX_QUESTION_NUMBER}.` };
+  }
+  if (from > to) return { ok: false, error: `The start (${from}) must not be after the end (${to}).` };
+  if (to - from + 1 > MAX_RANGE_SIZE) {
+    return { ok: false, error: `That is ${to - from + 1} questions — at most ${MAX_RANGE_SIZE} per run.` };
+  }
+  return { ok: true, range: { from, to } };
+}
+
+export function rangeSize(r: QuestionRange): number {
+  return r.to - r.from + 1;
+}
+
+// ---------------------------------------------------------------------------
+// Results
+// ---------------------------------------------------------------------------
+
+export type QuestionStatus = 'accepted' | 'failed' | 'error';
+
+export interface QuestionResult {
+  number: number;
+  status: QuestionStatus;
+  /** Judge verdict (failed) or short reason (error). */
+  detail?: string;
+  submissionId?: string;
+}
+
+export interface AccountRangeResult {
+  label: string;
+  username: string | null;
+  range: QuestionRange;
+  results: QuestionResult[];
+  /** Set when the account could not run at all (bad cookies, session rejected). */
+  fatal?: string;
+  /** Set when the account stopped before the end of the range. */
+  stoppedEarly?: 'cancelled' | 'blocked';
+  /** Question numbers never attempted because of an early stop. */
+  notAttempted: number[];
+  startedAt: number;
+  finishedAt: number;
+}
+
+export function countResults(results: QuestionResult[]): Record<QuestionStatus, number> {
+  const c = { accepted: 0, failed: 0, error: 0 };
+  for (const r of results) c[r.status]++;
+  return c;
+}
+
+// ---------------------------------------------------------------------------
+// Dependencies (all injectable, so the engine is fully testable offline)
+// ---------------------------------------------------------------------------
+
+export interface RangeApi {
+  checkSession(): Promise<SessionCheckResult>;
+  question(slug: string): Promise<RawQuestionData>;
+  submit(p: { slug: string; questionId: string; lang: string; code: string }): Promise<string>;
+  awaitResult(submissionId: string, slug: string): Promise<SubmissionOutcome>;
+}
+
+export interface RangeSession {
+  api: RangeApi;
+  close(): Promise<void>;
+}
+
+export interface RangeDeps {
+  listAccounts(): Promise<AccountRecord[]>;
+  getAccount(id: string): Promise<AccountRecord | null>;
+  openSession(account: AccountRecord): Promise<RangeSession>;
+  getSolution(questionNumber: number): Promise<WalkcccProblem>;
+  notify(text: string): Promise<void>;
+  /** Resolves after `ms`, or early (without throwing) when `signal` aborts. */
+  sleep(ms: number, signal: AbortSignal): Promise<void>;
+  isDailyRunInProgress(): boolean;
+  now(): number;
+  /** Pause after each question that touched LeetCode (default 30s). */
+  questionGapMs: number;
+  /** Back-off before retrying a blocked question: 1st, 2nd, 3rd retry. */
+  blockedBackoffMs: number[];
+  /** Consecutive blocked questions that trigger the long cool-down. */
+  blockedStreakLimit: number;
+  /** The long cool-down after a streak of blocked questions. */
+  blockedCooldownMs: number;
+  /** How often to re-check while the daily run is in progress. */
+  dailyRunPollMs: number;
+  /** Send a short progress message every N questions (0 = never). */
+  progressEvery: number;
+  /** Keeps the host awake while the job runs; returns a stop function. */
+  keepAlive(): () => void;
+}
+
+// ---------------------------------------------------------------------------
+// The single job
+// ---------------------------------------------------------------------------
+
+export interface RangeJobInfo {
+  range: QuestionRange;
+  accountLabels: string[];
+  accountIndex: number; // 1-based, 0 before the first account starts
+  currentLabel: string | null;
+  currentQuestion: number | null;
+  doneInAccount: number;
+  counts: Record<QuestionStatus, number>;
+  startedAt: number;
+  cancelling: boolean;
+  pausedReason: string | null;
+}
+
+interface RangeJob {
+  info: RangeJobInfo;
+  abort: AbortController;
+  done: Promise<AccountRangeResult[]>;
+}
+
+let activeJob: RangeJob | null = null;
+
+export function isRangeJobActive(): boolean {
+  return activeJob !== null;
+}
+
+export function currentRangeJob(): RangeJobInfo | null {
+  return activeJob ? { ...activeJob.info, counts: { ...activeJob.info.counts } } : null;
+}
+
+/** Requests cancellation. Returns false when no job is running. */
+export function cancelRangeJob(): boolean {
+  if (!activeJob) return false;
+  activeJob.info.cancelling = true;
+  activeJob.abort.abort();
+  return true;
+}
+
+export type StartRangeResult =
+  | { started: true; accounts: AccountRecord[]; done: Promise<AccountRangeResult[]> }
+  | { started: false; reason: 'busy'; job: RangeJobInfo }
+  | { started: false; reason: 'no-accounts' | 'account-not-found' };
+
+/**
+ * Starts a range job in the background for one account (by id) or all
+ * enabled accounts (`'all'`). Never runs two jobs at once.
+ */
+export async function startRangeJob(
+  range: QuestionRange,
+  target: string | 'all',
+  deps: RangeDeps = defaultRangeDeps(),
+): Promise<StartRangeResult> {
+  if (activeJob) return { started: false, reason: 'busy', job: currentRangeJob()! };
+
+  let accounts: AccountRecord[];
+  if (target === 'all') {
+    accounts = await deps.listAccounts();
+    if (accounts.length === 0) return { started: false, reason: 'no-accounts' };
+  } else {
+    const account = await deps.getAccount(target);
+    if (!account) return { started: false, reason: 'account-not-found' };
+    accounts = [account];
+  }
+  // Re-check: another start may have slipped in during the lookup above.
+  if (activeJob) return { started: false, reason: 'busy', job: currentRangeJob()! };
+
+  const abort = new AbortController();
+  const info: RangeJobInfo = {
+    range,
+    accountLabels: accounts.map((a) => a.label),
+    accountIndex: 0,
+    currentLabel: null,
+    currentQuestion: null,
+    doneInAccount: 0,
+    counts: { accepted: 0, failed: 0, error: 0 },
+    startedAt: deps.now(),
+    cancelling: false,
+    pausedReason: null,
+  };
+  const job: RangeJob = { info, abort, done: Promise.resolve([]) };
+  activeJob = job;
+
+  job.done = (async () => {
+    const all: AccountRangeResult[] = [];
+    const stopKeepAlive = deps.keepAlive();
+    try {
+      for (let i = 0; i < accounts.length; i++) {
+        if (abort.signal.aborted) break;
+        const account = accounts[i]!;
+        info.accountIndex = i + 1;
+        info.currentLabel = account.label;
+        info.currentQuestion = null;
+        info.doneInAccount = 0;
+        info.counts = { accepted: 0, failed: 0, error: 0 };
+
+        const result = await runAccountRange(account, range, deps, info, abort.signal, i + 1, accounts.length);
+        all.push(result);
+        await deps
+          .notify(formatAccountRangeSummary(result, i + 1, accounts.length))
+          .catch((err) => logger.warn({ err: errText(err) }, 'range summary notification failed'));
+
+        // Short breather before the next account (skipped when cancelled).
+        if (i < accounts.length - 1 && !abort.signal.aborted) {
+          await deps.sleep(deps.questionGapMs, abort.signal);
+        }
+      }
+      await deps
+        .notify(formatRangeJobFinished(range, all, accounts.length, abort.signal.aborted, deps.now() - info.startedAt))
+        .catch(() => undefined);
+      return all;
+    } catch (err) {
+      logger.error({ err: errText(err) }, 'range job crashed');
+      await deps.notify(`💥 The question-range job crashed: ${errText(err)}`).catch(() => undefined);
+      return all;
+    } finally {
+      stopKeepAlive();
+      if (activeJob === job) activeJob = null;
+    }
+  })();
+
+  return { started: true, accounts, done: job.done };
+}
+
+// ---------------------------------------------------------------------------
+// Per-account loop
+// ---------------------------------------------------------------------------
+
+async function runAccountRange(
+  account: AccountRecord,
+  range: QuestionRange,
+  deps: RangeDeps,
+  info: RangeJobInfo,
+  signal: AbortSignal,
+  index: number,
+  total: number,
+): Promise<AccountRangeResult> {
+  const result: AccountRangeResult = {
+    label: account.label,
+    username: account.username,
+    range,
+    results: [],
+    notAttempted: [],
+    startedAt: deps.now(),
+    finishedAt: 0,
+  };
+  const finish = (): AccountRangeResult => {
+    result.finishedAt = deps.now();
+    return result;
+  };
+
+  let session: RangeSession;
+  try {
+    session = await deps.openSession(account);
+  } catch (err) {
+    result.fatal = `could not open a session: ${errText(err)}`;
+    for (let n = range.from; n <= range.to; n++) result.notAttempted.push(n);
+    return finish();
+  }
+
+  try {
+    const check = await session.api.checkSession();
+    if (!check.authenticated) {
+      result.fatal =
+        check.cause === 'signed-out'
+          ? 'LeetCode rejected this session (signed out) — send fresh cookies'
+          : 'could not verify the session (LeetCode request failed)';
+      for (let n = range.from; n <= range.to; n++) result.notAttempted.push(n);
+      return finish();
+    }
+    result.username = check.username ?? account.username;
+
+    await deps
+      .notify(
+        `👤 Account ${index}/${total}: ${who(result)}\n🎯 Questions #${range.from}–#${range.to} (${rangeSize(range)}) — starting now`,
+      )
+      .catch(() => undefined);
+
+    let blockedStreak = 0;
+    let cooledDown = false;
+
+    for (let n = range.from; n <= range.to; n++) {
+      if (signal.aborted) break;
+      await waitForDailyRun(deps, info, signal);
+      if (signal.aborted) break;
+
+      info.currentQuestion = n;
+      const { outcome, touchedLeetCode, blocked } = await solveOneWithRetries(n, session.api, deps, signal);
+      if (outcome === null) break; // cancelled during a back-off wait
+      result.results.push(outcome);
+      info.doneInAccount++;
+      info.counts[outcome.status]++;
+      logger.info({ label: account.label, question: n, status: outcome.status, detail: outcome.detail }, 'range question finished');
+
+      if (deps.progressEvery > 0 && info.doneInAccount % deps.progressEvery === 0 && n < range.to) {
+        const c = info.counts;
+        await deps
+          .notify(`📈 ${who(result)}: ${info.doneInAccount}/${rangeSize(range)} done — ✅ ${c.accepted} · ❌ ${c.failed} · ⚠️ ${c.error}`)
+          .catch(() => undefined);
+      }
+
+      // Blocked handling: a streak means LeetCode is refusing this IP/session.
+      blockedStreak = blocked ? blockedStreak + 1 : 0;
+      if (blockedStreak >= deps.blockedStreakLimit) {
+        if (cooledDown) {
+          result.stoppedEarly = 'blocked';
+          break;
+        }
+        cooledDown = true;
+        blockedStreak = 0;
+        const minutes = Math.round(deps.blockedCooldownMs / 60_000);
+        info.pausedReason = `LeetCode is blocking requests — cooling down ${minutes} min`;
+        await deps
+          .notify(`🧊 LeetCode is blocking requests for ${who(result)} — cooling down for ${minutes} min before continuing.`)
+          .catch(() => undefined);
+        await deps.sleep(deps.blockedCooldownMs, signal);
+        info.pausedReason = null;
+      }
+
+      if (n < range.to && touchedLeetCode && !signal.aborted) {
+        await deps.sleep(deps.questionGapMs, signal);
+      }
+    }
+
+    if (signal.aborted) result.stoppedEarly = 'cancelled';
+    const last = result.results.at(-1)?.number ?? range.from - 1;
+    for (let n = last + 1; n <= range.to; n++) result.notAttempted.push(n);
+    return finish();
+  } catch (err) {
+    result.fatal = `unexpected: ${errText(err)}`;
+    const last = result.results.at(-1)?.number ?? range.from - 1;
+    for (let n = last + 1; n <= range.to; n++) result.notAttempted.push(n);
+    return finish();
+  } finally {
+    info.currentQuestion = null;
+    await session.close().catch(() => undefined);
+  }
+}
+
+async function waitForDailyRun(deps: RangeDeps, info: RangeJobInfo, signal: AbortSignal): Promise<void> {
+  if (!deps.isDailyRunInProgress()) return;
+  info.pausedReason = 'the daily run is in progress';
+  logger.info('range job paused while the daily run is in progress');
+  while (deps.isDailyRunInProgress() && !signal.aborted) {
+    await deps.sleep(deps.dailyRunPollMs, signal);
+  }
+  info.pausedReason = null;
+}
+
+interface OneOutcome {
+  outcome: QuestionResult | null; // null = cancelled mid-wait
+  touchedLeetCode: boolean;
+  blocked: boolean;
+}
+
+async function solveOneWithRetries(
+  n: number,
+  api: RangeApi,
+  deps: RangeDeps,
+  signal: AbortSignal,
+): Promise<OneOutcome> {
+  let touched = false;
+  for (let attempt = 0; ; attempt++) {
+    const r = await solveOne(n, api, deps);
+    touched ||= r.touchedLeetCode;
+    if (!r.blocked) return { ...r, touchedLeetCode: touched };
+    const wait = deps.blockedBackoffMs[attempt];
+    if (wait === undefined) return { ...r, touchedLeetCode: touched }; // retries exhausted
+    logger.warn({ question: n, attempt: attempt + 1, waitMs: wait }, 'LeetCode blocked the request - backing off before retrying');
+    await deps.sleep(wait, signal);
+    if (signal.aborted) return { outcome: null, touchedLeetCode: touched, blocked: true };
+  }
+}
+
+/** Solves + submits ONE question. Never throws. */
+async function solveOne(
+  n: number,
+  api: RangeApi,
+  deps: RangeDeps,
+): Promise<{ outcome: QuestionResult; touchedLeetCode: boolean; blocked: boolean }> {
+  const err = (detail: string, touched = true, blocked = false) => ({
+    outcome: { number: n, status: 'error' as const, detail },
+    touchedLeetCode: touched,
+    blocked,
+  });
+
+  // 1) walkccc solution + slug (shared across accounts; no LeetCode request).
+  let sol: WalkcccProblem;
+  try {
+    sol = await deps.getSolution(n);
+  } catch (e) {
+    if (e instanceof WalkcccError && /no walkccc page/i.test(e.message)) {
+      return err('no walkccc solution', false);
+    }
+    return err(`walkccc: ${shortErr(e)}`, false);
+  }
+
+  try {
+    // 2) The question (internal id + C++ starter).
+    const q = await api.question(sol.slug);
+    if (!q.questionId) return err('LeetCode returned no question id');
+    const cpp = q.codeSnippets.find((s) => s.langSlug === 'cpp');
+    if (!cpp) {
+      return err(q.codeSnippets.length === 0 ? 'premium-only question' : 'no C++ for this question');
+    }
+    if (!signatureMatchesStarter(sol.code, { starterCode: cpp.code } as ParsedProblem)) {
+      return err('walkccc signature does not match');
+    }
+
+    // 3) Submit + wait for the judge.
+    const submissionId = await api.submit({ slug: sol.slug, questionId: q.questionId, lang: 'cpp', code: sol.code });
+    const verdict = await api.awaitResult(submissionId, sol.slug);
+    if (verdict.classification === 'ACCEPTED') {
+      return { outcome: { number: n, status: 'accepted', submissionId }, touchedLeetCode: true, blocked: false };
+    }
+    if (verdict.classification === 'UNKNOWN') {
+      return {
+        outcome: { number: n, status: 'error', detail: 'judge timeout', submissionId },
+        touchedLeetCode: true,
+        blocked: false,
+      };
+    }
+    return {
+      outcome: { number: n, status: 'failed', detail: verdict.statusDisplay, submissionId },
+      touchedLeetCode: true,
+      blocked: false,
+    };
+  } catch (e) {
+    if (looksLikeChallenge(e)) return err('blocked by LeetCode', true, true);
+    return err(shortErr(e));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+const MAX_LIST = 60;
+
+function who(r: { label: string; username: string | null }): string {
+  return r.username && r.username !== r.label ? `${r.label} (${r.username})` : r.label;
+}
+
+function numberList(ns: number[]): string {
+  const shown = ns.slice(0, MAX_LIST).map((n) => `#${n}`).join(', ');
+  return ns.length > MAX_LIST ? `${shown} … +${ns.length - MAX_LIST} more` : shown;
+}
+
+export function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+/** The per-account notification: Accepted / Failed (+ numbers) / Error (+ numbers). */
+export function formatAccountRangeSummary(r: AccountRangeResult, index: number, total: number): string {
+  const head = `🏁 Account ${index}/${total}: ${who(r)}\n🎯 Questions #${r.range.from}–#${r.range.to}`;
+  if (r.fatal) {
+    return `${head}\n\n🚫 Not processed: ${r.fatal}${r.notAttempted.length ? `\n⏭️ Not attempted: ${r.notAttempted.length}` : ''}`;
+  }
+  const c = countResults(r.results);
+  const failed = r.results.filter((x) => x.status === 'failed');
+  const errors = r.results.filter((x) => x.status === 'error');
+  const lines = [head, '', `✅ Accepted: ${c.accepted}`, `❌ Failed: ${c.failed}`];
+  if (failed.length) {
+    // Group by verdict: "Wrong Answer: #212, #218"
+    for (const [verdict, ns] of groupBy(failed)) lines.push(`   • ${verdict}: ${numberList(ns)}`);
+  }
+  lines.push(`⚠️ Error: ${c.error}`);
+  if (errors.length) {
+    for (const [reason, ns] of groupBy(errors)) lines.push(`   • ${reason}: ${numberList(ns)}`);
+  }
+  if (r.stoppedEarly === 'cancelled') lines.push('', `🛑 Cancelled — ${r.notAttempted.length} question(s) not attempted`);
+  if (r.stoppedEarly === 'blocked') {
+    lines.push('', `🧱 Stopped early: LeetCode kept blocking requests — ${r.notAttempted.length} not attempted (${numberList(r.notAttempted.slice(0, 1))} onwards)`);
+  }
+  lines.push(`⏱️ Took ${formatDuration(r.finishedAt - r.startedAt)}`);
+  return truncate(lines.join('\n'));
+}
+
+function groupBy(rs: QuestionResult[]): Map<string, number[]> {
+  const m = new Map<string, number[]>();
+  for (const r of rs) {
+    const k = r.detail ?? 'unknown';
+    const list = m.get(k);
+    if (list) list.push(r.number);
+    else m.set(k, [r.number]);
+  }
+  return m;
+}
+
+export function formatRangeJobFinished(
+  range: QuestionRange,
+  results: AccountRangeResult[],
+  totalAccounts: number,
+  cancelled: boolean,
+  elapsedMs: number,
+): string {
+  const sum = { accepted: 0, failed: 0, error: 0 };
+  for (const r of results) {
+    const c = countResults(r.results);
+    sum.accepted += c.accepted;
+    sum.failed += c.failed;
+    sum.error += c.error;
+  }
+  const head = cancelled
+    ? `🛑 Question-range job cancelled (#${range.from}–#${range.to})`
+    : `🎉 Question-range job finished (#${range.from}–#${range.to})`;
+  return [
+    head,
+    `👥 Accounts processed: ${results.length}/${totalAccounts}`,
+    `✅ ${sum.accepted} accepted · ❌ ${sum.failed} failed · ⚠️ ${sum.error} errors`,
+    `⏱️ Total time: ${formatDuration(elapsedMs)}`,
+  ].join('\n');
+}
+
+export function formatRangeJobStatus(j: RangeJobInfo, now: number): string {
+  const size = rangeSize(j.range);
+  const lines = [
+    `⏳ Question-range job in progress (#${j.range.from}–#${j.range.to})`,
+    `👤 Account ${j.accountIndex}/${j.accountLabels.length}: ${j.currentLabel ?? '—'}`,
+    `📍 ${j.doneInAccount}/${size} done${j.currentQuestion ? ` — now on #${j.currentQuestion}` : ''}`,
+    `✅ ${j.counts.accepted} · ❌ ${j.counts.failed} · ⚠️ ${j.counts.error}`,
+    `⏱️ Running for ${formatDuration(now - j.startedAt)}`,
+  ];
+  if (j.pausedReason) lines.push(`⏸️ Paused: ${j.pausedReason}`);
+  if (j.cancelling) lines.push('🛑 Cancelling — stopping after the current question');
+  else lines.push('', 'Send /cancelrange to stop it.');
+  return lines.join('\n');
+}
+
+/** Rough duration estimate for one account (judge ≈ 8s + the pause per question). */
+export function estimateAccountMs(range: QuestionRange, gapMs: number): number {
+  return rangeSize(range) * (gapMs + 8_000);
+}
+
+function truncate(s: string, max = 4000): string {
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function shortErr(err: unknown): string {
+  const t = errText(err).replace(/\s+/g, ' ').trim();
+  return t.length > 80 ? `${t.slice(0, 80)}…` : t;
+}
+
+// ---------------------------------------------------------------------------
+// Real dependencies
+// ---------------------------------------------------------------------------
+
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+/** One HTTP session (no browser) carrying the account's own cookies. */
+async function openRequestSession(account: AccountRecord): Promise<RangeSession> {
+  const state = parseStoredStorageState(account.storageState);
+  if (!state.ok) throw new Error(state.error);
+  const ctx = await playwrightRequest.newContext({
+    userAgent: USER_AGENT,
+    storageState: { cookies: state.state.cookies, origins: [] },
+    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
+  });
+  const cookieJar = {
+    request: ctx,
+    cookies: async (url?: string | readonly string[]) => {
+      const all = (await ctx.storageState()).cookies;
+      const host = typeof url === 'string' ? new URL(url).hostname : null;
+      return host ? all.filter((c) => host === c.domain.replace(/^\./, '') || host.endsWith(c.domain)) : all;
+    },
+  };
+  const api = new LeetCodeApi(cookieJar as never);
+  return {
+    api: {
+      checkSession: () => checkSession(api),
+      question: (slug) => fetchQuestionData(api, slug),
+      submit: (p) => api.submitSolution(p),
+      awaitResult: (id, slug) => api.awaitSubmission(id, slug),
+    },
+    close: () => ctx.dispose(),
+  };
+}
+
+/**
+ * walkccc lookups are shared by every account in the job (the solution for
+ * question N is the same for everyone). Definitive answers — the solution, or
+ * "no page for this number" — are kept; transient network errors are not.
+ */
+export class RangeSolutionCache {
+  private readonly entries = new Map<number, Promise<WalkcccProblem>>();
+  constructor(
+    private readonly fetcher: (n: number) => Promise<WalkcccProblem> = fetchWalkcccProblem,
+    private readonly maxEntries = MAX_RANGE_SIZE,
+  ) {}
+
+  get(n: number): Promise<WalkcccProblem> {
+    const hit = this.entries.get(n);
+    if (hit) return hit;
+    const p = this.fetcher(n);
+    this.entries.set(n, p);
+    p.catch((e) => {
+      if (!(e instanceof WalkcccError) && this.entries.get(n) === p) this.entries.delete(n);
+    });
+    if (this.entries.size > this.maxEntries) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest !== undefined) this.entries.delete(oldest);
+    }
+    return p;
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+}
+
+/**
+ * Render's free tier spins an idle service down after ~15 min without
+ * INCOMING traffic — Telegram long-polling is outgoing and does not count, so
+ * a multi-hour range job would be killed mid-way. While a job runs, ping our
+ * own public /health every 10 minutes (through Render's edge, so it counts).
+ */
+function selfKeepAlive(): () => void {
+  const base = config.api.publicUrl;
+  if (!/^https:\/\//.test(base)) return () => undefined;
+  const url = `${base.replace(/\/+$/, '')}/health`;
+  const timer = setInterval(() => {
+    void fetch(url, { signal: AbortSignal.timeout(20_000) }).catch(() => undefined);
+  }, 10 * 60_000);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+let sharedCache = new RangeSolutionCache();
+
+export function defaultRangeDeps(notify: (text: string) => Promise<void> = async () => undefined): RangeDeps {
+  // A fresh cache per job keeps memory bounded to one range.
+  sharedCache = new RangeSolutionCache();
+  return {
+    listAccounts: listEnabledAccounts,
+    getAccount: getAccountById,
+    openSession: openRequestSession,
+    getSolution: (n) => sharedCache.get(n),
+    notify,
+    sleep: abortableSleep,
+    isDailyRunInProgress: isRunInProgress,
+    now: () => Date.now(),
+    questionGapMs: 30_000,
+    blockedBackoffMs: [60_000, 120_000, 240_000],
+    blockedStreakLimit: 3,
+    blockedCooldownMs: 10 * 60_000,
+    dailyRunPollMs: 15_000,
+    progressEvery: 25,
+    keepAlive: selfKeepAlive,
+  };
+}
+
+export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted || ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const t = setTimeout(done, ms);
+    function done() {
+      clearTimeout(t);
+      signal.removeEventListener('abort', done);
+      resolve();
+    }
+    signal.addEventListener('abort', done, { once: true });
+  });
+}
+
+/** Test hook: forget any job (only used by tests). */
+export function __resetRangeJobForTests(): void {
+  activeJob = null;
+}

@@ -34,13 +34,13 @@ beforeEach(() => {
 describe('formatAccountMessage', () => {
   it('renders one account with index and submission id', () => {
     expect(formatAccountMessage(outcomes[0]!, 1, 3)).toBe(
-      'Account 1/3 — [OK] a1 (a1) — Accepted · 0 ms · 8.6 MB\nSubmission ID: 11',
+      '👤 Account 1/3 — ✅ a1 (a1) — Accepted · 0 ms · 8.6 MB\n🆔 Submission ID: 11',
     );
     expect(formatAccountMessage(outcomes[1]!, 2, 3)).toBe(
-      'Account 2/3 — [FAIL] a2 — SUBMISSION_REJECTED: judge verdict: Wrong Answer\nSubmission ID: 12',
+      '👤 Account 2/3 — ❌ a2 — SUBMISSION_REJECTED: judge verdict: Wrong Answer\n🆔 Submission ID: 12',
     );
     expect(formatAccountMessage(outcomes[2]!, 3, 3)).toBe(
-      'Account 3/3 — [REJECTED] a3 (a3) — LeetCode rejected the transferred session',
+      '👤 Account 3/3 — 🚫 a3 (a3) — LeetCode rejected the transferred session',
     );
   });
 
@@ -48,12 +48,12 @@ describe('formatAccountMessage', () => {
     const r = buildReport({ date: '2026-09-27', reason: 'cron', startedAt: 'x', outcomes });
     expect(formatReportForTelegram(r)).toBe(
       [
-        'LeetCode Daily Report — 2026-09-27',
-        '3 account(s): 1 solved, 1 rejected, 1 failed',
+        '🤖 LeetCode Daily Agent — 📅 2026-09-27',
+        '📊 3 account(s): 1 solved, 1 rejected, 1 failed',
         '',
-        '[OK] a1 (a1) — Accepted · 0 ms · 8.6 MB',
-        '[FAIL] a2 — SUBMISSION_REJECTED: judge verdict: Wrong Answer',
-        '[REJECTED] a3 (a3) — LeetCode rejected the transferred session',
+        '✅ a1 (a1) — Accepted · 0 ms · 8.6 MB',
+        '❌ a2 — SUBMISSION_REJECTED: judge verdict: Wrong Answer',
+        '🚫 a3 (a3) — LeetCode rejected the transferred session',
       ].join('\n'),
     );
   });
@@ -69,9 +69,9 @@ describe('/triggersubmission', () => {
     expect(runner).toHaveBeenCalledWith('trigger-submission', expect.any(Object));
     expect(sent).toHaveLength(1 + outcomes.length);
     expect(sent[0]).toMatch(/Submitting today's daily question for all accounts/);
-    expect(sent[1]).toMatch(/^Account 1\/3 — \[OK\] a1/);
-    expect(sent[2]).toMatch(/^Account 2\/3 — \[FAIL\] a2/);
-    expect(sent[3]).toMatch(/^Account 3\/3 — \[REJECTED\] a3/);
+    expect(sent[1]).toMatch(/^👤 Account 1\/3 — ✅ a1/);
+    expect(sent[2]).toMatch(/^👤 Account 2\/3 — ❌ a2/);
+    expect(sent[3]).toMatch(/^👤 Account 3\/3 — 🚫 a3/);
   });
 
   it('does not block: returns before the run finishes', async () => {
@@ -108,6 +108,6 @@ describe('/triggersubmission', () => {
   it('reports a crash instead of failing silently', async () => {
     const h = await handleTriggerSubmission((async () => { throw new Error('boom'); }) as never, () => false);
     await h!.done;
-    expect(sent.at(-1)).toBe('/triggersubmission failed: boom');
+    expect(sent.at(-1)).toBe('⚠️ /triggersubmission failed: boom');
   });
 });

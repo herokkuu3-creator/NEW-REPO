@@ -27,6 +27,12 @@ export interface WalkcccSolution {
   sourceUrl: string;
 }
 
+/** A walkccc page resolved from a question NUMBER: the solution + which LeetCode problem it is. */
+export interface WalkcccProblem extends WalkcccSolution {
+  slug: string;
+  title: string | null;
+}
+
 const FETCH_TIMEOUT_MS = 15_000;
 const USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -34,6 +40,26 @@ const USER_AGENT =
 export async function fetchWalkcccSolution(
   questionFrontendId: string,
 ): Promise<WalkcccSolution> {
+  const { code, sourceUrl } = await fetchWalkcccPage(questionFrontendId);
+  return { code, sourceUrl };
+}
+
+/**
+ * Same single page fetch, but also resolves the LeetCode slug from the page's
+ * own title link (`<h1><a href="https://leetcode.com/problems/<slug>">N. Title</a>`),
+ * so a bare question NUMBER is enough — no LeetCode problem-list crawl needed.
+ */
+export async function fetchWalkcccProblem(questionNumber: number | string): Promise<WalkcccProblem> {
+  const page = await fetchWalkcccPage(String(questionNumber));
+  if (!page.slug) {
+    throw new WalkcccError(`could not find the LeetCode problem link on ${page.sourceUrl}`);
+  }
+  return { code: page.code, sourceUrl: page.sourceUrl, slug: page.slug, title: page.title };
+}
+
+async function fetchWalkcccPage(
+  questionFrontendId: string,
+): Promise<WalkcccSolution & { slug: string | null; title: string | null }> {
   const base = config.solution.walkcccBaseUrl.replace(/\/+$/, '');
   const url = `${base}/problems/${encodeURIComponent(questionFrontendId)}/`;
 
@@ -63,7 +89,17 @@ export async function fetchWalkcccSolution(
   }
 
   logger.info({ url, codeLength: code.length }, 'walkccc C++ solution extracted');
-  return { code, sourceUrl: url };
+  const link = extractProblemLink(html);
+  return { code, sourceUrl: url, slug: link?.slug ?? null, title: link?.title ?? null };
+}
+
+/** The LeetCode problem a walkccc page is about, from its title link. Exposed for testing. */
+export function extractProblemLink(html: string): { slug: string; title: string | null } | null {
+  const heading = /<h1[^>]*>\s*<a[^>]+href="https?:\/\/leetcode\.com\/problems\/([a-z0-9-]+)\/?"[^>]*>([^<]*)<\/a>/i.exec(html);
+  const m = heading ?? /href="https?:\/\/leetcode\.com\/problems\/([a-z0-9-]+)\/?"[^>]*>([^<]*)</i.exec(html);
+  if (!m || !m[1]) return null;
+  const title = decodeEntities(m[2] ?? '').replace(/^\s*\d+\.\s*/, '').trim();
+  return { slug: m[1], title: title || null };
 }
 
 /**

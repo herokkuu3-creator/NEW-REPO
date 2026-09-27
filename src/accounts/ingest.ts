@@ -136,9 +136,9 @@ export async function ingestStorageState(
 
 /** One Telegram-friendly line for an ingest result. */
 export function describeIngest(r: IngestResult): string {
-  if (!r.ok) return `Could not read these cookies: ${r.error}`;
+  if (!r.ok) return `❌ Could not read these cookies: ${r.error}`;
   const who = r.username ? ` (${r.username})` : '';
-  const verb = r.created ? 'Added new account' : 'Updated account (old cookies overridden)';
+  const verb = r.created ? '✅ Added new account' : '♻️ Updated account (old cookies overridden)';
   const status =
     r.status === AccountStatus.ACTIVE
       ? 'ACTIVE'
