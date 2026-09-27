@@ -204,13 +204,19 @@ export function decodeEntities(text: string): string {
 }
 
 /**
- * A real C++ solution for a LeetCode problem: declares `class Solution` with
- * a method, and is not a placeholder. Deliberately strict enough that a
- * Java/Python block (which lacks `class Solution { public:`) is rejected.
+ * A real C++ solution for a LeetCode problem: declares a class with a C++
+ * access-specifier section (`public:`), and is not a placeholder.
+ *
+ * The class NAME is deliberately not checked: design-style problems (1600
+ * "Throne Inheritance", 1603 "Design Parking System", …) use the problem's
+ * own class (`class ThroneInheritance`), not `class Solution` — rejecting
+ * those skipped real solutions. What separates the C++ block from the Java
+ * and Python blocks on the same page is `public:` — Java's `public` has no
+ * colon and Python has neither.
  */
 export function looksLikeCppSolution(code: string): boolean {
   if (code.length < 20) return false;
-  if (!/class\s+Solution\b/.test(code)) return false;
+  if (!/\bclass\s+[A-Za-z_]\w*/.test(code)) return false;
   if (!/public\s*:/.test(code)) return false;
   if (/\b(TODO|FIXME|implement me|your code here)\b/i.test(code)) return false;
   return true;
