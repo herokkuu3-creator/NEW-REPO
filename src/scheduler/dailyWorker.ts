@@ -121,9 +121,17 @@ function isForceReason(reason: string): boolean {
  * report (one outcome per account). Used by POST /triggerSubmission.
  * Returns null when another run is already in progress.
  */
-export async function runSubmissionNow(reason: string): Promise<RunReport | null> {
+export async function runSubmissionNow(
+  reason: string,
+  options: DailyRunOptions = {},
+): Promise<RunReport | null> {
   if (runInProgress) return null;
-  return executeDailyRun(reason);
+  return executeDailyRun(reason, options);
+}
+
+export interface DailyRunOptions {
+  /** Called right after EACH account finishes (index is 1-based). Errors are ignored. */
+  onAccountOutcome?: (outcome: AccountOutcome, index: number, total: number) => Promise<void> | void;
 }
 
 /**
@@ -140,7 +148,10 @@ class LlmSolveFailed extends Error {
   }
 }
 
-export async function executeDailyRun(reason: string): Promise<RunReport> {
+export async function executeDailyRun(
+  reason: string,
+  options: DailyRunOptions = {},
+): Promise<RunReport> {
   if (runInProgress) {
     logger.warn({ reason }, 'run skipped — already in progress');
     return buildReport({
@@ -176,6 +187,7 @@ export async function executeDailyRun(reason: string): Promise<RunReport> {
 
     const outcomes: AccountOutcome[] = [];
     for (const account of accounts) {
+      const before = outcomes.length;
       try {
         outcomes.push(await runForAccount(account, today, forceRun));
       } catch (err) {
@@ -189,6 +201,17 @@ export async function executeDailyRun(reason: string): Promise<RunReport> {
           kind: 'failed',
           error: `unexpected: ${msg}`,
         });
+      }
+      const outcome = outcomes[before];
+      if (options.onAccountOutcome && outcome) {
+        try {
+          await options.onAccountOutcome(outcome, outcomes.length, accounts.length);
+        } catch (err) {
+          logger.warn(
+            { label: account.label, err: err instanceof Error ? err.message : String(err) },
+            'per-account outcome callback failed',
+          );
+        }
       }
     }
 

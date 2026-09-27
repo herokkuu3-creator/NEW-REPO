@@ -210,6 +210,21 @@ describe('multi-account run shares one solution', () => {
     expect(again.totals.solved).toBe(3);
   });
 
+  it('calls onAccountOutcome once per account, in order, as each finishes', async () => {
+    h.fetchWalkccc.mockResolvedValue({ code: 'class Solution {};', sourceUrl: 'u' });
+    const { runSubmissionNow } = await import('../src/scheduler/dailyWorker');
+    const seen: string[] = [];
+    const report = await runSubmissionNow('trigger-submission', {
+      onAccountOutcome: (o, i, t) => {
+        // at callback time, later accounts must not have been submitted yet
+        seen.push(`${i}/${t}:${o.label}:${o.kind}:submits=${h.submit.mock.calls.length}`);
+        if (i === 2) throw new Error('telegram down'); // must not break the run
+      },
+    });
+    expect(seen).toEqual(['1/3:a1:solved:submits=1', '2/3:a2:solved:submits=2', '3/3:a3:solved:submits=3']);
+    expect(report?.totals.solved).toBe(3);
+  });
+
   it('a failed fetch is retried by the next account instead of failing everyone', async () => {
     const { WalkcccError } = await import('../src/solutions/walkccc');
     // First fetch fails; the cache must not keep the failure (fresh module = empty cache).

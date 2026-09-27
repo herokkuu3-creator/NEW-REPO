@@ -106,30 +106,42 @@ export function formatReportForTelegram(report: RunReport): string {
     '',
   ];
   for (const o of report.accounts) {
-    const who = o.username ? `${o.label} (${o.username})` : o.label;
-    switch (o.kind) {
-      case 'solved': {
-        const parts = [o.submissionStatus ?? 'done'];
-        if (o.runtime) parts.push(o.runtime);
-        if (o.memory) parts.push(o.memory);
-        lines.push(`[OK] ${who} — ${parts.filter(Boolean).join(' · ')}`);
-        break;
-      }
-      case 'expired':
-        lines.push(`[EXPIRED] ${who} — ${firstLine(o.error) ?? 'session token itself is expired — re-capture fresh cookies'}`);
-        break;
-      case 'rejected':
-        lines.push(`[REJECTED] ${who} — ${firstLine(o.error) ?? 'LeetCode rejected the transferred session; token expiry is not established'}`);
-        break;
-      case 'failed': {
-        const detail = firstLine(o.error);
-        lines.push(`[FAIL] ${who} — ${o.state ?? 'error'}${detail ? `: ${detail}` : ''}`);
-        break;
-      }
-      case 'skipped':
-        lines.push(`[SKIP] ${who} — ${firstLine(o.error) ?? 'already handled today'}`);
-        break;
-    }
+    lines.push(formatOutcomeLine(o));
   }
+  return lines.join('\n');
+}
+
+/** One report line for one account (shared by the report and per-account messages). */
+export function formatOutcomeLine(o: AccountOutcome): string {
+  const who = o.username ? `${o.label} (${o.username})` : o.label;
+  switch (o.kind) {
+    case 'solved': {
+      const parts = [o.submissionStatus ?? 'done'];
+      if (o.runtime) parts.push(o.runtime);
+      if (o.memory) parts.push(o.memory);
+      return `[OK] ${who} — ${parts.filter(Boolean).join(' · ')}`;
+    }
+    case 'expired':
+      return `[EXPIRED] ${who} — ${firstLine(o.error) ?? 'session token itself is expired — re-capture fresh cookies'}`;
+    case 'rejected':
+      return `[REJECTED] ${who} — ${firstLine(o.error) ?? 'LeetCode rejected the transferred session; token expiry is not established'}`;
+    case 'failed': {
+      const detail = firstLine(o.error);
+      return `[FAIL] ${who} — ${o.state ?? 'error'}${detail ? `: ${detail}` : ''}`;
+    }
+    case 'skipped':
+      return `[SKIP] ${who} — ${firstLine(o.error) ?? 'already handled today'}`;
+  }
+}
+
+/**
+ * Standalone Telegram message for ONE account's result, sent as soon as that
+ * account finishes during /triggersubmission, e.g.
+ *   Account 2/9 — [OK] dom4429 (dom4429) — Accepted · 0 ms · 8.6 MB
+ *   Submission ID: 2154720128
+ */
+export function formatAccountMessage(o: AccountOutcome, index: number, total: number): string {
+  const lines = [`Account ${index}/${total} — ${formatOutcomeLine(o)}`];
+  if (o.submissionId) lines.push(`Submission ID: ${o.submissionId}`);
   return lines.join('\n');
 }

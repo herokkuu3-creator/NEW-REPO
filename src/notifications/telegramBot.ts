@@ -6,7 +6,13 @@ import { getAllSystemState, latestRun } from '../database/models';
 import { listAccounts } from '../database/accounts';
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
-import { triggerRun } from '../scheduler/dailyWorker';
+import {
+  isRunInProgress,
+  runSubmissionNow,
+  triggerRun,
+  TRIGGER_SUBMISSION_REASON,
+} from '../scheduler/dailyWorker';
+import { formatAccountMessage, summarizeReport } from '../scheduler/report';
 
 /**
  * Telegram command bot â€” the interactive half of session renewal.
@@ -60,6 +66,7 @@ const HELP_TEXT = [
   '/renew - how to capture the cookie file on Android',
   '/renew <label> - store the NEXT file under this exact label',
   '/accounts - list every account with its cookie status',
+  '/triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
   '/status - show authentication status and the last run',
   '/cancel - cancel a renewal in progress',
   '/help - show this message',
@@ -160,12 +167,16 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/status':
         await reply(await statusText());
         return;
+      case '/triggersubmission':
+      case '/trigger_submission':
+        await handleTriggerSubmission();
+        return;
       case '/cancel':
         pendingRenewalLabel = undefined;
         await reply('No renewal is in progress. When you are ready, send /renew (or /renew <label>) and then the cookies.');
         return;
       default:
-        await reply('Unknown command. Available: /renew, /renew <label>, /accounts, /status, /cancel, /help');
+        await reply('Unknown command. Available: /renew, /renew <label>, /accounts, /status, /triggersubmission, /cancel, /help');
         return;
     }
   }
@@ -244,6 +255,43 @@ function scheduleBatchRun(): void {
       );
     })().catch((err) => logger.warn({ err: errText(err) }, 'batch run trigger failed'));
   }, BATCH_RUN_DELAY_MS);
+}
+
+/**
+ * /triggersubmission — re-submits today's daily question for every account.
+ * Replies once when starting, then ONE message per account as soon as that
+ * account finishes; the usual aggregated report follows at the end.
+ *
+ * The run is started in the background so the bot keeps answering other
+ * commands (/status etc.) while the submissions are in progress.
+ */
+export async function handleTriggerSubmission(
+  runner: typeof runSubmissionNow = runSubmissionNow,
+  inProgress: () => boolean = isRunInProgress,
+): Promise<{ done: Promise<void> } | null> {
+  if (inProgress()) {
+    await reply('A run is already in progress — wait for its report, then send /triggersubmission again.');
+    return null;
+  }
+  await reply("Submitting today's daily question for all accounts — you'll get one message per account.");
+  const done = (async () => {
+    const report = await runner(TRIGGER_SUBMISSION_REASON, {
+      onAccountOutcome: (outcome, index, total) => reply(formatAccountMessage(outcome, index, total)),
+    });
+    if (!report) {
+      await reply('Not started: another run began at the same moment. Send /triggersubmission again after it finishes.');
+    } else if (report.totals.accounts === 0) {
+      await reply('No accounts configured — send cookie files first (/renew).');
+    } else {
+      logger.info({ summary: summarizeReport(report) }, 'telegram /triggersubmission finished');
+    }
+  })().catch(async (err) => {
+    logger.warn({ err: errText(err) }, '/triggersubmission failed');
+    await reply(`/triggersubmission failed: ${errText(err)}`).catch(() => undefined);
+  });
+  // Wrapped in an object: returning the promise itself from an async function
+  // would make the caller wait for the whole run and block the poll loop.
+  return { done };
 }
 
 /** Pending /renew <label> target — consumed by the next cookie payload. */
