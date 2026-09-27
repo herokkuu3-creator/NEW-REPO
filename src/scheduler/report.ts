@@ -47,7 +47,14 @@ export function buildReport(input: {
   startedAt: string;
   outcomes: AccountOutcome[];
 }): RunReport {
-  const totals = { accounts: 0, solved: 0, failed: 0, expired: 0, skipped: 0 };
+  const totals: RunReport['totals'] = {
+    accounts: 0,
+    solved: 0,
+    failed: 0,
+    expired: 0,
+    rejected: 0,
+    skipped: 0,
+  };
   for (const outcome of input.outcomes) {
     totals.accounts += 1;
     totals[outcome.kind] += 1;
