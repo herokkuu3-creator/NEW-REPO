@@ -21,8 +21,9 @@ import { triggerRun } from '../scheduler/dailyWorker';
  *
  * Security: messages from ANY chat other than TELEGRAM_CHAT_ID are ignored â€”
  * the bot token is semi-public (anyone can message the bot), the chat ID is
- * the access control. Cookie payloads are parsed and stored immediately; live LeetCode validation is deferred to the daily run. The
- * anything is stored, and are never logged or echoed back.
+ * the access control. Cookie payloads are parsed and stored immediately; live
+ * LeetCode validation is deferred to the daily run. Cookie values are never
+ * logged or echoed back.
  *
  * Large exports: Telegram splits pasted text at ~4096 characters, which
  * corrupts JSON â€” so Cookie-Editor exports can also be sent as .txt/.json
