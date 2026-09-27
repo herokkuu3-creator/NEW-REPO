@@ -204,20 +204,23 @@ async function runForAccount(
 
     if (!check.authenticated) {
       if (check.cause === 'signed-out') {
-        // LeetCode answered and does not know this session — the cookies
-        // are expired. Report and move on to the next account.
+        // A live "signed out" response from the agent server proves only that
+        // LeetCode rejected this transferred session there. It does NOT prove
+        // that the token itself has expired, so keep the cookies and classify
+        // the account as REJECTED. Offline token expiry is the only path that
+        // marks an account EXPIRED.
         await patchAccount(account.id, {
-          status: AccountStatus.EXPIRED,
-          lastError: 'session expired or invalid — LeetCode reports the session signed out',
+          status: AccountStatus.REJECTED,
+          lastError: 'LeetCode rejected this transferred session from the agent server; token expiry is not established',
           checked: true,
         });
-        logger.warn({ label }, 'account cookies are EXPIRED — skipping (re-upload fresh cookies)');
+        logger.warn({ label }, 'account session REJECTED by LeetCode — skipping');
         return {
           label,
           username: account.username,
-          kind: 'expired',
+          kind: 'rejected',
           error:
-            'session expired — re-upload fresh cookies for this account (POST /admin/accounts or Telegram /renew)',
+            'LeetCode rejected the transferred session from the agent server — cookies were kept; re-capture only if this persists',
         };
       }
       // The request itself failed (network error / Cloudflare 403). NOT proof
