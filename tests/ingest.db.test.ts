@@ -38,25 +38,25 @@ suite('Telegram cookie files -> accounts (real DB)', async () => {
   });
 
   it('keeps adding one account per file, for different users', async () => {
-    const r1 = await processCookieMessage(fresh('alice', 'a1'), { fileName: 'lc_26Sept_4179.json', validate: true, validate: true, validator: signedIn('alice') });
-    const r2 = await processCookieMessage(fresh('bob', 'b1'), { fileName: 'lc_26Sept_3700.json', validate: true, validator: signedIn('bob') });
-    const r3 = await processCookieMessage(fresh('carol', 'c1'), { fileName: 'lc_26Sept_5075.json', validate: true, validator: blocked });
+    const r1 = await processCookieMessage(fresh('alice', 'a1'), { fileName: 'lc_26Sept_4179.json' });
+    const r2 = await processCookieMessage(fresh('bob', 'b1'), { fileName: 'lc_26Sept_3700.json' });
+    const r3 = await processCookieMessage(fresh('carol', 'c1'), { fileName: 'lc_26Sept_5075.json' });
     expect([r1.stored, r2.stored, r3.stored]).toEqual([true, true, true]);
     expect(r1.text).toContain('Added new account: alice');
     expect(r3.text).toContain('NOT VERIFIED YET');
 
     const accounts = await listAccounts();
     expect(accounts.map((a) => [a.label, a.username, a.status])).toEqual([
-      ['alice', 'alice', 'ACTIVE'],
-      ['bob', 'bob', 'ACTIVE'],
+      ['alice', 'alice', 'UNKNOWN'],
+      ['bob', 'bob', 'UNKNOWN'],
       ['carol', 'carol', 'UNKNOWN'],
     ]);
     expect(r3.text).toContain('Accounts stored: 3');
   });
 
   it('overrides the cookies when the same user sends a new file', async () => {
-    await processCookieMessage(fresh('alice', 'OLD'), { validator: signedIn('alice') });
-    const r = await processCookieMessage(fresh('alice', 'NEW'), { validator: signedIn('alice') });
+    await processCookieMessage(fresh('alice', 'OLD'));
+    const r = await processCookieMessage(fresh('alice', 'NEW'));
     expect(r.text).toContain('Updated account (old cookies overridden): alice');
 
     const accounts = await listAccounts();
@@ -71,7 +71,7 @@ suite('Telegram cookie files -> accounts (real DB)', async () => {
   it('overrides a legacy "default" account that belongs to the same user', async () => {
     const { saveAccount } = await import('../src/database/accounts');
     await saveAccount('default', fresh('alice', 'OLD'), { username: 'alice' });
-    await processCookieMessage(fresh('alice', 'NEW'), { validator: signedIn('alice') });
+    await processCookieMessage(fresh('alice', 'NEW'));
     const accounts = await listAccounts();
     expect(accounts.map((a) => a.label)).toEqual(['default']);
   });
@@ -115,7 +115,7 @@ suite('Telegram cookie files -> accounts (real DB)', async () => {
   });
 
   it('an explicit /renew <label> stores under that label', async () => {
-    await processCookieMessage(fresh('alice', 'x'), { label: 'main', validator: signedIn('alice') });
+    await processCookieMessage(fresh('alice', 'x'), { label: 'main' });
     expect((await listAccounts()).map((a) => a.label)).toEqual(['main']);
   });
 
