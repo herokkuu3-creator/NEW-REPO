@@ -2,7 +2,8 @@ import { AccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
 import { sendTelegramMessage } from './telegram';
-import { getAllSystemState, latestRun } from '../database/models';
+import { randomUUID } from 'node:crypto';
+import { getAllSystemState, getSystemState, latestRun, setSystemState } from '../database/models';
 import { listAccounts } from '../database/accounts';
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
@@ -87,29 +88,90 @@ const RENEW_INSTRUCTIONS = [
   'Multiple accounts: send one .json file per account, one after another. Each file is stored immediately (a new user = new account, a known user = cookies overridden), then checked with LeetCode. Once the uploads stop, today\'s run starts for all accounts.',
   ].join('\n');
 
-export function startTelegramBot(): () => void {
+/**
+ * Single-poller handover.
+ *
+ * Telegram allows ONE getUpdates long-poll per bot token; a second one gets
+ * HTTP 409 "terminated by other getUpdates request". On every Render deploy
+ * the NEW instance boots while the OLD one is still alive (zero-downtime
+ * deploy), so both poll for a while and 409 each other.
+ *
+ * Fix: each instance claims the poller slot in the database on startup
+ * (latest boot wins). Before every poll — and immediately after a 409 — an
+ * instance checks it still owns the slot; the old instance sees it was
+ * superseded and stops polling at once instead of fighting until it gets
+ * SIGTERM. Shutdown also aborts the in-flight long-poll instead of letting
+ * it hang for up to 25s. 409s during the short handover are expected and are
+ * logged quietly; only a 409 that persists (a genuinely separate process
+ * using the same bot token) is logged as a warning.
+ */
+export const POLLER_OWNER_KEY = 'telegramPollerOwner';
+const HANDOVER_GRACE_MS = 60_000;
+
+export function isConflictError(err: unknown): boolean {
+  return /\b409\b|terminated by other getUpdates/i.test(errText(err));
+}
+
+export interface PollerDeps {
+  instanceId?: string;
+  getOwner?: () => Promise<string | null>;
+  setOwner?: (id: string) => Promise<void>;
+  /** Delay before retrying after a polling error (default 5s). */
+  retryDelayMs?: number;
+}
+
+export function startTelegramBot(deps: PollerDeps = {}): () => void {
   if (!config.telegram.enabled || !config.telegram.commands) {
     logger.info('telegram command bot disabled (set TELEGRAM_BOT_TOKEN/CHAT_ID, TELEGRAM_COMMANDS=true)');
     return () => undefined;
   }
 
   let stopped = false;
+  const abort = new AbortController();
+  const instanceId = deps.instanceId ?? `${process.env.RENDER_INSTANCE_ID ?? 'local'}:${process.pid}:${randomUUID()}`;
+  const getOwner = deps.getOwner ?? (() => getSystemState(POLLER_OWNER_KEY));
+  const setOwner = deps.setOwner ?? ((id: string) => setSystemState(POLLER_OWNER_KEY, id));
+
+  /** false only when the DB positively says another instance took over. */
+  const stillOwner = async (): Promise<boolean> => {
+    try {
+      const owner = await getOwner();
+      return owner === null || owner === instanceId;
+    } catch {
+      return true; // DB hiccup: keep polling rather than going silent
+    }
+  };
 
   void (async () => {
+    await setOwner(instanceId).catch((err) =>
+      logger.warn({ err: errText(err) }, 'could not claim the telegram poller slot - polling anyway'),
+    );
+
     // A leftover webhook makes getUpdates fail with HTTP 409 â€” drop it once.
     await tgApi('deleteWebhook', { drop_pending_updates: true }).catch((err) =>
       logger.warn({ err: errText(err) }, 'Telegram deleteWebhook failed - continuing anyway'),
     );
     logger.info('telegram command bot polling started (/renew, /status, /help)');
 
+    const startedAt = Date.now();
+    let conflictSince: number | null = null;
     let offset = 0;
     while (!stopped) {
+      if (!(await stillOwner())) {
+        logger.info('a newer instance took over the telegram bot - this instance stops polling');
+        break;
+      }
       try {
         const updates = await tgApi<TgUpdate[]>(
           'getUpdates',
           { offset, timeout: POLL_TIMEOUT_S, allowed_updates: ['message'] },
           (POLL_TIMEOUT_S + 15) * 1000,
+          abort.signal,
         );
+        if (conflictSince !== null) {
+          logger.info('telegram polling conflict resolved - this instance is now the only poller');
+          conflictSince = null;
+        }
         for (const update of updates) {
           offset = update.update_id + 1;
           if (update.message) {
@@ -120,14 +182,33 @@ export function startTelegramBot(): () => void {
         }
       } catch (err) {
         if (stopped) break;
-        logger.warn({ err: errText(err) }, 'Telegram polling error - retrying in 5 seconds');
-        await sleep(5_000);
+        if (isConflictError(err)) {
+          if (!(await stillOwner())) {
+            logger.info('a newer instance took over the telegram bot - this instance stops polling');
+            break;
+          }
+          const now = Date.now();
+          conflictSince ??= now;
+          if (now - startedAt < HANDOVER_GRACE_MS) {
+            // Expected right after a deploy while the old instance shuts down.
+            logger.info('telegram poller handover in progress (previous instance still polling) - retrying in 5 seconds');
+          } else {
+            logger.warn(
+              { conflictForS: Math.round((now - conflictSince) / 1000) },
+              'Telegram 409: another process is polling with the SAME bot token (a second deployment, a local run, or another service) - only one may run',
+            );
+          }
+        } else {
+          logger.warn({ err: errText(err) }, 'Telegram polling error - retrying in 5 seconds');
+        }
+        await sleep(deps.retryDelayMs ?? 5_000);
       }
     }
   })();
 
   return () => {
     stopped = true;
+    abort.abort(); // release the long-poll immediately on shutdown
   };
 }
 
@@ -368,12 +449,14 @@ async function tgApi<T = unknown>(
   method: string,
   body: Record<string, unknown>,
   timeoutMs = 15_000,
+  cancel?: AbortSignal,
 ): Promise<T> {
+  const timeout = AbortSignal.timeout(timeoutMs);
   const res = await fetch(`https://api.telegram.org/bot${config.telegram.botToken}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: cancel ? AbortSignal.any([timeout, cancel]) : timeout,
   });
   const json = (await res.json()) as { ok: boolean; result?: T; description?: string };
   if (!res.ok || !json.ok) {
