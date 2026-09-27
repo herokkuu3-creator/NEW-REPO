@@ -3,8 +3,15 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { sendTelegramMessage } from './telegram';
 import { randomUUID } from 'node:crypto';
-import { getAllSystemState, getSystemState, latestRun, setSystemState } from '../database/models';
-import { listAccounts } from '../database/accounts';
+import {
+  deleteSystemState,
+  getAllSystemState,
+  getSystemState,
+  latestRun,
+  setSystemState,
+  SystemKeys,
+} from '../database/models';
+import { AccountRecord, deleteAccountById, deleteAllAccounts, listAccounts } from '../database/accounts';
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import {
@@ -14,6 +21,7 @@ import {
   TRIGGER_SUBMISSION_REASON,
 } from '../scheduler/dailyWorker';
 import { formatAccountMessage, summarizeReport } from '../scheduler/report';
+import { humanLocal } from '../time';
 
 /**
  * Telegram command bot â€” the interactive half of session renewal.
@@ -54,9 +62,16 @@ interface TgMessage {
   document?: TgDocument;
 }
 
+interface TgCallbackQuery {
+  id: string;
+  data?: string;
+  message?: { message_id: number; chat: { id: number | string } };
+}
+
 interface TgUpdate {
   update_id: number;
   message?: TgMessage;
+  callback_query?: TgCallbackQuery;
 }
 
 const HELP_TEXT = [
@@ -68,6 +83,8 @@ const HELP_TEXT = [
   '/renew <label> - store the NEXT file under this exact label',
   '/accounts - list every account with its cookie status',
   '/triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
+  '/removesession - list every account with a Remove button (tap to delete that account\'s session)',
+  '/removeallsessions - delete the sessions of ALL accounts (asks for confirmation)',
   '/status - show authentication status and the last run',
   '/cancel - cancel a renewal in progress',
   '/help - show this message',
@@ -164,7 +181,7 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
       try {
         const updates = await tgApi<TgUpdate[]>(
           'getUpdates',
-          { offset, timeout: POLL_TIMEOUT_S, allowed_updates: ['message'] },
+          { offset, timeout: POLL_TIMEOUT_S, allowed_updates: ['message', 'callback_query'] },
           (POLL_TIMEOUT_S + 15) * 1000,
           abort.signal,
         );
@@ -177,6 +194,11 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
           if (update.message) {
             await handleMessage(update.message).catch((err) =>
               logger.warn({ err: errText(err) }, 'telegram message handling failed'),
+            );
+          }
+          if (update.callback_query) {
+            await handleCallbackQuery(update.callback_query).catch((err) =>
+              logger.warn({ err: errText(err) }, 'telegram button handling failed'),
             );
           }
         }
@@ -252,12 +274,21 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/trigger_submission':
         await handleTriggerSubmission();
         return;
+      case '/removesession':
+      case '/remove_session':
+        await handleRemoveSession();
+        return;
+      case '/removeallsessions':
+      case '/remove_all_sessions':
+      case '/removeallsession':
+        await handleRemoveAllSessions();
+        return;
       case '/cancel':
         pendingRenewalLabel = undefined;
         await reply('No renewal is in progress. When you are ready, send /renew (or /renew <label>) and then the cookies.');
         return;
       default:
-        await reply('Unknown command. Available: /renew, /renew <label>, /accounts, /status, /triggersubmission, /cancel, /help');
+        await reply('Unknown command. Available: /renew, /renew <label>, /accounts, /status, /triggersubmission, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -375,6 +406,159 @@ export async function handleTriggerSubmission(
   return { done };
 }
 
+// ---------------------------------------------------------------------------
+// Session removal (/removesession, /removeallsessions) — inline buttons
+// ---------------------------------------------------------------------------
+
+type InlineButton = { text: string; callback_data: string };
+
+/** Everything session removal touches — injectable for tests. */
+export interface RemovalDeps {
+  listAccounts: () => Promise<AccountRecord[]>;
+  deleteAccountById: (id: string) => Promise<boolean>;
+  deleteAllAccounts: () => Promise<number>;
+  /** Drops the legacy single-session copy, so it can't re-seed a "default" account. */
+  clearLegacySession: () => Promise<void>;
+  isRunInProgress: () => boolean;
+  send: (text: string, buttons?: InlineButton[][]) => Promise<void>;
+  edit: (chatId: number | string, messageId: number, text: string, buttons?: InlineButton[][]) => Promise<void>;
+  answer: (callbackId: string, text?: string) => Promise<void>;
+}
+
+const RUN_BUSY_TEXT = 'A run is in progress right now - wait for its report, then try again (removing an account mid-run would break it).';
+
+const defaultRemovalDeps: RemovalDeps = {
+  listAccounts,
+  deleteAccountById,
+  deleteAllAccounts,
+  clearLegacySession: () => deleteSystemState(SystemKeys.storageState),
+  isRunInProgress,
+  send: async (text, buttons) => {
+    await tgApi('sendMessage', {
+      chat_id: config.telegram.chatId,
+      text,
+      disable_web_page_preview: true,
+      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+    });
+  },
+  edit: async (chatId, messageId, text, buttons) => {
+    await tgApi('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: buttons ?? [] },
+    });
+  },
+  answer: async (callbackId, text) => {
+    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text } : {}) });
+  },
+};
+
+function accountName(a: AccountRecord): string {
+  return a.username && a.username !== a.label ? `${a.label} (${a.username})` : a.label;
+}
+
+/** The session list + one "Remove" button per account. */
+export function buildRemoveSessionView(accounts: AccountRecord[]): { text: string; buttons: InlineButton[][] } {
+  if (accounts.length === 0) {
+    return { text: 'No sessions stored - nothing to remove.', buttons: [] };
+  }
+  const lines = [`Sessions stored: ${accounts.length}`, 'Tap an account to remove its session:', ''];
+  accounts.forEach((a, i) => lines.push(`${i + 1}. ${accountName(a)} - ${a.status}`));
+  const buttons = accounts.map((a) => [{ text: `Remove ${accountName(a)}`.slice(0, 60), callback_data: `rm:${a.id}` }]);
+  buttons.push([{ text: 'Done', callback_data: 'rm:done' }]);
+  return { text: lines.join('\n'), buttons };
+}
+
+export async function handleRemoveSession(deps: RemovalDeps = defaultRemovalDeps): Promise<void> {
+  const view = buildRemoveSessionView(await deps.listAccounts());
+  await deps.send(view.text, view.buttons.length ? view.buttons : undefined);
+}
+
+export async function handleRemoveAllSessions(deps: RemovalDeps = defaultRemovalDeps): Promise<void> {
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    await deps.send('No sessions stored - nothing to remove.');
+    return;
+  }
+  await deps.send(
+    [
+      `Remove ALL ${accounts.length} session(s)? This deletes every account's cookies and run history and cannot be undone:`,
+      '',
+      ...accounts.map((a) => `- ${accountName(a)}`),
+    ].join('\n'),
+    [[
+      { text: `Yes, remove all ${accounts.length}`, callback_data: 'rmall:yes' },
+      { text: 'Cancel', callback_data: 'rmall:no' },
+    ]],
+  );
+}
+
+/** Handles a tap on one of the inline buttons above. */
+export async function handleCallbackQuery(q: TgCallbackQuery, deps: RemovalDeps = defaultRemovalDeps): Promise<void> {
+  const chatId = q.message?.chat.id;
+  const messageId = q.message?.message_id;
+  // Same access control as commands: only the configured chat.
+  if (chatId === undefined || String(chatId) !== config.telegram.chatId || messageId === undefined) {
+    logger.warn('telegram: ignored a button tap from an unknown chat');
+    await deps.answer(q.id).catch(() => undefined);
+    return;
+  }
+  const data = q.data ?? '';
+
+  if (data === 'rm:done' || data === 'rmall:no') {
+    await deps.answer(q.id, data === 'rmall:no' ? 'Cancelled' : undefined);
+    await deps.edit(chatId, messageId, data === 'rmall:no' ? 'Cancelled - no sessions were removed.' : 'Done.');
+    return;
+  }
+
+  if (data === 'rmall:yes') {
+    if (deps.isRunInProgress()) {
+      await deps.answer(q.id, 'A run is in progress - try again after it finishes');
+      await deps.edit(chatId, messageId, RUN_BUSY_TEXT);
+      return;
+    }
+    const removed = await deps.deleteAllAccounts();
+    await deps.clearLegacySession().catch(() => undefined);
+    logger.info({ removed }, 'all account sessions removed via Telegram');
+    await deps.answer(q.id, `Removed ${removed}`);
+    await deps.edit(
+      chatId,
+      messageId,
+      `Removed all sessions (${removed} account(s)). Send cookie .json files to add accounts again.`,
+    );
+    return;
+  }
+
+  if (data.startsWith('rm:')) {
+    const id = data.slice(3);
+    const before = await deps.listAccounts();
+    const target = before.find((a) => a.id === id);
+    if (deps.isRunInProgress()) {
+      await deps.answer(q.id, 'A run is in progress - try again after it finishes');
+      await deps.send(RUN_BUSY_TEXT);
+      return;
+    }
+    let text: string;
+    if (!target || !(await deps.deleteAccountById(id))) {
+      text = 'That account was already removed.';
+    } else {
+      logger.info({ label: target.label }, 'account session removed via Telegram');
+      text = `Removed ${accountName(target)}`;
+    }
+    const remaining = await deps.listAccounts();
+    if (remaining.length === 0) await deps.clearLegacySession().catch(() => undefined);
+    await deps.answer(q.id, text);
+    // Refresh the same message so the list and buttons stay accurate.
+    const view = buildRemoveSessionView(remaining);
+    await deps.edit(chatId, messageId, `${text}\n\n${view.text}`, view.buttons);
+    return;
+  }
+
+  await deps.answer(q.id);
+}
+
 /** Pending /renew <label> target — consumed by the next cookie payload. */
 let pendingRenewalLabel: string | undefined;
 
@@ -387,7 +571,7 @@ async function accountsText(): Promise<string> {
   for (const a of accounts) {
     const who = a.username ? ` (${a.username})` : '';
     const when = a.lastRunAt
-      ? `, last run ${a.lastRunAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`
+      ? `, last run ${humanLocal(a.lastRunAt)}`
       : '';
     lines.push(`- ${a.label}${who}: ${a.status}${when}`);
     if (a.lastError) lines.push(`  error: ${a.lastError.slice(0, 150)}`);

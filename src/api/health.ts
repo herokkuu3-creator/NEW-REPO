@@ -25,11 +25,15 @@ import {
 } from '../browser/sessionRenewal';
 import { ingestCookiePayload } from '../accounts/ingest';
 import { RunReport, summarizeReport } from '../scheduler/report';
+import { isoLocal } from '../time';
+import { PIN_COOKIE, PinGate, pinPage, readPinFromEnv, safeNext } from './pinGate';
 
 /**
  * Health + minimal admin API.
  *
- *   GET  /health        — unauthenticated liveness + last-run + auth status
+ *   GET  /health        — liveness; full details (accounts, runs) only after the
+ *                         PIN_CODE is entered (browser form or X-PIN-Code header)
+ *   POST /unlock        — PIN form target (sets a short-lived session cookie)
  *   POST /admin/run-now — manual trigger, protected by SETUP_TOKEN (Bearer)
  *   POST /triggerSubmission — re-submit the daily question for every account
  *                          and return one result per account (Bearer)
@@ -58,11 +62,11 @@ function safeAccountView(a: AccountRecord) {
     username: a.username,
     status: a.status,
     cookieCount: parsed.ok ? parsed.state.cookies.length : 0,
-    lastCheckedAt: a.lastCheckedAt?.toISOString() ?? null,
-    lastRunAt: a.lastRunAt?.toISOString() ?? null,
+    lastCheckedAt: a.lastCheckedAt ? isoLocal(a.lastCheckedAt) : null,
+    lastRunAt: a.lastRunAt ? isoLocal(a.lastRunAt) : null,
     lastResult: a.lastResult,
     lastError: a.lastError,
-    createdAt: a.createdAt.toISOString(),
+    createdAt: isoLocal(a.createdAt),
   };
 }
 
@@ -100,22 +104,91 @@ export function formatSubmissionResponse(report: RunReport) {
   };
 }
 
-export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstance> {
+export async function startHealthServer(
+  hooks: ApiHooks,
+  opts: { pinCode?: string } = {},
+): Promise<FastifyInstance> {
   const app = Fastify({
     logger: false, // pino is our logger; fastify's would double-log
     trustProxy: true,
     bodyLimit: 16 * 1024 * 1024, // storageState uploads can exceed the 1MB default
   });
 
+  // --- PIN gate for everything that used to be public ------------------------
+  const pinGate = new PinGate(opts.pinCode ?? readPinFromEnv(), config.api.setupToken);
+  if (!pinGate.configured) {
+    logger.warn('PIN_CODE is not set - /health details stay locked (only {"status":"ok"} is served)');
+  }
+
+  // HTML PIN form posts application/x-www-form-urlencoded (small bodies only).
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string', bodyLimit: 4096 },
+    (_req, body, done) => {
+      done(null, Object.fromEntries(new URLSearchParams(body as string)));
+    },
+  );
+
+  const wantsHtml = (accept: string | undefined): boolean => /text\/html/i.test(accept ?? '');
+
+  app.post('/unlock', async (req, reply) => {
+    const body = (req.body ?? {}) as { pin?: string; next?: string };
+    const next = safeNext(body.next);
+    const result = pinGate.checkPin(req.ip, body.pin);
+    reply.header('Cache-Control', 'no-store');
+    if (result === 'ok') {
+      const token = pinGate.issueToken();
+      reply.header(
+        'Set-Cookie',
+        `${PIN_COOKIE}=${encodeURIComponent(token.value)}; Max-Age=${token.maxAgeS}; Path=/; HttpOnly; SameSite=Strict${req.protocol === 'https' ? '; Secure' : ''}`,
+      );
+      return reply.redirect(next, 303);
+    }
+    const message =
+      result === 'locked'
+        ? 'Too many wrong attempts. Try again in 15 minutes.'
+        : result === 'not-configured'
+          ? 'PIN_CODE is not configured on the server.'
+          : 'Wrong PIN.';
+    logger.warn({ result }, 'PIN unlock attempt rejected');
+    return reply
+      .code(result === 'locked' ? 429 : 401)
+      .type('text/html; charset=utf-8')
+      .send(pinPage({ next, message, disabled: result !== 'wrong' }));
+  });
+
+  app.get('/lock', async (_req, reply) => {
+    reply.header('Set-Cookie', `${PIN_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict`);
+    return reply.redirect('/health', 303);
+  });
+
   const requireAdmin = (authorization: string | undefined): boolean =>
     authorization === `Bearer ${config.api.setupToken}`;
 
-  app.get('/health', async () => {
+  app.get('/health', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    reply.header('X-Robots-Tag', 'noindex, nofollow');
+    if (!pinGate.isUnlocked(req.ip, req.headers)) {
+      // Locked: liveness only — enough for Render's health check, nothing else.
+      if (wantsHtml(req.headers.accept)) {
+        const locked = pinGate.isLockedOut(req.ip);
+        return reply
+          .type('text/html; charset=utf-8')
+          .send(
+            pinPage({
+              next: '/health',
+              message: locked ? 'Too many wrong attempts. Try again in 15 minutes.' : undefined,
+              disabled: locked || !pinGate.configured,
+            }),
+          );
+      }
+      return { status: 'ok' };
+    }
     const [sys, last, accounts] = await Promise.all([getAllSystemState(), latestRun(), listAccounts()]);
     return {
       status: 'ok',
       service: 'leetcode-daily-agent',
-      now: new Date().toISOString(),
+      now: isoLocal(),
       runInProgress: hooks.isRunInProgress(),
       authentication: {
         status: sys['authStatus'] ?? 'unknown',
@@ -137,7 +210,7 @@ export async function startHealthServer(hooks: ApiHooks): Promise<FastifyInstanc
             submissionStatus: last.submissionStatus,
             runtime: last.runtime,
             memory: last.memory,
-            createdAt: last.createdAt.toISOString(),
+            createdAt: isoLocal(last.createdAt),
           }
         : null,
       lastError: sys['lastError'] ?? null,

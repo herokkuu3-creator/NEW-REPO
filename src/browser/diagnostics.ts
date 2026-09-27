@@ -3,6 +3,7 @@ import path from 'node:path';
 import { Page } from 'playwright';
 import { config } from '../config';
 import { logger } from '../logger';
+import { fileStampLocal, isoLocal } from '../time';
 
 /**
  * Failure forensics. When the worker hits Cloudflare verification or any
@@ -28,12 +29,12 @@ export async function captureDiagnostics(
   browserLogs: string[],
 ): Promise<DiagnosticsBundle | null> {
   try {
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const stamp = fileStampLocal();
     const dir = path.join(config.browser.diagnosticsDir, `${stamp}-${reason}`);
     fs.mkdirSync(dir, { recursive: true });
 
     const meta = {
-      timestamp: new Date().toISOString(),
+      timestamp: isoLocal(),
       reason,
       url: page ? safeUrl(page) : null,
       title: page ? await page.title().catch(() => null) : null,

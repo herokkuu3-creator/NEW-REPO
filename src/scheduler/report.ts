@@ -9,6 +9,8 @@
  * run results.
  */
 
+import { isoLocal } from '../time';
+
 export type AccountOutcomeKind = 'solved' | 'failed' | 'expired' | 'rejected' | 'skipped';
 
 export interface AccountOutcome {
@@ -66,7 +68,7 @@ export function buildReport(input: {
     date: input.date,
     reason: input.reason,
     startedAt: input.startedAt,
-    finishedAt: new Date().toISOString(),
+    finishedAt: isoLocal(),
     totals,
     accounts: input.outcomes,
   };

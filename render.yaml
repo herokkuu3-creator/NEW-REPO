@@ -89,6 +89,8 @@ services:
         sync: false
       - key: SETUP_TOKEN
         sync: false # long random string; protects /admin/* endpoints
+      - key: PIN_CODE
+        sync: false # PIN required to view /health details (without it only {"status":"ok"} is shown)
       - key: MAX_SOLUTION_RETRIES
         value: "3"
       - key: LOG_LEVEL

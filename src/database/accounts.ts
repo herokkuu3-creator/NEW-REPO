@@ -75,6 +75,18 @@ export async function deleteAccountByLabel(label: string): Promise<void> {
   await prisma.account.delete({ where: { label } });
 }
 
+/** Removes one account (and, by cascade, its run history). Returns false if it no longer exists. */
+export async function deleteAccountById(id: string): Promise<boolean> {
+  const res = await prisma.account.deleteMany({ where: { id } });
+  return res.count > 0;
+}
+
+/** Removes EVERY account (cascade: run history). Returns how many were removed. */
+export async function deleteAllAccounts(): Promise<number> {
+  const res = await prisma.account.deleteMany({});
+  return res.count;
+}
+
 export interface AccountPatch {
   username?: string | null;
   status?: AccountStatus;

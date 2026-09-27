@@ -43,6 +43,7 @@ import { SolutionCache } from '../solutions/solutionCache';
 import { ensureLanguage, openProblemPage, setEditorCode } from '../leetcode/editor';
 import { submitCurrentEditor } from '../leetcode/submission';
 import { notifyMultiRunReport } from '../notifications/notifier';
+import { isoLocal } from '../time';
 
 /**
  * The daily pipeline — MULTI-ACCOUNT.
@@ -157,12 +158,12 @@ export async function executeDailyRun(
     return buildReport({
       date: todayInTimezone(),
       reason,
-      startedAt: new Date().toISOString(),
+      startedAt: isoLocal(),
       outcomes: [],
     });
   }
   runInProgress = true;
-  const startedAt = new Date().toISOString();
+  const startedAt = isoLocal();
   const forceRun = isForceReason(reason);
 
   try {
@@ -698,7 +699,7 @@ async function finishRun(
       date: updated.date,
       slug: updated.problemSlug,
       state: updated.state,
-      at: updated.updatedAt.toISOString(),
+      at: isoLocal(updated.updatedAt),
     }),
   );
   const solved = state === RunState.SUCCESS;

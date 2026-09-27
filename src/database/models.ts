@@ -101,6 +101,10 @@ export async function setSystemState(key: string, value: string): Promise<void> 
   });
 }
 
+export async function deleteSystemState(key: string): Promise<void> {
+  await prisma.systemState.deleteMany({ where: { key } });
+}
+
 export async function getSystemState(key: string): Promise<string | null> {
   const row = await prisma.systemState.findUnique({ where: { key } });
   return row?.value ?? null;
