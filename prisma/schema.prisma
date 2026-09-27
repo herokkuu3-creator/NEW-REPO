@@ -85,5 +85,6 @@ enum AccountStatus {
   UNKNOWN
   ACTIVE
   EXPIRED
+  REJECTED
   DISABLED
 }
