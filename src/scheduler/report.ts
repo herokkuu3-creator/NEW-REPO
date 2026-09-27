@@ -35,6 +35,7 @@ export interface RunReport {
     solved: number;
     failed: number;
     expired: number;
+    rejected: number;
     skipped: number;
   };
   accounts: AccountOutcome[];
