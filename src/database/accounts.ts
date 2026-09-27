@@ -56,7 +56,7 @@ export async function getAccountByLabel(label: string): Promise<AccountRecord | 
 
 /**
  * Inserts or replaces an account's credential. `meta.status` defaults to
- * UNKNOWN — the next run classifies it as ACTIVE or EXPIRED.
+ * UNKNOWN — the next run classifies it as ACTIVE, EXPIRED, or REJECTED.
  */
 export async function saveAccount(
   label: string,
