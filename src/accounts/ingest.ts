@@ -15,14 +15,16 @@ import type { ValidationOutcome } from '../browser/sessionRenewal';
  *
  *   parse -> read the username from the session token -> pick the account
  *   (explicit label > same username > new) -> STORE (new = add, existing =
- *   override) -> validate against LeetCode -> record the status.
+ *   override). Live validation is optional; normal uploads defer verification
+ *   to the daily run.
  *
  * Storing happens BEFORE the live check on purpose: a failed or blocked check
  * must never lose the user's cookies. The status tells the truth instead:
- *   ACTIVE  — LeetCode confirmed the session signed in
- *   EXPIRED — the token's own expiry passed, or LeetCode reports signed out
- *   UNKNOWN — the check could not run (network / Cloudflare); the daily run
- *             re-verifies it
+ *   ACTIVE   — LeetCode confirmed the session signed in
+ *   EXPIRED  — the token's own expiry passed
+ *   REJECTED — LeetCode explicitly rejected the transferred session; this is
+ *              not treated as proof that the token itself expired
+ *   UNKNOWN  — no live check was requested, or the check could not run
  */
 
 export type Validator = (state: StorageStateShape) => Promise<ValidationOutcome>;
@@ -100,7 +102,7 @@ export async function ingestStorageState(
     return { ...base, username: identity.username ?? null, status: AccountStatus.EXPIRED, detail };
   }
 
-  if (opts.validate === false) {
+  if (opts.validate !== true) {
     return {
       ...base,
       username: identity.username ?? null,
