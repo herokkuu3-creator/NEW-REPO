@@ -13,6 +13,10 @@ import {
 } from '../database/models';
 import { AccountRecord, deleteAccountById, deleteAllAccounts, listAccounts } from '../database/accounts';
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
+import { detectSessionSite } from '../accounts/sessionSite';
+import { ingestCodeforcesCookiePayload } from '../codeforces/renew';
+import { formatCodeforcesAccountOutcome, formatCodeforcesSummary, isCodeforcesRunInProgress, submitNextSolution } from '../codeforces/worker';
+import { listCodeforcesAccounts } from '../codeforces/accounts';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import {
   isRunInProgress,
@@ -88,12 +92,12 @@ interface TgUpdate {
 }
 
 const HELP_TEXT = [
-  '🤖 LeetCode Daily Agent',
+  '🤖 LeetCode + Codeforces Daily Agent',
   '',
   '📎 Just send cookie .json files (one per account) — each file is added as an account named after its LeetCode username; a file for a user that already exists overrides that account.',
   '',
   '🍪 Sessions',
-  '🔄 /renew - how to capture the cookie file on Android',
+  '🔄 /renew - store a LeetCode or Codeforces session; the bot identifies the site automatically',
   '🏷️ /renew <label> - store the NEXT file under this exact label',
   '👥 /accounts - list every account with its cookie status',
   '🗑️ /removesession - list every account with a Remove button (tap to delete that account\'s session)',
@@ -106,25 +110,28 @@ const HELP_TEXT = [
   '🛑 /cancelrange - stop the running range job',
   '',
   'ℹ️ Info',
+  '🟦 /submitnextsolution - submit the next Codeforces solution (one attempt per account/day)',
+  '👥 /cfaccounts - list Codeforces sessions and progress',
+  '',
   '📊 /status - show authentication status and the last run',
   '❌ /cancel - cancel a renewal in progress',
   '❓ /help - show this message',
 ].join('\n');
 
 const RENEW_INSTRUCTIONS = [
-  '📱 LeetCode session renewal: Android only',
+  '🍪 Session renewal — LeetCode or Codeforces',
   '',
-  '👍 No computer is required.',
+  '1️⃣ Sign in manually in Chrome on leetcode.com or codeforces.com.',
+  '2️⃣ Open the Session Capture extension from the active tab.',
+  '3️⃣ Click “Download session JSON”.',
+  '4️⃣ Send the downloaded .json file here with /renew.',
   '',
-  '1️⃣ Open Lemur Browser on your Android phone.',
-  '2️⃣ Open https://leetcode.com/ and sign in normally.',
-  '3️⃣ Open the LeetCode Session Capture extension.',
-  '4️⃣ Tap the capture button.',
-  '5️⃣ Save or download leetcode-session.json.',
-  '6️⃣ Send the .json file to this Telegram bot as a document.',
+  '🔎 The bot identifies the site internally from the exported site field and filename.',
+  '🟩 LeetCode → existing LeetCode account store/run flow.',
+  '🟦 Codeforces → separate Codeforces account store; no LeetCode run is triggered.',
   '',
-  'Multiple accounts: send one .json file per account, one after another. Each file is stored immediately (a new user = new account, a known user = cookies overridden), then checked with LeetCode. Once the uploads stop, today\'s run starts for all accounts.',
-  ].join('\n');
+  'Use /renew <label> before sending a file when you want a specific account label.',
+].join('\n');
 
 /**
  * Single-poller handover.
@@ -296,6 +303,14 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/trigger_submission':
         await handleTriggerSubmission();
         return;
+      case '/submitnextsolution':
+      case '/submit_next_solution':
+        await handleSubmitNextSolution();
+        return;
+      case '/cfaccounts':
+      case '/codeforcesaccounts':
+        await reply(await cfAccountsText());
+        return;
       case '/removesession':
       case '/remove_session':
         await handleRemoveSession();
@@ -331,7 +346,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /status, /triggersubmission, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /status, /triggersubmission, /submitnextsolution, /cfaccounts, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -360,7 +375,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
   });
   pendingRenewalLabel = undefined;
   await reply(result.text);
-  if (result.stored) scheduleBatchRun();
+  if (result.stored && detectSessionSite(payload, fileName) === 'leetcode') scheduleBatchRun();
 }
 
 export interface CookieMessageResult {
@@ -377,7 +392,21 @@ export interface CookieMessageResult {
  */
 export async function processCookieMessage(
   payload: string,
-  opts: { label?: string; fileName?: string; validator?: Validator } = {},
+  opts: {
+  const site = detectSessionSite(payload, opts.fileName);
+  if (site === 'codeforces') {
+    const result = await ingestCodeforcesCookiePayload(payload, { label: opts.label, fileName: opts.fileName });
+    return {
+      stored: result.ok,
+      text: result.ok
+        ? `🟦 Codeforces session stored: ${result.label}${result.username ? ` (${result.username})` : ''}\n${result.detail}\n\n➡️ Use /submitnextsolution to submit the next queued Codeforces solution.`
+        : `❌ Codeforces session was not stored: ${result.detail}`,
+    };
+  }
+  if (site === 'unknown') {
+    return { stored: false, text: '⚠️ Could not identify the session site. Use the Session Capture extension while you are on leetcode.com or codeforces.com, then send that JSON with /renew.' };
+  }
+ label?: string; fileName?: string; validator?: Validator } = {},
 ): Promise<CookieMessageResult> {
   if (!looksLikeCookiePayload(payload)) {
     return {
@@ -396,6 +425,49 @@ export async function processCookieMessage(
   };
 }
 
+/** Runs the next Codeforces solution for all configured Codeforces accounts. */
+export async function handleSubmitNextSolution(
+  runner: typeof submitNextSolution = submitNextSolution,
+  inProgress: () => boolean = isCodeforcesRunInProgress,
+): Promise<{ done: Promise<void> } | null> {
+  if (inProgress()) {
+    await reply('🚧 A Codeforces run is already in progress — wait for its report, then try again.');
+    return null;
+  }
+  await reply('🟦 Starting the next Codeforces solution for all configured Codeforces accounts…');
+  const done = (async () => {
+    const report = await runner('telegram', {
+      onOutcome: (outcome, index, total) => reply(formatCodeforcesAccountOutcome(outcome, index, total)),
+    });
+    if (!report) {
+      await reply('⏳ Codeforces run was not started because another run began at the same time.');
+    } else if (report.accounts.length === 0) {
+      await reply('📭 No Codeforces accounts configured — send a Codeforces session JSON with /renew.');
+    } else {
+      await reply(formatCodeforcesSummary(report));
+    }
+  })().catch(async (err) => {
+    logger.warn({ err: errText(err) }, '/submitnextsolution failed');
+    await reply(`⚠️ /submitnextsolution failed: ${errText(err)}`).catch(() => undefined);
+  });
+  return { done };
+}
+
+async function cfAccountsText(): Promise<string> {
+  const accounts = await listCodeforcesAccounts();
+  if (accounts.length === 0) return '📭 No Codeforces sessions configured. Send a Codeforces session JSON with /renew.';
+  const lines = [`🟦 Codeforces accounts: ${accounts.length}`, ''];
+  for (const account of accounts) {
+    const progress = account.progress;
+    lines.push(
+      `▪️ ${account.label}${account.username ? ` (${account.username})` : ''}: ${account.status}`,
+      `  🎯 next: ${progress?.nextKey ?? 'first queued problem'}`,
+      `  📅 last attempt: ${progress?.lastAttemptDate ?? 'none'}`,
+    );
+    if (account.lastError) lines.push(`  ⚠️ ${account.lastError.slice(0, 180)}`);
+  }
+  return lines.join('\n');
+}
 /**
  * Several files usually arrive back-to-back: wait until the uploads go quiet,
  * then run the daily challenge ONCE for all accounts (instead of one run per
