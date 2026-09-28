@@ -9,7 +9,7 @@ import { logger } from '../logger';
  *   click Submit â†’ capture the submission id from the network response â†’
  *   poll submissionDetails via GraphQL until the judge finishes â†’ classify.
  *
- * The module only runs when AUTO_SUBMIT=true; the orchestrator decides that.
+ * The orchestrator always uses this module when running through the browser transport.
  */
 
 export class SubmissionError extends Error {

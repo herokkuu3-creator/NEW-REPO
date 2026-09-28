@@ -32,7 +32,7 @@ A complete, from-scratch procedure: fresh clone → running, self-scheduling aut
 
 ## 1. What you are deploying, and why it looks this way
 
-The application is a long-lived Node service that wakes on a schedule, drives a headless Chromium browser against your already-authenticated LeetCode session, finds today's Daily Challenge through LeetCode's own GraphQL, fetches the curated C++ solution from walkccc.me by question number, and — depending on one flag — either fills the editor or submits and records the judge's verdict.
+The application is a long-lived Node service that wakes on a schedule, drives a headless Chromium browser against your already-authenticated LeetCode session, finds today's Daily Challenge through LeetCode's own GraphQL, fetches the curated C++ solution from walkccc.me by question number, and submits the validated solution while recording the judge's verdict.
 
 Render's free tier dictates the shape of the deployment in four specific ways:
 
@@ -184,16 +184,11 @@ Open the new service → **Environment**. Fill in and save (Render restarts the 
 | `SETUP_TOKEN` | The random string you generated |
 | `GEMINI_API_KEY` | **Leave empty** with the default walkccc source. Only set it if you switch `SOLUTION_SOURCE` to `llm`. |
 
-Two settings worth a deliberate decision while you're here:
+Submission is automatic: once a solution passes the existing validation checks, both the scheduled daily run and `/triggerSubmission` submit it to LeetCode and wait for the judge result. There is no environment variable or separate approval step for submission.
 
 | Variable | Guidance |
 |---|---|
-| `AUTO_SUBMIT` | Defaults to `false`. Read the warning below before leaving it there. |
 | `RUN_ON_BOOT` | Defaults to `true` — a cold start caused by an external trigger becomes the daily run. Leave it on for the wake-on-trigger pattern (Step 9); harmless either way since the database deduplicates by date. |
-
-> **⚠ `AUTO_SUBMIT=false` does not mean what it means on your laptop.** With `false`, the service fills the editor but never presses Submit — meant to let you review first. On Render, that editor lives inside a headless browser on someone else's machine: you cannot see it, and it is destroyed at the next spin-down. The run will honestly report `SUCCESS` / `EDITOR_FILLED`, but **no challenge will actually be completed**.
->
-> Use `false` while validating the pipeline. Once you trust it, set `AUTO_SUBMIT=true` — with walkccc's curated solutions, correctness risk is low, and the judge's verdict is reported to you on Telegram either way.
 
 ## 8. Step 6 — Confirm the service booted and migrated
 
@@ -255,7 +250,7 @@ curl -X POST \
 curl -s https://<your-service>.onrender.com/health
 ```
 
-You're looking for `lastRun` to populate, with `authentication.status` flipping to `ok` plus your username. A healthy first run with `AUTO_SUBMIT=false`:
+You're looking for `lastRun` to populate, with `authentication.status` flipping to `ok` plus your username. A healthy first run includes a judge verdict:
 
 ```json
 {
@@ -265,7 +260,7 @@ You're looking for `lastRun` to populate, with `authentication.status` flipping 
     "problemSlug": "two-sum",
     "title": "Two Sum",
     "state": "SUCCESS",
-    "submissionStatus": "EDITOR_FILLED (AUTO_SUBMIT=false)"
+    "submissionStatus": "Accepted"
   }
 }
 ```
@@ -274,7 +269,7 @@ Every invocation ends in exactly one terminal state, always persisted — nothin
 
 | State | Meaning and first action |
 |---|---|
-| `SUCCESS` | Pipeline completed. With `AUTO_SUBMIT=true` this means the judge accepted the submission. |
+| `SUCCESS` | The validated solution was submitted and the judge accepted it. |
 | `AUTHENTICATION_REQUIRED` | Stored session missing/expired. Repeat Steps 3 and 7. |
 | `CLOUDFLARE_VERIFICATION_REQUIRED` | Verification page appeared (screenshot in Telegram). Complete it once in a normal browser, then repeat Steps 3 and 7. |
 | `DAILY_PROBLEM_NOT_FOUND` | LeetCode returned no active daily challenge. Usually transient; retry later. |
@@ -321,7 +316,7 @@ Don't declare success on one green response. Confirm all four signals:
 - [ ] **Telegram delivered the summary** — problem, difficulty, language, status, runtime, and the problem link.
 - [ ] **The daily trigger is armed** — your cron job shows a recent successful execution, and tomorrow's run is scheduled.
 
-With `AUTO_SUBMIT=true`, the strongest confirmation is LeetCode's own submission history showing an accepted solution for today — the only signal that proves the challenge was genuinely completed.
+The strongest confirmation is LeetCode's own submission history showing an accepted solution for today — the only signal that proves the challenge was genuinely completed.
 
 ## 13. Ongoing maintenance: the 30-day database expiry
 
@@ -361,7 +356,6 @@ Free Render Postgres databases expire thirty days after creation (14-day grace, 
 - [ ] Session uploaded via `/admin/storage-state`, acknowledged with a cookie count.
 - [ ] A smoke-test run reached a terminal state; Telegram delivered the summary.
 - [ ] External cron configured: keep-alive every 10 min, or a daily authenticated trigger with a 120 s timeout.
-- [ ] Decision recorded on `AUTO_SUBMIT` — `false` only while validating.
 - [ ] A reminder exists for the Postgres expiry, or an external non-expiring database is in use.
 
 | Free-tier limit | Value as of September 2026 |

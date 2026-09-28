@@ -59,8 +59,6 @@ services:
         value: "true" # covers cold starts triggered by an external cron ping
       - key: LEETCODE_LANGUAGE
         value: cpp
-      - key: AUTO_SUBMIT
-        value: "false"
       # --- Solution source ---------------------------------------------------
       # walkccc (default): fetch curated C++ solutions from walkccc.me — no LLM
       # key needed. Set to "llm" to generate with an LLM instead.

@@ -35,7 +35,6 @@ services:
       TIMEZONE: Asia/Kolkata
       RUN_ON_BOOT: "false"
       LEETCODE_LANGUAGE: cpp
-      AUTO_SUBMIT: "false"
       SOLUTION_SOURCE: walkccc
       TRANSPORT: api
       # Only needed when SOLUTION_SOURCE=llm:

@@ -79,7 +79,6 @@ vi.mock('../src/config', async (orig) => {
     config: {
       ...real.config,
       transport: 'api',
-      submission: { autoSubmit: true },
       solution: { ...(real.config.solution as object), source: 'walkccc' },
       llm: { ...(real.config.llm as object), language: 'cpp' },
     },
@@ -208,6 +207,37 @@ describe('multi-account run shares one solution', () => {
     expect(h.fetchWalkccc).toHaveBeenCalledTimes(1);
     expect(h.submit).toHaveBeenCalledTimes(6);
     expect(again.totals.solved).toBe(3);
+  });
+
+  it('resubmits a previously solved-but-not-submitted row on the normal daily trigger', async () => {
+    h.accounts = [{
+      id: 'id-a1',
+      label: 'a1',
+      username: 'a1',
+      storageState: '{}',
+    }];
+    h.runs.set('id-a1', {
+      id: 'run-a1',
+      accountId: 'id-a1',
+      date: '2026-09-28',
+      problemSlug: 'old-problem',
+      title: 'Old Problem',
+      difficulty: 'Easy',
+      language: 'cpp',
+      state: 'SUCCESS',
+      submissionStatus: 'SOLVED_NOT_SUBMITTED (legacy run)',
+    });
+    h.fetchWalkccc.mockResolvedValue({ code: 'class Solution {};', sourceUrl: 'u' });
+
+    const { executeDailyRun } = await import('../src/scheduler/dailyWorker');
+    const report = await executeDailyRun('cron');
+
+    expect(h.submit).toHaveBeenCalledTimes(1);
+    expect(report.accounts[0]).toMatchObject({
+      label: 'a1',
+      kind: 'solved',
+      submissionId: '1',
+    });
   });
 
   it('calls onAccountOutcome once per account, in order, as each finishes', async () => {

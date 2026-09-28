@@ -16,7 +16,7 @@ export function createRunner(language: string): CodeRunner {
       return new PythonRunner();
     default:
       // C++ has no local runner: walkccc's solutions are human-verified, and
-      // LeetCode's own judge (when AUTO_SUBMIT=true) is the real compiler.
+      // LeetCode's own judge is the real compiler.
       throw new Error(`no local runner for language: ${language}`);
   }
 }

@@ -22,7 +22,6 @@ async function main(): Promise<void> {
     {
       schedule: `${config.schedule.hour}:${String(config.schedule.minute).padStart(2, '0')}`,
       timezone: config.schedule.timezone,
-      autoSubmit: config.submission.autoSubmit,
       solutionSource: config.solution.source,
       llmProvider: config.llm.provider,
       llmModel: config.llm.model,

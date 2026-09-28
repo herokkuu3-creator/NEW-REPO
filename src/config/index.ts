@@ -75,7 +75,6 @@ const envSchema = z.object({
   //   HTML pages to load unchallenged).
   TRANSPORT: z.enum(['api', 'browser']).default('api'),
 
-  AUTO_SUBMIT: boolFromString,
 
   TELEGRAM_BOT_TOKEN: z.string().default(''),
   TELEGRAM_CHAT_ID: z.string().default(''),
@@ -131,7 +130,6 @@ export type Config = Readonly<{
     walkcccBaseUrl: string;
   };
   transport: 'api' | 'browser';
-  submission: { autoSubmit: boolean };
   telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean };
   api: { port: number; setupToken: string; publicUrl: string };
   logLevel: z.infer<typeof envSchema>['LOG_LEVEL'];
@@ -182,7 +180,6 @@ function loadConfig(): Config {
       walkcccBaseUrl: env.WALKCCC_BASE_URL,
     },
     transport: env.TRANSPORT,
-    submission: { autoSubmit: env.AUTO_SUBMIT },
     telegram: {
       botToken: env.TELEGRAM_BOT_TOKEN,
       chatId: env.TELEGRAM_CHAT_ID,

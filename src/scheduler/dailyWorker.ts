@@ -310,9 +310,13 @@ async function runForAccount(
 
     // --- 2) Per-account duplicate guard ------------------------------------
     const existing = await findRunByDate(account.id, today);
+    const previousRunWasNotSubmitted =
+      existing?.state === RunState.SUCCESS &&
+      /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(existing.submissionStatus ?? '');
     if (
       !forceRun &&
       existing &&
+      !previousRunWasNotSubmitted &&
       (existing.state === RunState.SUCCESS || existing.state === RunState.PENDING)
     ) {
       logger.info({ label, today, state: existing.state }, 'account already handled today — skipping');
@@ -516,18 +520,6 @@ async function submitViaApi(
   code: string,
   run: DailyRunRecord,
 ): Promise<AccountOutcome> {
-  if (!config.submission.autoSubmit) {
-    // There is no editor to fill over the API — the only state-changing call is
-    // a submission. Respect the safety default and stop before it.
-    logger.warn(
-      { label: account.label },
-      'TRANSPORT=api with AUTO_SUBMIT=false — the solution was produced and validated but NOT submitted (the API has no "fill editor only" step). Set AUTO_SUBMIT=true to submit.',
-    );
-    return finishRun(account, username, run, RunState.SUCCESS, {
-      submissionStatus: 'SOLVED_NOT_SUBMITTED (TRANSPORT=api, AUTO_SUBMIT=false)',
-    });
-  }
-
   if (!problem.questionId) {
     return finishRun(account, username, run, RunState.SUBMISSION_ERROR, {
       error:
@@ -594,13 +586,6 @@ async function submitViaBrowser(
     logger.warn({ label: account.label, language: config.llm.language }, 'could not confirm language selection');
   }
   await setEditorCode(page, code);
-
-  if (!config.submission.autoSubmit) {
-    logger.info({ label: account.label }, 'AUTO_SUBMIT=false — editor filled, not submitting');
-    return finishRun(account, username, run, RunState.SUCCESS, {
-      submissionStatus: 'EDITOR_FILLED (AUTO_SUBMIT=false)',
-    });
-  }
 
   let result;
   try {
