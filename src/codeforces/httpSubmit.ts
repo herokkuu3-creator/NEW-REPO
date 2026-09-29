@@ -24,6 +24,7 @@ const BASE = 'https://codeforces.com';
 const CHALLENGE_RE = /<title>\s*Just a moment|cf-chl|challenge-platform\/h\/[a-z]\/orchestrate/i;
 const PENDING = new Set(['TESTING', 'QUEUE', 'QUEUED', undefined, null]);
 const VERDICT_WINDOW_MS = 180_000;
+const POLL_INTERVAL_MS = 3_000;
 
 export type HttpSubmitResult =
   | { ok: true; submissionId: string; verdict: string }
@@ -36,6 +37,11 @@ export type HttpSubmitResult =
     };
 
 export interface FormPage {
+  /** Verbatim action attribute of the submit form: carries Codeforces' per-page
+   *  query parameters (e.g. ?adcd1e=<token>&csrf_token=<token>) exactly as the
+   *  browser would post them. Posting anywhere else gets a 302 back to "/". */
+  action: string;
+  hidden: Record<string, string>;
   csrf: string | null;
   signedInHandle: string | null;
   problemIndexes: string[];
@@ -110,6 +116,20 @@ export function parseSubmitPage(html: string): FormPage {
   const signedIn = /\/logout/i.test(header);
   const signedInHandle = signedIn ? (/href=["']\/profile\/([^"'/?#]+)["']/i.exec(header)?.[1] ?? null) : null;
 
+  const formTag = [...html.matchAll(/<form\b[^>]*>([\s\S]*?)<\/form>/gi)].find((m) =>
+    /name=["']source["']/.test(m[1] ?? ''),
+  );
+  const formBody = formTag?.[1] ?? html;
+  const action = /<form\b[^>]*\baction=["']([^"']*)["']/i.exec(formTag?.[0] ?? '')?.[1] ?? '';
+  const hidden: Record<string, string> = {};
+  for (const input of formBody.matchAll(/<input\b[^>]*>/gi)) {
+    const tag = input[0];
+    if (!/type=["']hidden["']/i.test(tag)) continue;
+    const name = /name=["']([^"']+)["']/i.exec(tag)?.[1];
+    const value = /value=["']([^"']*)["']/i.exec(tag)?.[1] ?? '';
+    if (name) hidden[decode(name)] = decode(value);
+  }
+
   const select = (name: string) =>
     new RegExp(`<select[^>]*name=["']${name}["'][^>]*>([\\s\\S]*?)</select>`, 'i').exec(html)?.[1] ?? '';
   const options = (block: string) =>
@@ -119,7 +139,9 @@ export function parseSubmitPage(html: string): FormPage {
     }));
 
   return {
-    csrf,
+    action: action ? new URL(decode(action), BASE).toString() : '',
+    hidden,
+    csrf: csrf ?? hidden['csrf_token'] ?? null,
     signedInHandle: signedInHandle ? decodeURIComponent(signedInHandle) : null,
     problemIndexes: options(select('submittedProblemIndex'))
       .map((o) => o.value)
@@ -192,7 +214,8 @@ export function createClient(state: StoredCodeforcesState): HttpClient {
   };
   const cookie = () => [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
   const run = async (path: string, init: { method: 'GET' | 'POST'; body?: string; referer?: string }) => {
-    const res = await impit.fetch(`${BASE}${path}`, {
+    const url = path.startsWith('http') ? path : `${BASE}${path}`;
+    const res = await impit.fetch(url, {
       method: init.method,
       redirect: 'manual',
       headers: {
@@ -200,7 +223,7 @@ export function createClient(state: StoredCodeforcesState): HttpClient {
         accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.5',
         ...(init.body
-          ? { 'content-type': 'application/x-www-form-urlencoded', origin: BASE, referer: init.referer ?? `${BASE}${path}` }
+          ? { 'content-type': 'application/x-www-form-urlencoded', origin: BASE, referer: init.referer ?? url }
           : {}),
       },
       ...(init.body ? { body: init.body } : {}),
@@ -228,94 +251,130 @@ export async function submitViaHttp(
   const client = deps.client ?? createClient(state);
   const wait = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = deps.now ?? Date.now;
-  const path = submitPaths(entry);
+  // A finished contest refuses POSTs to /contest/<id>/submit by redirecting to "/",
+  // so the problemset endpoint is tried as well when that happens.
+  const candidates = entry.gym
+    ? [`/gym/${entry.contestId}/submit`]
+    : [`/contest/${entry.contestId}/submit`, `/problemset/submit/${entry.contestId}/${entry.problemIndex}`];
+  const attempts: string[] = [];
 
-  // 1. Open the submit page (the "2nd snap" request).
-  const page = await client.get(path);
-  if (page.status === 403 || CHALLENGE_RE.test(page.body)) {
-    return { ok: false, kind: 'blocked', error: `Cloudflare challenged GET ${path} (HTTP ${page.status})` };
-  }
-  if (page.status >= 300 && page.status < 400) {
+  for (const path of candidates) {
+    const page = await client.get(path);
+    if (page.status === 403 || CHALLENGE_RE.test(page.body)) {
+      return { ok: false, kind: 'blocked', error: `Cloudflare challenged GET ${path} (HTTP ${page.status})` };
+    }
+    if (page.status >= 300 && page.status < 400) {
+      return {
+        ok: false,
+        kind: 'signed-out',
+        error: `Codeforces redirected ${path} to ${page.location ?? '?'} — the session cookies are not signed in; re-send them with /renew`,
+      };
+    }
+    const form = parseSubmitPage(page.body);
+    if (!form.csrf) return { ok: false, kind: 'error', error: `no csrf_token on ${path} (HTTP ${page.status})` };
+    if (!form.signedInHandle) {
+      return { ok: false, kind: 'signed-out', error: 'Codeforces served the submit page anonymously — re-send the session cookies with /renew' };
+    }
+    const handle = form.signedInHandle;
+    if (expectedHandle && handle.toLowerCase() !== expectedHandle.toLowerCase()) {
+      logger.warn({ expectedHandle, handle }, 'Codeforces cookies belong to a different handle than stored');
+    }
+    if (form.problemIndexes.length && !form.problemIndexes.some((p) => p.toUpperCase() === entry.problemIndex!.toUpperCase())) {
+      return { ok: false, kind: 'rejected', error: `contest ${entry.contestId} has no problem ${entry.problemIndex} (has ${form.problemIndexes.join(', ')})` };
+    }
+    const programTypeId = pickLanguage(form.languages, entry.language);
+    if (!programTypeId) {
+      return { ok: false, kind: 'rejected', error: `no ${entry.language === 'python' ? 'Python' : 'C++'} compiler offered on ${path}` };
+    }
+
+    const list = () =>
+      entry.gym ? fetchContestStatus(entry.contestId!, handle, 30) : fetchUserStatus(handle, 30);
+    const before = new Set((await list().catch(() => [] as CodeforcesSubmission[])).map((x) => x.id));
+    const startedAt = Math.floor(now() / 1000);
+
+    const jar = client.jar;
+    const seed = jar?.get('39ce7') ?? state.cookies.find((c) => c.name === '39ce7')?.value ?? '';
+    const body = new URLSearchParams({
+      ...form.hidden,
+      csrf_token: form.csrf,
+      ftaa: jar?.get('_ftaa') ?? randomFtaa(),
+      bfaa: jar?.get('_bfaa') ?? randomHex(32),
+      action: 'submitSolutionFormSubmitted',
+      submittedProblemIndex: entry.problemIndex,
+      programTypeId,
+      source: code,
+      tabSize: '4',
+      sourceFile: '',
+      _tta: String(computeTta(seed)),
+    });
+    // Post to the form's own action, so Codeforces' per-page parameters survive.
+    const target = form.action || `${BASE}${path}?csrf_token=${encodeURIComponent(form.csrf)}`;
+    const post = await client.post(target, body, `${BASE}${path}`);
+    logger.info(
+      { path, target, hidden: Object.keys(form.hidden), status: post.status, location: post.location },
+      'Codeforces submission posted',
+    );
+
+    if (post.status === 403 || CHALLENGE_RE.test(post.body)) {
+      return { ok: false, kind: 'blocked', error: `Cloudflare challenged the submit POST (HTTP ${post.status})` };
+    }
+    const formError = post.status === 200 ? extractFormError(post.body) : null;
+    if (formError) return { ok: false, kind: 'rejected', error: `Codeforces refused the submission: ${formError}` };
+    const redirectedTo = post.location ? safePath(post.location) : null;
+    if (post.status >= 300 && post.status < 400 && (redirectedTo === '/' || redirectedTo === null)) {
+      attempts.push(`${path}: POST ${post.status} → ${post.location} (this endpoint refused the form)`);
+      continue;
+    }
+    if (post.status >= 400) {
+      return { ok: false, kind: 'error', error: `submit POST to ${target} returned HTTP ${post.status}` };
+    }
+
+    const deadline = now() + VERDICT_WINDOW_MS;
+    // Bounded by iterations as well as by the clock, so a stalled clock can never spin.
+    const maxPolls = Math.ceil(VERDICT_WINDOW_MS / POLL_INTERVAL_MS) + 2;
+    let latest: CodeforcesSubmission | undefined;
+    for (let poll = 0; poll < maxPolls && now() < deadline; poll++) {
+      await wait(POLL_INTERVAL_MS);
+      const found = (await list().catch(() => [] as CodeforcesSubmission[]))
+        .filter((x) => !before.has(x.id) && x.creationTimeSeconds >= startedAt - 30)
+        .filter((x) => (x.problem.contestId ?? x.contestId) === entry.contestId && x.problem.index === entry.problemIndex)
+        .sort((a, b) => b.id - a.id)[0];
+      if (found) {
+        latest = found;
+        if (!PENDING.has(found.verdict)) break;
+      }
+    }
+    if (!latest) {
+      return {
+        ok: false,
+        kind: 'judge-timeout',
+        error: `posted via ${path} (HTTP ${post.status} → ${post.location ?? '?'}) but no ${entry.contestId}/${entry.problemIndex} submission appeared in the API`,
+        handle,
+      } as HttpSubmitResult & { handle: string };
+    }
+    const verdict = latest.verdict ?? 'TESTING';
+    if (verdict === 'OK') return { ok: true, submissionId: String(latest.id), verdict, handle };
     return {
       ok: false,
-      kind: 'signed-out',
-      error: `Codeforces redirected ${path} to ${page.location ?? '?'} — the session cookies are not signed in; re-send them with /renew`,
+      kind: PENDING.has(latest.verdict) ? 'judge-timeout' : 'rejected',
+      error: PENDING.has(latest.verdict) ? `still ${verdict} after ${VERDICT_WINDOW_MS / 1000}s` : `Codeforces verdict: ${verdict}`,
+      submissionId: String(latest.id),
+      verdict,
+      handle,
     };
   }
-  const form = parseSubmitPage(page.body);
-  if (!form.csrf) return { ok: false, kind: 'error', error: `no csrf_token on ${path} (HTTP ${page.status})` };
-  if (!form.signedInHandle) {
-    return { ok: false, kind: 'signed-out', error: 'Codeforces served the submit page anonymously — re-send the session cookies with /renew' };
-  }
-  const handle = form.signedInHandle;
-  if (expectedHandle && handle.toLowerCase() !== expectedHandle.toLowerCase()) {
-    logger.warn({ expectedHandle, handle }, 'Codeforces cookies belong to a different handle than stored');
-  }
-  if (form.problemIndexes.length && !form.problemIndexes.some((p) => p.toUpperCase() === entry.problemIndex!.toUpperCase())) {
-    return { ok: false, kind: 'rejected', error: `contest ${entry.contestId} has no problem ${entry.problemIndex} (has ${form.problemIndexes.join(', ')})` };
-  }
-  const programTypeId = pickLanguage(form.languages, entry.language);
-  if (!programTypeId) {
-    return { ok: false, kind: 'rejected', error: `no ${entry.language === 'python' ? 'Python' : 'C++'} compiler offered on ${path}` };
-  }
 
-  // Baseline of existing submissions so the new one is unambiguous.
-  const list = () =>
-    entry.gym ? fetchContestStatus(entry.contestId!, handle, 30) : fetchUserStatus(handle, 30);
-  const before = new Set((await list().catch(() => [] as CodeforcesSubmission[])).map((s) => s.id));
-  const startedAt = Math.floor(now() / 1000);
-
-  // 2. Submit (the "3rd/4th snap" request + payload).
-  const jar = client.jar;
-  const seed = jar?.get('39ce7') ?? state.cookies.find((c) => c.name === '39ce7')?.value ?? '';
-  const body = new URLSearchParams({
-    csrf_token: form.csrf,
-    ftaa: jar?.get('_ftaa') ?? randomFtaa(),
-    bfaa: jar?.get('_bfaa') ?? randomHex(32),
-    action: 'submitSolutionFormSubmitted',
-    submittedProblemIndex: entry.problemIndex,
-    programTypeId,
-    source: code,
-    tabSize: '4',
-    sourceFile: '',
-    _tta: String(computeTta(seed)),
-  });
-  const post = await client.post(`${path}?csrf_token=${form.csrf}`, body, `${BASE}${path}`);
-  if (post.status === 403 || CHALLENGE_RE.test(post.body)) {
-    return { ok: false, kind: 'blocked', error: `Cloudflare challenged the submit POST (HTTP ${post.status})` };
-  }
-  const formError = post.status === 200 ? extractFormError(post.body) : null;
-  if (formError) return { ok: false, kind: 'rejected', error: `Codeforces refused the submission: ${formError}` };
-  if (post.status >= 300 && post.status < 400 && /\/enter/i.test(post.location ?? '')) {
-    return { ok: false, kind: 'signed-out', error: 'Codeforces sent the submit to the login page — re-send the session cookies with /renew' };
-  }
-  logger.info({ handle, problem: `${entry.contestId}${entry.problemIndex}`, status: post.status, location: post.location }, 'Codeforces submission posted');
-
-  // 3. Verdict from the official API.
-  const deadline = now() + VERDICT_WINDOW_MS;
-  let latest: CodeforcesSubmission | undefined;
-  while (now() < deadline) {
-    await wait(3_000);
-    const found = (await list().catch(() => [] as CodeforcesSubmission[]))
-      .filter((s) => !before.has(s.id) && s.creationTimeSeconds >= startedAt - 30)
-      .filter((s) => (s.problem.contestId ?? s.contestId) === entry.contestId && s.problem.index === entry.problemIndex)
-      .sort((a, b) => b.id - a.id)[0];
-    if (found) {
-      latest = found;
-      if (!PENDING.has(found.verdict)) break;
-    }
-  }
-  if (!latest) {
-    return { ok: false, kind: 'judge-timeout', error: `submission was posted (HTTP ${post.status} → ${post.location ?? '?'}) but never appeared in the API`, handle } as HttpSubmitResult & { handle: string };
-  }
-  const verdict = latest.verdict ?? 'TESTING';
-  if (verdict === 'OK') return { ok: true, submissionId: String(latest.id), verdict, handle };
   return {
     ok: false,
-    kind: PENDING.has(latest.verdict) ? 'judge-timeout' : 'rejected',
-    error: PENDING.has(latest.verdict) ? `still ${verdict} after ${VERDICT_WINDOW_MS / 1000}s` : `Codeforces verdict: ${verdict}`,
-    submissionId: String(latest.id),
-    verdict,
-    handle,
+    kind: 'rejected',
+    error: `Codeforces refused the submission on every endpoint — ${attempts.join(' | ')}`,
   };
+}
+
+function safePath(location: string): string | null {
+  try {
+    return new URL(location, BASE).pathname;
+  } catch {
+    return null;
+  }
 }
