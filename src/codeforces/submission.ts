@@ -64,6 +64,10 @@ export interface BrowserPostOutcome {
   finalUrl: string;
   /** Whether the Cloudflare Turnstile field on the form carried a token when it was posted. */
   turnstile: boolean;
+  /** Whether a submit control inside the submit form itself was found and clicked. */
+  clicked: boolean;
+  /** Whether Turnstile rendered an interactive widget instead of solving itself. */
+  interactive: boolean;
 }
 
 /**
@@ -204,37 +208,42 @@ export async function postSubmitForm(
     status: null,
     finalUrl: page.url(),
     turnstile: false,
+    clicked: false,
+    interactive: false,
   });
 
   try {
     await openSubmitForm(page, source);
-    const turnstile = await fillSubmitForm(page, source, code);
-    const { clicked, status } = await clickSubmit(page);
-    if (!clicked) {
-      return { ...fail('submission-error', `Codeforces submit button was not found on ${page.url()}`), status, turnstile };
+    const ts = await fillSubmitForm(page, source, code);
+    const click = await clickSubmit(page);
+    const flags = { turnstile: ts.turnstile, clicked: click.clicked, interactive: ts.interactive };
+    if (!click.clicked) {
+      return {
+        ...fail('submission-error', `Codeforces submit control was not found inside the submit form on ${page.url()}`),
+        status: click.status,
+        ...flags,
+      };
     }
+    logger.info({ ...flags, status: click.status }, 'Codeforces submit form posted from the browser');
 
     const body = await readBody(page);
     if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(page.url())) {
-      // A managed challenge answered the POST. Its JavaScript replays the
-      // request once it clears, so give the browser time instead of reporting
-      // the interstitial as a refusal.
-      const cleared = await waitOutChallenge(page);
+      await waitOutChallenge(page);
       const settled = await readBody(page);
       const settledUrl = page.url();
       if (CHALLENGE_RE.test(settled) || CHALLENGE_RE.test(settledUrl)) {
         return {
           ok: false,
           kind: 'blocked',
-          error: `Codeforces cloudflare challenge did not clear in the browser (HTTP ${status ?? '?'}, ${settledUrl})`,
-          status,
+          error: `Codeforces cloudflare challenge did not clear in the browser (HTTP ${click.status ?? '?'}, ${settledUrl})`,
+          status: click.status,
           finalUrl: settledUrl,
-          turnstile,
+          ...flags,
         };
       }
-      return finishPost(settled, settledUrl, status, turnstile, page);
+      return finishPost(settled, settledUrl, click.status, flags);
     }
-    return finishPost(body, page.url(), status, turnstile, page);
+    return finishPost(body, page.url(), click.status, flags);
   } catch (err) {
     const message = errorMessage(err);
     const kind = err instanceof CodeforcesBlockedError || CHALLENGE_RE.test(message) ? 'blocked' : 'submission-error';
@@ -246,29 +255,27 @@ function finishPost(
   body: string,
   finalUrl: string,
   status: number | null,
-  turnstile: boolean,
-  page: Page,
+  flags: { turnstile: boolean; clicked: boolean; interactive: boolean },
 ): BrowserPostOutcome {
   if (SIGNED_OUT_RE.test(body) || /\/enter(?:[/?#]|$)/i.test(finalUrl)) {
-    return { ok: false, kind: 'signed-out', error: 'Codeforces answered the submission with a signed-out page; re-send the session cookies with /renew', status, finalUrl, turnstile };
+    return {
+      ok: false,
+      kind: 'signed-out',
+      error: 'Codeforces answered the submission with a signed-out page; re-send the session cookies with /renew',
+      status,
+      finalUrl,
+      ...flags,
+    };
   }
   if (REJECTION_RE.test(body)) {
-    return { ok: false, kind: 'submission-error', error: compactBodyError(body), status, finalUrl, turnstile };
+    return { ok: false, kind: 'submission-error', error: compactBodyError(body), status, finalUrl, ...flags };
   }
   if (!/codeforces\.com/i.test(finalUrl)) {
-    return { ok: false, kind: 'submission-error', error: `the submit form left codeforces.com (${finalUrl})`, status, finalUrl, turnstile };
+    return { ok: false, kind: 'submission-error', error: `the submit form left codeforces.com (${finalUrl})`, status, finalUrl, ...flags };
   }
-  void page;
-  return { ok: true, status, finalUrl, turnstile };
+  return { ok: true, status, finalUrl, ...flags };
 }
 
-/**
- * Waits out a Cloudflare managed challenge. The interstitial carries
- * `cf-chl` / "Just a moment..." and its own JavaScript retries the request a few
- * seconds later; only a client that runs that script ever reaches Codeforces, so
- * polling for the page to leave the interstitial is the difference between a
- * verdict and a bogus "blocked" report.
- */
 /**
  * How long to let a managed challenge clear. Configurable so tests do not sit
  * through a minute of polling that a page double will never satisfy.
@@ -355,7 +362,7 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
   throw new CodeforcesSubmissionError(message);
 }
 
-async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string): Promise<boolean> {
+async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string): Promise<{ turnstile: boolean; interactive: boolean }> {
   const problemIndex = source.problemIndex!;
   const contestId = source.contestId!;
   const fields = await readFields(page);
@@ -422,50 +429,79 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
     throw new CodeforcesSubmissionError(`Codeforces ${csrfName} is empty — the submit page was not served correctly`);
   }
 
-  return waitForTurnstile(page);
+  return ensureTurnstile(page);
 }
 
-/**
- * Cloudflare's Turnstile widget sits on the submit form and fills a
- * `turnstileToken` field once it solves; Codeforces refuses the POST without it.
- * Waiting for it is what tells us whether the browser actually cleared the
- * challenge, so the outcome is logged either way.
- */
-async function waitForTurnstile(page: Page, timeoutMs = TURNSTILE_WAIT_MS): Promise<boolean> {
-  const field = page.locator('input[name="turnstileToken"]').first();
-  if ((await field.count().catch(() => 0)) === 0) return false;
+/** The token Cloudflare's widget writes into the form; Codeforces refuses to post without it. */
+async function turnstileToken(page: Page): Promise<string> {
+  return page.locator('input[name="turnstileToken"]').first().inputValue().catch(() => '');
+}
 
+async function waitForToken(page: Page, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const value = await field.inputValue().catch(() => '');
-    if (value.trim()) {
-      logger.info('Codeforces Turnstile solved itself in the browser');
-      return true;
-    }
+    if ((await turnstileToken(page)).trim()) return true;
     await sleep(1_000);
   }
-  logger.warn({ timeoutMs }, 'Codeforces Turnstile field stayed empty — the challenge did not solve in the browser');
   return false;
 }
 
+/**
+ * Cloudflare's Turnstile widget sits on the submit form and fills `turnstileToken`;
+ * Codeforces refuses the POST without it. A click that leaves the page where it
+ * was is exactly what an unsolved widget looks like. A trusted client solves
+ * itself invisibly in a second or two. From a datacenter IP the widget can
+ * instead render an interactive checkbox inside its own cross-origin frame,
+ * which a user would tick, so we tick it too and report both outcomes.
+ */
+async function ensureTurnstile(
+  page: Page,
+  timeoutMs = TURNSTILE_WAIT_MS,
+): Promise<{ turnstile: boolean; interactive: boolean }> {
+  if ((await page.locator('input[name="turnstileToken"]').first().count().catch(() => 0)) === 0) {
+    return { turnstile: false, interactive: false };
+  }
+  if (await waitForToken(page, timeoutMs)) {
+    logger.info('Codeforces Turnstile solved itself in the browser');
+    return { turnstile: true, interactive: false };
+  }
+
+  const widget = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
+  for (const selector of ['input[type="checkbox"]', '#challenge-stage', 'label']) {
+    const box = widget.locator(selector).first();
+    if ((await box.count().catch(() => 0)) === 0) continue;
+    logger.info({ selector }, 'Codeforces Turnstile is interactive - ticking its widget');
+    await box
+      .click({ timeout: 10_000, force: true })
+      .catch((err) => logger.warn({ selector, err: errorMessage(err) }, 'could not tick the Turnstile widget'));
+    if (await waitForToken(page, timeoutMs)) {
+      logger.info({ selector }, 'Codeforces Turnstile accepted the tick');
+      return { turnstile: true, interactive: true };
+    }
+  }
+
+  logger.warn({ timeoutMs }, 'Codeforces Turnstile stayed empty - the submit form cannot be posted');
+  return { turnstile: false, interactive: true };
+}
+
+/**
+ * Clicks the submit control OF THE SUBMIT FORM. The page also carries a header
+ * search form whose button is `type="submit"` too, so the control is looked up
+ * inside the form holding the source textarea rather than page-wide: clicking the
+ * wrong form is a click that posts nothing at all.
+ */
 async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: number | null }> {
-  const input = page.locator('input[type="submit"][value*="Submit" i]').first();
-  if ((await input.count().catch(() => 0)) > 0) {
-    const [response] = await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null),
-      input.click({ timeout: 20_000 }),
-    ]);
-    return { clicked: true, status: response?.status() ?? null };
-  }
-  const button = page.locator('button[type="submit"]').filter({ hasText: /submit/i }).first();
-  if ((await button.count().catch(() => 0)) > 0) {
-    const [response] = await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null),
-      button.click({ timeout: 20_000 }),
-    ]);
-    return { clicked: true, status: response?.status() ?? null };
-  }
-  return { clicked: false, status: null };
+  const scoped = page
+    .locator(
+      'form:has(textarea[name="source"]) input[type="submit"], form:has(textarea[name="source"]) button[type="submit"]',
+    )
+    .first();
+  if ((await scoped.count().catch(() => 0)) === 0) return { clicked: false, status: null };
+  const [response] = await Promise.all([
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => null),
+    scoped.click({ timeout: 15_000 }),
+  ]);
+  return { clicked: true, status: response?.status() ?? null };
 }
 
 async function readFields(page: Page): Promise<SubmitField[]> {

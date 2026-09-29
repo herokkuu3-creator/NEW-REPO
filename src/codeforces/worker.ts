@@ -306,7 +306,9 @@ async function submitViaBrowser(
       {
         status: posted.status,
         finalUrl: posted.finalUrl,
+        clicked: posted.clicked,
         turnstile: posted.turnstile,
+        interactive: posted.interactive,
         rssMb: Math.round(process.memoryUsage().rss / 1_048_576),
       },
       'Codeforces submit posted from Firefox',
@@ -317,7 +319,13 @@ async function submitViaBrowser(
   } finally {
     // Free the browser before polling: on the 512MB instance, polling with the
     // browser still open was what killed the service mid-submission.
-    await session.close().catch(() => undefined);
+    const closing = session.close().catch(() => undefined);
+    const bail = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 15_000);
+      timer.unref?.();
+    });
+    await Promise.race([closing, bail]);
+    logger.info({ rssMb: Math.round(process.memoryUsage().rss / 1_048_576) }, 'Codeforces Firefox context closed');
   }
 
   if (!posted.ok) {
