@@ -1,3 +1,4 @@
+import { gunzipSync } from 'node:zlib';
 import { CodeforcesSourceKind, Prisma } from '@prisma/client';
 import { logger } from '../logger';
 import { prisma } from '../database/prisma';
@@ -6,6 +7,8 @@ import { CodeforcesProblem, fetchProblemsetProblems } from './api';
 const SOURCE_OWNER = 'Saurav-Paul';
 const SOURCE_REPO = 'Codeforces-Problem-Solution-By-Saurav-Paul';
 const SOURCE_BRANCH = 'master';
+const SOURCE_TARBALL_URL = `https://codeload.github.com/${SOURCE_OWNER}/${SOURCE_REPO}/tar.gz/refs/heads/${SOURCE_BRANCH}`;
+const SOURCE_TOKEN_ENVS = ['GITHUB_TOKEN', 'GH_TOKEN', 'SOURCE_REPO_TOKEN'] as const;
 const INDEX_CACHE_MS = 30 * 60 * 1000;
 
 const STANDARD_RE = /^\s*(\d+)([A-Z][A-Z0-9]*)\s*-\s*(.*?)\s*\.(cpp|cc|cxx|py)\s*$/i;
@@ -196,13 +199,38 @@ export function buildSourceIndex(files: SourceTreeFile[], problems: CodeforcesPr
 }
 
 async function fetchSourceTree(): Promise<SourceTreeFile[]> {
+  const token = SOURCE_TOKEN_ENVS.map((key) => process.env[key]?.trim()).find((value) => !!value);
+  const routes: Array<{ label: string; run: () => Promise<SourceTreeFile[]> }> = [];
+  if (token) routes.push({ label: 'GitHub API (token)', run: () => fetchSourceTreeViaApi(token) });
+  routes.push({ label: 'codeload tarball', run: fetchSourceTreeViaTarball });
+  if (!token) routes.push({ label: 'GitHub API (anonymous)', run: () => fetchSourceTreeViaApi() });
+
+  const failures: string[] = [];
+  for (const route of routes) {
+    try {
+      const files = await route.run();
+      if (files.length === 0) throw new Error('the source archive contained no files');
+      logger.info({ route: route.label, files: files.length }, 'Codeforces source tree resolved');
+      return files;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      failures.push(`${route.label}: ${message}`);
+      logger.warn({ err: message, route: route.label }, 'Codeforces source tree route failed');
+    }
+  }
+  throw new Error(`source repository tree fetch failed — ${failures.join('; ')}`);
+}
+
+async function fetchSourceTreeViaApi(token?: string): Promise<SourceTreeFile[]> {
   const url = `https://api.github.com/repos/${SOURCE_OWNER}/${SOURCE_REPO}/git/trees/${SOURCE_BRANCH}?recursive=1`;
-  const response = await fetch(url, {
-    headers: { accept: 'application/vnd.github+json' },
-    signal: AbortSignal.timeout(30_000),
-  });
+  const headers: Record<string, string> = { accept: 'application/vnd.github+json' };
+  if (token) headers.authorization = `Bearer ${token}`;
+  const response = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) });
   if (!response.ok) {
-    throw new Error(`source repository tree fetch failed: HTTP ${response.status}`);
+    const quota = response.status === 403 && !token
+      ? ' - the anonymous GitHub API quota is 60 requests/hour and is shared by every service behind this host IP; set GITHUB_TOKEN to raise it to 5000/hour'
+      : '';
+    throw new Error(`GitHub API returned HTTP ${response.status}${quota}`);
   }
   const body = (await response.json()) as {
     truncated?: boolean;
@@ -212,6 +240,70 @@ async function fetchSourceTree(): Promise<SourceTreeFile[]> {
   return (body.tree ?? [])
     .filter((e): e is { type: 'blob'; path: string; sha: string } => e.type === 'blob' && typeof e.path === 'string' && typeof e.sha === 'string')
     .map((e) => ({ path: e.path, sha: e.sha }));
+}
+
+async function fetchSourceTreeViaTarball(): Promise<SourceTreeFile[]> {
+  const response = await fetch(SOURCE_TARBALL_URL, {
+    headers: { accept: 'application/gzip, application/octet-stream' },
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!response.ok) throw new Error(`codeload tarball returned HTTP ${response.status}`);
+  const gzipped = Buffer.from(await response.arrayBuffer());
+
+  let tar: Buffer;
+  try {
+    tar = gunzipSync(gzipped);
+  } catch (err) {
+    throw new Error(`could not decompress the source archive: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const files = treeFromTarball(tar);
+  if (files.length === 0) throw new Error('the source archive contained no files');
+  return files;
+}
+
+/**
+ * Exported for tests. Walks the tar stream and returns the flat file list with
+ * the archive's top-level folder stripped, so paths match what the GitHub API
+ * returns for the same branch.
+ */
+export function treeFromTarball(tar: Buffer): SourceTreeFile[] {
+  const root = `${SOURCE_REPO}-${SOURCE_BRANCH}/`;
+  const files: SourceTreeFile[] = [];
+  let offset = 0;
+  let longName: string | undefined;
+
+  while (offset + 512 <= tar.length) {
+    const header = tar.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+
+    const name = readTarString(header, 0, 100);
+    const size = Number.parseInt(readTarString(header, 124, 12) || '0', 8);
+    const typeFlag = String.fromCharCode(header[156] || 48);
+    const prefix = readTarString(header, 345, 155);
+    const dataStart = offset + 512;
+    const dataEnd = dataStart + (Number.isFinite(size) ? size : 0);
+    offset = dataStart + (size > 0 ? Math.ceil(size / 512) * 512 : 0);
+
+    if (typeFlag === 'L') {
+      longName = tar.toString('utf8', dataStart, dataEnd).replace(/\0+$/, '');
+      continue;
+    }
+
+    const path = longName ?? (prefix ? `${prefix}/${name}` : name);
+    longName = undefined;
+    if (typeFlag !== '0' && typeFlag !== '\0') continue;
+    if (!path.startsWith(root)) continue;
+    const relative = path.slice(root.length);
+    if (!relative) continue;
+    files.push({ path: relative, sha: '' });
+  }
+  return files;
+}
+
+function readTarString(header: Buffer, start: number, length: number): string {
+  const end = header.indexOf(0, start);
+  const stop = end === -1 || end > start + length ? start + length : end;
+  return header.toString('utf8', start, stop).trim();
 }
 
 function makeResolvedEntry(
