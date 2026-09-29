@@ -15,7 +15,7 @@ import { AccountRecord, deleteAccountById, deleteAllAccounts, listAccounts } fro
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
-import { isCodeforcesRunInProgress, runCodeforcesNow } from '../codeforces/worker';
+import { CODEFORCES_MANUAL_REASON, isCodeforcesRunInProgress, runCodeforcesNow } from '../codeforces/worker';
 import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../codeforces/report';
 import { listCodeforcesAccounts } from '../codeforces/storage';
 import {
@@ -510,7 +510,8 @@ export async function handleCodeforcesSubmitNext(
   }
   await reply('🏆 Submitting the next Codeforces source solution for all Codeforces accounts.');
   const done = (async () => {
-    const report = await runner('telegram', {
+    const report = await runner(CODEFORCES_MANUAL_REASON, {
+      forceDailyAttempt: true,
       onAccountOutcome: (outcome, index, total) =>
         reply(formatCodeforcesAccountMessage(outcome, index, total)),
     });
