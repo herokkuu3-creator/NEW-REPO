@@ -117,7 +117,7 @@ export async function validateCodeforcesStorageState(state: StorageStateShape): 
       timeout: 30_000,
     });
     await session.page.waitForTimeout(500);
-    return inspectCodeforcesSessionPage(session.page);
+    return await inspectCodeforcesSessionPage(session.page);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (CAPTCHA_RE.test(msg)) return { ok: false, reason: 'blocked', error: `Codeforces served a verification page: ${msg}` };
@@ -137,9 +137,15 @@ export async function inspectCodeforcesSessionPage(page: import('playwright').Pa
     return { ok: false, reason: 'signed-out', error: 'Codeforces session is not signed in' };
   }
 
-  const hrefs = await page.locator('a[href]').evaluateAll((anchors) =>
-    anchors.map((a) => ({ href: (a as HTMLAnchorElement).href, text: (a.textContent ?? '').trim() })),
-  );
+  let hrefs: Array<{ href: string; text: string }> = [];
+  try {
+    hrefs = await page.locator('a[href]').evaluateAll((anchors) =>
+      anchors.map((a) => ({ href: (a as HTMLAnchorElement).href, text: (a.textContent ?? '').trim() })),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: 'unknown', error: `could not inspect the Codeforces page: ${msg}` };
+  }
   const profile = hrefs.find((a) => /codeforces\.com\/profile\/[^/?#]+/i.test(a.href));
   if (!profile) {
     return { ok: false, reason: 'unknown', error: 'could not determine the signed-in Codeforces handle from the page' };
