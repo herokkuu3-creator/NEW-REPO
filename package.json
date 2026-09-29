@@ -11,6 +11,7 @@
     "scripts":  {
                     "build":  "tsc -p tsconfig.json",
                     "start":  "node dist/src/main.js",
+                    "submitter":  "node --expose-gc dist/src/codeforces/submitterService.js",
                     "dev":  "tsx watch src/main.ts",
                     "auth:setup":  "tsx scripts/auth-setup.ts",
                     "run:now":  "tsx scripts/run-now.ts",

@@ -19,7 +19,8 @@ import { shouldReleaseDailyAttempt } from './dailyGate';
 import { fetchSolvedProblemKeys } from './api';
 import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
 import type { HttpSubmitResult } from './httpSubmit';
-import { captureBefore, pollForVerdict, postSubmitForm } from './submission';
+import { captureBefore, pollForVerdict, postSubmitForm, type BrowserPostOutcome } from './submission';
+import { isRemoteSubmitterConfigured, submitViaRemoteSubmitter } from './remoteSubmitter';
 import { launchFirefoxWithStorageStateObject } from '../browser/playwright';
 import { logMemory, memoryReading, MemoryWatch, releaseHeap } from '../memory';
 import {
@@ -308,15 +309,20 @@ async function runForAccount(
 }
 
 /**
- * Replays the submit in a headless Firefox and reads the verdict from the public
- * API — still fully unattended.
+ * Posts the submit form and reads the verdict from the public API — fully
+ * unattended.
  *
- * Cloudflare redirects every POST to codeforces.com to "/" unless the client
- * passed its challenge, so header and field shaping can never get the HTTP
- * transport through. Firefox passes that challenge, and it also runs the page's
- * own JavaScript, which is what fills `_tta` (Codeforces.signForms), ftaa/bfaa
- * and the form action in a human's browser. Returns null when no browser could
- * be started, leaving the caller to report the HTTP failure unchanged.
+ * The POST itself happens in a browser, because Codeforces' form carries a
+ * Cloudflare Turnstile field that only a real page can fill, and its POSTs are
+ * answered 302 -> "/" for every other client. WHERE that browser runs depends on
+ * configuration: when a second free web service is configured
+ * (`CODEFORCES_SUBMITTER_URL`), the POST is handed to it, because a headless
+ * Firefox costs ~390MB the instant it launches and this container also runs
+ * Telehram, Prisma and the LeetCode scheduler inside 512MB. Without that
+ * configuration the browser runs locally, watched by the memory guard.
+ *
+ * The verdict poll is always browserless, so it does not matter which side did
+ * the POST.
  */
 async function submitViaBrowser(
   state: Parameters<typeof launchFirefoxWithStorageStateObject>[0],
@@ -327,8 +333,7 @@ async function submitViaBrowser(
 ): Promise<(HttpSubmitResult & { handle?: string }) | null> {
   const user = handle ?? label;
 
-  // All API work happens before the child process exists: the browser used to sit
-  // in memory while the pre-submission snapshot was still being fetched.
+  // All API work happens before any browser exists, local or remote.
   let before: Set<number>;
   try {
     before = await captureBefore(user, entry);
@@ -336,11 +341,77 @@ async function submitViaBrowser(
     return {
       ok: false,
       kind: 'error',
-      error: `could not snapshot Codeforces submissions before browser launch: ${err instanceof Error ? err.message : String(err)}`,
+      error: `could not snapshot Codeforces submissions before submitting: ${err instanceof Error ? err.message : String(err)}`,
       handle: user,
     };
   }
 
+  const posted = isRemoteSubmitterConfigured()
+    ? await submitViaRemoteSubmitter(state, label, user, entry, code)
+    : await postViaLocalBrowser(state, label, entry, code);
+
+  if (!posted) {
+    return {
+      ok: false,
+      kind: 'error',
+      error: 'no Codeforces browser transport is available (neither an isolated submitter URL nor a launchable local Firefox)',
+      handle: user,
+    };
+  }
+
+  if (!posted.ok) {
+    return {
+      ok: false,
+      kind: posted.kind === 'submission-error' ? 'rejected' : (posted.kind ?? 'error'),
+      error: `${posted.error ?? 'Codeforces rejected the submission form'} (${posted.transport})`,
+      handle: user,
+    } as HttpSubmitResult & { handle?: string };
+  }
+
+  const submission = await pollForVerdict(user, entry, before, posted.submittedAt).catch(() => null);
+  if (!submission) {
+    return {
+      ok: false,
+      kind: 'judge-timeout',
+      error: `the ${posted.transport} posted the form (HTTP ${posted.status ?? '?'} → ${posted.finalUrl}) but no new submission appeared in the API`,
+      handle: user,
+    } as HttpSubmitResult & { handle?: string };
+  }
+  const verdict = submission.verdict ?? 'TESTING';
+  if (verdict === 'OK') return { ok: true, submissionId: String(submission.id), verdict, handle: user };
+  return {
+    ok: false,
+    kind: verdict === 'TESTING' ? 'judge-timeout' : 'rejected',
+    error: `Codeforces verdict: ${verdict}`,
+    submissionId: String(submission.id),
+    verdict,
+    handle: user,
+  } as HttpSubmitResult & { handle?: string };
+}
+
+/**
+ * A posted (or failed-to-post) result from either transport. The local fallback
+ * can additionally fail with a transport-level `error`, which the shared tail
+ * below reports as-is rather than mislabelling it as a Codeforces rejection.
+ */
+type LocalPostOutcome = Omit<BrowserPostOutcome, 'kind'> & {
+  kind?: BrowserPostOutcome['kind'] | 'error';
+  submittedAt: number;
+  transport: string;
+};
+
+/**
+ * Local fallback: runs the POST in a Firefox inside THIS container, under the
+ * memory watchdog. Only reachable when no isolated submitter is configured —
+ * on a 512MB instance the browser is very likely to be closed at the ceiling,
+ * which is exactly why the isolated submitter exists.
+ */
+async function postViaLocalBrowser(
+  state: Parameters<typeof launchFirefoxWithStorageStateObject>[0],
+  label: string,
+  entry: SourceIndexEntry,
+  code: string,
+): Promise<LocalPostOutcome | null> {
   releaseHeap();
   await new Promise<void>((resolve) => setTimeout(resolve, 100));
   const available = availableMemoryMb();
@@ -350,9 +421,15 @@ async function submitViaBrowser(
       ok: false,
       kind: 'blocked',
       error:
-        `not starting Firefox: only ${available}MB is free after cleanup; the free-tier floor is ${BROWSER_MIN_FREE_MB}MB. ` +
-        'The source queue is DB-backed now, so a healthy run should have more headroom; set CODEFORCES_BROWSER_MIN_FREE_MB to override.',
-      handle: user,
+        `not starting Firefox locally: only ${available}MB is free after cleanup; the floor is ${BROWSER_MIN_FREE_MB}MB. ` +
+        'Set CODEFORCES_SUBMITTER_URL to run the browser in its own free service instead.',
+      status: null,
+      finalUrl: '',
+      turnstile: false,
+      clicked: false,
+      interactive: false,
+      submittedAt: Math.floor(Date.now() / 1000),
+      transport: 'Firefox transport',
     };
   }
 
@@ -362,18 +439,20 @@ async function submitViaBrowser(
       ok: false,
       kind: 'error',
       error: 'Firefox could not be launched from the stored Codeforces session',
-      handle: user,
+      status: null,
+      finalUrl: '',
+      turnstile: false,
+      clicked: false,
+      interactive: false,
+      submittedAt: Math.floor(Date.now() / 1000),
+      transport: 'Firefox transport',
     };
   }
   logMemory('codeforces firefox launched');
 
-  let posted: Awaited<ReturnType<typeof postSubmitForm>>;
-  let submittedAt: number;
   let pressured = false;
-
-  // Watchdog: if the container nears its ceiling the browser is closed and the
-  // failure is reported, instead of the kernel SIGKILLing the process and taking
-  // the whole service (LeetCode scheduler, Telegram bot) down with it.
+  let posted: BrowserPostOutcome;
+  let submittedAt: number;
   const watch = new MemoryWatch(() => {
     pressured = true;
     logger.error(
@@ -396,18 +475,23 @@ async function submitViaBrowser(
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const { peakMb, tripped } = watch.stop();
+    logMemory('codeforces browser step finished', { peakMb, tripped, pressured });
     return {
       ok: false,
       kind: pressured ? 'blocked' : 'error',
       error: pressured
-        ? `the browser step was stopped at the instance's memory ceiling: ${message}`
+        ? `the local browser step was stopped at the instance's memory ceiling: ${message}`
         : `Firefox transport failed: ${message}`,
-      handle: user,
+      status: null,
+      finalUrl: '',
+      turnstile: false,
+      clicked: false,
+      interactive: false,
+      submittedAt: Math.floor(Date.now() / 1000),
+      transport: 'Firefox transport',
     };
   } finally {
-    const { peakMb, tripped } = watch.stop();
-    // Free the browser before polling: polling with the browser still open is
-    // what killed the service mid-submission.
     const closing = session.close().catch(() => undefined);
     const bail = new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 15_000);
@@ -415,37 +499,11 @@ async function submitViaBrowser(
     });
     await Promise.race([closing, bail]);
     releaseHeap();
-    logMemory('codeforces browser step finished', { peakMb, tripped, pressured });
   }
 
-  if (!posted.ok) {
-    return {
-      ok: false,
-      kind: posted.kind === 'submission-error' ? 'rejected' : (posted.kind ?? 'error'),
-      error: `${posted.error} (Firefox transport)`,
-      handle: user,
-    } as HttpSubmitResult & { handle?: string };
-  }
-
-  const submission = await pollForVerdict(user, entry, before, submittedAt).catch(() => null);
-  if (!submission) {
-    return {
-      ok: false,
-      kind: 'judge-timeout',
-      error: `the Firefox transport posted the form (HTTP ${posted.status ?? '?'} → ${posted.finalUrl}) but no new submission appeared in the API`,
-      handle: user,
-    } as HttpSubmitResult & { handle?: string };
-  }
-  const verdict = submission.verdict ?? 'TESTING';
-  if (verdict === 'OK') return { ok: true, submissionId: String(submission.id), verdict, handle: user };
-  return {
-    ok: false,
-    kind: verdict === 'TESTING' ? 'judge-timeout' : 'rejected',
-    error: `Codeforces verdict: ${verdict}`,
-    submissionId: String(submission.id),
-    verdict,
-    handle: user,
-  } as HttpSubmitResult & { handle?: string };
+  const { peakMb, tripped } = watch.stop();
+  logMemory('codeforces browser step finished', { peakMb, tripped, pressured });
+  return { ...posted, submittedAt, transport: 'Firefox transport' };
 }
 
 function resolveCurrentEntry(queue: SourceIndexEntry[], nextKey: string | null, lastCompletedKey: string | null): SourceIndexEntry | null {

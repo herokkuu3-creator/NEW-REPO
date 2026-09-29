@@ -1,8 +1,8 @@
-import { Page, Response } from 'playwright';
-import { BrowserSession } from '../browser/playwright';
+import type { Page, Response } from 'playwright';
+import type { BrowserSession } from '../browser/playwright';
 import { logger } from '../logger';
 import { fetchUserStatus, fetchContestStatus, CodeforcesSubmission } from './api';
-import { SourceIndexEntry } from './sourceRepo';
+import type { SourceIndexEntry } from './sourceRepo';
 
 export type CodeforcesSubmissionResult =
   | {
