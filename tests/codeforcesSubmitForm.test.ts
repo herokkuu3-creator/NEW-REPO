@@ -12,6 +12,9 @@ import {
 import { formatCodeforcesOutcomeLine } from '../src/codeforces/report';
 import { SourceIndexEntry } from '../src/codeforces/sourceRepo';
 
+// A page double never clears a challenge, so keep the grace period to a tick.
+process.env.CODEFORCES_CHALLENGE_WAIT_MS = '50';
+
 const source = { contestId: 1, problemIndex: 'A', gym: false } as SourceIndexEntry;
 
 const FORM_FIELDS: SubmitField[] = [
