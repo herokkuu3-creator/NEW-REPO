@@ -40,15 +40,21 @@ const state = {
 } as never;
 
 type Reply = { status: number; location?: string | null; body?: string };
-function fakeClient(get: Reply, post: Reply) {
+type Handler = Reply | ((key: string) => Reply);
+function fakeClient(get: Handler, post: Handler) {
   const calls: Array<{ method: string; path: string; form?: URLSearchParams; referer?: string }> = [];
+  const pick = (h: Handler, key: string): Reply => (typeof h === 'function' ? h(key) : h);
   const client: HttpClient = {
     jar: new Map([['39ce7', 'CFEn0u5X']]),
-    get: async (path) => { calls.push({ method: 'GET', path }); return { location: null, body: '', setCookies: [], ...get } as never; },
-    post: async (path, form, referer) => { calls.push({ method: 'POST', path, form, referer }); return { location: null, body: '', setCookies: [], ...post } as never; },
+    get: async (path) => { calls.push({ method: 'GET', path }); return { location: null, body: '', setCookies: [], ...pick(get, path) } as never; },
+    post: async (path, form, referer) => { calls.push({ method: 'POST', path, form, referer }); return { location: null, body: '', setCookies: [], ...pick(post, path) } as never; },
   };
   return { client, calls };
 }
+const PROBLEMSET_PAGE = SUBMIT_PAGE.replace(
+  'action="/contest/1/submit?csrf_token=' + CSRF + '"',
+  'action="/problemset/submit/1/A?csrf_token=' + CSRF + '"',
+);
 const noSleep = async () => undefined;
 const sub = (id: number, verdict: string | undefined, index = 'A', t = 2_000_000_000) =>
   ({ id, problem: { contestId: 1, index }, contestId: 1, verdict, creationTimeSeconds: t });
@@ -98,7 +104,7 @@ describe('submitViaHttp', () => {
     expect(result).toMatchObject({ ok: true, submissionId: '11', verdict: 'OK', handle: 'me_superman' });
     expect(calls[0]).toMatchObject({ method: 'GET', path: '/contest/1/submit' });
     const post = calls[1]!;
-    expect(post.path).toBe(`/contest/1/submit?csrf_token=${CSRF}`);
+    expect(post.path).toBe(`https://codeforces.com/contest/1/submit?csrf_token=${CSRF}`);
     expect(post.referer).toBe('https://codeforces.com/contest/1/submit');
     const f = post.form!;
     expect(f.get('csrf_token')).toBe(CSRF);
@@ -155,5 +161,59 @@ describe('submitViaHttp', () => {
     const result = await submitViaHttp(state, 'me_superman', { ...entry, contestId: 101021, problemIndex: '1', gym: true } as SourceIndexEntry, 'x', { client, sleep: noSleep, now: () => 2_000_000_000_000 });
     expect(calls[0]!.path).toBe('/gym/101021/submit');
     expect(result).toMatchObject({ ok: true, submissionId: '13' });
+  });
+});
+
+describe('the codeforces submit form is replayed exactly', () => {
+  it('posts to the form action verbatim, keeping Codeforces per-page parameters', async () => {
+    api.fetchUserStatus.mockResolvedValue([]);
+    const page = SUBMIT_PAGE.replace(
+      `action="/contest/1/submit?csrf_token=${CSRF}"`,
+      `action="/contest/1/submit?adcd1e=caf4ffwp26nzrb&csrf_token=${CSRF}"`,
+    );
+    const { client, calls } = fakeClient({ status: 200, body: page }, { status: 302, location: 'https://codeforces.com/contest/1/my' });
+    await submitViaHttp(state, 'me_superman', entry, 'x', { client, sleep: noSleep, now: () => 2_000_000_000_000 });
+    expect(calls[1]!.path).toBe(`https://codeforces.com/contest/1/submit?adcd1e=caf4ffwp26nzrb&csrf_token=${CSRF}`);
+  });
+
+  it('carries over every hidden input on the form', async () => {
+    api.fetchUserStatus.mockResolvedValue([]);
+    const page = SUBMIT_PAGE.replace(
+      `<input type='hidden' name='csrf_token' value='${CSRF}'/>`,
+      `<input type='hidden' name='csrf_token' value='${CSRF}'/><input type="hidden" name="_tta" value="331"/><input type="hidden" name="adcd1e" value="tok"/>`,
+    );
+    const { client, calls } = fakeClient({ status: 200, body: page }, { status: 302, location: '/contest/1/my' });
+    await submitViaHttp(state, 'me_superman', entry, 'x', { client, sleep: noSleep, now: () => 2_000_000_000_000 });
+    const f = calls[1]!.form!;
+    expect(f.get('adcd1e')).toBe('tok');
+    expect(f.get('csrf_token')).toBe(CSRF);
+  });
+
+  it('falls back to the problemset endpoint when the contest endpoint bounces the POST to "/" (the reported failure)', async () => {
+    api.fetchUserStatus.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValue([sub(21, 'OK')]);
+    const { client, calls } = fakeClient(
+      (path) => ({ status: 200, body: path.startsWith('/problemset') ? PROBLEMSET_PAGE : SUBMIT_PAGE }),
+      (url) => (url.includes('/contest/')
+        ? { status: 302, location: 'https://codeforces.com/' }
+        : { status: 302, location: 'https://codeforces.com/contest/1/my' }),
+    );
+    const result = await submitViaHttp(state, 'me_superman', entry, 'x', { client, sleep: noSleep, now: () => 2_000_000_000_000 });
+    expect(result).toMatchObject({ ok: true, submissionId: '21' });
+    expect(calls.filter((c) => c.method === 'POST').map((c) => c.path)).toEqual([
+      `https://codeforces.com/contest/1/submit?csrf_token=${CSRF}`,
+      `https://codeforces.com/problemset/submit/1/A?csrf_token=${CSRF}`,
+    ]);
+  });
+
+  it('reports every endpoint when they all bounce the POST', async () => {
+    api.fetchUserStatus.mockResolvedValue([]);
+    const { client } = fakeClient(
+      (path) => ({ status: 200, body: path.startsWith('/problemset') ? PROBLEMSET_PAGE : SUBMIT_PAGE }),
+      { status: 302, location: 'https://codeforces.com/' },
+    );
+    const result = await submitViaHttp(state, 'me_superman', entry, 'x', { client, sleep: noSleep });
+    expect(result).toMatchObject({ ok: false, kind: 'rejected' });
+    expect(result.ok || result.error).toContain('/contest/1/submit');
+    expect(result.ok || result.error).toContain('/problemset/submit/1/A');
   });
 });
