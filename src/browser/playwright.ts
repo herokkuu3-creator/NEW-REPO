@@ -1,4 +1,4 @@
-import { chromium, BrowserContext, Page } from 'playwright';
+import { chromium, firefox, BrowserContext, Page } from 'playwright';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -190,6 +190,61 @@ export async function launchWithStorageStateObject(
     logger.error(
       { label, err: err instanceof Error ? err.message : String(err) },
       'failed to launch context from account storageState',
+    );
+    return null;
+  }
+}
+
+/**
+ * Firefox flavour of launchWithStorageStateObject, used by the Codeforces
+ * submit path.
+ *
+ * Codeforces sits behind Cloudflare, which sorts clients by TLS fingerprint:
+ * headless Chromium is handed "Just a moment..." there, while Firefox is served
+ * normally — including the submit POST, which Cloudflare answers with 302 → "/"
+ * for every other kind of client. Firefox also runs the page's own JavaScript,
+ * so `_tta`, `ftaa`, `bfaa` and the form action are filled in by Codeforces'
+ * own code instead of being guessed. LeetCode stays on Chromium.
+ */
+export async function launchFirefoxWithStorageStateObject(
+  state: StorageStateShape,
+  label: string,
+): Promise<BrowserSession | null> {
+  try {
+    const browser = await firefox.launch({
+      headless: config.browser.headless,
+      firefoxUserPrefs: {
+        // A submit form needs no images, and the free instance has 512MB total.
+        'permissions.default.image': 2,
+        'dom.ipc.processCount': 1,
+        'network.http.max-connections': 24,
+      },
+    });
+    const context = await browser.newContext({
+      storageState: {
+        cookies: state.cookies,
+        origins: state.origins,
+      },
+      viewport: { width: 1366, height: 900 },
+      locale: 'en-US',
+    });
+    const browserLogs: string[] = [];
+    const page = await openPageWithCapture(context, browserLogs);
+    logger.info({ label }, 'launched Firefox context from account storageState');
+    return {
+      context,
+      page,
+      mode: 'storage-state',
+      browserLogs,
+      close: async () => {
+        await context.close();
+        await browser.close();
+      },
+    };
+  } catch (err) {
+    logger.error(
+      { label, err: err instanceof Error ? err.message : String(err) },
+      'failed to launch Firefox context from account storageState',
     );
     return null;
   }

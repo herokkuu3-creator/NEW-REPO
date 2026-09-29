@@ -49,6 +49,13 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/prisma ./prisma
 COPY package.json ./
 
+# Firefox for the Codeforces submit path. Cloudflare bounces every POST from
+# this instance's IP unless the client passed its challenge, which only a real
+# browser does; Chromium is handed "Just a moment..." on Codeforces, Firefox is
+# served normally. The base image already ships the system dependencies, so this
+# only makes sure the Firefox build matches the Playwright version in use.
+RUN npx playwright install firefox
+
 # Run as the pre-existing non-root user shipped with the Playwright image.
 RUN mkdir -p /tmp/browser-profile /tmp/diagnostics && chown -R pwuser:pwuser /tmp/browser-profile /tmp/diagnostics /app
 USER pwuser

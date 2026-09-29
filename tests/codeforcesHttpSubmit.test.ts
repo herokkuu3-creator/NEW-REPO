@@ -51,10 +51,6 @@ function fakeClient(get: Handler, post: Handler) {
   };
   return { client, calls };
 }
-const PROBLEMSET_PAGE = SUBMIT_PAGE.replace(
-  'action="/contest/1/submit?csrf_token=' + CSRF + '"',
-  'action="/problemset/submit/1/A?csrf_token=' + CSRF + '"',
-);
 const noSleep = async () => undefined;
 const sub = (id: number, verdict: string | undefined, index = 'A', t = 2_000_000_000) =>
   ({ id, problem: { contestId: 1, index }, contestId: 1, verdict, creationTimeSeconds: t });
@@ -189,32 +185,18 @@ describe('the codeforces submit form is replayed exactly', () => {
     expect(f.get('csrf_token')).toBe(CSRF);
   });
 
-  it('falls back to the problemset endpoint when the contest endpoint bounces the POST to "/" (the reported failure)', async () => {
-    api.fetchUserStatus.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValue([sub(21, 'OK')]);
-    const { client, calls } = fakeClient(
-      (path) => ({ status: 200, body: path.startsWith('/problemset') ? PROBLEMSET_PAGE : SUBMIT_PAGE }),
-      (url) => (url.includes('/contest/')
-        ? { status: 302, location: 'https://codeforces.com/' }
-        : { status: 302, location: 'https://codeforces.com/contest/1/my' }),
-    );
-    const result = await submitViaHttp(state, 'me_superman', entry, 'x', { client, sleep: noSleep, now: () => 2_000_000_000_000 });
-    expect(result).toMatchObject({ ok: true, submissionId: '21' });
-    expect(calls.filter((c) => c.method === 'POST').map((c) => c.path)).toEqual([
-      `https://codeforces.com/contest/1/submit?csrf_token=${CSRF}`,
-      `https://codeforces.com/problemset/submit/1/A?csrf_token=${CSRF}`,
-    ]);
-  });
-
-  it('reports every endpoint when they all bounce the POST', async () => {
+  it('stops at the first endpoint and reports the edge block when the POST is bounced to "/" (the reported failure)', async () => {
     api.fetchUserStatus.mockResolvedValue([]);
-    const { client } = fakeClient(
-      (path) => ({ status: 200, body: path.startsWith('/problemset') ? PROBLEMSET_PAGE : SUBMIT_PAGE }),
-      { status: 302, location: 'https://codeforces.com/' },
-    );
+    const { client, calls } = fakeClient({ status: 200, body: SUBMIT_PAGE }, { status: 302, location: 'https://codeforces.com/' });
     const result = await submitViaHttp(state, 'me_superman', entry, 'x', { client, sleep: noSleep });
-    expect(result).toMatchObject({ ok: false, kind: 'rejected' });
-    expect(result.ok || result.error).toContain('/contest/1/submit');
-    expect(result.ok || result.error).toContain('/problemset/submit/1/A');
+
+    // Measured against the live site: a POST to the site root and a POST to a
+    // path that does not exist both answer 302 → "/", so another endpoint would
+    // only repeat it. The caller switches to the browser transport instead.
+    expect(result).toMatchObject({ ok: false, kind: 'blocked' });
+    expect(result.ok || result.error).toContain('Cloudflare');
+    expect(calls.filter((c) => c.method === 'POST')).toHaveLength(1);
+    expect(calls.filter((c) => c.method === 'GET')).toHaveLength(1);
   });
 });
 
