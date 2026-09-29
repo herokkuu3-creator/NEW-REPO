@@ -64,6 +64,75 @@ export async function loadSourceIndex(force = false): Promise<CodeforcesSourceIn
   return value;
 }
 
+/**
+ * Lightweight queue used by normal submission runs.
+ *
+ * The GitHub tree + ~11k-problem Codeforces join is an indexing job; running it
+ * seconds before Firefox inside a 512MB cgroup was pure waste. The audit table
+ * already stores everything needed to submit the next item (path, ids, language,
+ * gym flag, URL), so the daily path reads Postgres instead.
+ */
+export async function loadRuntimeSourceIndex(): Promise<CodeforcesSourceIndex> {
+  const readRows = () =>
+    prisma.codeforcesSourceAudit.findMany({
+      where: {
+        kind: CodeforcesSourceKind.CODEFORCES,
+        contestId: { not: null },
+        problemIndex: { not: null },
+      },
+      select: {
+        path: true,
+        fileName: true,
+        language: true,
+        contestId: true,
+        problemIndex: true,
+        problemUrl: true,
+        interactive: true,
+        gym: true,
+        reason: true,
+      },
+    });
+
+  let rows = await readRows();
+
+  // First deployment / rebuilt database: bootstrap the catalog once, persist it,
+  // then drop the heavy in-memory index and serve every later run from Postgres.
+  if (rows.length === 0) {
+    logger.warn('Codeforces source audit is empty; bootstrapping it once');
+    await loadSourceIndex(true);
+    cachedIndex = undefined;
+    rows = await readRows();
+  }
+
+  const queue: SourceIndexEntry[] = rows
+    .map((row) => {
+      const standard = STANDARD_RE.exec(row.fileName);
+      return {
+        key: row.path,
+        path: row.path,
+        fileName: row.fileName,
+        language: String(row.language) === 'python' ? 'python' : 'cpp',
+        kind: 'CODEFORCES',
+        contestId: row.contestId!,
+        problemIndex: row.problemIndex!,
+        problemName: standard?.[3]?.trim() || undefined,
+        problemUrl: row.problemUrl ?? undefined,
+        rawUrl: `https://raw.githubusercontent.com/${SOURCE_OWNER}/${SOURCE_REPO}/${SOURCE_BRANCH}/${encodePath(row.path)}`,
+        interactive: row.interactive,
+        gym: row.gym,
+        reason: row.reason,
+      } satisfies SourceIndexEntry;
+    })
+    .sort((a, b) => {
+      if (a.contestId !== b.contestId) return a.contestId! - b.contestId!;
+      const byIndex = compareProblemIndex(a.problemIndex!, b.problemIndex!);
+      return byIndex !== 0 ? byIndex : a.path.localeCompare(b.path);
+    });
+
+  logger.info({ queue: queue.length }, 'Codeforces source queue loaded from database');
+  return { entries: queue, queue };
+}
+
 export async function fetchSourceCode(entry: SourceIndexEntry): Promise<string> {
   const response = await fetch(entry.rawUrl, {
     headers: { accept: 'text/plain' },
@@ -201,9 +270,14 @@ export function buildSourceIndex(files: SourceTreeFile[], problems: CodeforcesPr
 async function fetchSourceTree(): Promise<SourceTreeFile[]> {
   const token = SOURCE_TOKEN_ENVS.map((key) => process.env[key]?.trim()).find((value) => !!value);
   const routes: Array<{ label: string; run: () => Promise<SourceTreeFile[]> }> = [];
-  if (token) routes.push({ label: 'GitHub API (token)', run: () => fetchSourceTreeViaApi(token) });
+  // Metadata API first: the tarball route buffers both the compressed archive
+  // and its gunzipSync() copy, which is expensive on a 512MB instance.
+  if (token) {
+    routes.push({ label: 'GitHub API (token)', run: () => fetchSourceTreeViaApi(token) });
+  } else {
+    routes.push({ label: 'GitHub API (anonymous)', run: () => fetchSourceTreeViaApi() });
+  }
   routes.push({ label: 'codeload tarball', run: fetchSourceTreeViaTarball });
-  if (!token) routes.push({ label: 'GitHub API (anonymous)', run: () => fetchSourceTreeViaApi() });
 
   const failures: string[] = [];
   for (const route of routes) {

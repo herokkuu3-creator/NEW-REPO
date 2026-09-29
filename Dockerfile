@@ -38,8 +38,10 @@ ENV NODE_ENV=production \
     BROWSER_PROFILE_PATH=/tmp/browser-profile \
     STORAGE_STATE_PATH=/tmp/storage-state.json \
     DIAGNOSTICS_DIR=/tmp/diagnostics \
-    # 512MB free instance: keep Node's heap comfortably under the ceiling.
-    NODE_OPTIONS=--max-old-space-size=384
+    # Leave most of the 512MB cgroup to the short-lived Codeforces Firefox:
+    # the app itself measured ~61MB of heap, so a 384MB V8 ceiling only starved
+    # the browser.
+    NODE_OPTIONS=--max-old-space-size=192
 
 WORKDIR /app
 

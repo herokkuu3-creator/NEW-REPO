@@ -14,11 +14,11 @@ import {
   recordAttempt,
   releaseDailyAttempt,
 } from './storage';
-import { loadSourceIndex, fetchSourceCode, SourceIndexEntry } from './sourceRepo';
+import { loadRuntimeSourceIndex, fetchSourceCode, SourceIndexEntry } from './sourceRepo';
 import { shouldReleaseDailyAttempt } from './dailyGate';
 import { fetchSolvedProblemKeys } from './api';
 import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
-import { submitViaHttp, HttpSubmitResult } from './httpSubmit';
+import type { HttpSubmitResult } from './httpSubmit';
 import { captureBefore, pollForVerdict, postSubmitForm } from './submission';
 import { launchFirefoxWithStorageStateObject } from '../browser/playwright';
 import { logMemory, memoryReading, MemoryWatch, releaseHeap } from '../memory';
@@ -33,14 +33,16 @@ const CODEFORCES_LAST_REPORT_KEY = 'codeforcesLastReport';
 let runInProgress = false;
 
 /**
- * Measured, not guessed: a warm headless Firefox costs ~405MB of proportional
- * memory on an empty page and ~520MB on a Codeforces page, on top of Node's
- * ~140MB. Render's free instance has 512MB in total, so starting a browser there
- * is what produced "Ran out of memory (used over 512MB)" and restarted the whole
- * service — LeetCode scheduler and Telegram bot included. The browser step is
- * therefore only started when the container can actually afford it.
+ * Minimum free container memory required before Firefox may start.
+ *
+ * Measured here: a warm headless Firefox is ~405MB PSS on a blank page and
+ * ~520MB on a Codeforces page, on top of Node's ~140MB — more than a 512MB free
+ * instance holds. So this is a MINIMUM-FREE floor, not a claim that Firefox
+ * fits: the memory watchdog is what actually protects the container, by closing
+ * the browser before the kernel OOM-kills the service. Demanding a full 520MB
+ * free made the browser path impossible by construction.
  */
-const BROWSER_BUDGET_MB = Number(process.env.CODEFORCES_BROWSER_BUDGET_MB ?? 520);
+const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 300);
 
 /** Free container memory in MB, or null when the container does not report it. */
 export function availableMemoryMb(): number | null {
@@ -96,7 +98,7 @@ export async function executeCodeforcesRun(
     options.forceDailyAttempt ?? reason === CODEFORCES_MANUAL_REASON;
 
   try {
-    const source = await loadSourceIndex();
+    const source = await loadRuntimeSourceIndex();
     const accounts = await listCodeforcesAccounts(false);
     const outcomes: CodeforcesAccountOutcome[] = [];
 
@@ -128,7 +130,7 @@ export async function executeCodeforcesRun(
 async function runForAccount(
   account: Awaited<ReturnType<typeof listCodeforcesAccounts>>[number],
   today: string,
-  source: Awaited<ReturnType<typeof loadSourceIndex>>,
+  source: Awaited<ReturnType<typeof loadRuntimeSourceIndex>>,
   forceDailyAttempt = false,
 ): Promise<CodeforcesAccountOutcome> {
   const label = account.label;
@@ -200,9 +202,23 @@ async function runForAccount(
       };
     }
 
-    // HTTP first — no browser, no extra memory. A POST the edge refuses (which
-    // is every POST from here) falls through to a real Firefox.
-    let result = await submitViaHttp(stored.state, account.username, entry, code);
+    // The header-only POST is answered 302 -> "/" by Codeforces' own router, so it
+    // is kept as an opt-in diagnostic: building its client and running it right
+    // before the browser only spends memory. The browser is the real transport.
+    const httpFirst = process.env.CODEFORCES_HTTP_FIRST?.trim().toLowerCase() === 'true';
+    let result: HttpSubmitResult & { handle?: string };
+    if (httpFirst) {
+      const { submitViaHttp } = await import('./httpSubmit');
+      result = await submitViaHttp(stored.state, account.username, entry, code);
+    } else {
+      result = {
+        ok: false,
+        kind: 'blocked',
+        error: 'browser transport selected for the free-tier submission path',
+        handle,
+      };
+    }
+
     let username = result.handle ?? handle;
     if (!result.ok && result.kind === 'blocked') {
       const viaBrowser = await submitViaBrowser(stored.state, label, username, entry, code);
@@ -310,25 +326,47 @@ async function submitViaBrowser(
   code: string,
 ): Promise<(HttpSubmitResult & { handle?: string }) | null> {
   const user = handle ?? label;
+
+  // All API work happens before the child process exists: the browser used to sit
+  // in memory while the pre-submission snapshot was still being fetched.
+  let before: Set<number>;
+  try {
+    before = await captureBefore(user, entry);
+  } catch (err) {
+    return {
+      ok: false,
+      kind: 'error',
+      error: `could not snapshot Codeforces submissions before browser launch: ${err instanceof Error ? err.message : String(err)}`,
+      handle: user,
+    };
+  }
+
+  releaseHeap();
+  await new Promise<void>((resolve) => setTimeout(resolve, 100));
   const available = availableMemoryMb();
-  if (available !== null && available < BROWSER_BUDGET_MB) {
-    logMemory('codeforces browser preflight', { availableMb: available, budgetMb: BROWSER_BUDGET_MB });
+  logMemory('codeforces browser preflight', { availableMb: available, minimumFreeMb: BROWSER_MIN_FREE_MB });
+  if (available !== null && available < BROWSER_MIN_FREE_MB) {
     return {
       ok: false,
       kind: 'blocked',
       error:
-        `not starting Firefox: this instance has ${available}MB free and the Codeforces browser step needs ~${BROWSER_BUDGET_MB}MB. ` +
-        'Starting it anyway is what made Render report "Ran out of memory (used over 512MB)" and restart the service. ' +
-        'Run this service on an instance with at least 1GB, or set CODEFORCES_BROWSER_BUDGET_MB to override.',
+        `not starting Firefox: only ${available}MB is free after cleanup; the free-tier floor is ${BROWSER_MIN_FREE_MB}MB. ` +
+        'The source queue is DB-backed now, so a healthy run should have more headroom; set CODEFORCES_BROWSER_MIN_FREE_MB to override.',
       handle: user,
-    } as HttpSubmitResult & { handle?: string };
+    };
   }
-  releaseHeap();
-  logMemory('codeforces browser preflight', { availableMb: available, budgetMb: BROWSER_BUDGET_MB });
-  const session = await launchFirefoxWithStorageStateObject(state, label);
-  if (!session) return null;
 
-  let before: Set<number>;
+  const session = await launchFirefoxWithStorageStateObject(state, label);
+  if (!session) {
+    return {
+      ok: false,
+      kind: 'error',
+      error: 'Firefox could not be launched from the stored Codeforces session',
+      handle: user,
+    };
+  }
+  logMemory('codeforces firefox launched');
+
   let posted: Awaited<ReturnType<typeof postSubmitForm>>;
   let submittedAt: number;
   let pressured = false;
@@ -347,7 +385,6 @@ async function submitViaBrowser(
   watch.start();
 
   try {
-    before = await captureBefore(user, entry);
     submittedAt = Math.floor(Date.now() / 1000);
     posted = await postSubmitForm(session, entry, code);
     logMemory('codeforces submit posted', {
@@ -428,7 +465,18 @@ function problemLabel(entry: SourceIndexEntry): string {
 }
 
 export function startCodeforcesScheduler(): () => void {
-  const { hour, minute, timezone } = config.schedule;
+  // Staggered away from the LeetCode run by default (09:15 vs 09:00) so the two
+  // never contend for the same 512MB container.
+  const fallback = config.schedule;
+  const requestedHour = Number(process.env.CODEFORCES_RUN_HOUR ?? fallback.hour);
+  const requestedMinute = Number(process.env.CODEFORCES_RUN_MINUTE ?? fallback.minute);
+  const hour = Number.isInteger(requestedHour) && requestedHour >= 0 && requestedHour <= 23
+    ? requestedHour
+    : fallback.hour;
+  const minute = Number.isInteger(requestedMinute) && requestedMinute >= 0 && requestedMinute <= 59
+    ? requestedMinute
+    : fallback.minute;
+  const timezone = fallback.timezone;
   const expression = `${minute} ${hour} * * *`;
   const task = cron.schedule(
     expression,

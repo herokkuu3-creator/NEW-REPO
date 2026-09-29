@@ -1,4 +1,4 @@
-import { chromium, firefox, BrowserContext, Page } from 'playwright';
+import { chromium, firefox, Browser, BrowserContext, Page } from 'playwright';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -210,30 +210,51 @@ export async function launchFirefoxWithStorageStateObject(
   state: StorageStateShape,
   label: string,
 ): Promise<BrowserSession | null> {
+  let browser: Browser | null = null;
   try {
-    const browser = await firefox.launch({
+    const activeBrowser = (browser = await firefox.launch({
       headless: config.browser.headless,
       firefoxUserPrefs: {
-        // A submit form needs no images, and the free instance has 512MB total:
-        // keep one content process and no caches, or the service is OOM-killed
-        // mid-submission.
+        // Keep Firefox to the smallest practical footprint for a single submit tab.
         'permissions.default.image': 2,
+        'browser.cache.disk.enable': false,
+        'browser.cache.memory.enable': false,
+        'browser.cache.offline.enable': false,
         'browser.cache.memory.capacity': 0,
         'browser.sessionhistory.max_entries': 2,
+        'browser.sessionstore.max_tabs_undo': 0,
+        'browser.sessionstore.max_windows_undo': 0,
         'network.prefetch-next': false,
         'browser.newtabpage.enabled': false,
         'toolkit.telemetry.enabled': false,
         'datareporting.policy.dataSubmissionEnabled': false,
+        'dom.ipc.processCount': 1,
+        'dom.ipc.processPrelaunch.enabled': false,
+        'dom.ipc.keepProcessesAlive.web': 0,
       },
-    });
-    const context = await browser.newContext({
+    }));
+    const context = await activeBrowser.newContext({
       storageState: {
         cookies: state.cookies,
         origins: state.origins,
       },
-      viewport: { width: 1366, height: 900 },
+      viewport: { width: 900, height: 600 },
       locale: 'en-US',
+      serviceWorkers: 'block',
     });
+
+    // Images/media/fonts are irrelevant to a submit form but cost decode buffers
+    // and renderer memory. Scripts, iframes, fetch and XHR stay enabled: the
+    // page's own signing code and Cloudflare's Turnstile both need them.
+    await context.route('**/*', async (route) => {
+      const type = route.request().resourceType();
+      if (type === 'image' || type === 'media' || type === 'font') {
+        await route.abort();
+        return;
+      }
+      await route.continue();
+    });
+
     const browserLogs: string[] = [];
     const page = await openPageWithCapture(context, browserLogs);
     logger.info({ label }, 'launched Firefox context from account storageState');
@@ -243,11 +264,13 @@ export async function launchFirefoxWithStorageStateObject(
       mode: 'storage-state',
       browserLogs,
       close: async () => {
-        await context.close();
-        await browser.close();
+        await context.close().catch(() => undefined);
+        await activeBrowser.close().catch(() => undefined);
       },
     };
   } catch (err) {
+    // Without this, a context failure left the browser process running.
+    await browser?.close().catch(() => undefined);
     logger.error(
       { label, err: err instanceof Error ? err.message : String(err) },
       'failed to launch Firefox context from account storageState',

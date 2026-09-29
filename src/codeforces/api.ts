@@ -86,10 +86,14 @@ export async function fetchProblemsetProblems(): Promise<CodeforcesProblem[]> {
   return problems;
 }
 
-export async function fetchUserStatus(handle: string, count = 100): Promise<CodeforcesSubmission[]> {
+export async function fetchUserStatus(
+  handle: string,
+  count = 100,
+  from = 1,
+): Promise<CodeforcesSubmission[]> {
   return callApi<CodeforcesSubmission[]>('user.status', {
     handle,
-    from: 1,
+    from,
     count,
   });
 }
@@ -111,13 +115,26 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Every problem the handle has an OK verdict on, keyed "contestId/index". */
+/**
+ * Every problem the handle has an OK verdict on, keyed "contestId/index".
+ *
+ * Paged deliberately: asking for 100,000 submissions in one JSON response builds
+ * a large temporary object immediately before the browser step on a 512MB box.
+ */
 export async function fetchSolvedProblemKeys(handle: string): Promise<Set<string>> {
-  const submissions = await callApi<CodeforcesSubmission[]>('user.status', { handle, from: 1, count: 100000 });
   const solved = new Set<string>();
-  for (const s of submissions) {
-    const contestId = s.problem.contestId ?? s.contestId;
-    if (s.verdict === 'OK' && contestId !== undefined && s.problem.index) solved.add(`${contestId}/${s.problem.index}`);
+  const pageSize = 2_000;
+  const maxToScan = 100_000;
+
+  for (let from = 1; from <= maxToScan; from += pageSize) {
+    const submissions = await fetchUserStatus(handle, pageSize, from);
+    for (const s of submissions) {
+      const contestId = s.problem.contestId ?? s.contestId;
+      if (s.verdict === 'OK' && contestId !== undefined && s.problem.index) {
+        solved.add(`${contestId}/${s.problem.index}`);
+      }
+    }
+    if (submissions.length < pageSize) break;
   }
   return solved;
 }
