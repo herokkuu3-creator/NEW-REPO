@@ -17,6 +17,12 @@ import {
 } from './storage';
 import { loadSourceIndex, fetchSourceCode, SourceIndexEntry } from './sourceRepo';
 import { shouldReleaseDailyAttempt } from './dailyGate';
+import { fetchSolvedProblemKeys } from './api';
+import { firstUnsolvedIndex, HANDOFF_VERDICT, sendHandoff } from './handoff';
+
+/** After Cloudflare blocks the server once, skip the doomed browser attempt for a while. */
+const BLOCK_BACKOFF_MS = 6 * 60 * 60 * 1000;
+let blockedUntil = 0;
 import { inspectCodeforcesSessionPage } from './session';
 import { submitAndVerify } from './submission';
 import {
@@ -118,8 +124,32 @@ async function runForAccount(
     return { label, username: account.username, kind: 'failed', error: stored.error };
   }
 
-  const progress = await getCodeforcesProgress(account.id);
-  const current = resolveCurrentEntry(source.queue, progress.nextKey, progress.lastCompletedKey);
+  let progress = await getCodeforcesProgress(account.id);
+  const resolved = resolveCurrentEntry(source.queue, progress.nextKey, progress.lastCompletedKey);
+  let current = resolved;
+  let note: string | undefined;
+  if (resolved && account.username) {
+    const solved = await fetchSolvedProblemKeys(account.username).catch(() => null);
+    if (solved) {
+      const start = source.queue.indexOf(resolved);
+      const index = firstUnsolvedIndex(source.queue, start, solved);
+      if (index > start) {
+        const passed = source.queue[index - 1]!;
+        current = source.queue[index] ?? null;
+        await completeCurrentProblem(account.id, {
+          completedKey: passed.key,
+          nextKey: current?.key ?? null,
+          submissionId: null,
+          verdict: 'OK',
+        });
+        const handedOff = progress.lastVerdict === HANDOFF_VERDICT && progress.lastAttemptKey === resolved.key;
+        note = handedOff
+          ? `✅ ${problemLabel(resolved)} was accepted on Codeforces — moved on`
+          : `⏩ skipped ${index - start} problem(s) already solved on Codeforces`;
+        progress = await getCodeforcesProgress(account.id);
+      }
+    }
+  }
   if (!current) {
     return {
       label,
@@ -127,6 +157,35 @@ async function runForAccount(
       kind: 'skipped',
       error: 'source repository queue is exhausted — no uncompleted Codeforces solution remains',
     };
+  }
+
+  const entry = current;
+  const handoff = async (reason: string, handle: string): Promise<CodeforcesAccountOutcome> => {
+    const code = await fetchSourceCode(entry);
+    const sent = await sendHandoff(entry, handle, code);
+    await claimDailyAttempt(account.id, today, entry.key).catch(() => false);
+    await recordAttempt(account.id, { submissionId: null, verdict: sent ? HANDOFF_VERDICT : 'BLOCKED' });
+    await patchCodeforcesAccount(account.id, {
+      status: CodeforcesAccountStatus.ACTIVE,
+      lastError: reason,
+      checked: true,
+      lastSubmissionDate: today,
+      lastVerdict: sent ? HANDOFF_VERDICT : 'BLOCKED',
+    });
+    logger.info({ label, problem: problemLabel(entry), sent, reason }, 'Codeforces solution handed off to the user');
+    return {
+      label,
+      username: handle,
+      kind: sent ? 'pending' : 'failed',
+      problem: problemLabel(entry),
+      problemUrl: entry.problemUrl ?? null,
+      note,
+      error: sent ? null : `${reason}; sending the solution file over Telegram also failed`,
+    };
+  };
+
+  if (Date.now() < blockedUntil) {
+    return handoff('Cloudflare blocked the server recently', account.username ?? label);
   }
 
   const session = await launchWithStorageStateObject(stored.state, `codeforces:${label}`);
@@ -139,6 +198,10 @@ async function runForAccount(
     await session.page.goto('https://codeforces.com/', { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await session.page.waitForTimeout(500);
     const check = await inspectCodeforcesSessionPage(session.page);
+    if (!check.ok && check.reason === 'blocked') {
+      blockedUntil = Date.now() + BLOCK_BACKOFF_MS;
+      return await handoff(check.error, account.username ?? label);
+    }
     if (!check.ok) {
       const status = check.reason === 'signed-out' ? CodeforcesAccountStatus.REJECTED : CodeforcesAccountStatus.UNKNOWN;
       await patchCodeforcesAccount(account.id, {
@@ -190,6 +253,10 @@ async function runForAccount(
     }
 
     const result = await submitAndVerify(session, username, current, code);
+    if (!result.ok && result.kind === 'blocked') {
+      blockedUntil = Date.now() + BLOCK_BACKOFF_MS;
+      return await handoff(result.error, username);
+    }
     if (result.ok) {
       const index = source.queue.findIndex((entry) => entry.key === current.key);
       const nextKey = source.queue[index + 1]?.key ?? null;
@@ -213,6 +280,7 @@ async function runForAccount(
         label,
         username,
         kind: 'solved',
+        note,
         problem: problemLabel(current),
         problemUrl: current.problemUrl ?? null,
         submissionId: result.submissionId,

@@ -68,3 +68,29 @@ export async function sendTelegramPhoto(photoPath: string, caption: string): Pro
     return false;
   }
 }
+
+/** Sends a text file as a Telegram document. Best-effort, never throws. */
+export async function sendTelegramDocument(fileName: string, content: string, caption: string): Promise<boolean> {
+  const { botToken, chatId, enabled } = config.telegram;
+  if (!enabled) return false;
+  try {
+    const form = new FormData();
+    form.append('chat_id', chatId);
+    form.append('caption', caption.slice(0, 1000));
+    form.append('document', new Blob([content], { type: 'text/plain' }), fileName);
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
+      method: 'POST',
+      body: form,
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) {
+      logger.warn({ status: res.status }, 'telegram document send failed');
+      return false;
+    }
+    logger.info({ fileName }, 'telegram document sent');
+    return true;
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'telegram document send error');
+    return false;
+  }
+}
