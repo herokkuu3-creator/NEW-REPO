@@ -2,9 +2,10 @@ import { CodeforcesAccountStatus } from '@prisma/client';
 import { Browser, chromium } from 'playwright';
 import { config } from '../config';
 import { logger } from '../logger';
-import { launchWithStorageStateObject, BrowserSession, buildLaunchArgs } from '../browser/playwright';
+import { createClient, parseSubmitPage } from './httpSubmit';
 import { StorageStateShape } from '../browser/cookiePayload';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
+import type { StoredCodeforcesState } from './storage';
 import {
   getCodeforcesAccountById,
   listCodeforcesAccounts,
@@ -107,23 +108,23 @@ export function parseCodeforcesPayload(raw: string):
 }
 
 export async function validateCodeforcesStorageState(state: StorageStateShape): Promise<CodeforcesSessionCheck> {
-  let session: BrowserSession | null = null;
+  // Same browserless client the submitter uses, so a session that validates here
+  // is exactly the session that will submit (headless Chromium gets Cloudflare 403s).
   try {
-    session = await launchWithStorageStateObject(state, 'codeforces-validation');
-    if (!session) return { ok: false, reason: 'unknown', error: 'browser launch failed' };
-
-    await session.page.goto('https://codeforces.com/', {
-      waitUntil: 'domcontentloaded',
-      timeout: 30_000,
-    });
-    await session.page.waitForTimeout(500);
-    return await inspectCodeforcesSessionPage(session.page);
+    const client = createClient(state as StoredCodeforcesState);
+    const res = await client.get('/');
+    if (res.status === 403 || /<title>\s*Just a moment/i.test(res.body)) {
+      return { ok: false, reason: 'blocked', error: `Codeforces served a Cloudflare challenge (HTTP ${res.status})` };
+    }
+    const page = parseSubmitPage(res.body);
+    if (!page.signedInHandle) {
+      return { ok: false, reason: 'signed-out', error: 'Codeforces session is not signed in — export the cookies again while logged in' };
+    }
+    logger.info({ label: 'codeforces-validation', handle: page.signedInHandle }, 'Codeforces session validated over HTTP');
+    return { ok: true, username: page.signedInHandle };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (CAPTCHA_RE.test(msg)) return { ok: false, reason: 'blocked', error: `Codeforces served a verification page: ${msg}` };
     return { ok: false, reason: 'unknown', error: `Codeforces session check failed: ${msg}` };
-  } finally {
-    await session?.close().catch(() => undefined);
   }
 }
 
