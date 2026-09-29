@@ -67,6 +67,12 @@ services:
       # transport as an opt-in diagnostic instead of loading it before Firefox.
       - key: CODEFORCES_HTTP_FIRST
         value: "false"
+      # The isolated Codeforces submitter, deployed as its own free web service
+      # below: Firefox gets a whole 512MB there instead of sharing this one.
+      - key: CODEFORCES_SUBMITTER_URL
+        sync: false
+      - key: CODEFORCES_SUBMITTER_TOKEN
+        sync: false
       - key: DAILY_RUN_HOUR
         value: "9"
       - key: DAILY_RUN_MINUTE
@@ -109,6 +115,43 @@ services:
         sync: false # PIN required to view /health details (without it only {"status":"ok"} is shown)
       - key: MAX_SOLUTION_RETRIES
         value: "3"
+      - key: LOG_LEVEL
+        value: info
+
+  # ---------------------------------------------------------------------------
+  # Isolated Codeforces submitter — its OWN free web service.
+  #
+  # A headless Firefox costs ~390MB the moment it launches, which cannot share
+  # the main service's 512MB cgroup (that produced Render's "Ran out of memory
+  # (used over 512MB)" restarts). This service holds nothing else: no Prisma, no
+  # Telegram, no scheduler, no LeetCode code. It normally sleeps and wakes only
+  # for a submission.
+  #
+  # Setup: generate one secret with `openssl rand -base64 32` and set that SAME
+  # value as CODEFORCES_SUBMITTER_TOKEN here and on the main service, then set
+  # CODEFORCES_SUBMITTER_URL on the main service to this service's public URL
+  # (no trailing slash).
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: codeforces-submit-browser
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    dockerCommand: npm run submitter
+    envVars:
+      - key: HEADLESS
+        value: "true"
+      # Nothing but a tiny HTTP server and one Firefox lives here.
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=96
+      # Bounded waits: never hold the container open for a long challenge.
+      - key: CODEFORCES_TURNSTILE_WAIT_MS
+        value: "10000"
+      - key: CODEFORCES_CHALLENGE_WAIT_MS
+        value: "10000"
+      - key: CODEFORCES_SUBMITTER_TOKEN
+        sync: false
       - key: LOG_LEVEL
         value: info
 
