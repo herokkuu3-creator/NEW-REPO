@@ -14,6 +14,10 @@ import {
 import { AccountRecord, deleteAccountById, deleteAllAccounts, listAccounts } from '../database/accounts';
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
+import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
+import { isCodeforcesRunInProgress, runCodeforcesNow } from '../codeforces/worker';
+import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../codeforces/report';
+import { listCodeforcesAccounts } from '../codeforces/storage';
 import {
   isRunInProgress,
   runSubmissionNow,
@@ -93,7 +97,7 @@ const HELP_TEXT = [
   '📎 Just send cookie .json files (one per account) — each file is added as an account named after its LeetCode username; a file for a user that already exists overrides that account.',
   '',
   '🍪 Sessions',
-  '🔄 /renew - how to capture the cookie file on Android',
+  '🔄 /renew - send a LeetCode or Codeforces session JSON; site is detected automatically',
   '🏷️ /renew <label> - store the NEXT file under this exact label',
   '👥 /accounts - list every account with its cookie status',
   '🗑️ /removesession - list every account with a Remove button (tap to delete that account\'s session)',
@@ -101,6 +105,8 @@ const HELP_TEXT = [
   '',
   '🚀 Submissions',
   '⚡ /triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
+  '🏆 /submitnextsolution - submit the next Codeforces source solution for every Codeforces account',
+  '📋 /cfaccounts - list Codeforces accounts, cursor and last verdict',
   '🎯 /questionrangesubmission 200-400 - submit every question in a range (pick one account or All)',
   '📍 /rangestatus - progress of the running range job',
   '🛑 /cancelrange - stop the running range job',
@@ -112,19 +118,17 @@ const HELP_TEXT = [
 ].join('\n');
 
 const RENEW_INSTRUCTIONS = [
-  '📱 LeetCode session renewal: Android only',
+  '🔐 Session renewal',
   '',
-  '👍 No computer is required.',
+  'Send a JSON export from your logged-in LeetCode or Codeforces browser session.',
+  'The bot inspects the domains/origins and automatically stores it in the correct platform account store.',
   '',
-  '1️⃣ Open Lemur Browser on your Android phone.',
-  '2️⃣ Open https://leetcode.com/ and sign in normally.',
-  '3️⃣ Open the LeetCode Session Capture extension.',
-  '4️⃣ Tap the capture button.',
-  '5️⃣ Save or download leetcode-session.json.',
-  '6️⃣ Send the .json file to this Telegram bot as a document.',
+  '🏠 LeetCode: your existing LeetCode renewal flow is unchanged.',
+  '🏆 Codeforces: export cookies/storageState while logged in to codeforces.com and send the JSON file here.',
   '',
-  'Multiple accounts: send one .json file per account, one after another. Each file is stored immediately (a new user = new account, a known user = cookies overridden), then checked with LeetCode. Once the uploads stop, today\'s run starts for all accounts.',
-  ].join('\n');
+  '🏷️ /renew <label> optionally forces the account label for the next upload.',
+  '❌ /cancel cancels a pending labeled renewal.',
+].join('\n');
 
 /**
  * Single-poller handover.
@@ -292,6 +296,14 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/status':
         await reply(await statusText());
         return;
+      case '/submitnextsolution':
+      case '/submit_next_solution':
+        await handleCodeforcesSubmitNext();
+        return;
+      case '/cfaccounts':
+      case '/cf_accounts':
+        await reply(await codeforcesAccountsText());
+        return;
       case '/triggersubmission':
       case '/trigger_submission':
         await handleTriggerSubmission();
@@ -331,7 +343,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /status, /triggersubmission, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /submitnextsolution, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -360,39 +372,67 @@ async function handleMessage(msg: TgMessage): Promise<void> {
   });
   pendingRenewalLabel = undefined;
   await reply(result.text);
-  if (result.stored) scheduleBatchRun();
+  if (result.stored && result.site === 'leetcode') scheduleBatchRun();
 }
 
+export type CookieSite = 'leetcode' | 'codeforces';
+
 export interface CookieMessageResult {
-  /** true when the cookies were stored (added or overridden). */
+  /** true when the session was stored (added or overridden). */
   stored: boolean;
+  /** Site selected from the supplied session metadata. */
+  site?: CookieSite;
   text: string;
 }
 
 /**
- * Handles one cookie message (file or text) — exported for tests. Every
- * message is ingested independently, so sending several files in a row adds
- * one account per LeetCode user, and a file for an already-known user
- * overrides that account's cookies.
+ * Handles one session message/file. Codeforces is routed to its own account
+ * store; the existing LeetCode ingestion path remains unchanged.
  */
 export async function processCookieMessage(
   payload: string,
   opts: { label?: string; fileName?: string; validator?: Validator } = {},
 ): Promise<CookieMessageResult> {
+  const detected = detectSessionSite(payload, opts.fileName);
+
+  if (detected === 'codeforces') {
+    const result = await ingestCodeforcesSession(payload, {
+      label: opts.label,
+      fileName: opts.fileName,
+    });
+    if (!result.ok) {
+      return {
+        stored: false,
+        site: 'codeforces',
+        text: `${opts.fileName ? `${opts.fileName}: ` : ''}${describeCodeforcesIngest(result)}`,
+      };
+    }
+    const total = (await listCodeforcesAccounts(true)).length;
+    return {
+      stored: true,
+      site: 'codeforces',
+      text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeCodeforcesIngest(result)}\n\n🏆 Codeforces accounts stored: ${total}. Use /cfaccounts to inspect progress.`,
+    };
+  }
+
   if (!looksLikeCookiePayload(payload)) {
     return {
       stored: false,
-      text: '⚠️ That does not look like a cookie export. Send the .json file from the capture extension (or /help).',
+      text: '⚠️ That does not look like a supported session export. Send the original LeetCode or Codeforces .json file (or /help).',
     };
   }
+
+  // Default/fallback path is deliberately the existing LeetCode ingestion.
+  // This preserves all current LeetCode /renew behavior.
   const result = await ingestCookiePayload(payload, opts);
   if (!result.ok) {
-    return { stored: false, text: `${opts.fileName ? `${opts.fileName}: ` : ''}${describeIngest(result)}` };
+    return { stored: false, site: 'leetcode', text: `${opts.fileName ? `${opts.fileName}: ` : ''}${describeIngest(result)}` };
   }
   const total = (await listAccounts()).length;
   return {
     stored: true,
-    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}\n\n📊 Accounts stored: ${total}. Send more files to add more — /accounts lists them.`,
+    site: 'leetcode',
+    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}\n\n📊 LeetCode accounts stored: ${total}. Send more files to add more — /accounts lists them.`,
   };
 }
 
@@ -453,6 +493,35 @@ export async function handleTriggerSubmission(
   });
   // Wrapped in an object: returning the promise itself from an async function
   // would make the caller wait for the whole run and block the poll loop.
+  return { done };
+}
+
+/** /submitnextsolution — run the next queued Codeforces source solution once per account. */
+export async function handleCodeforcesSubmitNext(
+  runner: typeof runCodeforcesNow = runCodeforcesNow,
+  inProgress: () => boolean = isCodeforcesRunInProgress,
+): Promise<{ done: Promise<void> } | null> {
+  if (inProgress()) {
+    await reply('🚧 A Codeforces run is already in progress — wait for its report, then send /submitnextsolution again.');
+    return null;
+  }
+  await reply('🏆 Submitting the next Codeforces source solution for all Codeforces accounts.');
+  const done = (async () => {
+    const report = await runner('telegram', {
+      onAccountOutcome: (outcome, index, total) =>
+        reply(formatCodeforcesAccountMessage(outcome, index, total)),
+    });
+    if (!report) {
+      await reply('⏳ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
+    } else if (report.totals.accounts === 0) {
+      await reply('📭 No Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
+    } else {
+      logger.info({ summary: summarizeCodeforcesReport(report) }, 'telegram /submitnextsolution finished');
+    }
+  })().catch(async (err) => {
+    logger.warn({ err: errText(err) }, '/submitnextsolution failed');
+    await reply(`⚠️ /submitnextsolution failed: ${errText(err)}`).catch(() => undefined);
+  });
   return { done };
 }
 
@@ -777,6 +846,22 @@ async function accountsText(): Promise<string> {
       : '';
     lines.push(`▪️ ${a.label}${who}: ${a.status}${when}`);
     if (a.lastError) lines.push(`  ⚠️ error: ${a.lastError.slice(0, 150)}`);
+  }
+  return lines.join('\n');
+}
+
+async function codeforcesAccountsText(): Promise<string> {
+  const accounts = await listCodeforcesAccounts(true);
+  if (accounts.length === 0) return '📭 No Codeforces accounts configured. Send /renew with a Codeforces session JSON.';
+  const lines = [`🏆 Codeforces accounts: ${accounts.length}`, ''];
+  for (const account of accounts) {
+    const progress = await (await import('../codeforces/storage')).getCodeforcesProgress(account.id);
+    lines.push(`▪️ ${account.label}${account.username ? ` (${account.username})` : ''}: ${account.status}`);
+    lines.push(`  📍 Next: ${progress.nextKey ?? 'first queued source'}`);
+    if (progress.lastCompletedKey) lines.push(`  ✅ Last accepted: ${progress.lastCompletedKey}`);
+    if (progress.lastAttemptDate) lines.push(`  🗓️ Last attempt: ${progress.lastAttemptDate}${progress.lastVerdict ? ` — ${progress.lastVerdict}` : ''}`);
+    if (progress.lastSubmissionId) lines.push(`  🆔 Submission: ${progress.lastSubmissionId}`);
+    if (account.lastError) lines.push(`  ⚠️ ${account.lastError.slice(0, 180)}`);
   }
   return lines.join('\n');
 }
