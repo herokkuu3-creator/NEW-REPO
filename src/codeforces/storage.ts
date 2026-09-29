@@ -117,6 +117,13 @@ export async function claimDailyAttempt(accountId: string, date: string, key: st
   return result.count === 1;
 }
 
+export async function releaseDailyAttempt(accountId: string, date: string): Promise<void> {
+  await prisma.codeforcesProgress.updateMany({
+    where: { accountId, lastAttemptDate: date },
+    data: { lastAttemptDate: null },
+  });
+}
+
 export async function recordAttempt(
   accountId: string,
   data: { submissionId?: string | null; verdict: string },

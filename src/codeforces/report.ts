@@ -63,7 +63,12 @@ export function formatCodeforcesOutcomeLine(outcome: CodeforcesAccountOutcome): 
   if (outcome.kind === 'skipped') return `⏭️ ${who} — ${outcome.error ?? 'already attempted today'}`;
   if (outcome.kind === 'expired') return `⏰ ${who} — ${outcome.error ?? 'Codeforces session expired or signed out'}`;
   if (outcome.kind === 'rejected') return `🚫 ${who} — ${outcome.error ?? 'Codeforces session rejected'}`;
-  return `❌ ${who} — ${outcome.problem ?? 'next problem'} — ${outcome.verdict ?? outcome.error ?? 'submission failed'}`;
+  const detail = outcome.error ?? outcome.verdict ?? 'submission failed';
+  const suffix =
+    outcome.verdict && outcome.error && outcome.verdict !== outcome.error
+      ? `${outcome.verdict} — ${outcome.error}`
+      : detail;
+  return `❌ ${who} — ${outcome.problem ?? 'next problem'} — ${suffix}`;
 }
 
 export function formatCodeforcesReport(report: CodeforcesRunReport): string {
@@ -82,6 +87,7 @@ export function formatCodeforcesAccountMessage(
   total: number,
 ): string {
   const lines = [`👤 Codeforces account ${index}/${total} — ${formatCodeforcesOutcomeLine(outcome)}`];
+  if (outcome.error && outcome.kind !== 'solved') lines.push(`⚠️ ${outcome.error}`);
   if (outcome.submissionId) lines.push(`🆔 Submission ID: ${outcome.submissionId}`);
   if (outcome.problemUrl) lines.push(`🔗 ${outcome.problemUrl}`);
   return lines.join('\n');
