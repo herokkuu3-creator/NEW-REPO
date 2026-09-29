@@ -276,6 +276,15 @@ function finishPost(
   return { ok: true, status, finalUrl, ...flags };
 }
 
+/**
+ * How long to let a managed challenge clear. Configurable so tests do not sit
+ * through a minute of polling that a page double will never satisfy.
+ */
+function challengeWaitMs(): number {
+  const configured = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 60_000;
+}
+
 async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs()): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
