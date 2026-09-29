@@ -19,7 +19,7 @@ import { shouldReleaseDailyAttempt } from './dailyGate';
 import { fetchSolvedProblemKeys } from './api';
 import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
 import { submitViaHttp, HttpSubmitResult } from './httpSubmit';
-import { submitAndVerify } from './submission';
+import { captureBefore, pollForVerdict, postSubmitForm } from './submission';
 import { launchFirefoxWithStorageStateObject } from '../browser/playwright';
 import {
   buildCodeforcesReport,
@@ -291,27 +291,63 @@ async function submitViaBrowser(
   entry: SourceIndexEntry,
   code: string,
 ): Promise<(HttpSubmitResult & { handle?: string }) | null> {
+  const user = handle ?? label;
   const session = await launchFirefoxWithStorageStateObject(state, label);
   if (!session) return null;
+
+  let before: Set<number>;
+  let posted: Awaited<ReturnType<typeof postSubmitForm>>;
+  let submittedAt: number;
   try {
-    const result = await submitAndVerify(session, handle ?? label, entry, code);
-    if (result.ok) {
-      return { ok: true, submissionId: result.submissionId, verdict: result.verdict, handle: handle ?? label };
-    }
-    return {
-      ok: false,
-      kind: result.kind === 'submission-error' ? 'rejected' : result.kind,
-      error: `${result.error} (Firefox transport)`,
-      submissionId: result.submissionId ?? null,
-      verdict: result.verdict ?? null,
-      handle: handle ?? label,
-    } as HttpSubmitResult & { handle?: string };
+    before = await captureBefore(user, entry);
+    submittedAt = Math.floor(Date.now() / 1000);
+    posted = await postSubmitForm(session, entry, code);
+    logger.info(
+      {
+        status: posted.status,
+        finalUrl: posted.finalUrl,
+        turnstile: posted.turnstile,
+        rssMb: Math.round(process.memoryUsage().rss / 1_048_576),
+      },
+      'Codeforces submit posted from Firefox',
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, kind: 'error', error: `Firefox transport failed: ${message}`, handle: handle ?? label };
+    return { ok: false, kind: 'error', error: `Firefox transport failed: ${message}`, handle: user };
   } finally {
+    // Free the browser before polling: on the 512MB instance, polling with the
+    // browser still open was what killed the service mid-submission.
     await session.close().catch(() => undefined);
   }
+
+  if (!posted.ok) {
+    return {
+      ok: false,
+      kind: posted.kind === 'submission-error' ? 'rejected' : (posted.kind ?? 'error'),
+      error: `${posted.error} (Firefox transport)`,
+      handle: user,
+    } as HttpSubmitResult & { handle?: string };
+  }
+
+  const submission = await pollForVerdict(user, entry, before, submittedAt).catch(() => null);
+  if (!submission) {
+    return {
+      ok: false,
+      kind: 'judge-timeout',
+      error: `the Firefox transport posted the form (HTTP ${posted.status ?? '?'} → ${posted.finalUrl}) but no new submission appeared in the API`,
+      handle: user,
+    } as HttpSubmitResult & { handle?: string };
+  }
+  const verdict = submission.verdict ?? 'TESTING';
+  if (verdict === 'OK') return { ok: true, submissionId: String(submission.id), verdict, handle: user };
+  return {
+    ok: false,
+    kind: verdict === 'TESTING' ? 'judge-timeout' : 'rejected',
+    error: `Codeforces verdict: ${verdict}`,
+    submissionId: String(submission.id),
+    verdict,
+    handle: user,
+  } as HttpSubmitResult & { handle?: string };
 }
 
 function resolveCurrentEntry(queue: SourceIndexEntry[], nextKey: string | null, lastCompletedKey: string | null): SourceIndexEntry | null {
