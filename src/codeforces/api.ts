@@ -110,3 +110,14 @@ export async function fetchContestStatus(
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/** Every problem the handle has an OK verdict on, keyed "contestId/index". */
+export async function fetchSolvedProblemKeys(handle: string): Promise<Set<string>> {
+  const submissions = await callApi<CodeforcesSubmission[]>('user.status', { handle, from: 1, count: 100000 });
+  const solved = new Set<string>();
+  for (const s of submissions) {
+    const contestId = s.problem.contestId ?? s.contestId;
+    if (s.verdict === 'OK' && contestId !== undefined && s.problem.index) solved.add(`${contestId}/${s.problem.index}`);
+  }
+  return solved;
+}

@@ -20,6 +20,14 @@ export type CodeforcesSubmissionResult =
       statusDisplay?: string | null;
     };
 
+/** Cloudflare refused every submit endpoint: the server cannot submit, a human can. */
+export class CodeforcesBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CodeforcesBlockedError';
+  }
+}
+
 export class CodeforcesSubmissionError extends Error {
   constructor(message: string) {
     super(message);
@@ -148,7 +156,9 @@ export async function submitAndVerify(
     }
   } catch (err) {
     const message = errorMessage(err);
-    if (CHALLENGE_RE.test(message)) return { ok: false, kind: 'blocked', error: message };
+    if (err instanceof CodeforcesBlockedError || CHALLENGE_RE.test(message)) {
+      return { ok: false, kind: 'blocked', error: message };
+    }
     return { ok: false, kind: 'submission-error', error: message };
   }
 
@@ -187,6 +197,7 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
   }
 
   const attempts: string[] = [];
+  let blocked = 0;
   for (const path of candidates) {
     let response: Response | null = null;
     try {
@@ -205,13 +216,14 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
       throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
     }
     if (status === 403 || status === 503) {
-      attempts.push(`${path}: HTTP ${status} (Codeforces bot protection blocked the request)`);
+      attempts.push(`${path}: HTTP ${status} (Cloudflare challenge)`);
+      blocked += 1;
       continue;
     }
 
     const body = await readBody(page);
     if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
-      throw new CodeforcesSubmissionError('Codeforces served a browser verification page while opening the submit form');
+      throw new CodeforcesBlockedError('Codeforces served a browser verification page while opening the submit form');
     }
 
     const fields = await readFields(page);
@@ -225,9 +237,9 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
     );
   }
 
-  throw new CodeforcesSubmissionError(
-    `Codeforces submit form could not be opened for ${source.contestId}/${source.problemIndex} — ${attempts.join(' | ')}`,
-  );
+  const message = `Codeforces submit form could not be opened for ${source.contestId}/${source.problemIndex} — ${attempts.join(' | ')}`;
+  if (blocked === candidates.length) throw new CodeforcesBlockedError(message);
+  throw new CodeforcesSubmissionError(message);
 }
 
 async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string): Promise<void> {
