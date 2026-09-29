@@ -5,15 +5,20 @@ import { SourceIndexEntry } from './sourceRepo';
 import { StoredCodeforcesState } from './storage';
 
 /**
- * Browserless Codeforces submission.
+ * Browserless Codeforces submission — the fast path. The browser transport in
+ * ./submission.ts takes over whenever the edge refuses a POST.
  *
  * Cloudflare decides by TLS/HTTP2 fingerprint. Headless Chromium and Chrome
- * profiles get a 403 "Just a moment..." challenge from datacenter IPs, while
- * a Firefox fingerprint is served normally, including the submit POST. So we
- * replay exactly what the browser sends (see the DevTools capture):
+ * profiles get a 403 "Just a moment..." challenge from datacenter IPs. A Firefox
+ * fingerprint is served normally for GETs, but NOT for POSTs: measured from a
+ * datacenter IP, every POST to codeforces.com — including to a path that does
+ * not exist and to the site root — comes back 302 → "/". A client that never
+ * passed Cloudflare's challenge simply cannot POST, which is why no payload or
+ * endpoint change ever got through. So this replay works only if the edge
+ * relents; otherwise the caller falls back to a real Firefox.
  *
  *   GET  /contest/<id>/submit            -> csrf_token + language list
- *   POST /contest/<id>/submit?csrf_token=<t>
+ *   POST <the form's own action>
  *        csrf_token, ftaa, bfaa, action=submitSolutionFormSubmitted,
  *        submittedProblemIndex, programTypeId, source, tabSize, _tta
  *
@@ -345,8 +350,17 @@ export async function submitViaHttp(
     if (formError) return { ok: false, kind: 'rejected', error: `Codeforces refused the submission: ${formError}` };
     const redirectedTo = post.location ? safePath(post.location) : null;
     if (post.status >= 300 && post.status < 400 && (redirectedTo === '/' || redirectedTo === null)) {
-      attempts.push(`${path}: POST ${post.status} → ${post.location} (this endpoint refused the form)`);
-      continue;
+      // Boxed in by the edge, not by this form: a POST to the site root and a
+      // POST to a path that does not exist both answer 302 → "/" the same way,
+      // so the next endpoint would only repeat it. The caller has to submit from
+      // a real browser, which passes the challenge this client never passed.
+      attempts.push(`${path}: POST ${post.status} → ${post.location}`);
+      return {
+        ok: false,
+        kind: 'blocked',
+        error: `Cloudflare redirected the submit POST to ${post.location} (HTTP ${post.status}) — every POST to codeforces.com is bounced for a client that has not passed its challenge, so the browser transport has to submit this one`,
+        handle,
+      } as HttpSubmitResult & { handle: string };
     }
     if (post.status >= 400) {
       return { ok: false, kind: 'error', error: `submit POST to ${target} returned HTTP ${post.status}` };

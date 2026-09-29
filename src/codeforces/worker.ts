@@ -18,7 +18,9 @@ import { loadSourceIndex, fetchSourceCode, SourceIndexEntry } from './sourceRepo
 import { shouldReleaseDailyAttempt } from './dailyGate';
 import { fetchSolvedProblemKeys } from './api';
 import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
-import { submitViaHttp } from './httpSubmit';
+import { submitViaHttp, HttpSubmitResult } from './httpSubmit';
+import { submitAndVerify } from './submission';
+import { launchFirefoxWithStorageStateObject } from '../browser/playwright';
 import {
   buildCodeforcesReport,
   CodeforcesAccountOutcome,
@@ -180,8 +182,17 @@ async function runForAccount(
       };
     }
 
-    const result = await submitViaHttp(stored.state, account.username, entry, code);
-    const username = result.handle ?? handle;
+    // HTTP first — no browser, no extra memory. A POST the edge refuses (which
+    // is every POST from here) falls through to a real Firefox.
+    let result = await submitViaHttp(stored.state, account.username, entry, code);
+    let username = result.handle ?? handle;
+    if (!result.ok && result.kind === 'blocked') {
+      const viaBrowser = await submitViaBrowser(stored.state, label, username, entry, code);
+      if (viaBrowser) {
+        result = viaBrowser;
+        username = viaBrowser.handle ?? username;
+      }
+    }
 
     if (result.ok) {
       const index = source.queue.findIndex((e) => e.key === entry.key);
@@ -259,6 +270,47 @@ async function runForAccount(
       problemUrl: entry.problemUrl ?? null,
       error: msg,
     };
+  }
+}
+
+/**
+ * Replays the submit in a headless Firefox and reads the verdict from the public
+ * API — still fully unattended.
+ *
+ * Cloudflare redirects every POST to codeforces.com to "/" unless the client
+ * passed its challenge, so header and field shaping can never get the HTTP
+ * transport through. Firefox passes that challenge, and it also runs the page's
+ * own JavaScript, which is what fills `_tta` (Codeforces.signForms), ftaa/bfaa
+ * and the form action in a human's browser. Returns null when no browser could
+ * be started, leaving the caller to report the HTTP failure unchanged.
+ */
+async function submitViaBrowser(
+  state: Parameters<typeof launchFirefoxWithStorageStateObject>[0],
+  label: string,
+  handle: string | null,
+  entry: SourceIndexEntry,
+  code: string,
+): Promise<(HttpSubmitResult & { handle?: string }) | null> {
+  const session = await launchFirefoxWithStorageStateObject(state, label);
+  if (!session) return null;
+  try {
+    const result = await submitAndVerify(session, handle ?? label, entry, code);
+    if (result.ok) {
+      return { ok: true, submissionId: result.submissionId, verdict: result.verdict, handle: handle ?? label };
+    }
+    return {
+      ok: false,
+      kind: result.kind === 'submission-error' ? 'rejected' : result.kind,
+      error: `${result.error} (Firefox transport)`,
+      submissionId: result.submissionId ?? null,
+      verdict: result.verdict ?? null,
+      handle: handle ?? label,
+    } as HttpSubmitResult & { handle?: string };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, kind: 'error', error: `Firefox transport failed: ${message}`, handle: handle ?? label };
+  } finally {
+    await session.close().catch(() => undefined);
   }
 }
 
