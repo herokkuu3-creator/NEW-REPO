@@ -21,6 +21,7 @@ import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
 import { submitViaHttp, HttpSubmitResult } from './httpSubmit';
 import { captureBefore, pollForVerdict, postSubmitForm } from './submission';
 import { launchFirefoxWithStorageStateObject } from '../browser/playwright';
+import { logMemory, memoryReading, MemoryWatch, releaseHeap } from '../memory';
 import {
   buildCodeforcesReport,
   CodeforcesAccountOutcome,
@@ -30,6 +31,23 @@ import {
 
 const CODEFORCES_LAST_REPORT_KEY = 'codeforcesLastReport';
 let runInProgress = false;
+
+/**
+ * Measured, not guessed: a warm headless Firefox costs ~405MB of proportional
+ * memory on an empty page and ~520MB on a Codeforces page, on top of Node's
+ * ~140MB. Render's free instance has 512MB in total, so starting a browser there
+ * is what produced "Ran out of memory (used over 512MB)" and restarted the whole
+ * service — LeetCode scheduler and Telegram bot included. The browser step is
+ * therefore only started when the container can actually afford it.
+ */
+const BROWSER_BUDGET_MB = Number(process.env.CODEFORCES_BROWSER_BUDGET_MB ?? 520);
+
+/** Free container memory in MB, or null when the container does not report it. */
+export function availableMemoryMb(): number | null {
+  const { usedMb, limitMb } = memoryReading();
+  if (usedMb === null || limitMb === null) return null;
+  return Math.max(0, limitMb - usedMb);
+}
 
 export function isCodeforcesRunInProgress(): boolean {
   return runInProgress;
@@ -292,40 +310,75 @@ async function submitViaBrowser(
   code: string,
 ): Promise<(HttpSubmitResult & { handle?: string }) | null> {
   const user = handle ?? label;
+  const available = availableMemoryMb();
+  if (available !== null && available < BROWSER_BUDGET_MB) {
+    logMemory('codeforces browser preflight', { availableMb: available, budgetMb: BROWSER_BUDGET_MB });
+    return {
+      ok: false,
+      kind: 'blocked',
+      error:
+        `not starting Firefox: this instance has ${available}MB free and the Codeforces browser step needs ~${BROWSER_BUDGET_MB}MB. ` +
+        'Starting it anyway is what made Render report "Ran out of memory (used over 512MB)" and restart the service. ' +
+        'Run this service on an instance with at least 1GB, or set CODEFORCES_BROWSER_BUDGET_MB to override.',
+      handle: user,
+    } as HttpSubmitResult & { handle?: string };
+  }
+  releaseHeap();
+  logMemory('codeforces browser preflight', { availableMb: available, budgetMb: BROWSER_BUDGET_MB });
   const session = await launchFirefoxWithStorageStateObject(state, label);
   if (!session) return null;
 
   let before: Set<number>;
   let posted: Awaited<ReturnType<typeof postSubmitForm>>;
   let submittedAt: number;
+  let pressured = false;
+
+  // Watchdog: if the container nears its ceiling the browser is closed and the
+  // failure is reported, instead of the kernel SIGKILLing the process and taking
+  // the whole service (LeetCode scheduler, Telegram bot) down with it.
+  const watch = new MemoryWatch(() => {
+    pressured = true;
+    logger.error(
+      { ...memoryReading(), phase: 'codeforces browser' },
+      'memory ceiling reached - closing the Codeforces browser before the kernel kills the whole service',
+    );
+    void session.close().catch(() => undefined);
+  });
+  watch.start();
+
   try {
     before = await captureBefore(user, entry);
     submittedAt = Math.floor(Date.now() / 1000);
     posted = await postSubmitForm(session, entry, code);
-    logger.info(
-      {
-        status: posted.status,
-        finalUrl: posted.finalUrl,
-        clicked: posted.clicked,
-        turnstile: posted.turnstile,
-        interactive: posted.interactive,
-        rssMb: Math.round(process.memoryUsage().rss / 1_048_576),
-      },
-      'Codeforces submit posted from Firefox',
-    );
+    logMemory('codeforces submit posted', {
+      status: posted.status,
+      finalUrl: posted.finalUrl,
+      clicked: posted.clicked,
+      turnstile: posted.turnstile,
+      interactive: posted.interactive,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, kind: 'error', error: `Firefox transport failed: ${message}`, handle: user };
+    return {
+      ok: false,
+      kind: pressured ? 'blocked' : 'error',
+      error: pressured
+        ? `the browser step was stopped at the instance's memory ceiling: ${message}`
+        : `Firefox transport failed: ${message}`,
+      handle: user,
+    };
   } finally {
-    // Free the browser before polling: on the 512MB instance, polling with the
-    // browser still open was what killed the service mid-submission.
+    const { peakMb, tripped } = watch.stop();
+    // Free the browser before polling: polling with the browser still open is
+    // what killed the service mid-submission.
     const closing = session.close().catch(() => undefined);
     const bail = new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 15_000);
       timer.unref?.();
     });
     await Promise.race([closing, bail]);
-    logger.info({ rssMb: Math.round(process.memoryUsage().rss / 1_048_576) }, 'Codeforces Firefox context closed');
+    releaseHeap();
+    logMemory('codeforces browser step finished', { peakMb, tripped, pressured });
   }
 
   if (!posted.ok) {

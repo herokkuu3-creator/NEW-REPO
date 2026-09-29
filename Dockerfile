@@ -62,4 +62,4 @@ USER pwuser
 
 # Apply migrations, then start the service. `prisma migrate deploy` is
 # idempotent and safe across restarts and free-tier spin-downs.
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/src/main.js"]
+CMD ["sh", "-c", "npx prisma migrate deploy && node --expose-gc dist/src/main.js"]
