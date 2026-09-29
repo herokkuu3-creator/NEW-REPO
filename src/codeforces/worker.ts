@@ -3,7 +3,6 @@ import { CodeforcesAccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
 import { setSystemState } from '../database/models';
-import { launchWithStorageStateObject } from '../browser/playwright';
 import { todayInTimezone } from '../scheduler/dailyWorker';
 import {
   claimDailyAttempt,
@@ -18,13 +17,8 @@ import {
 import { loadSourceIndex, fetchSourceCode, SourceIndexEntry } from './sourceRepo';
 import { shouldReleaseDailyAttempt } from './dailyGate';
 import { fetchSolvedProblemKeys } from './api';
-import { firstUnsolvedIndex, HANDOFF_VERDICT, sendHandoff } from './handoff';
-
-/** After Cloudflare blocks the server once, skip the doomed browser attempt for a while. */
-const BLOCK_BACKOFF_MS = 6 * 60 * 60 * 1000;
-let blockedUntil = 0;
-import { inspectCodeforcesSessionPage } from './session';
-import { submitAndVerify } from './submission';
+import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
+import { submitViaHttp } from './httpSubmit';
 import {
   buildCodeforcesReport,
   CodeforcesAccountOutcome,
@@ -160,109 +154,41 @@ async function runForAccount(
   }
 
   const entry = current;
-  const handoff = async (reason: string, handle: string): Promise<CodeforcesAccountOutcome> => {
-    const code = await fetchSourceCode(entry);
-    const sent = await sendHandoff(entry, handle, code);
-    await claimDailyAttempt(account.id, today, entry.key).catch(() => false);
-    await recordAttempt(account.id, { submissionId: null, verdict: sent ? HANDOFF_VERDICT : 'BLOCKED' });
-    await patchCodeforcesAccount(account.id, {
-      status: CodeforcesAccountStatus.ACTIVE,
-      lastError: reason,
-      checked: true,
-      lastSubmissionDate: today,
-      lastVerdict: sent ? HANDOFF_VERDICT : 'BLOCKED',
-    });
-    logger.info({ label, problem: problemLabel(entry), sent, reason }, 'Codeforces solution handed off to the user');
-    return {
-      label,
-      username: handle,
-      kind: sent ? 'pending' : 'failed',
-      problem: problemLabel(entry),
-      problemUrl: entry.problemUrl ?? null,
-      note,
-      error: sent ? null : `${reason}; sending the solution file over Telegram also failed`,
-    };
-  };
-
-  if (Date.now() < blockedUntil) {
-    return handoff('Cloudflare blocked the server recently', account.username ?? label);
-  }
-
-  const session = await launchWithStorageStateObject(stored.state, `codeforces:${label}`);
-  if (!session) {
-    await patchCodeforcesAccount(account.id, { status: CodeforcesAccountStatus.UNKNOWN, lastError: 'browser launch failed', checked: true });
-    return { label, username: account.username, kind: 'failed', problem: problemLabel(current), error: 'browser launch failed' };
-  }
-
+  const handle = account.username ?? label;
   try {
-    await session.page.goto('https://codeforces.com/', { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await session.page.waitForTimeout(500);
-    const check = await inspectCodeforcesSessionPage(session.page);
-    if (!check.ok && check.reason === 'blocked') {
-      blockedUntil = Date.now() + BLOCK_BACKOFF_MS;
-      return await handoff(check.error, account.username ?? label);
-    }
-    if (!check.ok) {
-      const status = check.reason === 'signed-out' ? CodeforcesAccountStatus.REJECTED : CodeforcesAccountStatus.UNKNOWN;
-      await patchCodeforcesAccount(account.id, {
-        status,
-        username: account.username,
-        lastError: check.error,
-        checked: true,
-      });
-      return {
-        label,
-        username: account.username,
-        kind: check.reason === 'signed-out' ? 'rejected' : 'failed',
-        problem: problemLabel(current),
-        error: check.error,
-      };
-    }
-
-    const username = check.username;
-    await patchCodeforcesAccount(account.id, {
-      username,
-      status: CodeforcesAccountStatus.ACTIVE,
-      lastError: null,
-      checked: true,
-    });
-
-    const code = await fetchSourceCode(current);
+    const code = await fetchSourceCode(entry);
     const retryToday = shouldReleaseDailyAttempt({
       manual: forceDailyAttempt,
       lastAttemptDate: progress.lastAttemptDate ?? null,
       lastVerdict: progress.lastVerdict ?? null,
       today,
     });
-    if (retryToday) {
-      await releaseDailyAttempt(account.id, today);
-    }
-    const claimed = await claimDailyAttempt(account.id, today, current.key);
+    if (retryToday) await releaseDailyAttempt(account.id, today);
+    const claimed = await claimDailyAttempt(account.id, today, entry.key);
     if (!claimed) {
       const latest = await getCodeforcesProgress(account.id);
       return {
         label,
-        username,
+        username: handle,
         kind: 'skipped',
-        problem: problemLabel(current),
-        problemUrl: current.problemUrl ?? null,
+        problem: problemLabel(entry),
+        problemUrl: entry.problemUrl ?? null,
         verdict: latest.lastVerdict,
         submissionId: latest.lastSubmissionId,
-        error: `already attempted ${today}; one Codeforces attempt per account per day is enforced`,
+        note,
+        error: `already solved/attempted ${today}; the next run submits the following problem`,
       };
     }
 
-    const result = await submitAndVerify(session, username, current, code);
-    if (!result.ok && result.kind === 'blocked') {
-      blockedUntil = Date.now() + BLOCK_BACKOFF_MS;
-      return await handoff(result.error, username);
-    }
+    const result = await submitViaHttp(stored.state, account.username, entry, code);
+    const username = result.handle ?? handle;
+
     if (result.ok) {
-      const index = source.queue.findIndex((entry) => entry.key === current.key);
+      const index = source.queue.findIndex((e) => e.key === entry.key);
       const nextKey = source.queue[index + 1]?.key ?? null;
       await recordAttempt(account.id, { submissionId: result.submissionId, verdict: result.verdict });
       await completeCurrentProblem(account.id, {
-        completedKey: current.key,
+        completedKey: entry.key,
         nextKey,
         submissionId: result.submissionId,
         verdict: result.verdict,
@@ -281,33 +207,36 @@ async function runForAccount(
         username,
         kind: 'solved',
         note,
-        problem: problemLabel(current),
-        problemUrl: current.problemUrl ?? null,
+        problem: problemLabel(entry),
+        problemUrl: entry.problemUrl ?? null,
         submissionId: result.submissionId,
         verdict: result.verdict,
       };
     }
 
-    await recordAttempt(account.id, {
-      submissionId: result.submissionId ?? null,
-      verdict: result.verdict ?? (result.kind === 'blocked' ? 'BLOCKED' : 'SUBMISSION_ERROR'),
-    });
+    const verdictCode = result.verdict ?? result.kind.toUpperCase().replace(/-/g, '_');
+    await recordAttempt(account.id, { submissionId: result.submissionId ?? null, verdict: verdictCode });
     await patchCodeforcesAccount(account.id, {
-      status: result.kind === 'blocked' ? CodeforcesAccountStatus.UNKNOWN : CodeforcesAccountStatus.ACTIVE,
+      status:
+        result.kind === 'signed-out'
+          ? CodeforcesAccountStatus.REJECTED
+          : result.kind === 'blocked'
+            ? CodeforcesAccountStatus.UNKNOWN
+            : CodeforcesAccountStatus.ACTIVE,
       username,
       lastError: result.error,
       checked: true,
       lastSubmissionDate: today,
       lastSubmissionId: result.submissionId ?? null,
-      lastVerdict: result.verdict ?? result.kind.toUpperCase(),
+      lastVerdict: verdictCode,
     });
-
     return {
       label,
       username,
-      kind: 'failed',
-      problem: problemLabel(current),
-      problemUrl: current.problemUrl ?? null,
+      kind: result.kind === 'signed-out' ? 'rejected' : 'failed',
+      note,
+      problem: problemLabel(entry),
+      problemUrl: entry.problemUrl ?? null,
       submissionId: result.submissionId ?? null,
       verdict: result.verdict ?? null,
       error: result.error,
@@ -316,7 +245,6 @@ async function runForAccount(
     const msg = err instanceof Error ? err.message : String(err);
     await patchCodeforcesAccount(account.id, {
       status: CodeforcesAccountStatus.UNKNOWN,
-      username: account.username,
       lastError: msg,
       checked: true,
       lastSubmissionDate: today,
@@ -324,15 +252,13 @@ async function runForAccount(
     }).catch(() => undefined);
     return {
       label,
-      username: account.username,
+      username: handle,
       kind: 'failed',
-      problem: problemLabel(current),
-      problemUrl: current.problemUrl ?? null,
-      verdict: 'SUBMISSION_ERROR',
+      note,
+      problem: problemLabel(entry),
+      problemUrl: entry.problemUrl ?? null,
       error: msg,
     };
-  } finally {
-    await session.close().catch(() => undefined);
   }
 }
 
