@@ -13,6 +13,7 @@ import {
   parseStoredCodeforcesState,
   patchCodeforcesAccount,
   recordAttempt,
+  releaseDailyAttempt,
 } from './storage';
 import { loadSourceIndex, fetchSourceCode, SourceIndexEntry } from './sourceRepo';
 import { inspectCodeforcesSessionPage } from './session';
@@ -33,6 +34,8 @@ export function isCodeforcesRunInProgress(): boolean {
 
 export interface CodeforcesRunOptions {
   onAccountOutcome?: (outcome: CodeforcesAccountOutcome, index: number, total: number) => Promise<void> | void;
+  /** Manual triggers may reuse a day's single attempt after it failed. */
+  forceDailyAttempt?: boolean;
 }
 
 export interface CodeforcesTriggerResult {
@@ -68,6 +71,8 @@ export async function executeCodeforcesRun(
   runInProgress = true;
   const startedAt = new Date().toISOString();
   const today = todayInTimezone();
+  const forceDailyAttempt =
+    options.forceDailyAttempt ?? reason === CODEFORCES_MANUAL_REASON;
 
   try {
     const source = await loadSourceIndex();
@@ -81,7 +86,7 @@ export async function executeCodeforcesRun(
     }
 
     for (const account of accounts) {
-      const outcome = await runForAccount(account, today, source);
+      const outcome = await runForAccount(account, today, source, forceDailyAttempt);
       outcomes.push(outcome);
       if (options.onAccountOutcome) {
         await Promise.resolve(options.onAccountOutcome(outcome, outcomes.length, accounts.length)).catch((err) =>
@@ -103,6 +108,7 @@ async function runForAccount(
   account: Awaited<ReturnType<typeof listCodeforcesAccounts>>[number],
   today: string,
   source: Awaited<ReturnType<typeof loadSourceIndex>>,
+  forceDailyAttempt = false,
 ): Promise<CodeforcesAccountOutcome> {
   const label = account.label;
   const stored = parseStoredCodeforcesState(account.storageState);
@@ -158,6 +164,9 @@ async function runForAccount(
     });
 
     const code = await fetchSourceCode(current);
+    if (forceDailyAttempt) {
+      await releaseDailyAttempt(account.id, today);
+    }
     const claimed = await claimDailyAttempt(account.id, today, current.key);
     if (!claimed) {
       const latest = await getCodeforcesProgress(account.id);
@@ -225,7 +234,7 @@ async function runForAccount(
       problem: problemLabel(current),
       problemUrl: current.problemUrl ?? null,
       submissionId: result.submissionId ?? null,
-      verdict: result.verdict ?? result.kind.toUpperCase(),
+      verdict: result.verdict ?? null,
       error: result.error,
     };
   } catch (err) {
