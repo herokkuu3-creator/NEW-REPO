@@ -51,6 +51,20 @@ const SIGNED_OUT_RE = /you are not logged in|please login|please sign in|not log
 const REJECTION_RE = /you have submitted exactly the same code before|source code is too long|submission failed|invalid csrf|you are not allowed to submit|no such problem|problem not found|not a participant/i;
 const PENDING_VERDICTS = new Set(['TESTING', 'QUEUE', 'QUEUED', undefined, null]);
 const VERIFICATION_WINDOW_MS = 150_000;
+const VERIFICATION_POLL_MS = 2_500;
+const TURNSTILE_WAIT_MS = 30_000;
+
+/** Outcome of posting the submit form from the browser, before any polling. */
+export interface BrowserPostOutcome {
+  ok: boolean;
+  kind?: 'signed-out' | 'blocked' | 'submission-error';
+  error?: string;
+  /** HTTP status of the form POST navigation, when the browser reported one. */
+  status: number | null;
+  finalUrl: string;
+  /** Whether the Cloudflare Turnstile field on the form carried a token when it was posted. */
+  turnstile: boolean;
+}
 
 /**
  * Every submit endpoint Codeforces exposes for a problem, most specific first.
@@ -120,9 +134,9 @@ export async function submitAndVerify(
     return { ok: false, kind: 'submission-error', error: 'source entry has no contestId/problemIndex' };
   }
 
-  let before: CodeforcesSubmission[] = [];
+  let beforeIds: Set<number>;
   try {
-    before = await fetchSubmissions(username, source);
+    beforeIds = await captureBefore(username, source);
   } catch (err) {
     return {
       ok: false,
@@ -130,39 +144,14 @@ export async function submitAndVerify(
       error: `could not read existing Codeforces submissions before submitting: ${errorMessage(err)}`,
     };
   }
-  const beforeIds = new Set(before.map((submission) => submission.id));
   const submittedAt = Math.floor(Date.now() / 1000);
 
-  try {
-    await openSubmitForm(session.page, source);
-    await fillSubmitForm(session.page, source, code);
-    const clicked = await clickSubmit(session.page);
-    if (!clicked) {
-      throw new CodeforcesSubmissionError(
-        `Codeforces submit button was not found on ${session.page.url()} (fields: ${summarizeFields(await readFields(session.page))})`,
-      );
-    }
-
-    const body = await readBody(session.page);
-    if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(session.page.url())) {
-      return {
-        ok: false,
-        kind: 'blocked',
-        error: 'Codeforces served a browser verification page during submission',
-      };
-    }
-    if (REJECTION_RE.test(body)) {
-      return { ok: false, kind: 'submission-error', error: compactBodyError(body) };
-    }
-  } catch (err) {
-    const message = errorMessage(err);
-    if (err instanceof CodeforcesBlockedError || CHALLENGE_RE.test(message)) {
-      return { ok: false, kind: 'blocked', error: message };
-    }
-    return { ok: false, kind: 'submission-error', error: message };
+  const posted = await postSubmitForm(session, source, code);
+  if (!posted.ok) {
+    return { ok: false, kind: posted.kind ?? 'submission-error', error: posted.error ?? 'Codeforces rejected the submission form' };
   }
 
-  const submission = await pollForNewSubmission(username, source, beforeIds, submittedAt);
+  const submission = await pollForVerdict(username, source, beforeIds, submittedAt);
   if (!submission) {
     return {
       ok: false,
@@ -188,6 +177,119 @@ export async function submitAndVerify(
     verdict,
     statusDisplay: verdict,
   };
+}
+
+/** Ids of the account's submissions before a POST, read browserless. */
+export async function captureBefore(handle: string, source: SourceIndexEntry): Promise<Set<number>> {
+  return new Set((await fetchSubmissions(handle, source)).map((submission) => submission.id));
+}
+
+/**
+ * Opens the submit page in the browser, fills the form and posts it.
+ *
+ * Callers must close the browser as soon as this resolves, before polling for
+ * the verdict: on the 512MB free instance, holding the browser open while the
+ * verdict was polled was enough to OOM-kill the whole service mid-submission.
+ */
+export async function postSubmitForm(
+  session: BrowserSession,
+  source: SourceIndexEntry,
+  code: string,
+): Promise<BrowserPostOutcome> {
+  const page = session.page;
+  const fail = (kind: BrowserPostOutcome['kind'], error: string): BrowserPostOutcome => ({
+    ok: false,
+    kind,
+    error,
+    status: null,
+    finalUrl: page.url(),
+    turnstile: false,
+  });
+
+  try {
+    await openSubmitForm(page, source);
+    const turnstile = await fillSubmitForm(page, source, code);
+    const { clicked, status } = await clickSubmit(page);
+    if (!clicked) {
+      return { ...fail('submission-error', `Codeforces submit button was not found on ${page.url()}`), status, turnstile };
+    }
+
+    const body = await readBody(page);
+    if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(page.url())) {
+      // A managed challenge answered the POST. Its JavaScript replays the
+      // request once it clears, so give the browser time instead of reporting
+      // the interstitial as a refusal.
+      const cleared = await waitOutChallenge(page);
+      const settled = await readBody(page);
+      const settledUrl = page.url();
+      if (CHALLENGE_RE.test(settled) || CHALLENGE_RE.test(settledUrl)) {
+        return {
+          ok: false,
+          kind: 'blocked',
+          error: `Codeforces cloudflare challenge did not clear in the browser (HTTP ${status ?? '?'}, ${settledUrl})`,
+          status,
+          finalUrl: settledUrl,
+          turnstile,
+        };
+      }
+      return finishPost(settled, settledUrl, status, turnstile, page);
+    }
+    return finishPost(body, page.url(), status, turnstile, page);
+  } catch (err) {
+    const message = errorMessage(err);
+    const kind = err instanceof CodeforcesBlockedError || CHALLENGE_RE.test(message) ? 'blocked' : 'submission-error';
+    return { ...fail(kind, message) };
+  }
+}
+
+function finishPost(
+  body: string,
+  finalUrl: string,
+  status: number | null,
+  turnstile: boolean,
+  page: Page,
+): BrowserPostOutcome {
+  if (SIGNED_OUT_RE.test(body) || /\/enter(?:[/?#]|$)/i.test(finalUrl)) {
+    return { ok: false, kind: 'signed-out', error: 'Codeforces answered the submission with a signed-out page; re-send the session cookies with /renew', status, finalUrl, turnstile };
+  }
+  if (REJECTION_RE.test(body)) {
+    return { ok: false, kind: 'submission-error', error: compactBodyError(body), status, finalUrl, turnstile };
+  }
+  if (!/codeforces\.com/i.test(finalUrl)) {
+    return { ok: false, kind: 'submission-error', error: `the submit form left codeforces.com (${finalUrl})`, status, finalUrl, turnstile };
+  }
+  void page;
+  return { ok: true, status, finalUrl, turnstile };
+}
+
+/**
+ * Waits out a Cloudflare managed challenge. The interstitial carries
+ * `cf-chl` / "Just a moment..." and its own JavaScript retries the request a few
+ * seconds later; only a client that runs that script ever reaches Codeforces, so
+ * polling for the page to leave the interstitial is the difference between a
+ * verdict and a bogus "blocked" report.
+ */
+/**
+ * How long to let a managed challenge clear. Configurable so tests do not sit
+ * through a minute of polling that a page double will never satisfy.
+ */
+function challengeWaitMs(): number {
+  const configured = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 60_000;
+}
+
+async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs()): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(2_000);
+    const body = await readBody(page);
+    if (!CHALLENGE_RE.test(body) && !CHALLENGE_RE.test(page.url())) {
+      logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser');
+      return true;
+    }
+  }
+  logger.warn({ timeoutMs, url: page.url() }, 'Codeforces challenge did not clear in the browser');
+  return false;
 }
 
 export async function openSubmitForm(page: Page, source: SourceIndexEntry): Promise<void> {
@@ -223,7 +325,18 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
 
     const body = await readBody(page);
     if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
-      throw new CodeforcesBlockedError('Codeforces served a browser verification page while opening the submit form');
+      await waitOutChallenge(page);
+      const settled = await readBody(page);
+      if (CHALLENGE_RE.test(settled) || CHALLENGE_RE.test(page.url())) {
+        throw new CodeforcesBlockedError('Codeforces served a browser verification page while opening the submit form');
+      }
+      const settledFields = await readFields(page);
+      if (hasSubmitForm(settledFields)) {
+        logger.info({ path, fields: summarizeFields(settledFields) }, 'Codeforces submit form opened after the challenge cleared');
+        return;
+      }
+      attempts.push(`${path}: challenge cleared but no submit form (url ${page.url()})`);
+      continue;
     }
 
     const fields = await readFields(page);
@@ -242,7 +355,7 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
   throw new CodeforcesSubmissionError(message);
 }
 
-async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string): Promise<void> {
+async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string): Promise<boolean> {
   const problemIndex = source.problemIndex!;
   const contestId = source.contestId!;
   const fields = await readFields(page);
@@ -308,26 +421,51 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
   if (!token) {
     throw new CodeforcesSubmissionError(`Codeforces ${csrfName} is empty — the submit page was not served correctly`);
   }
+
+  return waitForTurnstile(page);
 }
 
-async function clickSubmit(page: Page): Promise<boolean> {
+/**
+ * Cloudflare's Turnstile widget sits on the submit form and fills a
+ * `turnstileToken` field once it solves; Codeforces refuses the POST without it.
+ * Waiting for it is what tells us whether the browser actually cleared the
+ * challenge, so the outcome is logged either way.
+ */
+async function waitForTurnstile(page: Page, timeoutMs = TURNSTILE_WAIT_MS): Promise<boolean> {
+  const field = page.locator('input[name="turnstileToken"]').first();
+  if ((await field.count().catch(() => 0)) === 0) return false;
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await field.inputValue().catch(() => '');
+    if (value.trim()) {
+      logger.info('Codeforces Turnstile solved itself in the browser');
+      return true;
+    }
+    await sleep(1_000);
+  }
+  logger.warn({ timeoutMs }, 'Codeforces Turnstile field stayed empty — the challenge did not solve in the browser');
+  return false;
+}
+
+async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: number | null }> {
   const input = page.locator('input[type="submit"][value*="Submit" i]').first();
   if ((await input.count().catch(() => 0)) > 0) {
-    await Promise.all([
-      page.waitForLoadState('domcontentloaded', { timeout: 20_000 }).catch(() => undefined),
+    const [response] = await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null),
       input.click({ timeout: 20_000 }),
     ]);
-    return true;
+    return { clicked: true, status: response?.status() ?? null };
   }
   const button = page.locator('button[type="submit"]').filter({ hasText: /submit/i }).first();
   if ((await button.count().catch(() => 0)) > 0) {
-    await Promise.all([
-      page.waitForLoadState('domcontentloaded', { timeout: 20_000 }).catch(() => undefined),
+    const [response] = await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null),
       button.click({ timeout: 20_000 }),
     ]);
-    return true;
+    return { clicked: true, status: response?.status() ?? null };
   }
-  return false;
+  return { clicked: false, status: null };
 }
 
 async function readFields(page: Page): Promise<SubmitField[]> {
@@ -362,21 +500,29 @@ async function fetchSubmissions(username: string, source: SourceIndexEntry): Pro
     : fetchUserStatus(username, 100);
 }
 
-async function pollForNewSubmission(
+/**
+ * Reads the verdict of the submission that appeared after `submittedAt`.
+ * Runs browserless, so the browser that posted it can already be gone.
+ */
+export async function pollForVerdict(
   username: string,
   source: SourceIndexEntry,
   beforeIds: Set<number>,
   submittedAt: number,
+  deps: { sleep?: (ms: number) => Promise<void>; now?: () => number; windowMs?: number } = {},
 ): Promise<CodeforcesSubmission | null> {
-  const deadline = Date.now() + VERIFICATION_WINDOW_MS;
+  const wait = deps.sleep ?? sleep;
+  const now = deps.now ?? Date.now;
+  const deadline = now() + (deps.windowMs ?? VERIFICATION_WINDOW_MS);
+  const maxPolls = Math.ceil((deps.windowMs ?? VERIFICATION_WINDOW_MS) / VERIFICATION_POLL_MS) + 2;
   let latest: CodeforcesSubmission | undefined;
 
-  while (Date.now() < deadline) {
-    await sleep(2_500);
+  for (let poll = 0; poll < maxPolls && now() < deadline; poll++) {
+    await wait(VERIFICATION_POLL_MS);
     const submissions = await fetchSubmissions(username, source).catch(() => [] as CodeforcesSubmission[]);
     const candidate = submissions
       .filter((submission) => !beforeIds.has(submission.id))
-      .filter((submission) => submission.creationTimeSeconds >= submittedAt - 10)
+      .filter((submission) => submission.creationTimeSeconds >= submittedAt - 30)
       .filter((submission) =>
         submission.problem.contestId === source.contestId || submission.contestId === source.contestId,
       )

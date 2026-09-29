@@ -214,10 +214,16 @@ export async function launchFirefoxWithStorageStateObject(
     const browser = await firefox.launch({
       headless: config.browser.headless,
       firefoxUserPrefs: {
-        // A submit form needs no images, and the free instance has 512MB total.
+        // A submit form needs no images, and the free instance has 512MB total:
+        // keep one content process and no caches, or the service is OOM-killed
+        // mid-submission.
         'permissions.default.image': 2,
-        'dom.ipc.processCount': 1,
-        'network.http.max-connections': 24,
+        'browser.cache.memory.capacity': 0,
+        'browser.sessionhistory.max_entries': 2,
+        'network.prefetch-next': false,
+        'browser.newtabpage.enabled': false,
+        'toolkit.telemetry.enabled': false,
+        'datareporting.policy.dataSubmissionEnabled': false,
       },
     });
     const context = await browser.newContext({
