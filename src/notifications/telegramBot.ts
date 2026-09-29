@@ -399,7 +399,10 @@ export async function processCookieMessage(
     const result = await ingestCodeforcesSession(payload, {
       label: opts.label,
       fileName: opts.fileName,
-    });
+    }).catch((err: unknown) => ({
+      ok: false as const,
+      error: `Codeforces session check failed: ${err instanceof Error ? err.message : String(err)}`,
+    }));
     if (!result.ok) {
       return {
         stored: false,
