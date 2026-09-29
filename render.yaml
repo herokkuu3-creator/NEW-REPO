@@ -49,6 +49,24 @@ services:
       # raise this escape hatch only if you see Chromium OOM crashes.
       - key: CHROMIUM_SINGLE_PROCESS
         value: "false"
+      # Keep the Codeforces browser away from the LeetCode 09:00 run so the two
+      # never fight over the same 512MB container.
+      - key: CODEFORCES_RUN_HOUR
+        value: "9"
+      - key: CODEFORCES_RUN_MINUTE
+        value: "15"
+      # Firefox may only start once cleanup has released this much memory.
+      - key: CODEFORCES_BROWSER_MIN_FREE_MB
+        value: "300"
+      # Never hold an expensive browser open for a long Cloudflare/Turnstile wait.
+      - key: CODEFORCES_TURNSTILE_WAIT_MS
+        value: "8000"
+      - key: CODEFORCES_CHALLENGE_WAIT_MS
+        value: "8000"
+      # The header-only POST is bounced 302 -> "/" by Codeforces itself; keep that
+      # transport as an opt-in diagnostic instead of loading it before Firefox.
+      - key: CODEFORCES_HTTP_FIRST
+        value: "false"
       - key: DAILY_RUN_HOUR
         value: "9"
       - key: DAILY_RUN_MINUTE

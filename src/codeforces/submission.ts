@@ -52,7 +52,11 @@ const REJECTION_RE = /you have submitted exactly the same code before|source cod
 const PENDING_VERDICTS = new Set(['TESTING', 'QUEUE', 'QUEUED', undefined, null]);
 const VERIFICATION_WINDOW_MS = 150_000;
 const VERIFICATION_POLL_MS = 2_500;
-const TURNSTILE_WAIT_MS = 30_000;
+const configuredTurnstileWait = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 8_000);
+const TURNSTILE_WAIT_MS =
+  Number.isFinite(configuredTurnstileWait) && configuredTurnstileWait >= 1_000
+    ? configuredTurnstileWait
+    : 8_000;
 
 /** Outcome of posting the submit form from the browser, before any polling. */
 export interface BrowserPostOutcome {
@@ -277,18 +281,20 @@ function finishPost(
 }
 
 /**
- * How long to let a managed challenge clear. Configurable so tests do not sit
- * through a minute of polling that a page double will never satisfy.
+ * How long to let a managed challenge clear. The free tier cannot hold Firefox
+ * open for a long managed challenge, so the default is short — a normal managed
+ * challenge clears in a second or two, and otherwise the step is abandoned with
+ * a real reason instead of starving the container.
  */
 function challengeWaitMs(): number {
   const configured = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS);
-  return Number.isFinite(configured) && configured >= 0 ? configured : 60_000;
+  return Number.isFinite(configured) && configured >= 0 ? configured : 8_000;
 }
 
 async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs()): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    await sleep(2_000);
+    await sleep(1_000);
     const body = await readBody(page);
     if (!CHALLENGE_RE.test(body) && !CHALLENGE_RE.test(page.url())) {
       logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser');
@@ -441,18 +447,17 @@ async function waitForToken(page: Page, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if ((await turnstileToken(page)).trim()) return true;
-    await sleep(1_000);
+    await sleep(500);
   }
   return false;
 }
 
 /**
- * Cloudflare's Turnstile widget sits on the submit form and fills `turnstileToken`;
- * Codeforces refuses the POST without it. A click that leaves the page where it
- * was is exactly what an unsolved widget looks like. A trusted client solves
- * itself invisibly in a second or two. From a datacenter IP the widget can
- * instead render an interactive checkbox inside its own cross-origin frame,
- * which a user would tick, so we tick it too and report both outcomes.
+ * Cloudflare's Turnstile widget fills `turnstileToken`, and Codeforces refuses
+ * the POST without it. On a trusted/managed session it resolves on its own in a
+ * second or two. If it instead demands an interactive challenge, the container
+ * must NOT be kept alive trying to automate it: the step is abandoned with the
+ * reason recorded, so the service survives and the report says what happened.
  */
 async function ensureTurnstile(
   page: Page,
@@ -466,22 +471,13 @@ async function ensureTurnstile(
     return { turnstile: true, interactive: false };
   }
 
-  const widget = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
-  for (const selector of ['input[type="checkbox"]', '#challenge-stage', 'label']) {
-    const box = widget.locator(selector).first();
-    if ((await box.count().catch(() => 0)) === 0) continue;
-    logger.info({ selector }, 'Codeforces Turnstile is interactive - ticking its widget');
-    await box
-      .click({ timeout: 10_000, force: true })
-      .catch((err) => logger.warn({ selector, err: errorMessage(err) }, 'could not tick the Turnstile widget'));
-    if (await waitForToken(page, timeoutMs)) {
-      logger.info({ selector }, 'Codeforces Turnstile accepted the tick');
-      return { turnstile: true, interactive: true };
-    }
-  }
-
-  logger.warn({ timeoutMs }, 'Codeforces Turnstile stayed empty - the submit form cannot be posted');
-  return { turnstile: false, interactive: true };
+  const interactive =
+    (await page.locator('iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0)) > 0;
+  throw new CodeforcesBlockedError(
+    interactive
+      ? `Codeforces Turnstile requires interactive verification; no token appeared within ${timeoutMs}ms`
+      : `Codeforces Turnstile did not issue a token within ${timeoutMs}ms`,
+  );
 }
 
 /**

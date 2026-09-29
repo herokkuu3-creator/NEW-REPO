@@ -115,8 +115,10 @@ export class MemoryWatch {
 
   constructor(
     private readonly onPressure: (reading: MemoryReading, worstMb: number) => void,
-    private readonly reserveMb = 64,
-    private readonly intervalMs = 1_500,
+    // Sample fast enough to catch Firefox's growth before Render's cgroup OOM:
+    // the browser can add tens of megabytes per second.
+    private readonly reserveMb = 48,
+    private readonly intervalMs = 250,
   ) {}
 
   start(): void {
