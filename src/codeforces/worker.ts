@@ -16,6 +16,7 @@ import {
   releaseDailyAttempt,
 } from './storage';
 import { loadSourceIndex, fetchSourceCode, SourceIndexEntry } from './sourceRepo';
+import { shouldReleaseDailyAttempt } from './dailyGate';
 import { inspectCodeforcesSessionPage } from './session';
 import { submitAndVerify } from './submission';
 import {
@@ -164,7 +165,13 @@ async function runForAccount(
     });
 
     const code = await fetchSourceCode(current);
-    if (forceDailyAttempt) {
+    const retryToday = shouldReleaseDailyAttempt({
+      manual: forceDailyAttempt,
+      lastAttemptDate: progress.lastAttemptDate ?? null,
+      lastVerdict: progress.lastVerdict ?? null,
+      today,
+    });
+    if (retryToday) {
       await releaseDailyAttempt(account.id, today);
     }
     const claimed = await claimDailyAttempt(account.id, today, current.key);
