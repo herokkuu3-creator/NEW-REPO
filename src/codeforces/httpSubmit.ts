@@ -37,9 +37,14 @@ export type HttpSubmitResult =
     };
 
 export interface FormPage {
-  /** Verbatim action attribute of the submit form: carries Codeforces' per-page
-   *  query parameters (e.g. ?adcd1e=<token>&csrf_token=<token>) exactly as the
-   *  browser would post them. Posting anywhere else gets a 302 back to "/". */
+  /** The action attribute exactly as rendered, for logging. */
+  actionRaw: string;
+  /** Action resolved the way a browser resolves it — against the PAGE url, never
+   *  against the origin. Codeforces renders the submit form with an action that
+   *  keeps only the query ("?csrf_token=<token>"), so it preserves the submit
+   *  path only when resolved against the page it sits on. Resolved against the
+   *  origin it becomes https://codeforces.com/?csrf_token=… and the POST is
+   *  answered with 302 → "/". */
   action: string;
   hidden: Record<string, string>;
   csrf: string | null;
@@ -103,7 +108,7 @@ function decode(value: string): string {
     .replace(/&#(\d+);/g, (_, n: string) => String.fromCharCode(Number(n)));
 }
 
-export function parseSubmitPage(html: string): FormPage {
+export function parseSubmitPage(html: string, pageUrl: string = BASE): FormPage {
   const csrf =
     /name=['"]csrf_token['"][^>]*value=['"]([0-9a-f]{16,})['"]/i.exec(html)?.[1] ??
     /name=["']X-Csrf-Token["'][^>]*content=["']([0-9a-f]{16,})["']/i.exec(html)?.[1] ??
@@ -120,7 +125,7 @@ export function parseSubmitPage(html: string): FormPage {
     /name=["']source["']/.test(m[1] ?? ''),
   );
   const formBody = formTag?.[1] ?? html;
-  const action = /<form\b[^>]*\baction=["']([^"']*)["']/i.exec(formTag?.[0] ?? '')?.[1] ?? '';
+  const actionRaw = /<form\b[^>]*\baction=["']([^"']*)["']/i.exec(formTag?.[0] ?? '')?.[1] ?? '';
   const hidden: Record<string, string> = {};
   for (const input of formBody.matchAll(/<input\b[^>]*>/gi)) {
     const tag = input[0];
@@ -139,7 +144,8 @@ export function parseSubmitPage(html: string): FormPage {
     }));
 
   return {
-    action: action ? new URL(decode(action), BASE).toString() : '',
+    actionRaw,
+    action: actionRaw ? new URL(decode(actionRaw), pageUrl).toString() : '',
     hidden,
     csrf: csrf ?? hidden['csrf_token'] ?? null,
     signedInHandle: signedInHandle ? decodeURIComponent(signedInHandle) : null,
@@ -259,6 +265,7 @@ export async function submitViaHttp(
   const attempts: string[] = [];
 
   for (const path of candidates) {
+    const pageUrl = `${BASE}${path}`;
     const page = await client.get(path);
     if (page.status === 403 || CHALLENGE_RE.test(page.body)) {
       return { ok: false, kind: 'blocked', error: `Cloudflare challenged GET ${path} (HTTP ${page.status})` };
@@ -270,7 +277,7 @@ export async function submitViaHttp(
         error: `Codeforces redirected ${path} to ${page.location ?? '?'} — the session cookies are not signed in; re-send them with /renew`,
       };
     }
-    const form = parseSubmitPage(page.body);
+    const form = parseSubmitPage(page.body, pageUrl);
     if (!form.csrf) return { ok: false, kind: 'error', error: `no csrf_token on ${path} (HTTP ${page.status})` };
     if (!form.signedInHandle) {
       return { ok: false, kind: 'signed-out', error: 'Codeforces served the submit page anonymously — re-send the session cookies with /renew' };
@@ -297,8 +304,10 @@ export async function submitViaHttp(
     const body = new URLSearchParams({
       ...form.hidden,
       csrf_token: form.csrf,
-      ftaa: jar?.get('_ftaa') ?? randomFtaa(),
-      bfaa: jar?.get('_bfaa') ?? randomHex(32),
+      // What the page itself rendered wins (that is what the browser submits);
+      // the cookie is the fallback and a fresh id the last resort.
+      ftaa: form.hidden['ftaa']?.trim() || jar?.get('_ftaa') || randomFtaa(),
+      bfaa: form.hidden['bfaa']?.trim() || jar?.get('_bfaa') || randomHex(32),
       action: 'submitSolutionFormSubmitted',
       submittedProblemIndex: entry.problemIndex,
       programTypeId,
@@ -308,10 +317,24 @@ export async function submitViaHttp(
       _tta: String(computeTta(seed)),
     });
     // Post to the form's own action, so Codeforces' per-page parameters survive.
-    const target = form.action || `${BASE}${path}?csrf_token=${encodeURIComponent(form.csrf)}`;
-    const post = await client.post(target, body, `${BASE}${path}`);
+    // A query-only action is relative to the page it sits on, and Codeforces
+    // answers a submit form sent to the site root with 302 → "/", so a target
+    // that collapsed to "/" is sent to the page itself instead.
+    const target = new URL(form.action || pageUrl);
+    if (target.pathname === '/' && new URL(pageUrl).pathname !== '/') {
+      target.pathname = new URL(pageUrl).pathname;
+    }
+    const post = await client.post(target.toString(), body, pageUrl);
     logger.info(
-      { path, target, hidden: Object.keys(form.hidden), status: post.status, location: post.location },
+      {
+        path,
+        pageUrl,
+        action: form.actionRaw,
+        target: target.toString(),
+        hidden: Object.keys(form.hidden),
+        status: post.status,
+        location: post.location,
+      },
       'Codeforces submission posted',
     );
 

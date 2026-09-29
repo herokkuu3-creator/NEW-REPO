@@ -217,3 +217,51 @@ describe('the codeforces submit form is replayed exactly', () => {
     expect(result.ok || result.error).toContain('/problemset/submit/1/A');
   });
 });
+
+describe('an action that lost its path is still posted to the page', () => {
+  it('resolves a query-only action against the page url it sits on', () => {
+    const page = parseSubmitPage(
+      SUBMIT_PAGE.replace(`action="/contest/1/submit?csrf_token=${CSRF}"`, `action="?csrf_token=${CSRF}"`),
+      'https://codeforces.com/contest/1/submit',
+    );
+    expect(page.actionRaw).toBe(`?csrf_token=${CSRF}`);
+    expect(page.action).toBe(`https://codeforces.com/contest/1/submit?csrf_token=${CSRF}`);
+  });
+
+  it('keeps the submit path when the form renders a query-only action (the reported failure)', async () => {
+    api.fetchUserStatus.mockResolvedValueOnce([]).mockResolvedValue([sub(31, 'OK')]);
+    const page = SUBMIT_PAGE.replace(`action="/contest/1/submit?csrf_token=${CSRF}"`, `action="?csrf_token=${CSRF}"`);
+    const { client, calls } = fakeClient({ status: 200, body: page }, { status: 302, location: '/contest/1/my' });
+    const result = await submitViaHttp(state, 'me_superman', entry, 'x', { client, sleep: noSleep, now: () => 2_000_000_000_000 });
+
+    expect(calls[1]!.path).toBe(`https://codeforces.com/contest/1/submit?csrf_token=${CSRF}`);
+    expect(result).toMatchObject({ ok: true, submissionId: '31' });
+  });
+
+  it('never posts the submit form to the site root', async () => {
+    api.fetchUserStatus.mockResolvedValueOnce([]).mockResolvedValue([sub(32, 'OK')]);
+    const page = SUBMIT_PAGE.replace(`action="/contest/1/submit?csrf_token=${CSRF}"`, `action="/?csrf_token=${CSRF}"`);
+    const { client, calls } = fakeClient({ status: 200, body: page }, { status: 302, location: '/contest/1/my' });
+    await submitViaHttp(state, 'me_superman', entry, 'x', { client, sleep: noSleep, now: () => 2_000_000_000_000 });
+
+    expect(calls.filter((c) => c.method === 'POST').map((c) => c.path)).toEqual([
+      `https://codeforces.com/contest/1/submit?csrf_token=${CSRF}`,
+    ]);
+  });
+
+  it('reuses the ftaa/bfaa the page rendered instead of inventing new ones', async () => {
+    api.fetchUserStatus.mockResolvedValueOnce([]).mockResolvedValue([sub(33, 'OK')]);
+    const page = SUBMIT_PAGE.replace(
+      `<input type='hidden' name='csrf_token' value='${CSRF}'/>`,
+      `<input type='hidden' name='csrf_token' value='${CSRF}'/>` +
+        `<input type="hidden" name="ftaa" value="abc123def456ghi789"/>` +
+        `<input type="hidden" name="bfaa" value="d41d8cd98f00b204e9800998ecf8427e"/>`,
+    );
+    const { client, calls } = fakeClient({ status: 200, body: page }, { status: 302, location: '/contest/1/my' });
+    await submitViaHttp(state, 'me_superman', entry, 'x', { client, sleep: noSleep, now: () => 2_000_000_000_000 });
+
+    const f = calls[1]!.form!;
+    expect(f.get('ftaa')).toBe('abc123def456ghi789');
+    expect(f.get('bfaa')).toBe('d41d8cd98f00b204e9800998ecf8427e');
+  });
+});
