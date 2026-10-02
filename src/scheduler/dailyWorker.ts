@@ -446,6 +446,49 @@ async function runForAccount(
 }
 
 // ---------------------------------------------------------------------------
+// LeetCode C++ comment-stripping fallback
+// ---------------------------------------------------------------------------
+
+async function submitDailySolutionWithCommentFallback(
+  originalCode: string,
+  submit: (code: string) => Promise<AccountOutcome>,
+  label: string,
+  problemSlug: string,
+): Promise<AccountOutcome> {
+  const strippedCode = config.llm.language === 'cpp' ? stripCppComments(originalCode) : originalCode;
+  const useCommentStrippedFirst =
+    config.llm.language === 'cpp' &&
+    strippedCode.trim().length > 0 &&
+    strippedCode !== originalCode;
+
+  if (!useCommentStrippedFirst) {
+    return submit(originalCode);
+  }
+
+  logger.info(
+    { label, problem: problemSlug, removedComments: true },
+    'LeetCode daily: submitting comment-stripped source first',
+  );
+
+  const first = await submit(strippedCode);
+  if (!shouldRetryWithOriginal(first.submissionStatus)) {
+    return first;
+  }
+
+  logger.warn(
+    {
+      label,
+      problem: problemSlug,
+      firstVerdict: first.submissionStatus,
+      firstSubmissionId: first.submissionId ?? null,
+    },
+    'LeetCode daily: comment-stripped submission failed at compile/runtime; retrying exact original source',
+  );
+
+  return submit(originalCode);
+}
+
+// ---------------------------------------------------------------------------
 // Solution acquisition
 // ---------------------------------------------------------------------------
 
