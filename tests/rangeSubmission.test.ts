@@ -13,6 +13,7 @@ import {
   RangeSession,
   RangeSolutionCache,
   startRangeJob,
+  rangeQueueLength,
   cancelRangeJob,
   __resetRangeJobForTests,
 } from '../src/scheduler/rangeSubmission';
@@ -214,7 +215,7 @@ describe('range engine', () => {
     expect(results[0]!.notAttempted).toEqual([201, 202]);
   });
 
-  it('refuses a second job while one runs, with live progress', async () => {
+  it('queues later jobs FIFO and starts each one only after its predecessor completes', async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     const session = makeSession(() => 'accepted', []);
@@ -222,19 +223,55 @@ describe('range engine', () => {
       await gate;
       return { submissionId: id, classification: 'ACCEPTED' as const, statusDisplay: 'Accepted', runtime: null, memory: null, rawStatusMsg: 'Accepted' };
     };
-    const { deps } = makeDeps(session, [acc('a1'), acc('a2')]);
-    const first = await startRangeJob({ from: 200, to: 200 }, 'all', deps);
+    const { deps } = makeDeps(session, [acc('a1')]);
+
+    const first = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
     expect(first.started).toBe(true);
-    const second = await startRangeJob({ from: 200, to: 200 }, 'all', deps);
+
+    const second = await startRangeJob({ from: 201, to: 201 }, 'a1', deps);
+    const third = await startRangeJob({ from: 202, to: 202 }, 'a1', deps);
+
     expect(second.started).toBe(false);
-    if (!second.started && second.reason === 'busy') {
-      expect(second.job.currentLabel).toBe('a1');
-      expect(second.job.accountLabels).toEqual(['a1', 'a2']);
-    } else {
-      expect.unreachable('second start must be refused as busy');
+    expect(third.started).toBe(false);
+    if (!second.started && !third.started) {
+      expect(second.queued).toBe(true);
+      expect(second.position).toBe(1);
+      expect(third.queued).toBe(true);
+      expect(third.position).toBe(2);
     }
+    expect(rangeQueueLength()).toBe(2);
+
     release();
     await first.done;
+    await second.done;
+    await third.done;
+
+    expect(rangeQueueLength()).toBe(0);
+  });
+
+  it('starts the next queued job after the active job is cancelled', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const session = makeSession(() => 'accepted', []);
+    session.api.awaitResult = async (id: string) => {
+      await gate;
+      return { submissionId: id, classification: 'ACCEPTED' as const, statusDisplay: 'Accepted', runtime: null, memory: null, rawStatusMsg: 'Accepted' };
+    };
+    const { deps } = makeDeps(session, [acc('a1')]);
+
+    const first = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
+    const second = await startRangeJob({ from: 201, to: 201 }, 'a1', deps);
+
+    expect(first.started).toBe(true);
+    expect(second.started).toBe(false);
+    if (!second.started) expect(second.queued).toBe(true);
+    expect(cancelRangeJob()).toBe(true);
+
+    release();
+    await first.done;
+    const nextResults = await second.done;
+
+    expect(nextResults[0]!.results.map((r) => r.number)).toEqual([201]);
   });
 
   it('pauses while the daily run is in progress', async () => {
