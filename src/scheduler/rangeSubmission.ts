@@ -238,7 +238,9 @@ export async function startRangeJob(
 
   // Re-check after the async account lookup: another request may have
   // started the active job while this request was resolving its accounts.
-  if (activeJob) return enqueueRangeJob(range, accounts, deps);
+  // Also respect any existing queue so a newly-arrived request never jumps
+  // ahead of jobs that were already waiting.
+  if (activeJob || queuedJobs.length > 0) return enqueueRangeJob(range, accounts, deps);
 
   const job = createRangeJob(range, accounts, deps);
   return { started: true, accounts, done: job.done };
