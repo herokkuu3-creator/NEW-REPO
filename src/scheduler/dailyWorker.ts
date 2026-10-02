@@ -291,7 +291,8 @@ async function runForAccount(
         error: 'the browser could not be launched for this account',
       };
     }
-    const api = new LeetCodeApi(session.context);
+    const activeSession = session;
+    const api = new LeetCodeApi(activeSession.context);
     const check = await checkSession(api);
 
     if (!check.authenticated) {
@@ -436,7 +437,7 @@ async function runForAccount(
       (code) =>
         config.transport === 'api'
           ? submitViaApi(account, username, api, problem, code, run)
-          : submitViaBrowser(account, username, session, problem, code, run),
+          : submitViaBrowser(account, username, activeSession, problem, code, run),
       label,
       problem.slug,
     );
