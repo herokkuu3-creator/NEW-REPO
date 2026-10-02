@@ -431,10 +431,15 @@ async function runForAccount(
     run = await updateRun(run.id, { solution: solution.code });
 
     // --- 6) Apply the solution ---------------------------------------------
-    if (config.transport === 'api') {
-      return await submitViaApi(account, username, api, problem, solution.code, run);
-    }
-    return await submitViaBrowser(account, username, session, problem, solution.code, run);
+    return await submitDailySolutionWithCommentFallback(
+      solution.code,
+      (code) =>
+        config.transport === 'api'
+          ? submitViaApi(account, username, api, problem, code, run)
+          : submitViaBrowser(account, username, session, problem, code, run),
+      label,
+      problem.slug,
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ label, err: msg }, 'account run failed with unexpected error');
