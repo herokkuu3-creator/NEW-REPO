@@ -87,7 +87,7 @@ export function stripCppComments(source: string): string {
  */
 export function shouldRetryWithOriginal(verdict: string | null | undefined): boolean {
   const normalized = verdict?.trim().toUpperCase();
-  return normalized === 'COMPILATION_ERROR' || normalized === 'RUNTIME_ERROR' || normalized === 'CRASHED';
+  return normalized === 'COMPILATION_ERROR' || normalized === 'COMPILE_ERROR' || normalized === 'RUNTIME_ERROR' || normalized === 'CRASHED';
 }
 
 function isIdentifierChar(ch: string): boolean {
