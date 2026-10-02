@@ -86,8 +86,14 @@ export function stripCppComments(source: string): string {
  * so they must never trigger an automatic duplicate submission.
  */
 export function shouldRetryWithOriginal(verdict: string | null | undefined): boolean {
-  const normalized = verdict?.trim().toUpperCase();
-  return normalized === 'COMPILATION_ERROR' || normalized === 'COMPILE_ERROR' || normalized === 'RUNTIME_ERROR' || normalized === 'CRASHED';
+  const normalized = verdict?.trim().toUpperCase().replace(/[\s-]+/g, '_');
+  return (
+    normalized === 'COMPILATION_ERROR' ||
+    normalized === 'COMPILE_ERROR' ||
+    normalized === 'RUNTIME_ERROR' ||
+    normalized === 'CRASHED' ||
+    normalized === 'RUNTIME_FAILURE'
+  );
 }
 
 function isIdentifierChar(ch: string): boolean {
