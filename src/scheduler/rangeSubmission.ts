@@ -235,12 +235,13 @@ export async function startRangeJob(
     if (!account) return { started: false, reason: 'account-not-found' };
     accounts = [account];
   }
+
   // Re-check after the async account lookup: another request may have
   // started the active job while this request was resolving its accounts.
   if (activeJob) return enqueueRangeJob(range, accounts, deps);
 
   const job = createRangeJob(range, accounts, deps);
-  return { started: true, accounts, done: job.done };  return { started: true, accounts, done: job.done };
+  return { started: true, accounts, done: job.done };
 }
 
 function createRangeJob(range: QuestionRange, accounts: AccountRecord[], deps: RangeDeps): RangeJob {
@@ -259,11 +260,7 @@ function createRangeJob(range: QuestionRange, accounts: AccountRecord[], deps: R
   };
   const job: RangeJob = { info, abort, done: Promise.resolve([]) };
   activeJob = job;
-
-
-  const job: RangeJob = { info, abort, done: Promise.resolve([]) };
-  activeJob = job;
-  job.done = executeRangeJob(job, accounts, deps);
+  job.done = executeRangeJob(job, range, accounts, deps);
   return job;
 }
 
@@ -285,7 +282,10 @@ function enqueueRangeJob(
     resolve,
   };
   queuedJobs.push(queued);
-  logger.info({ position: queued.position, range, accounts: accounts.map((a) => a.label) }, 'range job queued behind active job');
+  logger.info(
+    { position: queued.position, range, accounts: accounts.map((a) => a.label) },
+    'range job queued behind active job',
+  );
   return { started: false, queued: true, position: queued.position, accounts, done };
 }
 
@@ -299,51 +299,51 @@ function startNextQueuedRangeJob(): void {
 
 async function executeRangeJob(
   job: RangeJob,
+  range: QuestionRange,
   accounts: AccountRecord[],
   deps: RangeDeps,
 ): Promise<AccountRangeResult[]> {
   const { info, abort } = job;
+  const all: AccountRangeResult[] = [];
+  const stopKeepAlive = deps.keepAlive();
+  try {
+    for (let i = 0; i < accounts.length; i++) {
+      if (abort.signal.aborted) break;
+      const account = accounts[i]!;
+      info.accountIndex = i + 1;
+      info.currentLabel = account.label;
+      info.currentQuestion = null;
+      info.doneInAccount = 0;
+      info.counts = { accepted: 0, failed: 0, error: 0, premium: 0 };
 
-    const all: AccountRangeResult[] = [];
-    const stopKeepAlive = deps.keepAlive();
-    try {
-      for (let i = 0; i < accounts.length; i++) {
-        if (abort.signal.aborted) break;
-        const account = accounts[i]!;
-        info.accountIndex = i + 1;
-        info.currentLabel = account.label;
-        info.currentQuestion = null;
-        info.doneInAccount = 0;
-        info.counts = { accepted: 0, failed: 0, error: 0, premium: 0 };
-
-        const result = await runAccountRange(account, range, deps, info, abort.signal, i + 1, accounts.length);
-        all.push(result);
-        await deps
-          .notify(formatAccountRangeSummary(result, i + 1, accounts.length))
-          .catch((err) => logger.warn({ err: errText(err) }, 'range summary notification failed'));
-
-        // Short breather before the next account (skipped when cancelled).
-        if (i < accounts.length - 1 && !abort.signal.aborted) {
-          await deps.sleep(deps.questionGapMs, abort.signal);
-        }
-      }
+      const result = await runAccountRange(account, range, deps, info, abort.signal, i + 1, accounts.length);
+      all.push(result);
       await deps
-        .notify(formatRangeJobFinished(range, all, accounts.length, abort.signal.aborted, deps.now() - info.startedAt))
-        .catch(() => undefined);
-      return all;
-    } catch (err) {
-      logger.error({ err: errText(err) }, 'range job crashed');
-      await deps.notify(`💥 The question-range job crashed: ${errText(err)}`).catch(() => undefined);
-      return all;
-    } finally {
-      stopKeepAlive();
-      if (activeJob === job) {
-        activeJob = null;
-        startNextQueuedRangeJob();
+        .notify(formatAccountRangeSummary(result, i + 1, accounts.length))
+        .catch((err) => logger.warn({ err: errText(err) }, 'range summary notification failed'));
+
+      // Short breather before the next account (skipped when cancelled).
+      if (i < accounts.length - 1 && !abort.signal.aborted) {
+        await deps.sleep(deps.questionGapMs, abort.signal);
       }
     }
-
+    await deps
+      .notify(formatRangeJobFinished(range, all, accounts.length, abort.signal.aborted, deps.now() - info.startedAt))
+      .catch(() => undefined);
+    return all;
+  } catch (err) {
+    logger.error({ err: errText(err) }, 'range job crashed');
+    await deps.notify(`💥 The question-range job crashed: ${errText(err)}`).catch(() => undefined);
+    return all;
+  } finally {
+    stopKeepAlive();
+    if (activeJob === job) {
+      activeJob = null;
+      startNextQueuedRangeJob();
+    }
+  }
 }
+
 // ---------------------------------------------------------------------------
 // Per-account loop
 // ---------------------------------------------------------------------------
