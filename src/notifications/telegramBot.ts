@@ -36,6 +36,7 @@ import {
   parseQuestionRange,
   QuestionRange,
   rangeSize,
+  rangeQueueLength,
   startRangeJob,
   StartRangeResult,
 } from '../scheduler/rangeSubmission';
@@ -706,6 +707,7 @@ export interface RangeUiDeps {
   current: typeof currentRangeJob;
   cancel: typeof cancelRangeJob;
   now: () => number;
+  queueLength?: () => number;
 }
 
 const defaultRangeUiDeps: RangeUiDeps = {
@@ -713,6 +715,7 @@ const defaultRangeUiDeps: RangeUiDeps = {
   current: currentRangeJob,
   cancel: cancelRangeJob,
   now: () => Date.now(),
+  queueLength: rangeQueueLength,
 };
 
 /** Account picker: one button per account, then "All accounts" and Cancel. */
@@ -741,11 +744,6 @@ export async function handleQuestionRangeCommand(
   deps: RemovalDeps = defaultRemovalDeps,
   ui: RangeUiDeps = defaultRangeUiDeps,
 ): Promise<void> {
-  const running = ui.current();
-  if (running) {
-    await deps.send(`🚧 A question-range process is already in progress.\n\n${formatRangeJobStatus(running, ui.now())}`);
-    return;
-  }
   if (!arg.trim()) {
     pendingRangePrompt = true;
     await deps.send('🎯 Which questions? Send the range, e.g. 200-400\n(or in one go: /questionrangesubmission 200-400)');
@@ -762,6 +760,9 @@ export async function handleQuestionRangeCommand(
     return;
   }
   const picker = buildRangePicker(parsed.range, accounts);
+  if (ui.current()) {
+    picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
+  }
   await deps.send(picker.text, picker.buttons);
 }
 
@@ -786,9 +787,20 @@ async function handleRangeButton(
   }
   const result = await ui.start(parsed.range, m[3]!);
   if (!result.started) {
-    if (result.reason === 'busy') {
-      await deps.answer(callbackId, 'A range process is already running');
-      await deps.send(`🚧 A question-range process is already in progress.\n\n${formatRangeJobStatus(result.job, ui.now())}`);
+    if (result.queued) {
+      await deps.answer(callbackId, `Queued #${result.position} 🗂️`);
+      await deps.edit(
+        chatId,
+        messageId,
+        [
+          `🗂️ Queued: questions #${parsed.range.from}–#${parsed.range.to} (${rangeSize(parsed.range)})`,
+          `📍 Queue position: ${result.position}`,
+          `👥 ${result.accounts.length === 1 ? `Account: ${result.accounts[0]?.label ?? 'unknown'}` : `Accounts (one by one): ${result.accounts.map((a) => a.label).join(', ')}`}`,
+          '',
+          '⏳ It will start automatically after the current range job completes or is cancelled.',
+          '📍 /rangestatus shows the active job and queue.',
+        ].join('\n'),
+      );
     } else {
       await deps.answer(callbackId, 'Account not found');
       await deps.edit(
@@ -831,7 +843,14 @@ export async function handleCancelRange(ui: RangeUiDeps = defaultRangeUiDeps): P
 
 export async function handleRangeStatus(ui: RangeUiDeps = defaultRangeUiDeps): Promise<void> {
   const job = ui.current();
-  await reply(job ? formatRangeJobStatus(job, ui.now()) : '💤 No question-range process is running. Start one with /questionrangesubmission 200-400');
+  const queued = ui.queueLength?.() ?? rangeQueueLength();
+  await reply(
+    job
+      ? formatRangeJobStatus(job, ui.now(), queued)
+      : queued > 0
+        ? `🗂️ ${queued} range job(s) waiting in the queue. A waiting job starts automatically when the active job finishes or is cancelled.`
+        : '💤 No question-range process is running. Start one with /questionrangesubmission 200-400',
+  );
 }
 
 /** Pending /renew <label> target — consumed by the next cookie payload. */
