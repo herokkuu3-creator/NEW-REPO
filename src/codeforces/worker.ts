@@ -299,9 +299,6 @@ async function runForAccount(
           'Codeforces: could not reclaim today attempt for original-source retry',
         );
       }
-    } viaBrowser;
-        username = viaBrowser.handle ?? username;
-      }
     }
 
     if (result.ok) {
