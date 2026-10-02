@@ -30,9 +30,10 @@ import { config } from '../config';
  *   - While the daily run is in progress the range pauses, so the two never
  *     submit at the same time.
  *
- * Only one range job can exist at a time; a second request is refused with
- * the current progress. /cancelrange stops it (immediately during a pause,
- * or right after the question that is being judged).
+ * Only one range job runs at a time. Additional requests are queued FIFO and
+ * start automatically when the current job completes or is cancelled.
+ * /cancelrange stops the active job (immediately during a pause, or right
+ * after the question that is being judged).
  */
 
 // ---------------------------------------------------------------------------
@@ -171,7 +172,17 @@ interface RangeJob {
   done: Promise<AccountRangeResult[]>;
 }
 
+interface QueuedRangeJob {
+  range: QuestionRange;
+  accounts: AccountRecord[];
+  deps: RangeDeps;
+  position: number;
+  enqueuedAt: number;
+  resolve: (results: AccountRangeResult[]) => void;
+}
+
 let activeJob: RangeJob | null = null;
+const queuedJobs: QueuedRangeJob[] = [];
 
 export function isRangeJobActive(): boolean {
   return activeJob !== null;
@@ -179,6 +190,11 @@ export function isRangeJobActive(): boolean {
 
 export function currentRangeJob(): RangeJobInfo | null {
   return activeJob ? { ...activeJob.info, counts: { ...activeJob.info.counts } } : null;
+}
+
+/** Number of range jobs waiting behind the active job. */
+export function rangeQueueLength(): number {
+  return queuedJobs.length;
 }
 
 /** Requests cancellation. Returns false when no job is running. */
@@ -191,20 +207,25 @@ export function cancelRangeJob(): boolean {
 
 export type StartRangeResult =
   | { started: true; accounts: AccountRecord[]; done: Promise<AccountRangeResult[]> }
-  | { started: false; reason: 'busy'; job: RangeJobInfo }
+  | {
+      started: false;
+      queued: true;
+      position: number;
+      accounts: AccountRecord[];
+      done: Promise<AccountRangeResult[]>;
+    }
   | { started: false; reason: 'no-accounts' | 'account-not-found' };
 
 /**
  * Starts a range job in the background for one account (by id) or all
- * enabled accounts (`'all'`). Never runs two jobs at once.
+ * enabled accounts (`'all'`). If another job is already active, the request
+ * is queued FIFO instead of being rejected.
  */
 export async function startRangeJob(
   range: QuestionRange,
   target: string | 'all',
   deps: RangeDeps = defaultRangeDeps(),
 ): Promise<StartRangeResult> {
-  if (activeJob) return { started: false, reason: 'busy', job: currentRangeJob()! };
-
   let accounts: AccountRecord[];
   if (target === 'all') {
     accounts = await deps.listAccounts();
@@ -214,9 +235,15 @@ export async function startRangeJob(
     if (!account) return { started: false, reason: 'account-not-found' };
     accounts = [account];
   }
-  // Re-check: another start may have slipped in during the lookup above.
-  if (activeJob) return { started: false, reason: 'busy', job: currentRangeJob()! };
+  // Re-check after the async account lookup: another request may have
+  // started the active job while this request was resolving its accounts.
+  if (activeJob) return enqueueRangeJob(range, accounts, deps);
 
+  const job = createRangeJob(range, accounts, deps);
+  return { started: true, accounts, done: job.done };  return { started: true, accounts, done: job.done };
+}
+
+function createRangeJob(range: QuestionRange, accounts: AccountRecord[], deps: RangeDeps): RangeJob {
   const abort = new AbortController();
   const info: RangeJobInfo = {
     range,
@@ -233,7 +260,50 @@ export async function startRangeJob(
   const job: RangeJob = { info, abort, done: Promise.resolve([]) };
   activeJob = job;
 
-  job.done = (async () => {
+
+  const job: RangeJob = { info, abort, done: Promise.resolve([]) };
+  activeJob = job;
+  job.done = executeRangeJob(job, accounts, deps);
+  return job;
+}
+
+function enqueueRangeJob(
+  range: QuestionRange,
+  accounts: AccountRecord[],
+  deps: RangeDeps,
+): Extract<StartRangeResult, { queued: true }> {
+  let resolve!: (results: AccountRangeResult[]) => void;
+  const done = new Promise<AccountRangeResult[]>((res) => {
+    resolve = res;
+  });
+  const queued: QueuedRangeJob = {
+    range: { ...range },
+    accounts,
+    deps,
+    position: queuedJobs.length + 1,
+    enqueuedAt: deps.now(),
+    resolve,
+  };
+  queuedJobs.push(queued);
+  logger.info({ position: queued.position, range, accounts: accounts.map((a) => a.label) }, 'range job queued behind active job');
+  return { started: false, queued: true, position: queued.position, accounts, done };
+}
+
+function startNextQueuedRangeJob(): void {
+  if (activeJob) return;
+  const queued = queuedJobs.shift();
+  if (!queued) return;
+  const job = createRangeJob(queued.range, queued.accounts, queued.deps);
+  job.done.then(queued.resolve);
+}
+
+async function executeRangeJob(
+  job: RangeJob,
+  accounts: AccountRecord[],
+  deps: RangeDeps,
+): Promise<AccountRangeResult[]> {
+  const { info, abort } = job;
+
     const all: AccountRangeResult[] = [];
     const stopKeepAlive = deps.keepAlive();
     try {
@@ -267,13 +337,13 @@ export async function startRangeJob(
       return all;
     } finally {
       stopKeepAlive();
-      if (activeJob === job) activeJob = null;
+      if (activeJob === job) {
+        activeJob = null;
+        startNextQueuedRangeJob();
+      }
     }
-  })();
 
-  return { started: true, accounts, done: job.done };
 }
-
 // ---------------------------------------------------------------------------
 // Per-account loop
 // ---------------------------------------------------------------------------
@@ -579,7 +649,7 @@ export function formatRangeJobFinished(
   ].join('\n');
 }
 
-export function formatRangeJobStatus(j: RangeJobInfo, now: number): string {
+export function formatRangeJobStatus(j: RangeJobInfo, now: number, queuedCount = 0): string {
   const size = rangeSize(j.range);
   const lines = [
     `⏳ Question-range job in progress (#${j.range.from}–#${j.range.to})`,
@@ -588,6 +658,7 @@ export function formatRangeJobStatus(j: RangeJobInfo, now: number): string {
     `✅ ${j.counts.accepted} · ❌ ${j.counts.failed} · ⚠️ ${j.counts.error}${j.counts.premium ? ` · 🔒 ${j.counts.premium}` : ''}`,
     `⏱️ Running for ${formatDuration(now - j.startedAt)}`,
   ];
+  if (queuedCount > 0) lines.push(`🗂️ Queue: ${queuedCount} waiting`);
   if (j.pausedReason) lines.push(`⏸️ Paused: ${j.pausedReason}`);
   if (j.cancelling) lines.push('🛑 Cancelling — stopping after the current question');
   else lines.push('', 'Send /cancelrange to stop it.');
@@ -737,4 +808,5 @@ export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 /** Test hook: forget any job (only used by tests). */
 export function __resetRangeJobForTests(): void {
   activeJob = null;
+  queuedJobs.length = 0;
 }
