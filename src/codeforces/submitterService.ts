@@ -532,14 +532,28 @@ function authorized(req: http.IncomingMessage): boolean {
 const server = http.createServer((req, res) => {
   const url = req.url ?? '/';
 
-  if (req.method === 'GET' && (url === '/health' || url === '/')) {
-    json(res, 200, {
+  // Public liveness endpoint for Render/UptimeRobot. Keep this path completely
+  // independent of the browser, auth token, or Codeforces itself. Support both
+  // GET and HEAD because HTTP monitors may use either request style.
+  if ((req.method === 'GET' || req.method === 'HEAD') && (url === '/health' || url === '/')) {
+    const body = JSON.stringify({
       ok: true,
       service: 'codeforces-submit-browser',
       busy,
       usedMb: cgroupUsedMb(),
       uptimeSeconds: Math.round(process.uptime()),
     });
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+      'cache-control': 'no-store',
+      'x-robots-tag': 'noindex, nofollow',
+    });
+    if (req.method === 'HEAD') {
+      res.end();
+    } else {
+      res.end(body);
+    }
     return;
   }
 
@@ -624,7 +638,7 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   log(
     { port: PORT, headless: HEADLESS, usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
     'isolated Codeforces submitter listening',
