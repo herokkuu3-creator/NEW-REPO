@@ -3,39 +3,61 @@ import { RunState } from '@prisma/client';
 import { shouldSkipExistingDailyRun } from '../src/scheduler/dailyWorker';
 
 describe('session-renewal daily dedupe', () => {
-  it('skips an account whose daily submission already succeeded', () => {
+  it('does not re-submit an account whose daily submission already succeeded during cookie renewal', () => {
     expect(
       shouldSkipExistingDailyRun(
         { state: RunState.SUCCESS, submissionStatus: 'Accepted' },
-        false, // session-renewal does not force a repeat
+        false,
+        true,
       ),
     ).toBe(true);
   });
 
-  it('skips a pending daily run instead of submitting a duplicate on renewal', () => {
+  it('does not re-submit an account with a pending daily run during cookie renewal', () => {
     expect(
       shouldSkipExistingDailyRun(
         { state: RunState.PENDING, submissionStatus: null },
         false,
+        true,
       ),
     ).toBe(true);
   });
 
-  it('allows a renewal-triggered run when there is no daily row yet', () => {
-    expect(shouldSkipExistingDailyRun(null, false)).toBe(false);
-  });
-
-  it('allows a renewal-triggered retry when the earlier run reached the solution but did not submit', () => {
+  it('does not re-submit an account whose earlier submission was already rejected during cookie renewal', () => {
     expect(
       shouldSkipExistingDailyRun(
-        { state: RunState.SUCCESS, submissionStatus: 'SOLVED_NOT_SUBMITTED' },
+        { state: RunState.SUBMISSION_REJECTED, submissionStatus: 'Wrong Answer' },
+        false,
+        true,
+      ),
+    ).toBe(true);
+  });
+
+  it('does not re-submit an account whose earlier daily attempt failed during cookie renewal', () => {
+    expect(
+      shouldSkipExistingDailyRun(
+        { state: RunState.SUBMISSION_ERROR, submissionStatus: null },
+        false,
+        true,
+      ),
+    ).toBe(true);
+  });
+
+  it('allows a new account or an expired account whose daily run never created a row to run after renewal', () => {
+    expect(shouldSkipExistingDailyRun(null, false, true)).toBe(false);
+  });
+
+  it('keeps the existing retry behavior for non-renewal runs', () => {
+    expect(
+      shouldSkipExistingDailyRun(
+        { state: RunState.SUBMISSION_ERROR, submissionStatus: null },
         false,
       ),
     ).toBe(false);
 
     expect(
       shouldSkipExistingDailyRun(
-        { state: RunState.SUCCESS, submissionStatus: 'EDITOR_FILLED' },
+        { state: RunState.SUCCESS, submissionStatus: 'SOLVED_NOT_SUBMITTED' },
         false,
       ),
     ).toBe(false);
@@ -46,22 +68,6 @@ describe('session-renewal daily dedupe', () => {
       shouldSkipExistingDailyRun(
         { state: RunState.SUCCESS, submissionStatus: 'Accepted' },
         true,
-      ),
-    ).toBe(false);
-  });
-
-  it('allows a renewed account with a prior non-success terminal run to follow the normal pipeline', () => {
-    expect(
-      shouldSkipExistingDailyRun(
-        { state: RunState.SUBMISSION_ERROR, submissionStatus: null },
-        false,
-      ),
-    ).toBe(false);
-
-    expect(
-      shouldSkipExistingDailyRun(
-        { state: RunState.AUTHENTICATION_REQUIRED, submissionStatus: null },
-        false,
       ),
     ).toBe(false);
   });
