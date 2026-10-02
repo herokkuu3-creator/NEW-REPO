@@ -218,8 +218,9 @@ describe('range engine', () => {
   it('queues later jobs FIFO and starts each one only after its predecessor completes', async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
-    const session = makeSession(() => 'accepted', []);
-    session.api.awaitResult = async (id: string) => {
+    const log: string[] = [];
+    const session = makeSession(() => 'accepted', log);
+    session.api.awaitResult = async (id: string, slug: string) => {
       await gate;
       return { submissionId: id, classification: 'ACCEPTED' as const, statusDisplay: 'Accepted', runtime: null, memory: null, rawStatusMsg: 'Accepted' };
     };
@@ -240,6 +241,7 @@ describe('range engine', () => {
       expect(third.position).toBe(2);
     }
     expect(rangeQueueLength()).toBe(2);
+    expect(log.filter((x) => x.startsWith('submit:'))).toEqual(['submit:slug-200']);
 
     release();
     await first.done;
