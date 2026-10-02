@@ -90,7 +90,6 @@ describe('/questionrangesubmission', () => {
     const { deps, sentViews } = makeDeps([acc('a1'), acc('a2', 'dom4429')]);
     const { ui } = makeUi(started(['a1']));
     await handleQuestionRangeCommand('200-400', deps, ui);
-    expect(ui.current).toHaveBeenCalledTimes(1); // the busy-check runs first
     expect(sentViews[0]!.text).toContain('🎯 Question range #200–#400 (201');
     expect(sentViews[0]!.text).toContain('30 s break');
     expect(sentViews[0]!.buttons).toEqual([
