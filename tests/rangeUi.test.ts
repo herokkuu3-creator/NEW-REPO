@@ -113,13 +113,12 @@ describe('/questionrangesubmission', () => {
     expect(sentViews[0]!.text).toMatch(/^⚠️ Send the range as two question numbers/);
   });
 
-  it('when a range process is already running it refuses and shows progress', async () => {
+  it('when a range process is already running it still shows the picker for queuing', async () => {
     const { deps, sentViews } = makeDeps([acc('a1')]);
     const { ui } = makeUi(started(['a1']), job());
     await handleQuestionRangeCommand('200-400', deps, ui);
-    expect(sentViews[0]!.text).toMatch(/🚧 A question-range process is already in progress/);
-    expect(sentViews[0]!.text).toMatch(/📍 5\/201 done/);
-    expect(sentViews[0]!.text).toMatch(/Send \/cancelrange to stop/);
+    expect(sentViews[0]!.text).toContain('🎯 Question range #200–#400');
+    expect(sentViews[0]!.text).toContain('This request will be queued');
   });
 
   it('with no accounts there is nothing to pick', async () => {
@@ -154,12 +153,22 @@ describe('range picker buttons', () => {
     expect(edits[0]!.text).toContain('🛑 /cancelrange');
   });
 
-  it('starting a second job is refused with the running job\'s progress', async () => {
+  it('starting a second job reports its queue position', async () => {
     const { deps, sentViews, answers } = makeDeps([acc('a1')]);
-    const busy: StartRangeResult = { started: false, reason: 'busy', job: job() };
-    await handleCallbackQuery({ id: 'c4', data: 'qr:200-400:a1', message: { message_id: 7, chat: { id: '555' } } }, deps, makeUi(busy).ui);
-    expect(answers[0]!.text).toBe('A range process is already running');
-    expect(sentViews[0]!.text).toMatch(/🚧 A question-range process is already in progress/);
+    const queued: StartRangeResult = {
+      started: false,
+      queued: true,
+      position: 1,
+      accounts: [acc('a1')],
+      done: Promise.resolve([]),
+    };
+    await handleCallbackQuery(
+      { id: 'c4', data: 'qr:200-400:a1', message: { message_id: 7, chat: { id: '555' } } },
+      deps,
+      makeUi(queued, job()).ui,
+    );
+    expect(answers[0]!.text).toBe('Queued #1 🗂️');
+    expect(sentViews).toEqual([]);
   });
 
   it('Cancel closes the picker without starting anything', async () => {
