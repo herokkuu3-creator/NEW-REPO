@@ -179,6 +179,7 @@ async function runForAccount(
 
   const entry = current;
   const handle = account.username ?? label;
+  let username = handle;
   try {
     const originalCode = await fetchSourceCode(entry);
     const strippedCode =
@@ -229,7 +230,7 @@ async function runForAccount(
         };
       }
 
-      let attemptUsername = attempt.handle ?? handle;
+      let attemptUsername = attempt.handle ?? username;
       if (!attempt.ok && attempt.kind === 'blocked') {
         const viaBrowser = await submitViaBrowser(
           stored.state,
@@ -243,6 +244,7 @@ async function runForAccount(
           attemptUsername = viaBrowser.handle ?? attemptUsername;
         }
       }
+      username = attemptUsername;
       return { ...attempt, handle: attemptUsername };
     };
 
