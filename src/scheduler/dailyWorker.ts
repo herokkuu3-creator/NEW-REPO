@@ -107,13 +107,41 @@ export async function triggerRun(reason: string): Promise<RunTriggerResult> {
 /** Reason used by POST /triggerSubmission (re-submits for every account). */
 export const TRIGGER_SUBMISSION_REASON = 'trigger-submission';
 
-/** Reasons that override the per-account per-day dedupe (re-attempt failed rows). */
+/** Reasons that intentionally override the per-account per-day dedupe. */
 function isForceReason(reason: string): boolean {
   return (
     reason === 'admin-api' ||
-    reason === 'session-renewal' ||
     reason === 'manual-cli' ||
     reason === TRIGGER_SUBMISSION_REASON
+  );
+}
+
+/**
+ * Whether an existing daily row means this account has already been handled
+ * today and should therefore be skipped.
+ *
+ * Session renewal deliberately does NOT force a repeat submission: a renewed
+ * session is only useful when today's submission is still missing. A new
+ * account (no row yet), or an account whose expired session prevented today's
+ * row from being created, naturally falls through and gets today's submission.
+ *
+ * A SUCCESS row with SOLVED_NOT_SUBMITTED / EDITOR_FILLED is the one exception:
+ * the row proves the workflow started, but no submission was made, so it must
+ * still be retried.
+ */
+export function shouldSkipExistingDailyRun(
+  existing: Pick<DailyRunRecord, 'state' | 'submissionStatus'> | null,
+  forceRun: boolean,
+): boolean {
+  const previousRunWasNotSubmitted =
+    existing?.state === RunState.SUCCESS &&
+    /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(existing.submissionStatus ?? '');
+
+  return Boolean(
+    !forceRun &&
+      existing &&
+      !previousRunWasNotSubmitted &&
+      (existing.state === RunState.SUCCESS || existing.state === RunState.PENDING),
   );
 }
 
@@ -310,16 +338,8 @@ async function runForAccount(
 
     // --- 2) Per-account duplicate guard ------------------------------------
     const existing = await findRunByDate(account.id, today);
-    const previousRunWasNotSubmitted =
-      existing?.state === RunState.SUCCESS &&
-      /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(existing.submissionStatus ?? '');
-    if (
-      !forceRun &&
-      existing &&
-      !previousRunWasNotSubmitted &&
-      (existing.state === RunState.SUCCESS || existing.state === RunState.PENDING)
-    ) {
-      logger.info({ label, today, state: existing.state }, 'account already handled today — skipping');
+    if (shouldSkipExistingDailyRun(existing, forceRun)) {
+      logger.info({ label, today, state: existing?.state }, 'account already handled today — skipping');
       await patchAccount(account.id, { ran: true });
       return {
         label,
