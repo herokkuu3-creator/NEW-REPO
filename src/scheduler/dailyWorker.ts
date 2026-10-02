@@ -44,6 +44,7 @@ import { ensureLanguage, openProblemPage, setEditorCode } from '../leetcode/edit
 import { submitCurrentEditor } from '../leetcode/submission';
 import { notifyMultiRunReport } from '../notifications/notifier';
 import { isoLocal } from '../time';
+import { shouldRetryWithOriginal, stripCppComments } from '../codeforces/codeSanitizer';
 
 /**
  * The daily pipeline — MULTI-ACCOUNT.
