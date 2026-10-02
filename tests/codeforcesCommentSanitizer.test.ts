@@ -10,9 +10,9 @@ describe('stripCppComments', () => {
       "  const char slash = '/'; /* remove this block */",
       '  /* block comment',
       '     spanning two lines */',
-      '  std::cout << a << slash << "\\n";',
+      '  std::cout << a << slash << "\n";',
       '}',
-    ].join('\\n');
+    ].join('\n');
 
     const stripped = stripCppComments(source);
 
@@ -20,11 +20,11 @@ describe('stripCppComments', () => {
     expect(stripped).not.toContain('remove this block');
     expect(stripped).toContain('"http://example.com/*not a comment*/"');
     expect(stripped).toContain("const char slash = '/';");
-    expect(stripped.split('\\n')).toHaveLength(source.split('\\n').length);
+    expect(stripped.split('\n')).toHaveLength(source.split('\n').length);
   });
 
   it('does not remove comment-looking text inside C++ raw strings', () => {
-    const source = 'const char* s = R"tag(\\n // this is inside the raw string\\n /* so is this */\\n)tag"; // actual comment';
+    const source = 'const char* s = R"tag(\n // this is inside the raw string\n /* so is this */\n)tag"; // actual comment';
     const stripped = stripCppComments(source);
 
     expect(stripped).toContain('// this is inside the raw string');
