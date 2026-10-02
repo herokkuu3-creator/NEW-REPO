@@ -117,6 +117,34 @@ function isForceReason(reason: string): boolean {
 }
 
 /**
+ * Returns whether an existing daily row must be skipped.
+ *
+ * Session renewal is intentionally stricter than a normal run: if a row for
+ * today already exists, the account has already entered today's daily pipeline,
+ * so renewing its cookies must never cause another submission. A brand-new
+ * account, or an account whose expired session prevented today's row from being
+ * created, has no row and therefore proceeds normally.
+ */
+export function shouldSkipExistingDailyRun(
+  existing: Pick<DailyRunRecord, 'state' | 'submissionStatus'> | null,
+  forceRun: boolean,
+  renewalTriggered = false,
+): boolean {
+  if (!existing) return false;
+  if (renewalTriggered) return true;
+
+  const previousRunWasNotSubmitted =
+    existing.state === RunState.SUCCESS &&
+    /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(existing.submissionStatus ?? '');
+
+  return Boolean(
+    !forceRun &&
+      !previousRunWasNotSubmitted &&
+      (existing.state === RunState.SUCCESS || existing.state === RunState.PENDING),
+  );
+}
+
+/**
  * Whether an existing daily row means this account has already been handled
  * today and should therefore be skipped.
  *
@@ -215,10 +243,11 @@ export async function executeDailyRun(
     }
 
     const outcomes: AccountOutcome[] = [];
+    const renewalTriggered = reason === 'session-renewal';
     for (const account of accounts) {
       const before = outcomes.length;
       try {
-        outcomes.push(await runForAccount(account, today, forceRun));
+        outcomes.push(await runForAccount(account, today, forceRun, renewalTriggered));
       } catch (err) {
         // runForAccount wraps its own pipeline; this is a last-resort guard
         // so one broken account can never abort the whole batch.
@@ -262,6 +291,7 @@ async function runForAccount(
   account: AccountRecord,
   today: string,
   forceRun: boolean,
+  renewalTriggered = false,
 ): Promise<AccountOutcome> {
   const label = account.label;
 
@@ -338,18 +368,29 @@ async function runForAccount(
 
     // --- 2) Per-account duplicate guard ------------------------------------
     const existing = await findRunByDate(account.id, today);
-    if (shouldSkipExistingDailyRun(existing, forceRun)) {
-      logger.info({ label, today, state: existing?.state }, 'account already handled today — skipping');
+    if (shouldSkipExistingDailyRun(existing, forceRun, renewalTriggered)) {
+      logger.info(
+        { label, today, state: existing?.state, renewalTriggered },
+        renewalTriggered ? 'session renewal — account already has a daily row, skipping' : 'account already handled today — skipping',
+      );
       await patchAccount(account.id, { ran: true });
       return {
         label,
         username,
-        kind: existing.state === RunState.SUCCESS ? 'solved' : 'skipped',
-        state: existing.state,
-        submissionStatus: existing.submissionStatus,
-        runtime: existing.runtime,
-        memory: existing.memory,
-        error: existing.state === RunState.SUCCESS ? null : 'a run for this account is already pending',
+        kind:
+          existing!.state === RunState.SUCCESS
+            ? 'solved'
+            : existing!.state === RunState.PENDING
+              ? 'skipped'
+              : 'failed',
+        state: existing!.state,
+        submissionStatus: existing!.submissionStatus,
+        runtime: existing!.runtime,
+        memory: existing!.memory,
+        error:
+          existing!.state === RunState.SUCCESS
+            ? null
+            : existing!.error ?? 'today already has a daily run record',
       };
     }
 
