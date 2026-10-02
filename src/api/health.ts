@@ -131,6 +131,19 @@ export async function startHealthServer(
 
   const wantsHtml = (accept: string | undefined): boolean => /text\/html/i.test(accept ?? '');
 
+  // Public liveness endpoint for external uptime monitors (e.g. UptimeRobot).
+  // It is deliberately unauthenticated, side-effect free, and supports both
+  // GET and HEAD so either monitor request style receives a 2xx response.
+  app.route({
+    method: ['GET', 'HEAD'],
+    url: '/',
+    handler: async (_req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      reply.header('X-Robots-Tag', 'noindex, nofollow');
+      return { status: 'ok' };
+    },
+  });
+
   app.post('/unlock', async (req, reply) => {
     const body = (req.body ?? {}) as { pin?: string; next?: string };
     const next = safeNext(body.next);
