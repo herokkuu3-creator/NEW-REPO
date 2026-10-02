@@ -787,7 +787,7 @@ async function handleRangeButton(
   }
   const result = await ui.start(parsed.range, m[3]!);
   if (!result.started) {
-    if (result.queued) {
+    if ('queued' in result && result.queued) {
       await deps.answer(callbackId, `Queued #${result.position} 🗂️`);
       await deps.edit(
         chatId,
