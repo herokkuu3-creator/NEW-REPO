@@ -145,35 +145,6 @@ export function shouldSkipExistingDailyRun(
 }
 
 /**
- * Whether an existing daily row means this account has already been handled
- * today and should therefore be skipped.
- *
- * Session renewal deliberately does NOT force a repeat submission: a renewed
- * session is only useful when today's submission is still missing. A new
- * account (no row yet), or an account whose expired session prevented today's
- * row from being created, naturally falls through and gets today's submission.
- *
- * A SUCCESS row with SOLVED_NOT_SUBMITTED / EDITOR_FILLED is the one exception:
- * the row proves the workflow started, but no submission was made, so it must
- * still be retried.
- */
-export function shouldSkipExistingDailyRun(
-  existing: Pick<DailyRunRecord, 'state' | 'submissionStatus'> | null,
-  forceRun: boolean,
-): boolean {
-  const previousRunWasNotSubmitted =
-    existing?.state === RunState.SUCCESS &&
-    /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(existing.submissionStatus ?? '');
-
-  return Boolean(
-    !forceRun &&
-      existing &&
-      !previousRunWasNotSubmitted &&
-      (existing.state === RunState.SUCCESS || existing.state === RunState.PENDING),
-  );
-}
-
-/**
  * Runs the full multi-account submission synchronously and returns the
  * report (one outcome per account). Used by POST /triggerSubmission.
  * Returns null when another run is already in progress.
