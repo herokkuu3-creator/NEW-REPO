@@ -21,6 +21,7 @@ import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
 import type { HttpSubmitResult } from './httpSubmit';
 import { captureBefore, pollForVerdict, postSubmitForm, type BrowserPostOutcome } from './submission';
 import { isRemoteSubmitterConfigured, submitViaRemoteSubmitter } from './remoteSubmitter';
+import { shouldRetryWithOriginal, stripCppComments } from './codeSanitizer';
 import { launchFirefoxWithStorageStateObject } from '../browser/playwright';
 import { logMemory, memoryReading, MemoryWatch, releaseHeap } from '../memory';
 import {
@@ -179,7 +180,14 @@ async function runForAccount(
   const entry = current;
   const handle = account.username ?? label;
   try {
-    const code = await fetchSourceCode(entry);
+    const originalCode = await fetchSourceCode(entry);
+    const strippedCode =
+      entry.language === 'cpp' ? stripCppComments(originalCode) : originalCode;
+    const useCommentStrippedFirst =
+      entry.language === 'cpp' &&
+      strippedCode.trim().length > 0 &&
+      strippedCode !== originalCode;
+
     const retryToday = shouldReleaseDailyAttempt({
       manual: forceDailyAttempt,
       lastAttemptDate: progress.lastAttemptDate ?? null,
@@ -203,28 +211,95 @@ async function runForAccount(
       };
     }
 
-    // The header-only POST is answered 302 -> "/" by Codeforces' own router, so it
-    // is kept as an opt-in diagnostic: building its client and running it right
-    // before the browser only spends memory. The browser is the real transport.
-    const httpFirst = process.env.CODEFORCES_HTTP_FIRST?.trim().toLowerCase() === 'true';
-    let result: HttpSubmitResult & { handle?: string };
-    if (httpFirst) {
-      const { submitViaHttp } = await import('./httpSubmit');
-      result = await submitViaHttp(stored.state, account.username, entry, code);
+    const submitOnce = async (submissionCode: string): Promise<HttpSubmitResult & { handle?: string }> => {
+      // The header-only POST is answered 302 -> "/" by Codeforces' own router,
+      // so it remains an opt-in diagnostic; the browser path is the real
+      // transport for the free-tier submission service.
+      const httpFirst = process.env.CODEFORCES_HTTP_FIRST?.trim().toLowerCase() === 'true';
+      let attempt: HttpSubmitResult & { handle?: string };
+      if (httpFirst) {
+        const { submitViaHttp } = await import('./httpSubmit');
+        attempt = await submitViaHttp(stored.state, account.username, entry, submissionCode);
+      } else {
+        attempt = {
+          ok: false,
+          kind: 'blocked',
+          error: 'browser transport selected for the free-tier submission path',
+          handle,
+        };
+      }
+
+      let attemptUsername = attempt.handle ?? handle;
+      if (!attempt.ok && attempt.kind === 'blocked') {
+        const viaBrowser = await submitViaBrowser(
+          stored.state,
+          label,
+          attemptUsername,
+          entry,
+          submissionCode,
+        );
+        if (viaBrowser) {
+          attempt = viaBrowser;
+          attemptUsername = viaBrowser.handle ?? attemptUsername;
+        }
+      }
+      return { ...attempt, handle: attemptUsername };
+    };
+
+    let submissionCode = useCommentStrippedFirst ? strippedCode : originalCode;
+    if (useCommentStrippedFirst) {
+      logger.info(
+        { label, problem: problemLabel(entry), removedComments: true },
+        'Codeforces: submitting comment-stripped source first',
+      );
     } else {
-      result = {
-        ok: false,
-        kind: 'blocked',
-        error: 'browser transport selected for the free-tier submission path',
-        handle,
-      };
+      logger.info(
+        { label, problem: problemLabel(entry), removedComments: false },
+        'Codeforces: submitting source without comment retry',
+      );
     }
 
-    let username = result.handle ?? handle;
-    if (!result.ok && result.kind === 'blocked') {
-      const viaBrowser = await submitViaBrowser(stored.state, label, username, entry, code);
-      if (viaBrowser) {
-        result = viaBrowser;
+    let result = await submitOnce(submissionCode);
+
+    if (
+      useCommentStrippedFirst &&
+      !result.ok &&
+      shouldRetryWithOriginal(result.verdict)
+    ) {
+      logger.warn(
+        {
+          label,
+          problem: problemLabel(entry),
+          firstVerdict: result.verdict,
+          firstSubmissionId: result.submissionId ?? null,
+        },
+        'Codeforces: comment-stripped submission failed at compile/runtime; retrying exact original source',
+      );
+
+      // The first attempt already consumed today's reservation. Release it,
+      // then immediately reserve the same day again for the exact original
+      // source. This is intentionally limited to compiler/runtime failures.
+      await releaseDailyAttempt(account.id, today);
+      const reclaimed = await claimDailyAttempt(account.id, today, entry.key);
+      if (reclaimed) {
+        submissionCode = originalCode;
+        result = await submitOnce(originalCode);
+        logger.info(
+          {
+            label,
+            problem: problemLabel(entry),
+            retryVerdict: result.verdict ?? (result.ok ? 'OK' : null),
+            retrySubmissionId: result.submissionId ?? null,
+          },
+          'Codeforces: original-source retry finished',
+        );
+      } else {
+        logger.error(
+          { label, problem: problemLabel(entry) },
+          'Codeforces: could not reclaim today attempt for original-source retry',
+        );
+      }
+    } viaBrowser;
         username = viaBrowser.handle ?? username;
       }
     }
