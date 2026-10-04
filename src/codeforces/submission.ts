@@ -1,4 +1,5 @@
 import type { Page, Response } from 'playwright';
+import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory } from './browserForm';
 import type { BrowserSession } from '../browser/playwright';
 import { logger } from '../logger';
 import { fetchUserStatus, fetchContestStatus, CodeforcesSubmission } from './api';
@@ -216,10 +217,12 @@ export async function postSubmitForm(
     interactive: false,
   });
 
+  const verificationFlags = { turnstile: false, interactive: false };
   try {
     await openSubmitForm(page, source);
     const ts = await fillSubmitForm(page, source, code);
-    const click = await clickSubmit(page);
+    Object.assign(verificationFlags, ts);
+    const click = await clickSubmitForm(page);
     const flags = { turnstile: ts.turnstile, clicked: click.clicked, interactive: ts.interactive };
     if (!click.clicked) {
       return {
@@ -232,10 +235,10 @@ export async function postSubmitForm(
 
     const body = await readBody(page);
     if (click.status === 403 || click.status === 503 || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(page.url()) || /__cf_chl/i.test(page.url())) {
-      await waitOutChallenge(page);
-      let settled = await readBody(page);
-      let settledUrl = page.url();
-      if (CHALLENGE_RE.test(settled) || CHALLENGE_RE.test(settledUrl) || /__cf_chl/i.test(settledUrl)) {
+      const cleared = await waitOutChallenge(page);
+      const settled = await readBody(page);
+      const settledUrl = page.url();
+      if (!cleared || CHALLENGE_RE.test(settled) || CHALLENGE_RE.test(settledUrl) || /__cf_chl/i.test(settledUrl)) {
         return {
           ok: false,
           kind: 'blocked',
@@ -245,23 +248,17 @@ export async function postSubmitForm(
           ...flags,
         };
       }
-      
-      if (!/\/my/i.test(settledUrl) && /submit/i.test(settledUrl)) {
-        logger.info({}, 'Challenge cleared, but POST data was lost. Re-filling and re-submitting...');
-        await fillSubmitForm(page, source, code);
-        const click2 = await clickSubmit(page);
-        settled = await readBody(page);
-        settledUrl = page.url();
-        click.status = click2.status;
-      }
-      
-      return finishPost(settled, settledUrl, click.status, flags);
+      return finishPost(settled, settledUrl, null, flags);
     }
     return finishPost(body, page.url(), click.status, flags);
   } catch (err) {
     const message = errorMessage(err);
-    const kind = err instanceof CodeforcesBlockedError || CHALLENGE_RE.test(message) ? 'blocked' : 'submission-error';
-    return { ...fail(kind, message) };
+    const kind = err instanceof BrowserFormError ? err.kind : err instanceof CodeforcesBlockedError || CHALLENGE_RE.test(message) ? 'blocked' : 'submission-error';
+    return { ...fail(kind, message), ...verificationFlags, ...(err instanceof BrowserFormError ? {
+      turnstile: verificationFlags.turnstile || err.flags.turnstile,
+      interactive: verificationFlags.interactive || err.flags.interactive,
+      clicked: err.clicked,
+    } : {}) };
   }
 }
 
@@ -284,8 +281,14 @@ function finishPost(
   if (REJECTION_RE.test(body)) {
     return { ok: false, kind: 'submission-error', error: compactBodyError(body), status, finalUrl, ...flags };
   }
+  if (status !== null && status >= 400) {
+    return { ok: false, kind: 'submission-error', error: `Codeforces answered the submission with HTTP ${status}`, status, finalUrl, ...flags };
+  }
   if (!/codeforces\.com/i.test(finalUrl)) {
     return { ok: false, kind: 'submission-error', error: `the submit form left codeforces.com (${finalUrl})`, status, finalUrl, ...flags };
+  }
+  if (!isSubmissionHistory(finalUrl)) {
+    return { ok: false, kind: 'submission-error', error: 'Codeforces did not redirect to submission history after the POST; acceptance is uncertain and the POST was not retried.', status, finalUrl, ...flags };
   }
   return { ok: true, status, finalUrl, ...flags };
 }
@@ -446,108 +449,14 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
     throw new CodeforcesSubmissionError(`Codeforces submit form has no source textarea (fields: ${summarizeFields(fields)})`);
   }
 
-  await page.evaluate((content) => {
-    const toggle = document.getElementById('toggleEditorCheckbox') as HTMLInputElement | null;
-    if (toggle && toggle.checked) {
-      toggle.click(); // Let Codeforces' own JS cleanly destroy CodeMirror
-    }
-    const ta = document.querySelector('textarea[name="source"]') as HTMLTextAreaElement | null;
-    if (ta) {
-      ta.value = content;
-    }
-    // mock window.editor so native submit click doesn't crash Codeforces JS
-    (window as any).editor = { save: () => {} };
-  }, code).catch(() => undefined);
+  await fillSource(page, code);
 
   const token = await page.locator(`input[name="${csrfName}"]`).first().inputValue({ timeout: 5000 }).catch(() => '');
   if (!token) {
     throw new CodeforcesSubmissionError(`Codeforces ${csrfName} is empty — the submit page was not served correctly`);
   }
 
-  return ensureTurnstile(page);
-}
-
-/** The token Cloudflare's widget writes into the form; Codeforces refuses to post without it. */
-async function turnstileToken(page: Page): Promise<string> {
-  return page.locator('input[name="turnstileToken"]').first().inputValue().catch(() => '');
-}
-
-async function waitForToken(page: Page, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if ((await turnstileToken(page)).trim()) return true;
-    await sleep(500);
-  }
-  return false;
-}
-
-/**
- * Cloudflare's Turnstile widget fills `turnstileToken`, and Codeforces refuses
- * the POST without it. On a trusted/managed session it resolves on its own in a
- * second or two. If it instead demands an interactive challenge, the container
- * must NOT be kept alive trying to automate it: the step is abandoned with the
- * reason recorded, so the service survives and the report says what happened.
- */
-async function ensureTurnstile(
-  page: Page,
-  timeoutMs = TURNSTILE_WAIT_MS,
-): Promise<{ turnstile: boolean; interactive: boolean }> {
-  if ((await page.locator('input[name="turnstileToken"]').first().count().catch(() => 0)) === 0) {
-    return { turnstile: false, interactive: false };
-  }
-
-  const solverUrl = process.env.TURNSTILE_SOLVER_URL;
-  if (solverUrl) {
-    const sitekey = await page.locator('.cf-turnstile').first().getAttribute('data-sitekey').catch(() => null);
-    if (sitekey) {
-      logger.info({ sitekey, solverUrl }, 'Requesting Turnstile token from external solver...');
-      try {
-        const res = await fetch(`${solverUrl.replace(/\/+$/, '')}/solve`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ siteurl: page.url(), sitekey })
-        });
-        const data = (await res.json()) as { token?: string };
-        if (data.token) {
-          logger.info({}, 'External Turnstile solver succeeded');
-          await page.evaluate((tok) => {
-            const el = document.querySelector('input[name="turnstileToken"]') as HTMLInputElement;
-            if (el) el.value = tok;
-          }, data.token);
-          return { turnstile: true, interactive: false };
-        }
-      } catch (err) {
-        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'External Turnstile solver failed');
-      }
-    }
-  }
-
-  if (await waitForToken(page, timeoutMs)) {
-    logger.info('Codeforces Turnstile solved itself in the browser');
-    return { turnstile: true, interactive: false };
-  }
-
-  const interactive =
-    (await page.locator('iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0)) > 0;
-  logger.warn({ interactive }, 'Codeforces Turnstile failed to issue a token. Proceeding anyway.');
-  return { turnstile: true, interactive };
-}
-
-/**
- * Clicks the submit control OF THE SUBMIT FORM. The page also carries a header
- * search form whose button is `type="submit"` too, so the control is looked up
- * inside the form holding the source textarea rather than page-wide: clicking the
- * wrong form is a click that posts nothing at all.
- */
-async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: number | null }> {
-  const form = page.locator('form:has(textarea[name="source"])').first();
-  if ((await form.count().catch(() => 0)) === 0) return { clicked: false, status: null };
-
-  const [response] = await Promise.all([
-    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => null),
-    form.locator('input[type="submit"]').first().click({ force: true, timeout: 15_000 }).catch(() => undefined),
-  ]);
-  return { clicked: true, status: response?.status() ?? null };
+  return ensureFormTurnstile(page, TURNSTILE_WAIT_MS);
 }
 
 async function readFields(page: Page): Promise<SubmitField[]> {

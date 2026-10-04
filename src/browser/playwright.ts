@@ -1,3 +1,4 @@
+import { blockCodeforcesResource } from '../codeforces/browserForm';
 import { chromium, firefox, Browser, BrowserContext, Page } from 'playwright';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -216,7 +217,6 @@ export async function launchFirefoxWithStorageStateObject(
       headless: config.browser.headless,
       firefoxUserPrefs: {
         // Keep Firefox to the smallest practical footprint for a single submit tab.
-        'permissions.default.image': 2,
         'browser.cache.disk.enable': false,
         'browser.cache.memory.enable': false,
         'browser.cache.offline.enable': false,
@@ -243,12 +243,10 @@ export async function launchFirefoxWithStorageStateObject(
       serviceWorkers: 'block',
     });
 
-    // Images/media/fonts are irrelevant to a submit form but cost decode buffers
-    // and renderer memory. Scripts, iframes, fetch and XHR stay enabled: the
-    // page's own signing code and Cloudflare's Turnstile both need them.
+    // Omit decorative assets while preserving CSS and verification resources.
     await context.route('**/*', async (route) => {
       const type = route.request().resourceType();
-      if (type === 'image' || type === 'media' || type === 'font' || type === 'stylesheet') {
+      if (blockCodeforcesResource(route.request().url(), type)) {
         await route.abort();
         return;
       }

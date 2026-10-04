@@ -143,8 +143,9 @@ services:
       - key: HEADLESS
         value: "true"
       # Route Firefox through a userspace Cloudflare WARP tunnel so Codeforces'
-      # Cloudflare sees a WARP egress IP instead of a flagged Render datacenter
-      # IP. Set to "false" to go back to the direct connection.
+      # Cloudflare sees a WARP egress IP when the tunnel passes its connectivity
+      # check. This does not guarantee verification succeeds. Set to "false"
+      # to use the direct connection. An explicit CODEFORCES_PROXY takes priority.
       - key: WARP_ENABLED
         value: "true"
       # Nothing but a tiny HTTP server and one Firefox lives here.
@@ -152,7 +153,7 @@ services:
         value: --max-old-space-size=96
       # Bounded waits: never hold the container open for a long challenge.
       - key: CODEFORCES_TURNSTILE_WAIT_MS
-        value: "10000"
+        value: "20000"
       - key: CODEFORCES_CHALLENGE_WAIT_MS
         value: "10000"
       - key: CODEFORCES_SUBMITTER_TOKEN

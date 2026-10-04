@@ -46,7 +46,7 @@ function fakePage(routes: Record<string, Route>): Page {
     url: () => `https://codeforces.com${current}`,
     title: async () => at().title ?? 'Codeforces',
     evaluate: async () => at().fields ?? [],
-    locator: () => ({ innerText: async () => at().body ?? '' }),
+    locator: () => ({ innerText: async () => at().body ?? '', count: async () => 0 }),
   };
   return page as unknown as Page;
 }

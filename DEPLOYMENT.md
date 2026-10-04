@@ -347,6 +347,54 @@ Free Render Postgres databases expire thirty days after creation (14-day grace, 
 | Service suspended by Render | Instance-hours exhausted or unusually high outbound traffic. Reduce testing bursts; let the schedule do the work. |
 | Editor fill / Submit broke after a LeetCode UI update | Every selector is in `src/leetcode/selectors.ts` with ordered fallbacks. Patch that one file and push — Render redeploys automatically. |
 
+### Codeforces submitter verification and WARP
+
+The Codeforces browser service must receive a Turnstile token before clicking
+Submit. A token timeout is now a `blocked` result with `clicked: false`; it no
+longer continues with an empty token and reports a navigation timeout as a
+successful POST. CSS and Cloudflare verification assets stay enabled. The
+submitter preserves Codeforces' own submit handlers and watches the actual POST
+and redirected document. Returning to the submit form or homepage does not count
+as success. A challenged or ambiguous POST is never automatically repeated.
+
+After deploying this change, set `CODEFORCES_TURNSTILE_WAIT_MS=20000` on the
+**codeforces-submit-browser** service. An existing dashboard value of `10000`
+may remain even though `render.yaml` has changed. Keep the same
+`CODEFORCES_SUBMITTER_TOKEN` on both services.
+
+`Detected a new open port UDP:...` is Render reporting the WireGuard tunnel's
+UDP socket. The HTTP service still listens on `PORT` (normally 10000). This
+message alone does not indicate submission failure or a working tunnel.
+
+If startup reports `wgcf register failed`, the container could not register its
+WARP account. The old script discarded the cause and went back to the same
+direct connection. Registration is now bounded, existing profiles are reused,
+and startup reports the exit status. Avoid repeated registrations on cold starts:
+
+1. On a machine with working WARP connectivity, run `wgcf register --accept-tos`
+   and `wgcf generate` using the [wgcf instructions](https://github.com/ViRb3/wgcf).
+2. Base64-encode the complete `wgcf-profile.conf` file and store the result as
+   the secret `WARP_PROFILE_B64` on the isolated submitter. In PowerShell:
+   `[Convert]::ToBase64String([IO.File]::ReadAllBytes((Resolve-Path ./wgcf-profile.conf)))`.
+   The profile contains a private key; do not commit or paste it into logs.
+3. Redeploy and look for `WARP tunnel verified`. A listening SOCKS port alone
+   is insufficient: startup checks that Cloudflare's trace reports `warp=on`
+   or `warp=plus`. If this fails, the unusable tunnel is stopped.
+
+Alternatively, set `CODEFORCES_PROXY` to an accessible proxy endpoint; the script
+preserves it and skips automatic WARP setup. WARP and a longer timeout do not
+guarantee Cloudflare will accept a headless browser. If verification remains
+blocked, run the isolated submitter on a connection where verification succeeds,
+or use the existing source-file handoff for a manual submission. Renewing login
+cookies alone does not resolve a server-side browser verification failure.
+
+`npm test -- tests/codeforcesBrowserFlow.test.ts` checks the native form behavior
+with Chromium and a loopback HTTP server, including verification failure,
+native signing, redirects, and duplicate prevention. It requires the matching
+Playwright Chromium installation (`npx playwright install chromium`). This is
+a browser regression test; an authenticated submission from the deployed Render
+service is still required to verify its actual network and Cloudflare behavior.
+
 ## 15. Go-live checklist and free-tier limits
 
 - [ ] Repository pushed to a private GitHub repo; no secrets tracked.

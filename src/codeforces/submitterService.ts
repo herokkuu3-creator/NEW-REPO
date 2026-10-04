@@ -23,6 +23,7 @@
  * could create a duplicate Codeforces submission.
  */
 import http from 'node:http';
+import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource } from './browserForm';
 import { firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
 const PORT = Number(process.env.PORT ?? 10000);
@@ -145,7 +146,6 @@ async function launchFirefox(state: SubmitRequest['state'], label: string): Prom
       headless: HEADLESS,
       ...(PROXY_SERVER ? { proxy: { server: PROXY_SERVER } } : {}),
       firefoxUserPrefs: {
-        'permissions.default.image': 2,
         'browser.cache.disk.enable': false,
         'browser.cache.memory.enable': false,
         'browser.cache.offline.enable': false,
@@ -174,7 +174,7 @@ async function launchFirefox(state: SubmitRequest['state'], label: string): Prom
     });
     await context.route('**/*', async (route) => {
       const type = route.request().resourceType();
-      if (type === 'image' || type === 'media' || type === 'font' || type === 'stylesheet') {
+      if (blockCodeforcesResource(route.request().url(), type)) {
         await route.abort();
         return;
       }
@@ -239,19 +239,12 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
 
 async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  let triedSolver = false;
   while (Date.now() < deadline) {
     await sleep(1_000);
     const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
     if (isCodeforces) return true;
     
-    // If it's still blocking, try solving the Turnstile (this is critical for 403 on POSTs)
-    if (!triedSolver) {
-      const res = await ensureTurnstile(page).catch(() => undefined);
-      if (res && (res.turnstile || res.interactive)) {
-        triedSolver = true; // only mark as tried if it actually found and processed the widget
-      }
-    }
+
   }
   return false;
 }
@@ -272,7 +265,7 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
       if (/\/enter(?:[/?#]|$)/i.test(finalUrl)) {
         throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
       }
-      if (status === 403 || status === 503) {
+      if ((status === 403 || status === 503) && !(await waitOutChallenge(page))) {
         attempts.push(`${path}: HTTP ${status} (Cloudflare challenge)`);
         blocked += 1;
         continue;
@@ -298,96 +291,6 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
 
   const message = `Codeforces submit form could not be opened for ${entry.contestId}/${entry.problemIndex} — ${attempts.join(' | ')}`;
   throw new Error(blocked === paths.length ? `blocked: ${message}` : message);
-}
-
-async function waitForToken(page: Page, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = await page
-      .locator('input[name="turnstileToken"]')
-      .first()
-      .inputValue()
-      .catch(() => '');
-    if (value.trim()) return true;
-    await sleep(500);
-  }
-  return false;
-}
-
-async function ensureTurnstile(page: Page): Promise<{ turnstile: boolean; interactive: boolean }> {
-  // Check for both the Codeforces native token field AND the Cloudflare interstitial field
-  const cfNativeCount = await page.locator('input[name="turnstileToken"]').count().catch(() => 0);
-  const cfInterstitialCount = await page.locator('input[name="cf-turnstile-response"]').count().catch(() => 0);
-  
-  if (cfNativeCount === 0 && cfInterstitialCount === 0) {
-    // If there is an iframe, it might be a delayed Turnstile widget loading
-    const iframeCount = await page.locator('iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0);
-    if (iframeCount === 0) {
-      return { turnstile: false, interactive: false };
-    }
-  }
-
-  const solverUrl = process.env.TURNSTILE_SOLVER_URL;
-  if (solverUrl) {
-    // Cloudflare interstitial uses an iframe or div with sitekey. Try to find the sitekey.
-    // Sometimes it's in a script block, but usually the .cf-turnstile div is present.
-    let sitekey: string | null | undefined = await page.locator('.cf-turnstile').first().getAttribute('data-sitekey').catch(() => null);
-    if (!sitekey) {
-      // If we can't find it natively, try to extract from script tags on the challenge page
-      sitekey = await page.evaluate(() => {
-        const scripts = Array.from(document.querySelectorAll('script'));
-        for (const s of scripts) {
-          const match = /'sitekey'\s*:\s*'([^']+)'/.exec(s.innerHTML || '');
-          if (match) return match[1];
-        }
-        return null;
-      });
-    }
-
-    if (sitekey) {
-      log({ sitekey, solverUrl }, 'Requesting Turnstile token from external solver...');
-      try {
-        const res = await fetch(`${solverUrl.replace(/\/+$/, '')}/solve`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ siteurl: page.url(), sitekey })
-        });
-        const data = (await res.json()) as { token?: string };
-        if (data.token) {
-          log({}, 'External Turnstile solver succeeded');
-          await page.evaluate((tok) => {
-            // Fill Codeforces native if present
-            const el1 = document.querySelector('input[name="turnstileToken"]') as HTMLInputElement;
-            if (el1) el1.value = tok;
-            // Fill Cloudflare interstitial if present
-            const el2 = document.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement;
-            if (el2) el2.value = tok;
-            
-            // If it's the interstitial, we MUST submit the challenge form!
-            const cfForm = (document.getElementById('challenge-form') || document.forms[0]) as HTMLFormElement;
-            if (cfForm) cfForm.submit();
-          }, data.token);
-          return { turnstile: true, interactive: false };
-        }
-      } catch (err) {
-        log({ err: err instanceof Error ? err.message : String(err) }, 'External Turnstile solver failed');
-      }
-    } else {
-      log({}, 'Could not find Turnstile sitekey on page despite widget being present');
-    }
-  }
-
-  if (await waitForToken(page, TURNSTILE_WAIT_MS)) {
-    log({}, 'Codeforces Turnstile solved itself');
-    return { turnstile: true, interactive: false };
-  }
-  const interactive =
-    (await page.locator('iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0)) > 0;
-  log({}, interactive
-      ? `Codeforces Turnstile requires interactive verification; no token appeared within ${TURNSTILE_WAIT_MS}ms. Proceeding anyway.`
-      : `Codeforces Turnstile did not issue a token within ${TURNSTILE_WAIT_MS}ms. Proceeding anyway.`
-  );
-  return { turnstile: true, interactive };
 }
 
 /**
@@ -488,54 +391,14 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
   const sourceBox = page.locator('textarea[name="source"]').first();
   if ((await sourceBox.count().catch(() => 0)) === 0) throw new Error('Codeforces submit form has no source textarea');
 
-  await page.evaluate((content) => {
-    const toggle = document.getElementById('toggleEditorCheckbox') as HTMLInputElement | null;
-    if (toggle && toggle.checked) {
-      toggle.click(); // Let Codeforces' own JS cleanly destroy CodeMirror
-    }
-    const ta = document.querySelector('textarea[name="source"]') as HTMLTextAreaElement | null;
-    if (ta) {
-      ta.value = content;
-    }
-    // mock window.editor so native submit click doesn't crash Codeforces JS
-    (window as any).editor = { save: () => {} };
-  }, code).catch((err) => { log({err: err.message}, 'evaluate failed'); });
+  await fillSource(page, code);
 
   log({}, 'reading token');
   const token = await page.locator(`input[name="${csrfName}"]`).first().inputValue({ timeout: 5000 }).catch(() => '');
   if (!token) throw new Error(`Codeforces ${csrfName} is empty — the submit page was not served correctly`);
 
   log({}, 'checking turnstile');
-  return ensureTurnstile(page);
-}
-
-/**
- * Clicks the submit control OF THE SUBMIT FORM: the page also carries a header
- * search form whose button is type=submit too, and clicking that posts nothing.
- */
-async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: number | null }> {
-  log({}, 'locating submit form');
-  const form = page.locator('form:has(textarea[name="source"])').first();
-  if ((await form.count().catch(() => 0)) === 0) {
-    log({}, 'no submit form found');
-    return { clicked: false, status: null };
-  }
-  
-  log({}, 'submitting form via JS');
-  try {
-    const [response] = await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch((e) => {
-        log({err: e.message}, 'waitForNavigation rejected');
-        return null;
-      }),
-      form.locator('input[type="submit"]').first().click({ force: true, timeout: 15_000 }).catch(() => undefined),
-    ]);
-    log({}, 'submit finished');
-    return { clicked: true, status: response?.status() ?? null };
-  } catch (err) {
-    log({ err: err instanceof Error ? err.message : String(err) }, 'submit threw');
-    throw err;
-  }
+  return ensureFormTurnstile(page, TURNSTILE_WAIT_MS);
 }
 
 function compactBodyError(body: string): string {
@@ -572,7 +435,7 @@ async function submit(request: SubmitRequest): Promise<SubmitResponse> {
     flags.turnstile = ts.turnstile;
     flags.interactive = ts.interactive;
 
-    const click = await clickSubmit(session.page);
+    const click = await clickSubmitForm(session.page);
     if (!click.clicked) {
       return {
         ok: false,
@@ -603,15 +466,7 @@ async function submit(request: SubmitRequest): Promise<SubmitResponse> {
           ...flags,
         };
       }
-      
-      if (!/\/my/i.test(finalUrl) && /submit/i.test(finalUrl)) {
-        log({}, 'Challenge cleared, but POST data was lost. Re-filling and re-submitting...');
-        await fillSubmitForm(session.page, request.entry, request.code);
-        const click2 = await clickSubmit(session.page);
-        body = await readBody(session.page);
-        finalUrl = session.page.url();
-        click.status = click2.status;
-      }
+      click.status = null; // The initial challenged response is no longer the displayed document.
     }
 
     if (SIGNED_OUT_RE.test(body) || /\/enter(?:[/?#]|$)/i.test(finalUrl)) {
@@ -636,6 +491,9 @@ async function submit(request: SubmitRequest): Promise<SubmitResponse> {
         ...flags,
       };
     }
+    if (click.status !== null && click.status >= 400) {
+      return { ok: false, kind: 'submission-error', error: `Codeforces answered the submission with HTTP ${click.status}`, status: click.status, finalUrl, clicked: true, ...flags };
+    }
     if (!/codeforces\.com/i.test(finalUrl)) {
       return {
         ok: false,
@@ -647,7 +505,18 @@ async function submit(request: SubmitRequest): Promise<SubmitResponse> {
         ...flags,
       };
     }
+    if (!isSubmissionHistory(finalUrl)) {
+      return { ok: false, kind: 'submission-error', error: 'Codeforces did not redirect to submission history after the POST; acceptance is uncertain and the POST was not retried.', status: click.status, finalUrl, clicked: true, ...flags };
+    }
     return { ok: true, status: click.status, finalUrl, clicked: true, ...flags };
+  } catch (err) {
+    if (err instanceof BrowserFormError) {
+      throw new BrowserFormError(err.message, err.kind, {
+        turnstile: flags.turnstile || err.flags.turnstile,
+        interactive: flags.interactive || err.flags.interactive,
+      }, err.clicked);
+    }
+    throw err;
   } finally {
     await session.close();
     log({ usedMb: cgroupUsedMb() }, 'isolated Codeforces browser closed');
@@ -759,7 +628,7 @@ const server = http.createServer((req, res) => {
       })
       .catch((err) => {
         const message = errorMessage(err);
-        const kind = /^blocked:/.test(message) ? 'blocked' : 'submission-error';
+        const kind = err instanceof BrowserFormError ? err.kind : /^blocked:/.test(message) ? 'blocked' : 'submission-error';
         logError({ err: message, ms: Date.now() - startedAt }, 'isolated Codeforces browser submitter failed');
         json(res, 200, {
           ok: false,
@@ -767,9 +636,9 @@ const server = http.createServer((req, res) => {
           error: message,
           status: null,
           finalUrl: '',
-          clicked: false,
-          turnstile: false,
-          interactive: false,
+          clicked: err instanceof BrowserFormError && err.clicked,
+          turnstile: err instanceof BrowserFormError && err.flags.turnstile,
+          interactive: err instanceof BrowserFormError && err.flags.interactive,
         });
       })
       .finally(() => {
