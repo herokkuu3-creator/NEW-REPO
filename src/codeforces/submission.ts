@@ -395,14 +395,14 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
           `contest ${contestId} submit form has no option for problem ${problemIndex} (options: ${options.map((o) => o.text).join(', ') || 'none'})`,
         );
       }
-      await select.selectOption(target.value);
+      await select.selectOption(target.value, { timeout: 5000 });
       break;
     }
     case 'input-index':
-      await page.locator('input[name="submittedProblemIndex"]').first().fill(problemIndex);
+      await page.locator('input[name="submittedProblemIndex"]').first().fill(problemIndex, { timeout: 5000 });
       break;
     case 'input-code':
-      await page.locator('input[name="submittedProblemCode"]').first().fill(`${contestId}${problemIndex}`);
+      await page.locator('input[name="submittedProblemCode"]').first().fill(`${contestId}${problemIndex}`, { timeout: 5000 });
       break;
     default:
       throw new CodeforcesSubmissionError(
@@ -422,12 +422,12 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
         : `no C++ language option on the Codeforces form (options: ${options.map((o) => o.text).join(', ')})`,
     );
   }
-  await page.locator('select[name="programTypeId"]').first().selectOption(language.value);
+  await page.locator('select[name="programTypeId"]').first().selectOption(language.value, { timeout: 5000 });
 
   const toggle = page.locator('#toggleEditorCheckbox').first();
   if ((await toggle.count().catch(() => 0)) > 0) {
     if (await toggle.isChecked().catch(() => false)) {
-      await toggle.uncheck({ force: true }).catch(() => undefined);
+      await toggle.uncheck({ force: true, timeout: 5000 }).catch(() => undefined);
     }
   }
 
@@ -438,9 +438,9 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
   await sourceBox.evaluate((node, content) => {
     (node as HTMLTextAreaElement).value = content;
   }, code);
-  await sourceBox.fill(code, { force: true }).catch(() => undefined);
+  await sourceBox.fill(code, { force: true, timeout: 5000 }).catch(() => undefined);
 
-  const token = await page.locator(`input[name="${csrfName}"]`).first().inputValue().catch(() => '');
+  const token = await page.locator(`input[name="${csrfName}"]`).first().inputValue({ timeout: 5000 }).catch(() => '');
   if (!token) {
     throw new CodeforcesSubmissionError(`Codeforces ${csrfName} is empty — the submit page was not served correctly`);
   }

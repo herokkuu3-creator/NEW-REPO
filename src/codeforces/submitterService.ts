@@ -319,16 +319,19 @@ async function ensureTurnstile(page: Page): Promise<{ turnstile: boolean; intera
 }
 
 async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): Promise<{ turnstile: boolean; interactive: boolean }> {
+  log({}, 'reading fields');
   const fields = await readFields(page);
 
   const csrfName = fields.find((field) => field.tag === 'input' && /csrf/i.test(field.name))?.name;
   if (!csrfName) throw new Error(`Codeforces submit form has no csrf field (fields: ${summarize(fields)})`);
 
+  log({}, 'selecting contest');
   const contestSelector = page.locator('select[name="contestId"]').first();
   if ((await contestSelector.count().catch(() => 0)) > 0) {
-    await contestSelector.selectOption(String(entry.contestId)).catch(() => undefined);
+    await contestSelector.selectOption(String(entry.contestId), { timeout: 5000 }).catch(() => undefined);
   }
 
+  log({}, 'selecting problem index');
   const hasSelect = fields.some((field) => field.tag === 'select' && /^submittedProblemIndex$/i.test(field.name));
   if (hasSelect) {
     const options = await page
@@ -345,20 +348,19 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
       options.find((option) => option.text.trim().toUpperCase() === entry.problemIndex.toUpperCase());
     if (!target) {
       throw new Error(
-        `contest ${entry.contestId} submit form has no option for problem ${entry.problemIndex} (options: ${options
-          .map((option) => option.text)
-          .join(', ') || 'none'})`,
+        `contest ${entry.contestId} submit form has no option for problem ${entry.problemIndex}`,
       );
     }
-    await page.locator('select[name="submittedProblemIndex"]').first().selectOption(target.value);
+    await page.locator('select[name="submittedProblemIndex"]').first().selectOption(target.value, { timeout: 5000 });
   } else if (fields.some((field) => field.tag === 'input' && /^submittedProblemIndex$/i.test(field.name))) {
-    await page.locator('input[name="submittedProblemIndex"]').first().fill(entry.problemIndex);
+    await page.locator('input[name="submittedProblemIndex"]').first().fill(entry.problemIndex, { timeout: 5000 });
   } else if (fields.some((field) => field.tag === 'input' && /^submittedProblemCode$/i.test(field.name))) {
-    await page.locator('input[name="submittedProblemCode"]').first().fill(`${entry.contestId}${entry.problemIndex}`);
+    await page.locator('input[name="submittedProblemCode"]').first().fill(`${entry.contestId}${entry.problemIndex}`, { timeout: 5000 });
   } else {
     throw new Error(`Codeforces submit form has no problem selector (fields: ${summarize(fields)})`);
   }
 
+  log({}, 'selecting language');
   const options = await page
     .locator('select[name="programTypeId"] option')
     .evaluateAll((nodes) =>
@@ -376,26 +378,30 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
         .sort((a, b) => Number(b.match[1]) - Number(a.match[1]))[0]?.option ??
       options.find((option) => /C\+\+/i.test(option.text));
   if (!language) throw new Error(`no ${wantsPython ? 'Python 3' : 'C++'} language option on the Codeforces form`);
-  await page.locator('select[name="programTypeId"]').first().selectOption(language.value);
+  await page.locator('select[name="programTypeId"]').first().selectOption(language.value, { timeout: 5000 });
 
+  log({}, 'unchecking toggle editor');
   const toggle = page.locator('#toggleEditorCheckbox').first();
   if ((await toggle.count().catch(() => 0)) > 0) {
     if (await toggle.isChecked().catch(() => false)) {
-      await toggle.uncheck({ force: true }).catch(() => undefined);
+      await toggle.uncheck({ force: true, timeout: 5000 }).catch(() => undefined);
     }
   }
 
+  log({}, 'filling source code textarea');
   const sourceBox = page.locator('textarea[name="source"]').first();
   if ((await sourceBox.count().catch(() => 0)) === 0) throw new Error('Codeforces submit form has no source textarea');
   await sourceBox.evaluate((node, content) => {
     (node as HTMLTextAreaElement).value = content;
-  }, code);
+  }, code).catch((err) => { log({err: err.message}, 'evaluate failed'); });
   // Also try to force-fill just in case Playwright needs to trigger events
-  await sourceBox.fill(code, { force: true }).catch(() => undefined);
+  await sourceBox.fill(code, { force: true, timeout: 5000 }).catch((err) => { log({err: err.message}, 'force fill failed'); });
 
-  const token = await page.locator(`input[name="${csrfName}"]`).first().inputValue().catch(() => '');
+  log({}, 'reading token');
+  const token = await page.locator(`input[name="${csrfName}"]`).first().inputValue({ timeout: 5000 }).catch(() => '');
   if (!token) throw new Error(`Codeforces ${csrfName} is empty — the submit page was not served correctly`);
 
+  log({}, 'checking turnstile');
   return ensureTurnstile(page);
 }
 
@@ -404,17 +410,32 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
  * search form whose button is type=submit too, and clicking that posts nothing.
  */
 async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: number | null }> {
+  log({}, 'locating submit button');
   const scoped = page
     .locator(
       'form:has(textarea[name="source"]) input[type="submit"], form:has(textarea[name="source"]) button[type="submit"]',
     )
     .first();
-  if ((await scoped.count().catch(() => 0)) === 0) return { clicked: false, status: null };
-  const [response] = await Promise.all([
-    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null),
-    scoped.click({ timeout: 30_000 }),
-  ]);
-  return { clicked: true, status: response?.status() ?? null };
+  if ((await scoped.count().catch(() => 0)) === 0) {
+    log({}, 'no submit button found');
+    return { clicked: false, status: null };
+  }
+  
+  log({}, 'clicking submit button');
+  try {
+    const [response] = await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch((e) => {
+        log({err: e.message}, 'waitForNavigation rejected');
+        return null;
+      }),
+      scoped.click({ timeout: 15_000 }),
+    ]);
+    log({}, 'submit click finished');
+    return { clicked: true, status: response?.status() ?? null };
+  } catch (err) {
+    log({ err: err instanceof Error ? err.message : String(err) }, 'submit click threw');
+    throw err;
+  }
 }
 
 function compactBodyError(body: string): string {
