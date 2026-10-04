@@ -30,8 +30,8 @@ const TOKEN = process.env.CODEFORCES_SUBMITTER_TOKEN?.trim() ?? '';
 const HEADLESS = process.env.HEADLESS !== 'false';
 const BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const NAV_TIMEOUT_MS = Number(process.env.CODEFORCES_NAV_TIMEOUT_MS ?? 60_000);
-const TURNSTILE_WAIT_MS = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 20_000);
-const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 20_000);
+const TURNSTILE_WAIT_MS = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 30_000);
+const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 60_000);
 const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 300);
 
 const CHALLENGE_RE = /just a moment|checking your browser|verify you are human|cf-chl|enable javascript and cookies/i;
@@ -360,7 +360,7 @@ async function ensureTurnstile(page: Page): Promise<{ turnstile: boolean; intera
             if (el2) el2.value = tok;
             
             // If it's the interstitial, we MUST submit the challenge form!
-            const cfForm = document.getElementById('challenge-form') as HTMLFormElement;
+            const cfForm = (document.getElementById('challenge-form') || document.forms[0]) as HTMLFormElement;
             if (cfForm) cfForm.submit();
           }, data.token);
           return { turnstile: true, interactive: false };
