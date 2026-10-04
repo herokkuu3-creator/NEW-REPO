@@ -493,6 +493,33 @@ async function ensureTurnstile(
   if ((await page.locator('input[name="turnstileToken"]').first().count().catch(() => 0)) === 0) {
     return { turnstile: false, interactive: false };
   }
+
+  const solverUrl = process.env.TURNSTILE_SOLVER_URL;
+  if (solverUrl) {
+    const sitekey = await page.locator('.cf-turnstile').first().getAttribute('data-sitekey').catch(() => null);
+    if (sitekey) {
+      logger.info({ sitekey, solverUrl }, 'Requesting Turnstile token from external solver...');
+      try {
+        const res = await fetch(`${solverUrl.replace(/\/+$/, '')}/solve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ siteurl: page.url(), sitekey })
+        });
+        const data = (await res.json()) as { token?: string };
+        if (data.token) {
+          logger.info({}, 'External Turnstile solver succeeded');
+          await page.evaluate((tok) => {
+            const el = document.querySelector('input[name="turnstileToken"]') as HTMLInputElement;
+            if (el) el.value = tok;
+          }, data.token);
+          return { turnstile: true, interactive: false };
+        }
+      } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'External Turnstile solver failed');
+      }
+    }
+  }
+
   if (await waitForToken(page, timeoutMs)) {
     logger.info('Codeforces Turnstile solved itself in the browser');
     return { turnstile: true, interactive: false };
