@@ -25,6 +25,7 @@ jobs:
       CODEFORCES_SUBMITTER_URL: https://codeforces-submit-browser.onrender.com
       CODEFORCES_SUBMITTER_TOKEN: ${{ secrets.CODEFORCES_SUBMITTER_TOKEN }}
       HEADLESS: 'false'
+      CODEFORCES_BLOCK_ASSETS: 'false'
     steps:
       - name: Find waiting browser job
         id: lookup

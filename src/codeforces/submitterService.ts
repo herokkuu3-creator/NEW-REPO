@@ -188,14 +188,16 @@ async function launchFirefox(state: SubmitRequest['state'], label: string): Prom
       locale: 'en-US',
       serviceWorkers: 'block',
     });
-    await context.route('**/*', async (route) => {
-      const type = route.request().resourceType();
-      if (blockCodeforcesResource(route.request().url(), type)) {
-        await route.abort();
-        return;
-      }
-      await route.continue();
-    });
+    if (process.env.CODEFORCES_BLOCK_ASSETS !== 'false') {
+      await context.route('**/*', async (route) => {
+        const type = route.request().resourceType();
+        if (blockCodeforcesResource(route.request().url(), type)) {
+          await route.abort();
+          return;
+        }
+        await route.continue();
+      });
+    }
     const page = context.pages()[0] ?? (await context.newPage());
     return {
       browser: active,
