@@ -96,8 +96,14 @@ describe('Codeforces native browser submission', () => {
     expect(await page.locator('#body').evaluate(e => getComputedStyle(e).color)).toBe('rgb(1, 2, 3)');
   });
 
-  it('stops without clicking or posting when verification never produces a token', async () => {
-    await fixture({ disabled: true });
+  it('allows an empty legacy token field when no Turnstile widget is present', async () => {
+    await fixture();
+    expect(await ensureFormTurnstile(page, 25)).toEqual({ turnstile: false, interactive: false });
+    expect(posts).toHaveLength(0);
+  });
+
+  it('stops without clicking or posting when a Turnstile widget never produces a token', async () => {
+    await fixture({ disabled: true, callback: true });
     await expect(ensureFormTurnstile(page, 25)).rejects.toMatchObject({ kind: 'blocked', clicked: false, flags: { turnstile: false } });
     expect(posts).toHaveLength(0);
   });

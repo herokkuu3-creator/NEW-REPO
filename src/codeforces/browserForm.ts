@@ -42,7 +42,11 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
   const field = form.locator('input[name="turnstileToken"]');
   if (await field.count() === 0) return { turnstile: false, interactive: false };
 
-  // A token must be present in the Codeforces form, not merely in a challenge iframe.
+  // Codeforces leaves an empty hidden turnstileToken input on some accounts even
+  // when the form has no Turnstile challenge. The widget itself, rather than the
+  // hidden input, tells us whether verification is required.
+  const widget = form.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
+  const noWidgetGraceMs = Math.min(1_500, timeoutMs);
   const deadline = Date.now() + timeoutMs;
   const startedAt = Date.now();
   let renderAttempt = 'not-needed';
@@ -52,6 +56,9 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
   const hasToken = async () => !!(await field.first().inputValue({ timeout: 1_000 }).catch(() => '')).trim();
   while (Date.now() < deadline) {
     if (await hasToken()) return { turnstile: true, interactive: false };
+    if (Date.now() - startedAt >= noWidgetGraceMs && await widget.count() === 0) {
+      return { turnstile: false, interactive: false };
+    }
     if (!renderChecked && Date.now() - startedAt >= 2_000) {
       renderChecked = true;
       // Codeforces sometimes leaves the container unrendered even though api.js
@@ -106,6 +113,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
     await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
   }
   if (await hasToken()) return { turnstile: true, interactive: false };
+  if (await widget.count() === 0) return { turnstile: false, interactive: false };
 
   // Retain the optional solver contract, but never submit any form from here.
   const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
