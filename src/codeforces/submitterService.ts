@@ -428,6 +428,8 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
     if (ta) {
       ta.value = content;
     }
+    // mock window.editor so native submit click doesn't crash Codeforces JS
+    (window as any).editor = { save: () => {} };
   }, code).catch((err) => { log({err: err.message}, 'evaluate failed'); });
 
   log({}, 'reading token');
@@ -457,7 +459,7 @@ async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: numb
         log({err: e.message}, 'waitForNavigation rejected');
         return null;
       }),
-      form.evaluate((f) => (f as HTMLFormElement).submit()).catch(() => undefined),
+      page.locator('input[type="submit"][name="submit"]').first().click({ force: true, timeout: 15_000 }).catch(() => undefined),
     ]);
     log({}, 'submit finished');
     return { clicked: true, status: response?.status() ?? null };

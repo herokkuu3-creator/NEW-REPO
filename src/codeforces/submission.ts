@@ -455,6 +455,8 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
     if (ta) {
       ta.value = content;
     }
+    // mock window.editor so native submit click doesn't crash Codeforces JS
+    (window as any).editor = { save: () => {} };
   }, code).catch(() => undefined);
 
   const token = await page.locator(`input[name="${csrfName}"]`).first().inputValue({ timeout: 5000 }).catch(() => '');
@@ -543,7 +545,7 @@ async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: numb
 
   const [response] = await Promise.all([
     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => null),
-    form.evaluate((f) => (f as HTMLFormElement).submit()).catch(() => undefined),
+    page.locator('input[type="submit"][name="submit"]').first().click({ force: true, timeout: 15_000 }).catch(() => undefined),
   ]);
   return { clicked: true, status: response?.status() ?? null };
 }
