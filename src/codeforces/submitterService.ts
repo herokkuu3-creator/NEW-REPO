@@ -378,9 +378,20 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
   if (!language) throw new Error(`no ${wantsPython ? 'Python 3' : 'C++'} language option on the Codeforces form`);
   await page.locator('select[name="programTypeId"]').first().selectOption(language.value);
 
+  const toggle = page.locator('#toggleEditorCheckbox').first();
+  if ((await toggle.count().catch(() => 0)) > 0) {
+    if (await toggle.isChecked().catch(() => false)) {
+      await toggle.uncheck({ force: true }).catch(() => undefined);
+    }
+  }
+
   const sourceBox = page.locator('textarea[name="source"]').first();
   if ((await sourceBox.count().catch(() => 0)) === 0) throw new Error('Codeforces submit form has no source textarea');
-  await sourceBox.fill(code);
+  await sourceBox.evaluate((node, content) => {
+    (node as HTMLTextAreaElement).value = content;
+  }, code);
+  // Also try to force-fill just in case Playwright needs to trigger events
+  await sourceBox.fill(code, { force: true }).catch(() => undefined);
 
   const token = await page.locator(`input[name="${csrfName}"]`).first().inputValue().catch(() => '');
   if (!token) throw new Error(`Codeforces ${csrfName} is empty — the submit page was not served correctly`);

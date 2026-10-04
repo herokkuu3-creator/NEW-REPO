@@ -232,6 +232,7 @@ async function runForAccount(
 
       let attemptUsername = attempt.handle ?? username;
       if (!attempt.ok && attempt.kind === 'blocked') {
+        logger.warn({ label, problem: problemLabel(entry), error: attempt.error }, 'Codeforces HTTP submission blocked; falling back to browser transport');
         const viaBrowser = await submitViaBrowser(
           stored.state,
           label,
@@ -243,6 +244,8 @@ async function runForAccount(
           attempt = viaBrowser;
           attemptUsername = viaBrowser.handle ?? attemptUsername;
         }
+      } else if (!attempt.ok) {
+        logger.warn({ label, problem: problemLabel(entry), kind: attempt.kind, error: attempt.error }, 'Codeforces HTTP submission failed (not blocked, no browser fallback)');
       }
       username = attemptUsername;
       return { ...attempt, handle: attemptUsername };

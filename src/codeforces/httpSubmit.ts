@@ -275,18 +275,22 @@ export async function submitViaHttp(
 
   for (const path of candidates) {
     const pageUrl = `${BASE}${path}`;
+    logger.debug({ path }, 'Codeforces HTTP GET candidate');
     const page = await client.get(path);
     if (page.status === 403 || CHALLENGE_RE.test(page.body)) {
+      logger.debug({ path, status: page.status }, 'Cloudflare blocked GET');
       return { ok: false, kind: 'blocked', error: `Cloudflare challenged GET ${path} (HTTP ${page.status})` };
     }
     if (page.status >= 300 && page.status < 400) {
       if (page.location && /\/enter(?:[/?#]|$)/i.test(page.location)) {
+        logger.debug({ path, location: page.location }, 'Redirected to login');
         return {
           ok: false,
           kind: 'signed-out',
           error: `Codeforces redirected ${path} to ${page.location} — the session cookies are not signed in; re-send them with /renew`,
         };
       }
+      logger.debug({ path, location: page.location }, 'Redirected');
       attempts.push(`${path}: redirected to ${page.location ?? '?'}`);
       continue;
     }
@@ -349,13 +353,14 @@ export async function submitViaHttp(
     if (target.pathname === '/' && new URL(pageUrl).pathname !== '/') {
       target.pathname = new URL(pageUrl).pathname;
     }
-    const post = await client.post(target.toString(), body, pageUrl);
+    const targetUrl = target.toString();
+    const post = await client.post(targetUrl, body, pageUrl);
     logger.info(
       {
         path,
         pageUrl,
         action: form.actionRaw,
-        target: target.toString(),
+        target: targetUrl,
         hidden: Object.keys(form.hidden),
         status: post.status,
         location: post.location,
@@ -364,6 +369,7 @@ export async function submitViaHttp(
     );
 
     if (post.status === 403 || CHALLENGE_RE.test(post.body)) {
+      logger.debug({ path, status: post.status }, 'Cloudflare blocked POST');
       return { ok: false, kind: 'blocked', error: `Cloudflare challenged the submit POST (HTTP ${post.status})` };
     }
     const formError = post.status === 200 ? extractFormError(post.body) : null;
