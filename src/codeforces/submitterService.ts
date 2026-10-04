@@ -235,10 +235,17 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
 
 async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
+  let triedSolver = false;
   while (Date.now() < deadline) {
     await sleep(1_000);
     const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
     if (isCodeforces) return true;
+    
+    // If it's still blocking, try solving the Turnstile (this is critical for 403 on POSTs)
+    if (!triedSolver) {
+      triedSolver = true;
+      await ensureTurnstile(page).catch(() => undefined);
+    }
   }
   return false;
 }
@@ -302,13 +309,31 @@ async function waitForToken(page: Page, timeoutMs: number): Promise<boolean> {
 }
 
 async function ensureTurnstile(page: Page): Promise<{ turnstile: boolean; interactive: boolean }> {
-  if ((await page.locator('input[name="turnstileToken"]').first().count().catch(() => 0)) === 0) {
+  // Check for both the Codeforces native token field AND the Cloudflare interstitial field
+  const cfNativeCount = await page.locator('input[name="turnstileToken"]').count().catch(() => 0);
+  const cfInterstitialCount = await page.locator('input[name="cf-turnstile-response"]').count().catch(() => 0);
+  
+  if (cfNativeCount === 0 && cfInterstitialCount === 0) {
     return { turnstile: false, interactive: false };
   }
 
   const solverUrl = process.env.TURNSTILE_SOLVER_URL;
   if (solverUrl) {
-    const sitekey = await page.locator('.cf-turnstile').first().getAttribute('data-sitekey').catch(() => null);
+    // Cloudflare interstitial uses an iframe or div with sitekey. Try to find the sitekey.
+    // Sometimes it's in a script block, but usually the .cf-turnstile div is present.
+    let sitekey = await page.locator('.cf-turnstile').first().getAttribute('data-sitekey').catch(() => null);
+    if (!sitekey) {
+      // If we can't find it natively, try to extract from script tags on the challenge page
+      sitekey = await page.evaluate(() => {
+        const scripts = Array.from(document.querySelectorAll('script'));
+        for (const s of scripts) {
+          const match = /'sitekey'\s*:\s*'([^']+)'/.exec(s.innerHTML || '');
+          if (match) return match[1];
+        }
+        return null;
+      });
+    }
+
     if (sitekey) {
       log({ sitekey, solverUrl }, 'Requesting Turnstile token from external solver...');
       try {
@@ -321,14 +346,24 @@ async function ensureTurnstile(page: Page): Promise<{ turnstile: boolean; intera
         if (data.token) {
           log({}, 'External Turnstile solver succeeded');
           await page.evaluate((tok) => {
-            const el = document.querySelector('input[name="turnstileToken"]') as HTMLInputElement;
-            if (el) el.value = tok;
+            // Fill Codeforces native if present
+            const el1 = document.querySelector('input[name="turnstileToken"]') as HTMLInputElement;
+            if (el1) el1.value = tok;
+            // Fill Cloudflare interstitial if present
+            const el2 = document.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement;
+            if (el2) el2.value = tok;
+            
+            // If it's the interstitial, we MUST submit the challenge form!
+            const cfForm = document.getElementById('challenge-form') as HTMLFormElement;
+            if (cfForm) cfForm.submit();
           }, data.token);
           return { turnstile: true, interactive: false };
         }
       } catch (err) {
         log({ err: err instanceof Error ? err.message : String(err) }, 'External Turnstile solver failed');
       }
+    } else {
+      log({}, 'Could not find Turnstile sitekey on page despite widget being present');
     }
   }
 
