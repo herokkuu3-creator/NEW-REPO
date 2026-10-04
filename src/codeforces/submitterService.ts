@@ -170,7 +170,7 @@ async function launchFirefox(state: SubmitRequest['state'], label: string): Prom
     });
     await context.route('**/*', async (route) => {
       const type = route.request().resourceType();
-      if (type === 'image' || type === 'media' || type === 'font') {
+      if (type === 'image' || type === 'media' || type === 'font' || type === 'stylesheet') {
         await route.abort();
         return;
       }

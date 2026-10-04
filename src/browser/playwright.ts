@@ -248,7 +248,7 @@ export async function launchFirefoxWithStorageStateObject(
     // page's own signing code and Cloudflare's Turnstile both need them.
     await context.route('**/*', async (route) => {
       const type = route.request().resourceType();
-      if (type === 'image' || type === 'media' || type === 'font') {
+      if (type === 'image' || type === 'media' || type === 'font' || type === 'stylesheet') {
         await route.abort();
         return;
       }

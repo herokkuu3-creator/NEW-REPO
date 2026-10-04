@@ -56,6 +56,8 @@ export interface FormPage {
   signedInHandle: string | null;
   problemIndexes: string[];
   languages: Array<{ value: string; text: string }>;
+  expectsProblemCode: boolean;
+  hasSubmitForm: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +160,8 @@ export function parseSubmitPage(html: string, pageUrl: string = BASE): FormPage 
       .map((o) => o.value)
       .filter(Boolean),
     languages: options(select('programTypeId')).filter((o) => o.value),
+    expectsProblemCode: /name=["']submittedProblemCode["']/i.test(formBody),
+    hasSubmitForm: formTag !== undefined,
   };
 }
 
@@ -276,14 +280,25 @@ export async function submitViaHttp(
       return { ok: false, kind: 'blocked', error: `Cloudflare challenged GET ${path} (HTTP ${page.status})` };
     }
     if (page.status >= 300 && page.status < 400) {
-      return {
-        ok: false,
-        kind: 'signed-out',
-        error: `Codeforces redirected ${path} to ${page.location ?? '?'} — the session cookies are not signed in; re-send them with /renew`,
-      };
+      if (page.location && /\/enter(?:[/?#]|$)/i.test(page.location)) {
+        return {
+          ok: false,
+          kind: 'signed-out',
+          error: `Codeforces redirected ${path} to ${page.location} — the session cookies are not signed in; re-send them with /renew`,
+        };
+      }
+      attempts.push(`${path}: redirected to ${page.location ?? '?'}`);
+      continue;
     }
     const form = parseSubmitPage(page.body, pageUrl);
-    if (!form.csrf) return { ok: false, kind: 'error', error: `no csrf_token on ${path} (HTTP ${page.status})` };
+    if (!form.csrf) {
+      attempts.push(`${path}: no csrf_token (HTTP ${page.status})`);
+      continue;
+    }
+    if (!form.hasSubmitForm) {
+      attempts.push(`${path}: no submit form found`);
+      continue;
+    }
     if (!form.signedInHandle) {
       return { ok: false, kind: 'signed-out', error: 'Codeforces served the submit page anonymously — re-send the session cookies with /renew' };
     }
@@ -306,7 +321,7 @@ export async function submitViaHttp(
 
     const jar = client.jar;
     const seed = jar?.get('39ce7') ?? state.cookies.find((c) => c.name === '39ce7')?.value ?? '';
-    const body = new URLSearchParams({
+    const bodyArgs: Record<string, string> = {
       ...form.hidden,
       csrf_token: form.csrf,
       // What the page itself rendered wins (that is what the browser submits);
@@ -314,13 +329,18 @@ export async function submitViaHttp(
       ftaa: form.hidden['ftaa']?.trim() || jar?.get('_ftaa') || randomFtaa(),
       bfaa: form.hidden['bfaa']?.trim() || jar?.get('_bfaa') || randomHex(32),
       action: 'submitSolutionFormSubmitted',
-      submittedProblemIndex: entry.problemIndex,
       programTypeId,
       source: code,
       tabSize: '4',
       sourceFile: '',
       _tta: String(computeTta(seed)),
-    });
+    };
+    if (form.expectsProblemCode) {
+      bodyArgs.submittedProblemCode = `${entry.contestId}${entry.problemIndex}`;
+    } else {
+      bodyArgs.submittedProblemIndex = entry.problemIndex;
+    }
+    const body = new URLSearchParams(bodyArgs);
     // Post to the form's own action, so Codeforces' per-page parameters survive.
     // A query-only action is relative to the page it sits on, and Codeforces
     // answers a submit form sent to the site root with 302 → "/", so a target

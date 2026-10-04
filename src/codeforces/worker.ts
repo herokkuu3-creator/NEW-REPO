@@ -577,6 +577,10 @@ async function postViaLocalBrowser(
 
   const { peakMb, tripped } = watch.stop();
   logMemory('codeforces browser step finished', { peakMb, tripped, pressured });
+  if (pressured && !posted.ok) {
+    posted.kind = 'blocked';
+    posted.error = `the local browser step was stopped at the instance's memory ceiling: ${posted.error}`;
+  }
   return { ...posted, submittedAt, transport: 'Firefox transport' };
 }
 

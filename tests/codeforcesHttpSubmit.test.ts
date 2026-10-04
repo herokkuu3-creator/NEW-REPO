@@ -132,7 +132,7 @@ describe('submitViaHttp', () => {
   });
 
   it('flags expired cookies instead of posting anonymously', async () => {
-    const { client, calls } = fakeClient({ status: 302, location: 'https://codeforces.com/' }, { status: 500 });
+    const { client, calls } = fakeClient({ status: 302, location: 'https://codeforces.com/enter' }, { status: 500 });
     const result = await submitViaHttp(state, 'me_superman', entry, 'x', { client, sleep: noSleep });
     expect(result).toMatchObject({ ok: false, kind: 'signed-out' });
     expect(calls.filter((c) => c.method === 'POST')).toHaveLength(0);
