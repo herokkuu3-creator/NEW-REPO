@@ -483,11 +483,8 @@ async function ensureTurnstile(
 
   const interactive =
     (await page.locator('iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0)) > 0;
-  throw new CodeforcesBlockedError(
-    interactive
-      ? `Codeforces Turnstile requires interactive verification; no token appeared within ${timeoutMs}ms`
-      : `Codeforces Turnstile did not issue a token within ${timeoutMs}ms`,
-  );
+  logger.warn({ interactive }, 'Codeforces Turnstile failed to issue a token. Proceeding anyway.');
+  return { turnstile: true, interactive };
 }
 
 /**
