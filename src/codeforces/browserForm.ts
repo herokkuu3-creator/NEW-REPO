@@ -44,9 +44,50 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
 
   // A token must be present in the Codeforces form, not merely in a challenge iframe.
   const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  let renderAttempt = 'not-needed';
+  let renderChecked = false;
   const hasToken = async () => !!(await field.first().inputValue({ timeout: 1_000 }).catch(() => '')).trim();
   while (Date.now() < deadline) {
     if (await hasToken()) return { turnstile: true, interactive: false };
+    if (!renderChecked && Date.now() - startedAt >= 2_000) {
+      renderChecked = true;
+      // Codeforces sometimes leaves the container unrendered even though api.js
+      // loaded. Ask the real Turnstile API to render it once; never fabricate a token.
+      renderAttempt = await form.evaluate((element) => {
+        const widget = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
+        const api = (window as unknown as { turnstile?: {
+          render?: (container: HTMLElement, options: { sitekey: string; callback: (token: string) => void }) => string;
+          execute?: (container: HTMLElement) => void;
+        } }).turnstile;
+        if (!widget || !api?.render || widget.querySelector('iframe')) return 'not-needed';
+        const sitekey = widget.dataset.sitekey;
+        if (!sitekey) return 'no-sitekey';
+        try {
+          api.render(widget, {
+            sitekey,
+            callback: (token) => {
+              const callbackName = widget.getAttribute('data-callback');
+              if (callbackName) {
+                const fn = callbackName.split('.').reduce<unknown>((value, key) =>
+                  value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
+                if (typeof fn === 'function') (fn as (value: string) => void)(token);
+              }
+              const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
+              if (input && !input.value) {
+                input.value = token;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            },
+          });
+          if (widget.dataset.execution === 'execute') api.execute?.(widget);
+          return 'rendered';
+        } catch {
+          return 'render-error';
+        }
+      }).catch(() => 'page-error');
+    }
     await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
   }
   if (await hasToken()) return { turnstile: true, interactive: false };
@@ -97,9 +138,12 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
     apiLoaded: typeof (window as unknown as { turnstile?: unknown }).turnstile !== 'undefined',
     iframePresent: !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
     widgetPresent: !!document.querySelector('.cf-turnstile'),
+    widgetInForm: !!document.querySelector('form:has(textarea[name="source"]) .cf-turnstile'),
+    sitekeyInForm: !!document.querySelector('form:has(textarea[name="source"]) .cf-turnstile[data-sitekey]'),
+    execution: document.querySelector('form:has(textarea[name="source"]) .cf-turnstile')?.getAttribute('data-execution') ?? null,
   }));
   throw new BrowserFormError(
-    `Codeforces Turnstile did not issue a token within ${timeoutMs}ms (${JSON.stringify(diagnostics)}). ` +
+    `Codeforces Turnstile did not issue a token within ${timeoutMs}ms (${JSON.stringify({ ...diagnostics, renderAttempt })}). ` +
     'No submission was sent. Complete verification in a supported browser or use an accessible submitter connection.',
     'blocked',
     { turnstile: false, interactive: diagnostics.iframePresent },

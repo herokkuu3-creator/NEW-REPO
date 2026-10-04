@@ -110,6 +110,21 @@ describe('Codeforces native browser submission', () => {
     expect(await ensureFormTurnstile(page, 1_000)).toEqual({ turnstile: true, interactive: false });
   });
 
+  it('renders an uninitialized Turnstile widget with the real page API', async () => {
+    await fixture({ disabled: true, callback: true });
+    await page.evaluate(() => {
+      (window as any).turnstile = {
+        render: (_widget: HTMLElement, options: { callback: (token: string) => void }) => {
+          setTimeout(() => options.callback('native-render-token'), 10);
+          return 'widget-id';
+        },
+      };
+    });
+    expect(await ensureFormTurnstile(page, 3_500)).toEqual({ turnstile: true, interactive: false });
+    expect(await page.locator('#solution input[type=submit]').isEnabled()).toBe(true);
+    expect(posts).toHaveLength(0);
+  });
+
   it('never turns a disabled button into a successful click', async () => {
     await fixture({ token: 'verified', disabled: true });
     await expect(clickSubmitForm(page, 300)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
