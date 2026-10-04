@@ -321,7 +321,7 @@ async function ensureTurnstile(page: Page): Promise<{ turnstile: boolean; intera
   if (solverUrl) {
     // Cloudflare interstitial uses an iframe or div with sitekey. Try to find the sitekey.
     // Sometimes it's in a script block, but usually the .cf-turnstile div is present.
-    let sitekey = await page.locator('.cf-turnstile').first().getAttribute('data-sitekey').catch(() => null);
+    let sitekey: string | null | undefined = await page.locator('.cf-turnstile').first().getAttribute('data-sitekey').catch(() => null);
     if (!sitekey) {
       // If we can't find it natively, try to extract from script tags on the challenge page
       sitekey = await page.evaluate(() => {

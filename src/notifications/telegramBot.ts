@@ -17,7 +17,6 @@ import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
 import { CODEFORCES_MANUAL_REASON, isCodeforcesRunInProgress, runCodeforcesNow } from '../codeforces/worker';
 import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../codeforces/report';
-import { listCodeforcesAccounts } from '../codeforces/storage';
 import {
   isRunInProgress,
   runSubmissionNow,
@@ -624,8 +623,7 @@ export async function handleRemoveAllSessions(deps: RemovalDeps = defaultRemoval
   );
 }
 
-import { listCodeforcesAccounts } from '../codeforces/storage';
-import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts } from '../codeforces/storage';
+import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts, listCodeforcesAccounts } from '../codeforces/storage';
 
 function cfAccountName(a: { label: string; username?: string | null }): string {
   return a.username && a.username !== a.label ? `${a.label} (${a.username})` : a.label;
