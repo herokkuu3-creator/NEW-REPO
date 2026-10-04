@@ -390,6 +390,30 @@ async function ensureTurnstile(page: Page): Promise<{ turnstile: boolean; intera
   return { turnstile: true, interactive };
 }
 
+/**
+ * Sets a <select> in the page directly and fires the events Codeforces listens
+ * to. Playwright's selectOption runs actionability checks that time out when
+ * Firefox is starved at the 512MB limit; a DOM assignment is instant.
+ */
+async function setSelectValue(page: Page, name: string, value: string): Promise<void> {
+  const done = await page
+    .evaluate(
+      ({ name, value }) => {
+        const el = document.querySelector(`select[name="${name}"]`) as HTMLSelectElement | null;
+        if (!el) return false;
+        el.value = value;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return el.value === value;
+      },
+      { name, value },
+    )
+    .catch(() => false);
+  if (done) return;
+  log({ name }, 'DOM select failed, falling back to selectOption');
+  await page.locator(`select[name="${name}"]`).first().selectOption(value, { force: true, timeout: 20_000 });
+}
+
 async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): Promise<{ turnstile: boolean; interactive: boolean }> {
   log({}, 'waiting for form to settle');
   const settled = await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).then(() => true).catch(() => false);
@@ -408,7 +432,7 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
   log({}, 'selecting contest');
   const contestSelector = page.locator('select[name="contestId"]').first();
   if ((await contestSelector.count().catch(() => 0)) > 0) {
-    await contestSelector.selectOption(String(entry.contestId), { force: true, timeout: 5000 }).catch(() => undefined);
+    await setSelectValue(page, 'contestId', String(entry.contestId));
   }
 
   log({}, 'selecting problem index');
@@ -431,7 +455,7 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
         `contest ${entry.contestId} submit form has no option for problem ${entry.problemIndex}`,
       );
     }
-    await page.locator('select[name="submittedProblemIndex"]').first().selectOption(target.value, { force: true, timeout: 5000 });
+    await setSelectValue(page, 'submittedProblemIndex', target.value);
   } else if (fields.some((field) => field.tag === 'input' && /^submittedProblemIndex$/i.test(field.name))) {
     await page.locator('input[name="submittedProblemIndex"]').first().fill(entry.problemIndex, { force: true, timeout: 5000 });
   } else if (fields.some((field) => field.tag === 'input' && /^submittedProblemCode$/i.test(field.name))) {
@@ -458,7 +482,7 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
         .sort((a, b) => Number(b.match[1]) - Number(a.match[1]))[0]?.option ??
       options.find((option) => /C\+\+/i.test(option.text));
   if (!language) throw new Error(`no ${wantsPython ? 'Python 3' : 'C++'} language option on the Codeforces form`);
-  await page.locator('select[name="programTypeId"]').first().selectOption(language.value, { force: true, timeout: 5000 });
+  await setSelectValue(page, 'programTypeId', language.value);
 
   log({}, 'unchecking editor and filling source');
   const sourceBox = page.locator('textarea[name="source"]').first();
