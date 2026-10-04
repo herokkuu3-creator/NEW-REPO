@@ -459,7 +459,7 @@ async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: numb
         log({err: e.message}, 'waitForNavigation rejected');
         return null;
       }),
-      page.locator('input[type="submit"][name="submit"]').first().click({ force: true, timeout: 15_000 }).catch(() => undefined),
+      form.locator('input[type="submit"]').first().click({ force: true, timeout: 15_000 }).catch(() => undefined),
     ]);
     log({}, 'submit finished');
     return { clicked: true, status: response?.status() ?? null };

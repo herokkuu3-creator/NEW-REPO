@@ -545,7 +545,7 @@ async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: numb
 
   const [response] = await Promise.all([
     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => null),
-    page.locator('input[type="submit"][name="submit"]').first().click({ force: true, timeout: 15_000 }).catch(() => undefined),
+    form.locator('input[type="submit"]').first().click({ force: true, timeout: 15_000 }).catch(() => undefined),
   ]);
   return { clicked: true, status: response?.status() ?? null };
 }
