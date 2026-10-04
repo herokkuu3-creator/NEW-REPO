@@ -30,9 +30,12 @@ const TOKEN = process.env.CODEFORCES_SUBMITTER_TOKEN?.trim() ?? '';
 const HEADLESS = process.env.HEADLESS !== 'false';
 const BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const NAV_TIMEOUT_MS = Number(process.env.CODEFORCES_NAV_TIMEOUT_MS ?? 60_000);
-const TURNSTILE_WAIT_MS = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 30_000);
-const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 60_000);
+const TURNSTILE_WAIT_MS = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 20_000);
+const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 20_000);
 const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 300);
+// Outbound proxy for Firefox, e.g. socks5://127.0.0.1:40000 (the local WARP
+// tunnel started by scripts/start-submitter.sh). Empty = direct connection.
+const PROXY_SERVER = (process.env.CODEFORCES_PROXY ?? '').trim();
 
 const CHALLENGE_RE = /just a moment|checking your browser|verify you are human|cf-chl|enable javascript and cookies/i;
 const SIGNED_OUT_RE = /you are not logged in|please login|please sign in|not logged in|register for practice/i;
@@ -140,6 +143,7 @@ async function launchFirefox(state: SubmitRequest['state'], label: string): Prom
   try {
     const active = (browser = await firefox.launch({
       headless: HEADLESS,
+      ...(PROXY_SERVER ? { proxy: { server: PROXY_SERVER } } : {}),
       firefoxUserPrefs: {
         'permissions.default.image': 2,
         'browser.cache.disk.enable': false,
@@ -753,7 +757,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   log(
-    { port: PORT, headless: HEADLESS, usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
+    { port: PORT, headless: HEADLESS, proxy: PROXY_SERVER || 'direct', usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
     'isolated Codeforces submitter listening',
   );
 });

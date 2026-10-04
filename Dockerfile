@@ -58,6 +58,17 @@ COPY package.json ./
 # only makes sure the Firefox build matches the Playwright version in use.
 RUN npx playwright install firefox
 
+# Cloudflare WARP in userspace for the Codeforces submitter (see
+# scripts/start-submitter.sh): wgcf creates a free WARP WireGuard profile and
+# wireproxy exposes it as a local SOCKS5 proxy — no root or TUN device needed.
+ADD https://github.com/ViRb3/wgcf/releases/download/v2.3.0/wgcf_2.3.0_linux_amd64 /usr/local/bin/wgcf
+ADD https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz /tmp/wireproxy.tar.gz
+RUN tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
+ && rm /tmp/wireproxy.tar.gz \
+ && chmod 0755 /usr/local/bin/wgcf /usr/local/bin/wireproxy
+COPY scripts/start-submitter.sh /app/scripts/start-submitter.sh
+RUN sed -i 's/\r$//' /app/scripts/start-submitter.sh && chmod 0755 /app/scripts/start-submitter.sh
+
 # Run as the pre-existing non-root user shipped with the Playwright image.
 RUN mkdir -p /tmp/browser-profile /tmp/diagnostics && chown -R pwuser:pwuser /tmp/browser-profile /tmp/diagnostics /app
 USER pwuser

@@ -138,9 +138,14 @@ services:
     plan: free
     region: frankfurt
     healthCheckPath: /health
-    dockerCommand: npm run submitter
+    dockerCommand: bash /app/scripts/start-submitter.sh
     envVars:
       - key: HEADLESS
+        value: "true"
+      # Route Firefox through a userspace Cloudflare WARP tunnel so Codeforces'
+      # Cloudflare sees a WARP egress IP instead of a flagged Render datacenter
+      # IP. Set to "false" to go back to the direct connection.
+      - key: WARP_ENABLED
         value: "true"
       # Nothing but a tiny HTTP server and one Firefox lives here.
       - key: NODE_OPTIONS
