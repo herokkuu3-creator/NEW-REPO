@@ -328,7 +328,7 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
   log({}, 'selecting contest');
   const contestSelector = page.locator('select[name="contestId"]').first();
   if ((await contestSelector.count().catch(() => 0)) > 0) {
-    await contestSelector.selectOption(String(entry.contestId), { timeout: 5000 }).catch(() => undefined);
+    await contestSelector.selectOption(String(entry.contestId), { force: true, timeout: 5000 }).catch(() => undefined);
   }
 
   log({}, 'selecting problem index');
@@ -351,11 +351,11 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
         `contest ${entry.contestId} submit form has no option for problem ${entry.problemIndex}`,
       );
     }
-    await page.locator('select[name="submittedProblemIndex"]').first().selectOption(target.value, { timeout: 5000 });
+    await page.locator('select[name="submittedProblemIndex"]').first().selectOption(target.value, { force: true, timeout: 5000 });
   } else if (fields.some((field) => field.tag === 'input' && /^submittedProblemIndex$/i.test(field.name))) {
-    await page.locator('input[name="submittedProblemIndex"]').first().fill(entry.problemIndex, { timeout: 5000 });
+    await page.locator('input[name="submittedProblemIndex"]').first().fill(entry.problemIndex, { force: true, timeout: 5000 });
   } else if (fields.some((field) => field.tag === 'input' && /^submittedProblemCode$/i.test(field.name))) {
-    await page.locator('input[name="submittedProblemCode"]').first().fill(`${entry.contestId}${entry.problemIndex}`, { timeout: 5000 });
+    await page.locator('input[name="submittedProblemCode"]').first().fill(`${entry.contestId}${entry.problemIndex}`, { force: true, timeout: 5000 });
   } else {
     throw new Error(`Codeforces submit form has no problem selector (fields: ${summarize(fields)})`);
   }
@@ -378,7 +378,7 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
         .sort((a, b) => Number(b.match[1]) - Number(a.match[1]))[0]?.option ??
       options.find((option) => /C\+\+/i.test(option.text));
   if (!language) throw new Error(`no ${wantsPython ? 'Python 3' : 'C++'} language option on the Codeforces form`);
-  await page.locator('select[name="programTypeId"]').first().selectOption(language.value, { timeout: 5000 });
+  await page.locator('select[name="programTypeId"]').first().selectOption(language.value, { force: true, timeout: 5000 });
 
   log({}, 'unchecking toggle editor');
   const toggle = page.locator('#toggleEditorCheckbox').first();

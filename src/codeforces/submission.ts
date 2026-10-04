@@ -380,7 +380,7 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
 
   const contestSelector = page.locator('select[name="contestId"]').first();
   if ((await contestSelector.count().catch(() => 0)) > 0) {
-    await contestSelector.selectOption(String(contestId)).catch(() => undefined);
+    await contestSelector.selectOption(String(contestId), { force: true, timeout: 5000 }).catch(() => undefined);
   }
 
   switch (planProblemField(fields)) {
@@ -395,14 +395,14 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
           `contest ${contestId} submit form has no option for problem ${problemIndex} (options: ${options.map((o) => o.text).join(', ') || 'none'})`,
         );
       }
-      await select.selectOption(target.value, { timeout: 5000 });
+      await select.selectOption(target.value, { force: true, timeout: 5000 });
       break;
     }
     case 'input-index':
-      await page.locator('input[name="submittedProblemIndex"]').first().fill(problemIndex, { timeout: 5000 });
+      await page.locator('input[name="submittedProblemIndex"]').first().fill(problemIndex, { force: true, timeout: 5000 });
       break;
     case 'input-code':
-      await page.locator('input[name="submittedProblemCode"]').first().fill(`${contestId}${problemIndex}`, { timeout: 5000 });
+      await page.locator('input[name="submittedProblemCode"]').first().fill(`${contestId}${problemIndex}`, { force: true, timeout: 5000 });
       break;
     default:
       throw new CodeforcesSubmissionError(
@@ -422,7 +422,7 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
         : `no C++ language option on the Codeforces form (options: ${options.map((o) => o.text).join(', ')})`,
     );
   }
-  await page.locator('select[name="programTypeId"]').first().selectOption(language.value, { timeout: 5000 });
+  await page.locator('select[name="programTypeId"]').first().selectOption(language.value, { force: true, timeout: 5000 });
 
   const toggle = page.locator('#toggleEditorCheckbox').first();
   if ((await toggle.count().catch(() => 0)) > 0) {
