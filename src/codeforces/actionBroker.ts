@@ -7,11 +7,12 @@ interface Job {
   id: string;
   payload: unknown;
   createdAt: number;
+  ready: boolean;
   claimed: boolean;
   result: unknown | null;
 }
 
-const JOB_LIFETIME_MS = 15 * 60_000;
+const JOB_LIFETIME_MS = 25 * 60_000;
 
 export class ActionBroker {
   private job: Job | null = null;
@@ -26,13 +27,19 @@ export class ActionBroker {
     return this.job !== null && this.job.result === null;
   }
 
+  get nextId(): string | null {
+    this.expire();
+    return this.job && this.job.ready && !this.job.claimed && this.job.result === null ? this.job.id : null;
+  }
+
   async enqueue(payload: unknown, requestedId?: string): Promise<string> {
     if (requestedId && this.job?.id === requestedId) return requestedId;
     if (this.busy) throw new Error('a Codeforces submission is already running');
     const id = requestedId && /^[a-f0-9-]{36}$/.test(requestedId) ? requestedId : randomUUID();
-    this.job = { id, payload, createdAt: this.now(), claimed: false, result: null };
+    this.job = { id, payload, createdAt: this.now(), ready: false, claimed: false, result: null };
     try {
       await this.dispatch(id);
+      if (this.job?.id === id) this.job.ready = true;
     } catch (err) {
       this.job = null;
       throw err;
@@ -43,7 +50,7 @@ export class ActionBroker {
   /** The browser can claim the source and session only once. */
   claim(id: string): unknown | null {
     this.expire();
-    if (!this.job || this.job.id !== id || this.job.claimed) return null;
+    if (!this.job || this.job.id !== id || !this.job.ready || this.job.claimed) return null;
     this.job.claimed = true;
     const payload = this.job.payload;
     this.job.payload = null;

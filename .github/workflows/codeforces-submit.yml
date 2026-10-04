@@ -1,6 +1,8 @@
 name: Codeforces browser submission
 
 on:
+  schedule:
+    - cron: '2/5 * * * *'
   workflow_dispatch:
     inputs:
       job_id:
@@ -20,18 +22,44 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
-      CODEFORCES_JOB_ID: ${{ inputs.job_id }}
       CODEFORCES_SUBMITTER_URL: https://codeforces-submit-browser.onrender.com
       CODEFORCES_SUBMITTER_TOKEN: ${{ secrets.CODEFORCES_SUBMITTER_TOKEN }}
       HEADLESS: 'true'
     steps:
+      - name: Find waiting browser job
+        id: lookup
+        if: github.event_name == 'schedule'
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const base = process.env.CODEFORCES_SUBMITTER_URL;
+          fetch(`${base}/jobs/next`, {
+            headers: { authorization: `Bearer ${process.env.CODEFORCES_SUBMITTER_TOKEN}` },
+            signal: AbortSignal.timeout(30000),
+          }).then(async response => {
+            if (!response.ok) throw new Error(`Render job lookup failed: HTTP ${response.status}`);
+            const { jobId } = await response.json();
+            if (jobId) {
+              if (!/^[a-f0-9-]{36}$/.test(jobId)) throw new Error('invalid broker job id');
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `job_id=${jobId}\n`);
+            }
+          }).catch(error => { console.error(error.message); process.exitCode = 1; });
+          NODE
       - uses: actions/checkout@v4
+        if: github.event_name == 'workflow_dispatch' || steps.lookup.outputs.job_id != ''
       - uses: actions/setup-node@v4
+        if: github.event_name == 'workflow_dispatch' || steps.lookup.outputs.job_id != ''
         with:
           node-version: '22'
           cache: npm
       - run: npm ci
+        if: github.event_name == 'workflow_dispatch' || steps.lookup.outputs.job_id != ''
       - run: npx playwright install --with-deps firefox
+        if: github.event_name == 'workflow_dispatch' || steps.lookup.outputs.job_id != ''
       - run: npm run build
+        if: github.event_name == 'workflow_dispatch' || steps.lookup.outputs.job_id != ''
       - name: Submit once and return browser result
+        if: github.event_name == 'workflow_dispatch' || steps.lookup.outputs.job_id != ''
+        env:
+          CODEFORCES_JOB_ID: ${{ inputs.job_id || steps.lookup.outputs.job_id }}
         run: node --expose-gc dist/src/codeforces/actionRunner.js

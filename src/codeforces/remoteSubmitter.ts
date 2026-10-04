@@ -31,7 +31,7 @@ export interface PostedResult extends BrowserPostOutcome {
 const WAKE_TIMEOUT_MS = Number(process.env.CODEFORCES_SUBMITTER_WAKE_MS ?? 120_000);
 const WAKE_INTERVAL_MS = 3_000;
 const SUBMIT_TIMEOUT_MS = Number(process.env.CODEFORCES_SUBMITTER_TIMEOUT_MS ?? 300_000);
-const ACTION_TIMEOUT_MS = Number(process.env.CODEFORCES_ACTION_TIMEOUT_MS ?? 13 * 60_000);
+const ACTION_TIMEOUT_MS = Number(process.env.CODEFORCES_ACTION_TIMEOUT_MS ?? 22 * 60_000);
 
 export function remoteSubmitterUrl(): string | null {
   const raw = process.env.CODEFORCES_SUBMITTER_URL?.trim();

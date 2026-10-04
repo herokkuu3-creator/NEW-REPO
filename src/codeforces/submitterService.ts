@@ -41,7 +41,10 @@ const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ??
 const PROXY_SERVER = (process.env.CODEFORCES_PROXY ?? '').trim();
 const RUNNER_REPOSITORY = (process.env.CODEFORCES_RUNNER_REPOSITORY ?? '').trim();
 const broker = RUNNER_REPOSITORY
-  ? new ActionBroker((id) => dispatchAction(RUNNER_REPOSITORY, process.env.GITHUB_DISPATCH_TOKEN?.trim() ?? '', id))
+  ? new ActionBroker((id) => {
+      const token = process.env.GITHUB_DISPATCH_TOKEN?.trim();
+      return token ? dispatchAction(RUNNER_REPOSITORY, token, id) : Promise.resolve();
+    })
   : null;
 
 const CHALLENGE_RE = /just a moment|checking your browser|verify you are human|cf-chl|enable javascript and cookies/i;
@@ -552,7 +555,7 @@ function authorized(req: http.IncomingMessage): boolean {
   return header === `Bearer ${TOKEN}`;
 }
 
-const server = http.createServer((req, res) => {
+export const server = http.createServer((req, res) => {
   const url = req.url ?? '/';
 
   // Public liveness endpoint for Render/UptimeRobot. Keep this path completely
@@ -581,6 +584,11 @@ const server = http.createServer((req, res) => {
   }
 
   const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result))?$/.exec(url);
+  if (broker && req.method === 'GET' && url === '/jobs/next') {
+    if (!authorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
+    json(res, 200, { jobId: broker.nextId });
+    return;
+  }
   if (broker && jobRoute) {
     if (!authorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
     const id = jobRoute[1]!;

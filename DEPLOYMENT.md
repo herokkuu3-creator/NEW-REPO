@@ -360,23 +360,19 @@ remains the bot and a small authenticated job broker. The browser job runs
 only when a Codeforces submission is requested. The bot then polls the public
 Codeforces API for the submission ID and verdict.
 
-After pushing the commit containing `.github/workflows/codeforces-submit.yml`:
+The workflow checks for a queued job every five minutes. After pushing the
+commit containing `.github/workflows/codeforces-submit.yml`:
 
 1. In GitHub repository **Settings → Secrets and variables → Actions**, create
    repository secret `CODEFORCES_SUBMITTER_TOKEN` with exactly the same value as
    on the two Render services. The source and session are fetched by the runner
    over HTTPS; the workflow input is only a random job ID. Never put the token
    in a repository variable or workflow file.
-2. Create a fine-grained GitHub personal access token limited to **this
-   repository**, with **Actions: Read and write**. In Render's
-   **codeforces-submit-browser → Environment**, set it as secret
-   `GITHUB_DISPATCH_TOKEN`. [GitHub's dispatch endpoint](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)
-   requires Actions write permission. Keep this token out of the repo and logs.
-3. Verify the isolated service has
+2. Verify the isolated service has
    `CODEFORCES_RUNNER_REPOSITORY=pateljk479-afk/NEW-REPO` and
    `WARP_ENABLED=false` (the blueprint sets both). Its `/health` should show
    `busy:false`. GitHub workflow points to the existing isolated service URL.
-4. Trigger `/submitnextsolution` once. A GitHub Actions run named **Codeforces
+3. Trigger `/submitnextsolution` once. A GitHub Actions run named **Codeforces
    browser submission** should appear. The bot will report a Codeforces
    submission ID and verdict if Codeforces accepts the form. Check the runner
    logs and isolated Render logs if the form is blocked. A successful workflow
@@ -385,6 +381,12 @@ After pushing the commit containing `.github/workflows/codeforces-submit.yml`:
 An ambiguous runner failure is reconciled against the pre-submit Codeforces API
 snapshot. No path automatically retries the form POST. GitHub and Codeforces
 can still issue a verification challenge; this requires a live run to confirm.
+
+For faster starts, `GITHUB_DISPATCH_TOKEN` is optional on the isolated Render
+service. A fine-grained personal access token limited to this repository with
+**Actions: Read and write** lets Render start the workflow immediately via
+[GitHub's dispatch endpoint](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event).
+The scheduled check works without this token.
 
 #### Legacy Render browser and WARP
 

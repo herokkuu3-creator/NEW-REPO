@@ -10,7 +10,9 @@ describe('Codeforces Actions handoff', () => {
     expect(dispatch).toHaveBeenCalledWith(id);
     expect(dispatch.mock.calls[0]?.[0]).not.toContain('secret');
     expect(broker.busy).toBe(true);
+    expect(broker.nextId).toBe(id);
     expect(broker.claim(id)).toEqual(payload);
+    expect(broker.nextId).toBeNull();
     expect(broker.claim(id)).toBeNull();
     expect(broker.status(id)).toEqual({ pending: true });
     expect(broker.finish(id, { ok: true, clicked: true })).toBe(true);
@@ -27,7 +29,7 @@ describe('Codeforces Actions handoff', () => {
     expect(failed.busy).toBe(false);
     const broker = new ActionBroker(async () => undefined, () => now);
     const id = await broker.enqueue({ code: 'x' });
-    now += 15 * 60_000;
+    now += 25 * 60_000;
     expect(broker.claim(id)).toBeNull();
     expect(broker.status(id)).toBeNull();
     expect(broker.busy).toBe(false);

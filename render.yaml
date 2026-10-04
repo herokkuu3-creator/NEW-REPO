@@ -146,6 +146,8 @@ services:
       # This 512 MB service brokers the request without launching Firefox.
       - key: CODEFORCES_RUNNER_REPOSITORY
         value: pateljk479-afk/NEW-REPO
+      # Optional: a fine-grained Actions-write token starts jobs immediately.
+      # Without it, the workflow checks for queued jobs every five minutes.
       - key: GITHUB_DISPATCH_TOKEN
         sync: false
       # Route Firefox through a userspace Cloudflare WARP tunnel so Codeforces'
