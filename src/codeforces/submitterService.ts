@@ -428,7 +428,7 @@ async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: numb
         log({err: e.message}, 'waitForNavigation rejected');
         return null;
       }),
-      scoped.click({ timeout: 15_000 }),
+      scoped.click({ force: true, timeout: 15_000 }),
     ]);
     log({}, 'submit click finished');
     return { clicked: true, status: response?.status() ?? null };

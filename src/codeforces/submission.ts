@@ -505,7 +505,7 @@ async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: numb
   if ((await scoped.count().catch(() => 0)) === 0) return { clicked: false, status: null };
   const [response] = await Promise.all([
     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => null),
-    scoped.click({ timeout: 15_000 }),
+    scoped.click({ force: true, timeout: 15_000 }),
   ]);
   return { clicked: true, status: response?.status() ?? null };
 }
