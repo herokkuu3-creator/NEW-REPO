@@ -379,6 +379,8 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
 }
 
 async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string): Promise<{ turnstile: boolean; interactive: boolean }> {
+  await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).catch(() => null);
+  
   const problemIndex = source.problemIndex!;
   const contestId = source.contestId!;
   const fields = await readFields(page);

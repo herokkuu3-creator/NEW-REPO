@@ -319,6 +319,9 @@ async function ensureTurnstile(page: Page): Promise<{ turnstile: boolean; intera
 }
 
 async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): Promise<{ turnstile: boolean; interactive: boolean }> {
+  log({}, 'waiting for form to settle');
+  await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).catch(() => null);
+  
   log({}, 'reading fields');
   const fields = await readFields(page);
 
