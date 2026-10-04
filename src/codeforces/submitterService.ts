@@ -243,8 +243,10 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Prom
     
     // If it's still blocking, try solving the Turnstile (this is critical for 403 on POSTs)
     if (!triedSolver) {
-      triedSolver = true;
-      await ensureTurnstile(page).catch(() => undefined);
+      const res = await ensureTurnstile(page).catch(() => undefined);
+      if (res && (res.turnstile || res.interactive)) {
+        triedSolver = true; // only mark as tried if it actually found and processed the widget
+      }
     }
   }
   return false;
@@ -314,7 +316,11 @@ async function ensureTurnstile(page: Page): Promise<{ turnstile: boolean; intera
   const cfInterstitialCount = await page.locator('input[name="cf-turnstile-response"]').count().catch(() => 0);
   
   if (cfNativeCount === 0 && cfInterstitialCount === 0) {
-    return { turnstile: false, interactive: false };
+    // If there is an iframe, it might be a delayed Turnstile widget loading
+    const iframeCount = await page.locator('iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0);
+    if (iframeCount === 0) {
+      return { turnstile: false, interactive: false };
+    }
   }
 
   const solverUrl = process.env.TURNSTILE_SOLVER_URL;
