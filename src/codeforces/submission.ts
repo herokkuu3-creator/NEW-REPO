@@ -500,6 +500,12 @@ async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: numb
     )
     .first();
   if ((await scoped.count().catch(() => 0)) === 0) return { clicked: false, status: null };
+  await scoped.evaluate((btn) => {
+    if (btn instanceof HTMLInputElement || btn instanceof HTMLButtonElement) {
+      btn.disabled = false;
+    }
+  }).catch(() => undefined);
+
   const [response] = await Promise.all([
     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => null),
     scoped.click({ force: true, timeout: 15_000 }),

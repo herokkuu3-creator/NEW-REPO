@@ -421,6 +421,12 @@ async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: numb
   
   log({}, 'clicking submit button');
   try {
+    await scoped.evaluate((btn) => {
+      if (btn instanceof HTMLInputElement || btn instanceof HTMLButtonElement) {
+        btn.disabled = false;
+      }
+    }).catch(() => undefined);
+
     const [response] = await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch((e) => {
         log({err: e.message}, 'waitForNavigation rejected');
