@@ -142,12 +142,18 @@ services:
     envVars:
       - key: HEADLESS
         value: "true"
+      # On-demand browser jobs use a standard free GitHub Actions runner.
+      # This 512 MB service brokers the request without launching Firefox.
+      - key: CODEFORCES_RUNNER_REPOSITORY
+        value: pateljk479-afk/NEW-REPO
+      - key: GITHUB_DISPATCH_TOKEN
+        sync: false
       # Route Firefox through a userspace Cloudflare WARP tunnel so Codeforces'
       # Cloudflare sees a WARP egress IP when the tunnel passes its connectivity
       # check. This does not guarantee verification succeeds. Set to "false"
       # to use the direct connection. An explicit CODEFORCES_PROXY takes priority.
       - key: WARP_ENABLED
-        value: "true"
+        value: "false"
       # Nothing but a tiny HTTP server and one Firefox lives here.
       - key: NODE_OPTIONS
         value: --max-old-space-size=96

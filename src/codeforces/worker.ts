@@ -437,6 +437,18 @@ async function submitViaBrowser(
   }
 
   if (!posted.ok) {
+    // A broker restart, 502 or response loss can happen after the single
+    // Codeforces POST. Reconcile against the pre-submit snapshot before saying
+    // the job failed. Never fire another POST from this path.
+    if (posted.clicked || /outcome is uncertain|not JSON|call failed/i.test(posted.error ?? '')) {
+      const discovered = await pollForVerdict(user, entry, before, posted.submittedAt).catch(() => null);
+      if (discovered) {
+        const verdict = discovered.verdict ?? 'TESTING';
+        return verdict === 'OK'
+          ? { ok: true, submissionId: String(discovered.id), verdict, handle: user }
+          : { ok: false, kind: verdict === 'TESTING' ? 'judge-timeout' : 'rejected', error: `Codeforces verdict: ${verdict}`, submissionId: String(discovered.id), verdict, handle: user } as HttpSubmitResult & { handle?: string };
+      }
+    }
     return {
       ok: false,
       kind: posted.kind === 'submission-error' ? 'rejected' : (posted.kind ?? 'error'),

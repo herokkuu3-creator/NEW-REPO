@@ -23,6 +23,8 @@
  * could create a duplicate Codeforces submission.
  */
 import http from 'node:http';
+import os from 'node:os';
+import { ActionBroker, dispatchAction } from './actionBroker';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource } from './browserForm';
 import { firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
@@ -37,6 +39,10 @@ const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ??
 // Outbound proxy for Firefox, e.g. socks5://127.0.0.1:40000 (the local WARP
 // tunnel started by scripts/start-submitter.sh). Empty = direct connection.
 const PROXY_SERVER = (process.env.CODEFORCES_PROXY ?? '').trim();
+const RUNNER_REPOSITORY = (process.env.CODEFORCES_RUNNER_REPOSITORY ?? '').trim();
+const broker = RUNNER_REPOSITORY
+  ? new ActionBroker((id) => dispatchAction(RUNNER_REPOSITORY, process.env.GITHUB_DISPATCH_TOKEN?.trim() ?? '', id))
+  : null;
 
 const CHALLENGE_RE = /just a moment|checking your browser|verify you are human|cf-chl|enable javascript and cookies/i;
 const SIGNED_OUT_RE = /you are not logged in|please login|please sign in|not logged in|register for practice/i;
@@ -51,6 +57,7 @@ interface SubmitterEntry {
 }
 
 interface SubmitRequest {
+  requestId?: string;
   label?: string;
   handle?: string;
   code: string;
@@ -119,9 +126,15 @@ function cgroupUsedMb(): number | null {
 }
 
 function freeMemoryMb(): number | null {
-  const limit = Number(process.env.MEMORY_LIMIT_MB ?? 512);
+  const cgroupLimit = (() => {
+    try {
+      const raw = require('node:fs').readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+      return raw === 'max' ? null : Math.round(Number(raw) / 1_048_576);
+    } catch { return null; }
+  })();
+  const limit = Number(process.env.MEMORY_LIMIT_MB ?? cgroupLimit ?? Math.round(os.totalmem() / 1_048_576));
   const used = cgroupUsedMb();
-  return used === null ? null : Math.max(0, limit - used);
+  return used === null ? Math.round(os.freemem() / 1_048_576) : Math.max(0, limit - used);
 }
 
 function releaseHeap(): void {
@@ -407,7 +420,7 @@ function compactBodyError(body: string): string {
   return useful?.slice(0, 500) ?? 'Codeforces rejected the submission form';
 }
 
-async function submit(request: SubmitRequest): Promise<SubmitResponse> {
+export async function submit(request: SubmitRequest): Promise<SubmitResponse> {
   const label = request.label ?? request.handle ?? 'account';
   const available = freeMemoryMb();
   log({ label, availableMb: available, minimumFreeMb: BROWSER_MIN_FREE_MB }, 'isolated Codeforces browser preflight');
@@ -549,7 +562,7 @@ const server = http.createServer((req, res) => {
     const body = JSON.stringify({
       ok: true,
       service: 'codeforces-submit-browser',
-      busy,
+      busy: broker?.busy ?? busy,
       usedMb: cgroupUsedMb(),
       uptimeSeconds: Math.round(process.uptime()),
     });
@@ -567,6 +580,38 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result))?$/.exec(url);
+  if (broker && jobRoute) {
+    if (!authorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
+    const id = jobRoute[1]!;
+    const action = jobRoute[2];
+    if (req.method === 'GET' && !action) {
+      const status = broker.status(id);
+      json(res, status ? 200 : 404, status ?? { error: 'job not found or expired' });
+      return;
+    }
+    if (req.method === 'POST' && action === 'claim') {
+      const payload = broker.claim(id);
+      json(res, payload ? 200 : 404, payload ?? { error: 'job not found or already claimed' });
+      return;
+    }
+    if (req.method === 'POST' && action === 'result') {
+      let raw = '';
+      req.on('data', (chunk: Buffer) => {
+        raw += chunk.toString('utf8');
+        if (raw.length > 8192) req.destroy();
+      });
+      req.on('end', () => {
+        try {
+          const value = JSON.parse(raw) as SubmitResponse;
+          if (typeof value?.ok !== 'boolean' || typeof value?.clicked !== 'boolean') throw new Error('invalid result');
+          json(res, broker.finish(id, value) ? 200 : 409, { accepted: broker.status(id)?.pending === false });
+        } catch { json(res, 400, { error: 'invalid result' }); }
+      });
+      return;
+    }
+  }
+
   if (req.method !== 'POST' || url !== '/submit') {
     json(res, 404, { ok: false, error: 'not found' });
     return;
@@ -581,7 +626,7 @@ const server = http.createServer((req, res) => {
     json(res, 401, { ok: false, error: 'unauthorized' });
     return;
   }
-  if (busy) {
+  if (broker?.busy ?? busy) {
     json(res, 409, { ok: false, error: 'a Codeforces submission is already running' });
     return;
   }
@@ -619,6 +664,12 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    if (broker) {
+      void broker.enqueue(parsed, parsed.requestId)
+        .then((id) => { log({ id }, 'Codeforces browser job dispatched'); json(res, 202, { jobId: id }); })
+        .catch((err) => { logError({ err: errorMessage(err) }, 'browser job dispatch failed'); json(res, 503, { ok: false, error: errorMessage(err) }); });
+      return;
+    }
     busy = true;
     const startedAt = Date.now();
     void submit(parsed)
@@ -648,9 +699,9 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
+if (require.main === module) server.listen(PORT, '0.0.0.0', () => {
   log(
-    { port: PORT, headless: HEADLESS, proxy: PROXY_SERVER || 'direct', usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
+    { port: PORT, headless: HEADLESS, proxy: PROXY_SERVER || 'direct', runnerRepository: RUNNER_REPOSITORY || null, usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
     'isolated Codeforces submitter listening',
   );
 });

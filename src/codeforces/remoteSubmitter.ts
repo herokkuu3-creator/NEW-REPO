@@ -1,4 +1,5 @@
 import { logger } from '../logger';
+import { randomUUID } from 'node:crypto';
 import { logMemory } from '../memory';
 import type { StorageStateShape } from '../browser/cookiePayload';
 import type { SourceIndexEntry } from './sourceRepo';
@@ -30,6 +31,7 @@ export interface PostedResult extends BrowserPostOutcome {
 const WAKE_TIMEOUT_MS = Number(process.env.CODEFORCES_SUBMITTER_WAKE_MS ?? 120_000);
 const WAKE_INTERVAL_MS = 3_000;
 const SUBMIT_TIMEOUT_MS = Number(process.env.CODEFORCES_SUBMITTER_TIMEOUT_MS ?? 300_000);
+const ACTION_TIMEOUT_MS = Number(process.env.CODEFORCES_ACTION_TIMEOUT_MS ?? 13 * 60_000);
 
 export function remoteSubmitterUrl(): string | null {
   const raw = process.env.CODEFORCES_SUBMITTER_URL?.trim();
@@ -109,6 +111,7 @@ export async function submitViaRemoteSubmitter(
 
   logMemory('isolated submitter preflight', { label, url });
   const payload = {
+    requestId: randomUUID(),
     label,
     handle,
     code,
@@ -132,6 +135,8 @@ export async function submitViaRemoteSubmitter(
     });
   } catch (err) {
     // Deliberately NOT retried: the POST may have reached Codeforces.
+    const recovered = await waitForActionResult(url, token, payload.requestId);
+    if (recovered) return normalizeOutcome(recovered, submittedAt, 'GitHub browser');
     return {
       ...failed(
         `the isolated submitter call failed and was not retried (a retry could duplicate the submission): ${
@@ -142,9 +147,20 @@ export async function submitViaRemoteSubmitter(
     };
   }
 
-  const body = (await response.json().catch(() => null)) as
+  let body = (await response.json().catch(() => null)) as
     | (Partial<PostedResult> & { error?: string; kind?: string })
     | null;
+  if (!body && response.status >= 500) {
+    body = await waitForActionResult(url, token, payload.requestId);
+    if (body) return normalizeOutcome(body, submittedAt, 'GitHub browser');
+  }
+  if (response.status === 202 && typeof (body as { jobId?: unknown } | null)?.jobId === 'string') {
+    const id = (body as { jobId: string }).jobId;
+    body = await waitForActionResult(url, token, id);
+    if (!body || 'jobId' in body) {
+      return { ...failed(`GitHub browser job ${id} did not return a result; its Codeforces outcome is uncertain`), submittedAt };
+    }
+  }
   if (!body) {
     return {
       ...failed(`the isolated submitter answered HTTP ${response.status} with a body that was not JSON`),
@@ -152,18 +168,7 @@ export async function submitViaRemoteSubmitter(
     };
   }
 
-  const outcome: PostedResult = {
-    ok: body.ok === true,
-    kind: (body.kind as BrowserPostOutcome['kind']) ?? undefined,
-    error: body.error,
-    status: typeof body.status === 'number' ? body.status : null,
-    finalUrl: typeof body.finalUrl === 'string' ? body.finalUrl : '',
-    turnstile: body.turnstile === true,
-    clicked: body.clicked === true,
-    interactive: body.interactive === true,
-    submittedAt,
-    transport: 'isolated browser',
-  };
+  const outcome = normalizeOutcome(body, submittedAt, response.status === 202 ? 'GitHub browser' : 'isolated browser');
   logger.info(
     {
       transport: outcome.transport,
@@ -179,6 +184,39 @@ export async function submitViaRemoteSubmitter(
     'isolated Codeforces browser submitter finished',
   );
   return outcome;
+}
+
+function normalizeOutcome(body: Partial<PostedResult>, submittedAt: number, transport: string): PostedResult {
+  return {
+    ok: body.ok === true,
+    kind: (body.kind as BrowserPostOutcome['kind']) ?? undefined,
+    error: body.error,
+    status: typeof body.status === 'number' ? body.status : null,
+    finalUrl: typeof body.finalUrl === 'string' ? body.finalUrl : '',
+    turnstile: body.turnstile === true,
+    clicked: body.clicked === true,
+    interactive: body.interactive === true,
+    submittedAt,
+    transport,
+  };
+}
+
+async function waitForActionResult(url: string, token: string, id: string): Promise<Partial<PostedResult> | null> {
+  const deadline = Date.now() + ACTION_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await sleep(3_000);
+    try {
+      const poll = await fetch(`${url}/jobs/${id}`, {
+        headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (poll.status === 404) return null;
+      if (!poll.ok) continue;
+      const state = await poll.json() as { pending?: boolean; result?: Partial<PostedResult> };
+      if (state.pending === false && state.result) return state.result;
+    } catch { /* Keep polling the same job. Never enqueue another submission. */ }
+  }
+  return null;
 }
 
 function sleep(ms: number): Promise<void> {

@@ -66,7 +66,9 @@ EOF
   return 1
 )
 
-if [ -n "${CODEFORCES_PROXY:-}" ]; then
+if [ -n "${CODEFORCES_RUNNER_REPOSITORY:-}" ]; then
+  log "GitHub browser runner configured; Render will only dispatch and broker jobs"
+elif [ -n "${CODEFORCES_PROXY:-}" ]; then
   log "using configured CODEFORCES_PROXY"
 elif [ "${WARP_ENABLED:-true}" != "false" ]; then
   if start_warp; then
