@@ -35,6 +35,9 @@ async function main(): Promise<void> {
         method: 'POST', headers, body: JSON.stringify(result), signal: AbortSignal.timeout(30_000),
       });
       if (response.ok) {
+        if (result.error?.startsWith('Codeforces Turnstile did not issue a token')) {
+          process.stdout.write(`${result.error}\n`);
+        }
         process.stdout.write(`Browser job completed: ok=${result.ok}, clicked=${result.clicked}, status=${result.status ?? '?'}\n`);
         return;
       }

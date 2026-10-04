@@ -24,7 +24,7 @@ jobs:
     env:
       CODEFORCES_SUBMITTER_URL: https://codeforces-submit-browser.onrender.com
       CODEFORCES_SUBMITTER_TOKEN: ${{ secrets.CODEFORCES_SUBMITTER_TOKEN }}
-      HEADLESS: 'true'
+      HEADLESS: 'false'
     steps:
       - name: Find waiting browser job
         id: lookup
@@ -62,4 +62,4 @@ jobs:
         if: github.event_name == 'workflow_dispatch' || steps.lookup.outputs.job_id != ''
         env:
           CODEFORCES_JOB_ID: ${{ inputs.job_id || steps.lookup.outputs.job_id }}
-        run: node --expose-gc dist/src/codeforces/actionRunner.js
+        run: xvfb-run -a node --expose-gc dist/src/codeforces/actionRunner.js
