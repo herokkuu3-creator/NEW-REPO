@@ -238,7 +238,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Prom
   while (Date.now() < deadline) {
     await sleep(1_000);
     const body = await readBody(page);
-    if (!CHALLENGE_RE.test(body) && !CHALLENGE_RE.test(page.url())) return true;
+    if (!CHALLENGE_RE.test(body) && !CHALLENGE_RE.test(page.url()) && !/__cf_chl/i.test(page.url())) return true;
   }
   return false;
 }
@@ -467,7 +467,7 @@ async function submit(request: SubmitRequest): Promise<SubmitResponse> {
 
     let body = await readBody(session.page);
     let finalUrl = session.page.url();
-    if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
+    if (click.status === 403 || click.status === 503 || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl) || /__cf_chl/i.test(finalUrl)) {
       const cleared = await waitOutChallenge(session.page);
       body = await readBody(session.page);
       finalUrl = session.page.url();

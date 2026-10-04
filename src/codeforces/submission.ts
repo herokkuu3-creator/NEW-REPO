@@ -231,11 +231,11 @@ export async function postSubmitForm(
     logger.info({ ...flags, status: click.status }, 'Codeforces submit form posted from the browser');
 
     const body = await readBody(page);
-    if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(page.url())) {
+    if (click.status === 403 || click.status === 503 || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(page.url()) || /__cf_chl/i.test(page.url())) {
       await waitOutChallenge(page);
       const settled = await readBody(page);
       const settledUrl = page.url();
-      if (CHALLENGE_RE.test(settled) || CHALLENGE_RE.test(settledUrl)) {
+      if (CHALLENGE_RE.test(settled) || CHALLENGE_RE.test(settledUrl) || /__cf_chl/i.test(settledUrl)) {
         return {
           ok: false,
           kind: 'blocked',
@@ -296,7 +296,7 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs()): Prom
   while (Date.now() < deadline) {
     await sleep(1_000);
     const body = await readBody(page);
-    if (!CHALLENGE_RE.test(body) && !CHALLENGE_RE.test(page.url())) {
+    if (!CHALLENGE_RE.test(body) && !CHALLENGE_RE.test(page.url()) && !/__cf_chl/i.test(page.url())) {
       logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser');
       return true;
     }
