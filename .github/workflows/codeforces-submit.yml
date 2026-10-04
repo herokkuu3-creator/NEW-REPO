@@ -2,7 +2,7 @@ name: Codeforces browser submission
 
 on:
   schedule:
-    - cron: '2/5 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       job_id:

@@ -47,6 +47,8 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
   const startedAt = Date.now();
   let renderAttempt = 'not-needed';
   let renderChecked = false;
+  let executeAttempt = 'not-needed';
+  let executeChecked = false;
   const hasToken = async () => !!(await field.first().inputValue({ timeout: 1_000 }).catch(() => '')).trim();
   while (Date.now() < deadline) {
     if (await hasToken()) return { turnstile: true, interactive: false };
@@ -81,10 +83,23 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
               }
             },
           });
-          if (widget.dataset.execution === 'execute') api.execute?.(widget);
           return 'rendered';
         } catch {
           return 'render-error';
+        }
+      }).catch(() => 'page-error');
+    }
+    if (!executeChecked && Date.now() - startedAt >= 5_000) {
+      executeChecked = true;
+      executeAttempt = await form.evaluate((element) => {
+        const widget = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
+        const api = (window as unknown as { turnstile?: { execute?: (container: HTMLElement) => void } }).turnstile;
+        if (!widget || !api?.execute) return 'unavailable';
+        try {
+          api.execute(widget);
+          return 'executed';
+        } catch {
+          return 'execute-error';
         }
       }).catch(() => 'page-error');
     }
@@ -141,9 +156,10 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
     widgetInForm: !!document.querySelector('form:has(textarea[name="source"]) .cf-turnstile'),
     sitekeyInForm: !!document.querySelector('form:has(textarea[name="source"]) .cf-turnstile[data-sitekey]'),
     execution: document.querySelector('form:has(textarea[name="source"]) .cf-turnstile')?.getAttribute('data-execution') ?? null,
+    responseInputPresent: !!document.querySelector('form:has(textarea[name="source"]) input[name="cf-turnstile-response"]'),
   }));
   throw new BrowserFormError(
-    `Codeforces Turnstile did not issue a token within ${timeoutMs}ms (${JSON.stringify({ ...diagnostics, renderAttempt })}). ` +
+    `Codeforces Turnstile did not issue a token within ${timeoutMs}ms (${JSON.stringify({ ...diagnostics, renderAttempt, executeAttempt })}). ` +
     'No submission was sent. Complete verification in a supported browser or use an accessible submitter connection.',
     'blocked',
     { turnstile: false, interactive: diagnostics.iframePresent },

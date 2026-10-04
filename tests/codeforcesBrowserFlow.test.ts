@@ -125,6 +125,23 @@ describe('Codeforces native browser submission', () => {
     expect(posts).toHaveLength(0);
   });
 
+  it('executes a rendered widget when verification remains idle', async () => {
+    await fixture({ disabled: true, callback: true });
+    await page.evaluate(() => {
+      let verified: ((token: string) => void) | undefined;
+      (window as any).turnstile = {
+        render: (_widget: HTMLElement, options: { callback: (token: string) => void }) => {
+          verified = options.callback;
+          return 'widget-id';
+        },
+        execute: () => verified?.('executed-token'),
+      };
+    });
+    expect(await ensureFormTurnstile(page, 6_500)).toEqual({ turnstile: true, interactive: false });
+    expect(await page.locator('input[name="turnstileToken"]').inputValue()).toBe('executed-token');
+    expect(posts).toHaveLength(0);
+  });
+
   it('never turns a disabled button into a successful click', async () => {
     await fixture({ token: 'verified', disabled: true });
     await expect(clickSubmitForm(page, 300)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
