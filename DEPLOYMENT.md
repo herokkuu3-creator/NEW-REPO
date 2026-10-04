@@ -349,6 +349,29 @@ Free Render Postgres databases expire thirty days after creation (14-day grace, 
 
 ### Codeforces submitter verification and WARP
 
+#### Local PC browser runner
+
+To submit through the PC's own connection without exposing the PC to the
+internet, set `CODEFORCES_RUNNER_MODE=local` and a new random
+`CODEFORCES_LOCAL_RUNNER_TOKEN` on the **codeforces-submit-browser** Render
+service. Keep `CODEFORCES_SUBMITTER_TOKEN` unchanged; it still lets the main
+service queue jobs. On the PC, set these temporary PowerShell variables, then
+run the local runner:
+
+```powershell
+$env:CODEFORCES_SUBMITTER_URL='https://codeforces-submit-browser.onrender.com'
+$env:CODEFORCES_LOCAL_RUNNER_TOKEN='your-local-runner-token'
+$env:HEADLESS='false'
+$env:CODEFORCES_BROWSER='chromium'
+npm run codeforces:local
+```
+
+The runner loads the Codeforces session sent through `/renew` into a visible
+browser on the PC. Leave it running while you want automatic Codeforces
+submissions. It supports selected-account and all-account commands, but cannot
+submit while the PC is off. In local mode GitHub Actions is prevented from
+claiming the queued job, so the workflow can remain enabled.
+
 #### Free cloud browser runner (recommended)
 
 Render's Events page confirmed that the isolated Firefox process exceeded its

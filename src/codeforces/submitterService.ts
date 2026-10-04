@@ -42,8 +42,11 @@ const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ??
 const PROXY_SERVER = (process.env.CODEFORCES_PROXY ?? '').trim();
 const RUNNER_REPOSITORY = (process.env.CODEFORCES_RUNNER_REPOSITORY ?? '').trim();
 const GITHUB_DISPATCH_TOKEN = (process.env.GITHUB_DISPATCH_TOKEN ?? '').trim();
-const broker = RUNNER_REPOSITORY
-  ? new ActionBroker((id) => dispatchAction(RUNNER_REPOSITORY, GITHUB_DISPATCH_TOKEN, id))
+const RUNNER_MODE = (process.env.CODEFORCES_RUNNER_MODE ?? 'github').trim().toLowerCase();
+const LOCAL_RUNNER_MODE = RUNNER_MODE === 'local';
+const LOCAL_RUNNER_TOKEN = (process.env.CODEFORCES_LOCAL_RUNNER_TOKEN ?? '').trim();
+const broker = RUNNER_REPOSITORY || LOCAL_RUNNER_MODE
+  ? new ActionBroker((id) => LOCAL_RUNNER_MODE ? Promise.resolve() : dispatchAction(RUNNER_REPOSITORY, GITHUB_DISPATCH_TOKEN, id))
   : null;
 
 const CHALLENGE_RE = /just a moment|checking your browser|verify you are human|cf-chl|enable javascript and cookies/i;
@@ -579,6 +582,13 @@ function authorized(req: http.IncomingMessage): boolean {
   return header === `Bearer ${TOKEN}`;
 }
 
+/** In local-runner mode, only the PC process can take a queued browser job. */
+function runnerAuthorized(req: http.IncomingMessage): boolean {
+  if (!LOCAL_RUNNER_MODE) return authorized(req);
+  if (!LOCAL_RUNNER_TOKEN) return false;
+  return req.headers.authorization === `Bearer ${LOCAL_RUNNER_TOKEN}`;
+}
+
 export const server = http.createServer((req, res) => {
   const url = req.url ?? '/';
 
@@ -609,12 +619,12 @@ export const server = http.createServer((req, res) => {
 
   const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result))?$/.exec(url);
   if (broker && req.method === 'GET' && url === '/jobs/next') {
-    if (!authorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
+    if (!runnerAuthorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
     json(res, 200, { jobId: broker.nextId });
     return;
   }
   if (broker && jobRoute) {
-    if (!authorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
+    if (!runnerAuthorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
     const id = jobRoute[1]!;
     const action = jobRoute[2];
     if (req.method === 'GET' && !action) {
@@ -733,7 +743,7 @@ export const server = http.createServer((req, res) => {
 
 if (require.main === module) server.listen(PORT, '0.0.0.0', () => {
   log(
-    { port: PORT, headless: HEADLESS, proxy: proxyLabel(browserProxy(PROXY_SERVER)), runnerRepository: RUNNER_REPOSITORY || null, runnerDispatchConfigured: GITHUB_DISPATCH_TOKEN.length > 0, usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
+    { port: PORT, headless: HEADLESS, proxy: proxyLabel(browserProxy(PROXY_SERVER)), runnerRepository: RUNNER_REPOSITORY || null, runnerMode: RUNNER_MODE, runnerDispatchConfigured: GITHUB_DISPATCH_TOKEN.length > 0, localRunnerConfigured: LOCAL_RUNNER_TOKEN.length > 0, usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
     'isolated Codeforces submitter listening',
   );
 });
