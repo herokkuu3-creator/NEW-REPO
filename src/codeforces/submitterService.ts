@@ -493,17 +493,52 @@ async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: numb
     return { clicked: false, status: null };
   }
   
-  log({}, 'submitting form via JS');
+  log({}, 'submitting form via background AJAX to bypass WAF');
   try {
-    const [response] = await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch((e) => {
-        log({err: e.message}, 'waitForNavigation rejected');
-        return null;
-      }),
-      form.locator('input[type="submit"]').first().click({ force: true, timeout: 15_000 }).catch(() => undefined),
-    ]);
+    const status = await page.evaluate(async () => {
+      const f = document.querySelector('form:has(textarea[name="source"])') as HTMLFormElement;
+      if (!f) return null;
+      
+      // Let Codeforces calculate adcd1e natively by calling its own onsubmit (if it exists)
+      if (typeof f.onsubmit === 'function') {
+        try { f.onsubmit(new Event('submit') as any); } catch(e) {}
+      }
+
+      // Small delay to let Codeforces JS append the action parameters
+      await new Promise(r => setTimeout(r, 50));
+      
+      const formData = new FormData(f);
+      const action = f.getAttribute('action') || window.location.href;
+      
+      try {
+        const res = await fetch(action, {
+          method: 'POST',
+          body: new URLSearchParams(formData as any),
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        });
+        
+        // If it succeeds (e.g. 200 or 302/redirects to my status), we reload to that page
+        if (res.ok || res.status === 200) {
+          window.location.href = res.url;
+          return res.status;
+        }
+        
+        // If it's 403, we still return 403 to trigger fallback logic if needed
+        return res.status;
+      } catch(err) {
+        return null; // Network error
+      }
+    });
+
+    if (status === 200) {
+      log({}, 'waiting for background AJAX reload');
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => undefined);
+    }
+    
     log({}, 'submit finished');
-    return { clicked: true, status: response?.status() ?? null };
+    return { clicked: true, status: status ?? null };
   } catch (err) {
     log({ err: err instanceof Error ? err.message : String(err) }, 'submit threw');
     throw err;
