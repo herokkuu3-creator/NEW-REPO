@@ -494,21 +494,12 @@ async function ensureTurnstile(
  * wrong form is a click that posts nothing at all.
  */
 async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: number | null }> {
-  const scoped = page
-    .locator(
-      'form:has(textarea[name="source"]) input[type="submit"], form:has(textarea[name="source"]) button[type="submit"]',
-    )
-    .first();
-  if ((await scoped.count().catch(() => 0)) === 0) return { clicked: false, status: null };
-  await scoped.evaluate((btn) => {
-    if (btn instanceof HTMLInputElement || btn instanceof HTMLButtonElement) {
-      btn.disabled = false;
-    }
-  }).catch(() => undefined);
+  const form = page.locator('form:has(textarea[name="source"])').first();
+  if ((await form.count().catch(() => 0)) === 0) return { clicked: false, status: null };
 
   const [response] = await Promise.all([
     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => null),
-    scoped.click({ force: true, timeout: 15_000 }),
+    form.evaluate((f) => (f as HTMLFormElement).submit()).catch(() => undefined),
   ]);
   return { clicked: true, status: response?.status() ?? null };
 }

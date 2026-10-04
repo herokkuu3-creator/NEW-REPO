@@ -408,36 +408,26 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
  * search form whose button is type=submit too, and clicking that posts nothing.
  */
 async function clickSubmit(page: Page): Promise<{ clicked: boolean; status: number | null }> {
-  log({}, 'locating submit button');
-  const scoped = page
-    .locator(
-      'form:has(textarea[name="source"]) input[type="submit"], form:has(textarea[name="source"]) button[type="submit"]',
-    )
-    .first();
-  if ((await scoped.count().catch(() => 0)) === 0) {
-    log({}, 'no submit button found');
+  log({}, 'locating submit form');
+  const form = page.locator('form:has(textarea[name="source"])').first();
+  if ((await form.count().catch(() => 0)) === 0) {
+    log({}, 'no submit form found');
     return { clicked: false, status: null };
   }
   
-  log({}, 'clicking submit button');
+  log({}, 'submitting form via JS');
   try {
-    await scoped.evaluate((btn) => {
-      if (btn instanceof HTMLInputElement || btn instanceof HTMLButtonElement) {
-        btn.disabled = false;
-      }
-    }).catch(() => undefined);
-
     const [response] = await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch((e) => {
         log({err: e.message}, 'waitForNavigation rejected');
         return null;
       }),
-      scoped.click({ force: true, timeout: 15_000 }),
+      form.evaluate((f) => (f as HTMLFormElement).submit()).catch(() => undefined),
     ]);
-    log({}, 'submit click finished');
+    log({}, 'submit finished');
     return { clicked: true, status: response?.status() ?? null };
   } catch (err) {
-    log({ err: err instanceof Error ? err.message : String(err) }, 'submit click threw');
+    log({ err: err instanceof Error ? err.message : String(err) }, 'submit threw');
     throw err;
   }
 }
