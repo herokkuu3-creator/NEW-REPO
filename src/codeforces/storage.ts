@@ -157,3 +157,13 @@ export async function completeCurrentProblem(
     },
   });
 }
+
+export async function deleteCodeforcesAccountById(id: string): Promise<boolean> {
+  const res = await prisma.codeforcesAccount.deleteMany({ where: { id } });
+  return res.count > 0;
+}
+
+export async function deleteAllCodeforcesAccounts(): Promise<number> {
+  const res = await prisma.codeforcesAccount.deleteMany({});
+  return res.count;
+}

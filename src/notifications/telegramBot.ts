@@ -108,6 +108,7 @@ const HELP_TEXT = [
   '⚡ /triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
   '🏆 /submitnextsolution - submit the next Codeforces source solution for every Codeforces account',
   '📋 /cfaccounts - list Codeforces accounts, cursor and last verdict',
+  '🗑️ /cf_clear_cookies - list every Codeforces account with a Remove button, plus a Remove All option',
   '🎯 /questionrangesubmission 200-400 - submit every question in a range (pick one account or All)',
   '📍 /rangestatus - progress of the running range job',
   '🛑 /cancelrange - stop the running range job',
@@ -317,6 +318,10 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/remove_all_sessions':
       case '/removeallsession':
         await handleRemoveAllSessions();
+        return;
+      case '/cf_clear_cookies':
+      case '/cfclearcookies':
+        await handleCfRemoveSession();
         return;
       case '/questionrangesubmission':
       case '/question_range_submission':
@@ -619,6 +624,31 @@ export async function handleRemoveAllSessions(deps: RemovalDeps = defaultRemoval
   );
 }
 
+import { listCodeforcesAccounts } from '../codeforces/storage';
+import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts } from '../codeforces/storage';
+
+function cfAccountName(a: { label: string; username?: string | null }): string {
+  return a.username && a.username !== a.label ? `${a.label} (${a.username})` : a.label;
+}
+
+export function buildCfRemoveSessionView(accounts: any[]): { text: string; buttons: InlineButton[][] } {
+  if (accounts.length === 0) {
+    return { text: '📭 No Codeforces sessions stored - nothing to remove.', buttons: [] };
+  }
+  const lines = [`🗂️ Codeforces Sessions stored: ${accounts.length}`, '👇 Tap an account to remove its session:', ''];
+  accounts.forEach((a, i) => lines.push(`${i + 1}. ${cfAccountName(a)} - ${a.status}`));
+  const buttons = accounts.map((a) => [{ text: `🗑️ Remove ${cfAccountName(a)}`.slice(0, 60), callback_data: `cfrm:${a.id}` }]);
+  buttons.push([{ text: `🔥 Remove All`, callback_data: 'cfrmall:yes' }]);
+  buttons.push([{ text: '✅ Done', callback_data: 'cfrm:done' }]);
+  return { text: lines.join('\n'), buttons };
+}
+
+export async function handleCfRemoveSession(deps: RemovalDeps = defaultRemovalDeps): Promise<void> {
+  const accounts = await listCodeforcesAccounts();
+  const view = buildCfRemoveSessionView(accounts);
+  await deps.send(view.text, view.buttons.length ? view.buttons : undefined);
+}
+
 /** Handles a tap on one of the inline buttons above (rm:* and qr:*). */
 export async function handleCallbackQuery(
   q: TgCallbackQuery,
@@ -685,6 +715,48 @@ export async function handleCallbackQuery(
     await deps.answer(q.id, text);
     // Refresh the same message so the list and buttons stay accurate.
     const view = buildRemoveSessionView(remaining);
+    await deps.edit(chatId, messageId, `${text}\n\n${view.text}`, view.buttons);
+    return;
+  }
+
+  if (data === 'cfrm:done') {
+    await deps.answer(q.id);
+    await deps.edit(chatId, messageId, '✅ Done.');
+    return;
+  }
+
+  if (data === 'cfrmall:yes') {
+    if (isCodeforcesRunInProgress()) {
+      await deps.answer(q.id, 'A Codeforces run is in progress - try again later');
+      await deps.edit(chatId, messageId, '🚧 A Codeforces run is in progress right now - wait for its report, then try again.');
+      return;
+    }
+    const removed = await deleteAllCodeforcesAccounts();
+    logger.info({ removed }, 'all Codeforces account sessions removed via Telegram');
+    await deps.answer(q.id, `Removed ${removed}`);
+    await deps.edit(chatId, messageId, `🧹 Removed all Codeforces sessions (${removed} account(s)). Send Codeforces cookie .json files to add accounts again.`);
+    return;
+  }
+
+  if (data.startsWith('cfrm:')) {
+    const id = data.slice(5);
+    const before = await listCodeforcesAccounts();
+    const target = before.find((a) => a.id === id);
+    if (isCodeforcesRunInProgress()) {
+      await deps.answer(q.id, 'A Codeforces run is in progress - try again later');
+      await deps.send('🚧 A Codeforces run is in progress right now - wait for its report, then try again.');
+      return;
+    }
+    let text: string;
+    if (!target || !(await deleteCodeforcesAccountById(id))) {
+      text = '🤷 That Codeforces account was already removed.';
+    } else {
+      logger.info({ label: target.label }, 'Codeforces account session removed via Telegram');
+      text = `✅ Removed Codeforces account ${cfAccountName(target)}`;
+    }
+    const remaining = await listCodeforcesAccounts();
+    await deps.answer(q.id, text);
+    const view = buildCfRemoveSessionView(remaining);
     await deps.edit(chatId, messageId, `${text}\n\n${view.text}`, view.buttons);
     return;
   }
