@@ -35,10 +35,17 @@ async function main(): Promise<void> {
         method: 'POST', headers, body: JSON.stringify(result), signal: AbortSignal.timeout(30_000),
       });
       if (response.ok) {
-        if (result.error?.startsWith('Codeforces Turnstile did not issue a token')) {
-          process.stdout.write(`${result.error}\n`);
-        }
-        process.stdout.write(`Browser job completed: ok=${result.ok}, clicked=${result.clicked}, status=${result.status ?? '?'}\n`);
+        // Keep logs useful for diagnosis without exposing cookies, source code,
+        // or the broker payload held by the runner.
+        process.stdout.write(`Browser job completed: ${JSON.stringify({
+          ok: result.ok,
+          kind: result.kind ?? null,
+          clicked: result.clicked,
+          turnstile: result.turnstile,
+          interactive: result.interactive,
+          status: result.status ?? null,
+          error: result.error?.slice(0, 1_000) ?? null,
+        })}\n`);
         return;
       }
     } catch { /* Retry result delivery, never the Codeforces form. */ }
