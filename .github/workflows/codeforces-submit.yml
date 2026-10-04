@@ -27,6 +27,9 @@ jobs:
       HEADLESS: 'false'
       CODEFORCES_BLOCK_ASSETS: 'false'
       CODEFORCES_BROWSER: chromium
+      # Store the complete residential endpoint only in GitHub Actions secrets,
+      # for example http://user:password@host:port or socks5://host:port.
+      CODEFORCES_PROXY: ${{ secrets.CODEFORCES_RESIDENTIAL_PROXY }}
     steps:
       - name: Find waiting browser job
         id: lookup

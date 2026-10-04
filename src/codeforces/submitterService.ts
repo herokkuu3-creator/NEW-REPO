@@ -154,12 +154,35 @@ interface Session {
   close: () => Promise<void>;
 }
 
+/** Converts the standard provider endpoint into Playwright's proxy shape.
+ * Credentials remain separate from the server field and are never logged. */
+function browserProxy(raw: string): { server: string; username?: string; password?: string } | undefined {
+  if (!raw) return undefined;
+  try {
+    const endpoint = new URL(raw);
+    if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(endpoint.protocol) || !endpoint.hostname) return undefined;
+    const server = `${endpoint.protocol}//${endpoint.host}`;
+    const username = decodeURIComponent(endpoint.username);
+    const password = decodeURIComponent(endpoint.password);
+    return { server, ...(username ? { username } : {}), ...(password ? { password } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
+function proxyLabel(proxy: ReturnType<typeof browserProxy>): string {
+  if (!proxy) return 'direct';
+  try { return new URL(proxy.server).origin; } catch { return 'configured'; }
+}
+
 async function launchFirefox(state: SubmitRequest['state'], label: string): Promise<Session> {
   let browser: Browser | null = null;
+  const proxy = browserProxy(PROXY_SERVER);
+  if (PROXY_SERVER && !proxy) throw new Error('CODEFORCES_PROXY must be a http(s), socks4, or socks5 endpoint');
   try {
     const active = (browser = await (BROWSER_ENGINE === 'chromium' ? chromium : firefox).launch({
       headless: HEADLESS,
-      ...(PROXY_SERVER ? { proxy: { server: PROXY_SERVER } } : {}),
+      ...(proxy ? { proxy } : {}),
       ...(BROWSER_ENGINE === 'firefox' ? { firefoxUserPrefs: {
         'browser.cache.disk.enable': false,
         'browser.cache.memory.enable': false,
@@ -710,7 +733,7 @@ export const server = http.createServer((req, res) => {
 
 if (require.main === module) server.listen(PORT, '0.0.0.0', () => {
   log(
-    { port: PORT, headless: HEADLESS, proxy: PROXY_SERVER || 'direct', runnerRepository: RUNNER_REPOSITORY || null, runnerDispatchConfigured: GITHUB_DISPATCH_TOKEN.length > 0, usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
+    { port: PORT, headless: HEADLESS, proxy: proxyLabel(browserProxy(PROXY_SERVER)), runnerRepository: RUNNER_REPOSITORY || null, runnerDispatchConfigured: GITHUB_DISPATCH_TOKEN.length > 0, usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
     'isolated Codeforces submitter listening',
   );
 });
