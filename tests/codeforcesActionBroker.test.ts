@@ -46,4 +46,8 @@ describe('Codeforces Actions handoff', () => {
       expect(String(init.body)).not.toContain('dispatch-secret');
     } finally { vi.unstubAllGlobals(); }
   });
+
+  it('fails immediately when the Render dispatch token is absent', async () => {
+    await expect(dispatchAction('owner/repo', '', 'job-id')).rejects.toThrow('GITHUB_DISPATCH_TOKEN is missing');
+  });
 });

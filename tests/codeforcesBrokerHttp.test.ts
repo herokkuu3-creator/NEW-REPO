@@ -9,7 +9,13 @@ const headers = { authorization: 'Bearer test-broker-token', 'content-type': 'ap
 beforeAll(async () => {
   vi.stubEnv('CODEFORCES_RUNNER_REPOSITORY', 'owner/repo');
   vi.stubEnv('CODEFORCES_SUBMITTER_TOKEN', 'test-broker-token');
-  vi.stubEnv('GITHUB_DISPATCH_TOKEN', ''); // Scheduled runner, no PAT needed.
+  vi.stubEnv('GITHUB_DISPATCH_TOKEN', 'test-dispatch-token');
+  const realFetch = globalThis.fetch;
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) =>
+    String(input).startsWith('https://api.github.com/')
+      ? Promise.resolve(new Response(null, { status: 204 }))
+      : realFetch(input, init),
+  ));
   ({ server } = await import('../src/codeforces/submitterService'));
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -17,6 +23,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 describe('authenticated scheduled runner broker', () => {

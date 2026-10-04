@@ -41,11 +41,9 @@ const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ??
 // tunnel started by scripts/start-submitter.sh). Empty = direct connection.
 const PROXY_SERVER = (process.env.CODEFORCES_PROXY ?? '').trim();
 const RUNNER_REPOSITORY = (process.env.CODEFORCES_RUNNER_REPOSITORY ?? '').trim();
+const GITHUB_DISPATCH_TOKEN = (process.env.GITHUB_DISPATCH_TOKEN ?? '').trim();
 const broker = RUNNER_REPOSITORY
-  ? new ActionBroker((id) => {
-      const token = process.env.GITHUB_DISPATCH_TOKEN?.trim();
-      return token ? dispatchAction(RUNNER_REPOSITORY, token, id) : Promise.resolve();
-    })
+  ? new ActionBroker((id) => dispatchAction(RUNNER_REPOSITORY, GITHUB_DISPATCH_TOKEN, id))
   : null;
 
 const CHALLENGE_RE = /just a moment|checking your browser|verify you are human|cf-chl|enable javascript and cookies/i;
@@ -712,7 +710,7 @@ export const server = http.createServer((req, res) => {
 
 if (require.main === module) server.listen(PORT, '0.0.0.0', () => {
   log(
-    { port: PORT, headless: HEADLESS, proxy: PROXY_SERVER || 'direct', runnerRepository: RUNNER_REPOSITORY || null, usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
+    { port: PORT, headless: HEADLESS, proxy: PROXY_SERVER || 'direct', runnerRepository: RUNNER_REPOSITORY || null, runnerDispatchConfigured: GITHUB_DISPATCH_TOKEN.length > 0, usedMb: cgroupUsedMb(), tokenConfigured: TOKEN.length > 0 },
     'isolated Codeforces submitter listening',
   );
 });
