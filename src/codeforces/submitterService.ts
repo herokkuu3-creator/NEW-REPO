@@ -497,6 +497,15 @@ async function submit(request: SubmitRequest): Promise<SubmitResponse> {
           ...flags,
         };
       }
+      
+      if (!/\/my/i.test(finalUrl) && /submit/i.test(finalUrl)) {
+        log({}, 'Challenge cleared, but POST data was lost. Re-filling and re-submitting...');
+        await fillSubmitForm(session.page, request.entry, request.code);
+        const click2 = await clickSubmit(session.page);
+        body = await readBody(session.page);
+        finalUrl = session.page.url();
+        click.status = click2.status;
+      }
     }
 
     if (SIGNED_OUT_RE.test(body) || /\/enter(?:[/?#]|$)/i.test(finalUrl)) {

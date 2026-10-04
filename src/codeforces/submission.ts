@@ -233,8 +233,8 @@ export async function postSubmitForm(
     const body = await readBody(page);
     if (click.status === 403 || click.status === 503 || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(page.url()) || /__cf_chl/i.test(page.url())) {
       await waitOutChallenge(page);
-      const settled = await readBody(page);
-      const settledUrl = page.url();
+      let settled = await readBody(page);
+      let settledUrl = page.url();
       if (CHALLENGE_RE.test(settled) || CHALLENGE_RE.test(settledUrl) || /__cf_chl/i.test(settledUrl)) {
         return {
           ok: false,
@@ -245,6 +245,16 @@ export async function postSubmitForm(
           ...flags,
         };
       }
+      
+      if (!/\/my/i.test(settledUrl) && /submit/i.test(settledUrl)) {
+        logger.info({}, 'Challenge cleared, but POST data was lost. Re-filling and re-submitting...');
+        await fillSubmitForm(page, source, code);
+        const click2 = await clickSubmit(page);
+        settled = await readBody(page);
+        settledUrl = page.url();
+        click.status = click2.status;
+      }
+      
       return finishPost(settled, settledUrl, click.status, flags);
     }
     return finishPost(body, page.url(), click.status, flags);
