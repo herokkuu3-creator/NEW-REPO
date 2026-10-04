@@ -26,6 +26,7 @@ jobs:
       CODEFORCES_SUBMITTER_TOKEN: ${{ secrets.CODEFORCES_SUBMITTER_TOKEN }}
       HEADLESS: 'false'
       CODEFORCES_BLOCK_ASSETS: 'false'
+      CODEFORCES_BROWSER: chromium
     steps:
       - name: Find waiting browser job
         id: lookup
@@ -55,7 +56,7 @@ jobs:
           cache: npm
       - run: npm ci
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
-      - run: npx playwright install --with-deps firefox
+      - run: npx playwright install --with-deps chromium
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
       - run: npm run build
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''

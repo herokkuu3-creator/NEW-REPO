@@ -26,11 +26,12 @@ import http from 'node:http';
 import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource } from './browserForm';
-import { firefox, type Browser, type BrowserContext, type Page } from 'playwright';
+import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
 const PORT = Number(process.env.PORT ?? 10000);
 const TOKEN = process.env.CODEFORCES_SUBMITTER_TOKEN?.trim() ?? '';
 const HEADLESS = process.env.HEADLESS !== 'false';
+const BROWSER_ENGINE = process.env.CODEFORCES_BROWSER === 'chromium' ? 'chromium' : 'firefox';
 const BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const NAV_TIMEOUT_MS = Number(process.env.CODEFORCES_NAV_TIMEOUT_MS ?? 60_000);
 const TURNSTILE_WAIT_MS = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 20_000);
@@ -158,10 +159,10 @@ interface Session {
 async function launchFirefox(state: SubmitRequest['state'], label: string): Promise<Session> {
   let browser: Browser | null = null;
   try {
-    const active = (browser = await firefox.launch({
+    const active = (browser = await (BROWSER_ENGINE === 'chromium' ? chromium : firefox).launch({
       headless: HEADLESS,
       ...(PROXY_SERVER ? { proxy: { server: PROXY_SERVER } } : {}),
-      firefoxUserPrefs: {
+      ...(BROWSER_ENGINE === 'firefox' ? { firefoxUserPrefs: {
         'browser.cache.disk.enable': false,
         'browser.cache.memory.enable': false,
         'browser.cache.offline.enable': false,
@@ -176,7 +177,7 @@ async function launchFirefox(state: SubmitRequest['state'], label: string): Prom
         'dom.ipc.processCount': 1,
         'dom.ipc.processPrelaunch.enabled': false,
         'dom.ipc.keepProcessesAlive.web': 0,
-      },
+      } } : {}),
     }));
     const context = await active.newContext({
       storageState: { cookies: state.cookies, origins: state.origins ?? [] } as Parameters<
@@ -444,7 +445,7 @@ export async function submit(request: SubmitRequest): Promise<SubmitResponse> {
 
   releaseHeap();
   const session = await launchFirefox(request.state, label);
-  log({ label, usedMb: cgroupUsedMb() }, 'Firefox launched for isolated Codeforces submission');
+  log({ label, browser: BROWSER_ENGINE, usedMb: cgroupUsedMb() }, 'browser launched for isolated Codeforces submission');
 
   const flags = { turnstile: false, interactive: false };
   try {
