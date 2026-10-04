@@ -305,8 +305,8 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs()): Prom
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await sleep(1_000);
-    const body = await readBody(page);
-    if (!CHALLENGE_RE.test(body) && !CHALLENGE_RE.test(page.url()) && !/__cf_chl/i.test(page.url())) {
+    const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
+    if (isCodeforces) {
       logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser');
       return true;
     }
@@ -379,7 +379,12 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
 }
 
 async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string): Promise<{ turnstile: boolean; interactive: boolean }> {
-  await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).catch(() => null);
+  const settled = await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).then(() => true).catch(() => false);
+  if (!settled) {
+    const body = await readBody(page);
+    const title = await page.title().catch(() => '');
+    logger.warn({ title, bodySnippet: body.slice(0, 500) }, 'Form did not settle, page is stuck');
+  }
   
   const problemIndex = source.problemIndex!;
   const contestId = source.contestId!;

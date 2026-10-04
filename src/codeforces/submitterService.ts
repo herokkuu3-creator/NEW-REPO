@@ -237,8 +237,8 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Prom
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await sleep(1_000);
-    const body = await readBody(page);
-    if (!CHALLENGE_RE.test(body) && !CHALLENGE_RE.test(page.url()) && !/__cf_chl/i.test(page.url())) return true;
+    const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
+    if (isCodeforces) return true;
   }
   return false;
 }
@@ -320,7 +320,12 @@ async function ensureTurnstile(page: Page): Promise<{ turnstile: boolean; intera
 
 async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): Promise<{ turnstile: boolean; interactive: boolean }> {
   log({}, 'waiting for form to settle');
-  await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).catch(() => null);
+  const settled = await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).then(() => true).catch(() => false);
+  if (!settled) {
+    const body = await readBody(page);
+    const title = await page.title().catch(() => '');
+    log({ title, bodySnippet: body.slice(0, 500) }, 'Form did not settle, page is stuck');
+  }
   
   log({}, 'reading fields');
   const fields = await readFields(page);
