@@ -604,7 +604,7 @@ async function postViaLocalBrowser(
   return { ...posted, submittedAt, transport: 'Firefox transport' };
 }
 
-function resolveCurrentEntry(queue: SourceIndexEntry[], nextKey: string | null, lastCompletedKey: string | null): SourceIndexEntry | null {
+export function resolveCurrentEntry(queue: SourceIndexEntry[], nextKey: string | null, lastCompletedKey: string | null): SourceIndexEntry | null {
   if (nextKey) {
     const exact = queue.find((entry) => entry.key === nextKey);
     if (exact) return exact;

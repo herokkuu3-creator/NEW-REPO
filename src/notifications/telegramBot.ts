@@ -15,9 +15,11 @@ import { AccountRecord, deleteAccountById, deleteAllAccounts, listAccounts } fro
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
-import { CODEFORCES_MANUAL_REASON, isCodeforcesRunInProgress, runCodeforcesNow } from '../codeforces/worker';
-import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts, listCodeforcesAccounts } from '../codeforces/storage';
+import { CODEFORCES_MANUAL_REASON, isCodeforcesRunInProgress, resolveCurrentEntry, runCodeforcesNow } from '../codeforces/worker';
+import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts, getCodeforcesProgress, listCodeforcesAccounts } from '../codeforces/storage';
 import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../codeforces/report';
+import { loadRuntimeSourceIndex, SourceIndexEntry } from '../codeforces/sourceRepo';
+import { submitPageUrl } from '../codeforces/handoff';
 import {
   isRunInProgress,
   runSubmissionNow,
@@ -108,6 +110,7 @@ const HELP_TEXT = [
   '⚡ /triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
   '🏆 /submitnextsolution - submit the next Codeforces source solution for every Codeforces account',
   '🎯 /nextsubcustomaccount - choose one Codeforces account, or all, for the next source solution',
+  '📱 /cfmanualnext - send the next source and submit link for a phone-browser fallback',
   '📋 /cfaccounts - list Codeforces accounts, cursor and last verdict',
   '🗑️ /cf_clear_cookies - list every Codeforces account with a Remove button, plus a Remove All option',
   '🎯 /questionrangesubmission 200-400 - submit every question in a range (pick one account or All)',
@@ -309,6 +312,10 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cfsubmitcustom':
         await handleCodeforcesCustomSubmit();
         return;
+      case '/cfmanualnext':
+      case '/cf_manual_next':
+        await handleCodeforcesManualNext();
+        return;
       case '/cfaccounts':
       case '/cf_accounts':
         await reply(await codeforcesAccountsText());
@@ -356,7 +363,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /submitnextsolution, /nextsubcustomaccount, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /submitnextsolution, /nextsubcustomaccount, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -670,6 +677,92 @@ async function handleCodeforcesSubmitButton(
   });
 }
 
+export interface CodeforcesManualUiDeps {
+  listAccounts: () => Promise<Awaited<ReturnType<typeof listCodeforcesAccounts>>>;
+  nextEntry: (accountId: string) => Promise<SourceIndexEntry | null>;
+  send: (text: string, buttons?: InlineButton[][]) => Promise<void>;
+  edit: (chatId: number | string, messageId: number, text: string, buttons?: InlineButton[][]) => Promise<void>;
+  answer: (callbackId: string, text?: string) => Promise<void>;
+}
+
+async function nextManualEntry(accountId: string): Promise<SourceIndexEntry | null> {
+  const [source, progress] = await Promise.all([loadRuntimeSourceIndex(), getCodeforcesProgress(accountId)]);
+  return resolveCurrentEntry(source.queue, progress.nextKey, progress.lastCompletedKey);
+}
+
+const defaultCodeforcesManualUiDeps: CodeforcesManualUiDeps = {
+  listAccounts: () => listCodeforcesAccounts(false),
+  nextEntry: nextManualEntry,
+  send: defaultCodeforcesSubmitUiDeps.send,
+  edit: defaultCodeforcesSubmitUiDeps.edit,
+  answer: defaultCodeforcesSubmitUiDeps.answer,
+};
+
+function buildCodeforcesManualPicker(accounts: Awaited<ReturnType<typeof listCodeforcesAccounts>>): { text: string; buttons: InlineButton[][] } {
+  return {
+    text: '📱 Phone fallback\n\nPick the Codeforces account signed in on your phone. The bot will send its next source link and the matching Codeforces submit page. No cloud browser or proxy is used.',
+    buttons: [
+      ...accounts.map((account) => [{ text: `👤 ${cfAccountName(account)}`.slice(0, 60), callback_data: `cfmanual:${account.id}` }]),
+      [{ text: '✖️ Cancel', callback_data: 'cfmanual:x' }],
+    ],
+  };
+}
+
+/** /cfmanualnext — send a mobile-ready source/submit handoff without posting anything. */
+export async function handleCodeforcesManualNext(
+  deps: CodeforcesManualUiDeps = defaultCodeforcesManualUiDeps,
+): Promise<void> {
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    await deps.send('📭 No active Codeforces accounts configured. Add one with /renew first.');
+    return;
+  }
+  const picker = buildCodeforcesManualPicker(accounts);
+  await deps.send(picker.text, picker.buttons);
+}
+
+async function handleCodeforcesManualButton(
+  chatId: number | string,
+  messageId: number,
+  callbackId: string,
+  data: string,
+  deps: CodeforcesManualUiDeps,
+): Promise<void> {
+  if (data === 'cfmanual:x') {
+    await deps.answer(callbackId, 'Cancelled');
+    await deps.edit(chatId, messageId, '✖️ Phone fallback cancelled.');
+    return;
+  }
+  const account = (await deps.listAccounts()).find((item) => data === `cfmanual:${item.id}`);
+  if (!account) {
+    await deps.answer(callbackId, 'This button is no longer valid');
+    await deps.edit(chatId, messageId, '🔍 That Codeforces account is no longer active. Send /cfmanualnext again.');
+    return;
+  }
+  const entry = await deps.nextEntry(account.id);
+  if (!entry || entry.contestId === undefined || !entry.problemIndex) {
+    await deps.answer(callbackId, 'No source available');
+    await deps.edit(chatId, messageId, '📭 No next Codeforces source is available for this account.');
+    return;
+  }
+  await deps.answer(callbackId, 'Ready 📱');
+  await deps.edit(
+    chatId,
+    messageId,
+    [
+      `📱 Manual Codeforces submission for ${cfAccountName(account)}`,
+      `Problem: ${entry.contestId}${entry.problemIndex}${entry.problemName ? ` — ${entry.problemName}` : ''}`,
+      `Language: ${entry.language === 'python' ? 'Python 3' : 'GNU C++'}`,
+      '',
+      `1. Open source: ${entry.rawUrl}`,
+      `2. Open submit page: ${submitPageUrl(entry)}`,
+      '3. Paste the source and submit in the same Codeforces account on your phone.',
+      '',
+      'After an Accepted verdict, the next automatic or manual run detects it and moves to the following problem.',
+    ].join('\n'),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Session removal (/removesession, /removeallsessions) — inline buttons
 // ---------------------------------------------------------------------------
@@ -787,6 +880,7 @@ export async function handleCallbackQuery(
   deps: RemovalDeps = defaultRemovalDeps,
   ui: RangeUiDeps = defaultRangeUiDeps,
   codeforcesUi: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
+  codeforcesManualUi: CodeforcesManualUiDeps = defaultCodeforcesManualUiDeps,
 ): Promise<void> {
   const chatId = q.message?.chat.id;
   const messageId = q.message?.message_id;
@@ -805,6 +899,11 @@ export async function handleCallbackQuery(
 
   if (data.startsWith('cfsub:')) {
     await handleCodeforcesSubmitButton(chatId, messageId, q.id, data, codeforcesUi);
+    return;
+  }
+
+  if (data.startsWith('cfmanual:')) {
+    await handleCodeforcesManualButton(chatId, messageId, q.id, data, codeforcesManualUi);
     return;
   }
 

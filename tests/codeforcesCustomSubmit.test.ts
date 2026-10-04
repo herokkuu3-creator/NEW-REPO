@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { CodeforcesAccount } from '@prisma/client';
 import {
   buildCodeforcesSubmitPicker,
+  CodeforcesManualUiDeps,
   CodeforcesSubmitUiDeps,
   handleCallbackQuery,
   handleCodeforcesCustomSubmit,
@@ -9,6 +10,7 @@ import {
   RangeUiDeps,
 } from '../src/notifications/telegramBot';
 import { buildCodeforcesReport } from '../src/codeforces/report';
+import type { SourceIndexEntry } from '../src/codeforces/sourceRepo';
 
 vi.mock('../src/config', async (orig) => {
   const real = (await orig()) as { config: Record<string, unknown> };
@@ -105,5 +107,34 @@ describe('/nextsubcustomaccount', () => {
   it('keeps callback data under Telegram\'s 64-byte limit', () => {
     const picker = buildCodeforcesSubmitPicker([account('cmg3x9k2v0000qz8l5y7abcde')]);
     for (const row of picker.buttons) for (const button of row) expect(Buffer.byteLength(button.callback_data)).toBeLessThanOrEqual(64);
+  });
+});
+
+describe('/cfmanualnext', () => {
+  it('sends the selected account a source link and matching Codeforces submit page without posting', async () => {
+    const { ui } = makeCodeforcesUi([account('a1', 'sks4401')]);
+    const edits: string[] = [];
+    const manualUi: CodeforcesManualUiDeps = {
+      listAccounts: ui.listAccounts,
+      nextEntry: async () => ({
+        key: '2A - Winner.cpp', path: '2A - Winner.cpp', fileName: '2A - Winner.cpp', language: 'cpp',
+        kind: 'CODEFORCES', contestId: 2, problemIndex: 'A', problemName: 'Winner',
+        problemUrl: 'https://codeforces.com/contest/2/problem/A', rawUrl: 'https://raw.example/2A.cpp',
+        interactive: false, gym: false, reason: 'test',
+      } satisfies SourceIndexEntry),
+      send: async () => undefined,
+      edit: async (_chat, _message, text) => void edits.push(text),
+      answer: async () => undefined,
+    };
+    await handleCallbackQuery(
+      { id: 'manual-1', data: 'cfmanual:a1', message: { message_id: 7, chat: { id: '555' } } },
+      removalDeps,
+      rangeUi,
+      ui,
+      manualUi,
+    );
+    expect(edits[0]).toContain('https://raw.example/2A.cpp');
+    expect(edits[0]).toContain('https://codeforces.com/problemset/submit/2/A');
+    expect(edits[0]).toContain('Paste the source and submit');
   });
 });

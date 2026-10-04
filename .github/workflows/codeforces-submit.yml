@@ -25,7 +25,9 @@ jobs:
       CODEFORCES_SUBMITTER_URL: https://codeforces-submit-browser.onrender.com
       CODEFORCES_SUBMITTER_TOKEN: ${{ secrets.CODEFORCES_SUBMITTER_TOKEN }}
       HEADLESS: 'false'
-      CODEFORCES_BLOCK_ASSETS: 'false'
+      # Decorative assets are blocked; Codeforces and Cloudflare verification
+      # resources remain available. This keeps residential-proxy data low.
+      CODEFORCES_BLOCK_ASSETS: 'true'
       CODEFORCES_BROWSER: chromium
       # Store the complete residential endpoint only in GitHub Actions secrets,
       # for example http://user:password@host:port or socks5://host:port.
