@@ -424,21 +424,21 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
   }
   await page.locator('select[name="programTypeId"]').first().selectOption(language.value, { force: true, timeout: 5000 });
 
-  const toggle = page.locator('#toggleEditorCheckbox').first();
-  if ((await toggle.count().catch(() => 0)) > 0) {
-    if (await toggle.isChecked().catch(() => false)) {
-      await toggle.uncheck({ force: true, timeout: 5000 }).catch(() => undefined);
-    }
-  }
-
   const sourceBox = page.locator('textarea[name="source"]').first();
   if ((await sourceBox.count().catch(() => 0)) === 0) {
     throw new CodeforcesSubmissionError(`Codeforces submit form has no source textarea (fields: ${summarizeFields(fields)})`);
   }
-  await sourceBox.evaluate((node, content) => {
-    (node as HTMLTextAreaElement).value = content;
-  }, code);
-  await sourceBox.fill(code, { force: true, timeout: 5000 }).catch(() => undefined);
+
+  await page.evaluate((content) => {
+    const toggle = document.getElementById('toggleEditorCheckbox') as HTMLInputElement | null;
+    if (toggle && toggle.checked) {
+      toggle.click(); // Let Codeforces' own JS cleanly destroy CodeMirror
+    }
+    const ta = document.querySelector('textarea[name="source"]') as HTMLTextAreaElement | null;
+    if (ta) {
+      ta.value = content;
+    }
+  }, code).catch(() => undefined);
 
   const token = await page.locator(`input[name="${csrfName}"]`).first().inputValue({ timeout: 5000 }).catch(() => '');
   if (!token) {

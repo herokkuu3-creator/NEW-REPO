@@ -380,22 +380,20 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
   if (!language) throw new Error(`no ${wantsPython ? 'Python 3' : 'C++'} language option on the Codeforces form`);
   await page.locator('select[name="programTypeId"]').first().selectOption(language.value, { force: true, timeout: 5000 });
 
-  log({}, 'unchecking toggle editor');
-  const toggle = page.locator('#toggleEditorCheckbox').first();
-  if ((await toggle.count().catch(() => 0)) > 0) {
-    if (await toggle.isChecked().catch(() => false)) {
-      await toggle.uncheck({ force: true, timeout: 5000 }).catch(() => undefined);
-    }
-  }
-
-  log({}, 'filling source code textarea');
+  log({}, 'unchecking editor and filling source');
   const sourceBox = page.locator('textarea[name="source"]').first();
   if ((await sourceBox.count().catch(() => 0)) === 0) throw new Error('Codeforces submit form has no source textarea');
-  await sourceBox.evaluate((node, content) => {
-    (node as HTMLTextAreaElement).value = content;
+
+  await page.evaluate((content) => {
+    const toggle = document.getElementById('toggleEditorCheckbox') as HTMLInputElement | null;
+    if (toggle && toggle.checked) {
+      toggle.click(); // Let Codeforces' own JS cleanly destroy CodeMirror
+    }
+    const ta = document.querySelector('textarea[name="source"]') as HTMLTextAreaElement | null;
+    if (ta) {
+      ta.value = content;
+    }
   }, code).catch((err) => { log({err: err.message}, 'evaluate failed'); });
-  // Also try to force-fill just in case Playwright needs to trigger events
-  await sourceBox.fill(code, { force: true, timeout: 5000 }).catch((err) => { log({err: err.message}, 'force fill failed'); });
 
   log({}, 'reading token');
   const token = await page.locator(`input[name="${csrfName}"]`).first().inputValue({ timeout: 5000 }).catch(() => '');
