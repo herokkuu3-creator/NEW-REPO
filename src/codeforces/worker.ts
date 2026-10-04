@@ -61,6 +61,8 @@ export interface CodeforcesRunOptions {
   onAccountOutcome?: (outcome: CodeforcesAccountOutcome, index: number, total: number) => Promise<void> | void;
   /** Manual triggers may reuse a day's single attempt after it failed. */
   forceDailyAttempt?: boolean;
+  /** When present, run only these active Codeforces account IDs. */
+  accountIds?: readonly string[];
 }
 
 export interface CodeforcesTriggerResult {
@@ -101,7 +103,10 @@ export async function executeCodeforcesRun(
 
   try {
     const source = await loadRuntimeSourceIndex();
-    const accounts = await listCodeforcesAccounts(false);
+    const requestedAccountIds = options.accountIds ? new Set(options.accountIds) : null;
+    const accounts = (await listCodeforcesAccounts(false)).filter(
+      (account) => !requestedAccountIds || requestedAccountIds.has(account.id),
+    );
     const outcomes: CodeforcesAccountOutcome[] = [];
 
     if (accounts.length === 0) {

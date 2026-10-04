@@ -16,6 +16,7 @@ import { describeIngest, ingestCookiePayload, Validator } from '../accounts/inge
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
 import { CODEFORCES_MANUAL_REASON, isCodeforcesRunInProgress, runCodeforcesNow } from '../codeforces/worker';
+import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts, listCodeforcesAccounts } from '../codeforces/storage';
 import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../codeforces/report';
 import {
   isRunInProgress,
@@ -106,6 +107,7 @@ const HELP_TEXT = [
   '🚀 Submissions',
   '⚡ /triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
   '🏆 /submitnextsolution - submit the next Codeforces source solution for every Codeforces account',
+  '🎯 /nextsubcustomaccount - choose one Codeforces account, or all, for the next source solution',
   '📋 /cfaccounts - list Codeforces accounts, cursor and last verdict',
   '🗑️ /cf_clear_cookies - list every Codeforces account with a Remove button, plus a Remove All option',
   '🎯 /questionrangesubmission 200-400 - submit every question in a range (pick one account or All)',
@@ -301,6 +303,12 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/submit_next_solution':
         await handleCodeforcesSubmitNext();
         return;
+      case '/nextsubcustomaccount':
+      case '/nextsubcustomaccout':
+      case '/next_sub_custom_account':
+      case '/cfsubmitcustom':
+        await handleCodeforcesCustomSubmit();
+        return;
       case '/cfaccounts':
       case '/cf_accounts':
         await reply(await codeforcesAccountsText());
@@ -348,7 +356,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /submitnextsolution, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /submitnextsolution, /nextsubcustomaccount, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -534,6 +542,134 @@ export async function handleCodeforcesSubmitNext(
   return { done };
 }
 
+export interface CodeforcesSubmitUiDeps {
+  listAccounts: () => Promise<Awaited<ReturnType<typeof listCodeforcesAccounts>>>;
+  runner: typeof runCodeforcesNow;
+  inProgress: () => boolean;
+  send: (text: string, buttons?: InlineButton[][]) => Promise<void>;
+  edit: (chatId: number | string, messageId: number, text: string, buttons?: InlineButton[][]) => Promise<void>;
+  answer: (callbackId: string, text?: string) => Promise<void>;
+}
+
+const defaultCodeforcesSubmitUiDeps: CodeforcesSubmitUiDeps = {
+  listAccounts: () => listCodeforcesAccounts(false),
+  runner: runCodeforcesNow,
+  inProgress: isCodeforcesRunInProgress,
+  send: async (text, buttons) => {
+    await tgApi('sendMessage', {
+      chat_id: config.telegram.chatId,
+      text,
+      disable_web_page_preview: true,
+      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+    });
+  },
+  edit: async (chatId, messageId, text, buttons) => {
+    await tgApi('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: buttons ?? [] },
+    });
+  },
+  answer: async (callbackId, text) => {
+    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text } : {}) });
+  },
+};
+
+/** One account per button, followed by the explicit all-accounts choice. */
+export function buildCodeforcesSubmitPicker(
+  accounts: Awaited<ReturnType<typeof listCodeforcesAccounts>>,
+): { text: string; buttons: InlineButton[][] } {
+  const buttons = accounts.map((account) => [
+    { text: `👤 ${cfAccountName(account)}`.slice(0, 60), callback_data: `cfsub:${account.id}` },
+  ]);
+  buttons.push([{ text: `👥 All accounts (${accounts.length}, one by one)`, callback_data: 'cfsub:all' }]);
+  buttons.push([{ text: '✖️ Cancel', callback_data: 'cfsub:x' }]);
+  return {
+    text: [
+      '🏆 Submit the next Codeforces source solution',
+      '',
+      '👇 Pick an account, or choose All accounts:',
+      'Only the selected account(s) will receive a submission.',
+    ].join('\n'),
+    buttons,
+  };
+}
+
+/** /nextsubcustomaccount — show the active Codeforces account picker. */
+export async function handleCodeforcesCustomSubmit(
+  deps: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
+): Promise<void> {
+  if (deps.inProgress()) {
+    await deps.send('🚧 A Codeforces run is already in progress — wait for its report, then try again.');
+    return;
+  }
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    await deps.send('📭 No active Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
+    return;
+  }
+  const picker = buildCodeforcesSubmitPicker(accounts);
+  await deps.send(picker.text, picker.buttons);
+}
+
+async function startSelectedCodeforcesRun(
+  accountIds: readonly string[] | undefined,
+  description: string,
+  deps: CodeforcesSubmitUiDeps,
+): Promise<void> {
+  const report = await deps.runner(CODEFORCES_MANUAL_REASON, {
+    forceDailyAttempt: true,
+    ...(accountIds ? { accountIds } : {}),
+    onAccountOutcome: (outcome, index, total) => deps.send(formatCodeforcesAccountMessage(outcome, index, total)),
+  });
+  if (!report) {
+    await deps.send('⏳ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
+  } else if (report.totals.accounts === 0) {
+    await deps.send('📭 The selected Codeforces account is no longer active. Send /nextsubcustomaccount again.');
+  } else {
+    logger.info({ description, summary: summarizeCodeforcesReport(report) }, 'telegram custom Codeforces submission finished');
+  }
+}
+
+async function handleCodeforcesSubmitButton(
+  chatId: number | string,
+  messageId: number,
+  callbackId: string,
+  data: string,
+  deps: CodeforcesSubmitUiDeps,
+): Promise<void> {
+  if (data === 'cfsub:x') {
+    await deps.answer(callbackId, 'Cancelled');
+    await deps.edit(chatId, messageId, '✖️ Codeforces submission cancelled — nothing was submitted.');
+    return;
+  }
+  if (deps.inProgress()) {
+    await deps.answer(callbackId, 'A Codeforces run is in progress');
+    await deps.edit(chatId, messageId, '🚧 A Codeforces run is already in progress — wait for its report, then try again.');
+    return;
+  }
+  const accounts = await deps.listAccounts();
+  const selected = data === 'cfsub:all' ? accounts : accounts.filter((account) => data === `cfsub:${account.id}`);
+  if (selected.length === 0) {
+    await deps.answer(callbackId, 'This button is no longer valid');
+    await deps.edit(chatId, messageId, '🔍 That Codeforces account is no longer active. Send /nextsubcustomaccount again.');
+    return;
+  }
+  const description = selected.length === 1 ? cfAccountName(selected[0]!) : `all ${selected.length} Codeforces accounts`;
+  await deps.answer(callbackId, 'Started 🚀');
+  await deps.edit(
+    chatId,
+    messageId,
+    `🚀 Submitting the next Codeforces source solution for ${description}.\n\n📬 You will receive the verdict here.`,
+  );
+  void startSelectedCodeforcesRun(data === 'cfsub:all' ? undefined : [selected[0]!.id], description, deps).catch(async (err) => {
+    logger.warn({ err: errText(err) }, 'custom Codeforces submission failed');
+    await deps.send(`⚠️ Codeforces submission failed: ${errText(err)}`).catch(() => undefined);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Session removal (/removesession, /removeallsessions) — inline buttons
 // ---------------------------------------------------------------------------
@@ -623,8 +759,6 @@ export async function handleRemoveAllSessions(deps: RemovalDeps = defaultRemoval
   );
 }
 
-import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts, listCodeforcesAccounts } from '../codeforces/storage';
-
 function cfAccountName(a: { label: string; username?: string | null }): string {
   return a.username && a.username !== a.label ? `${a.label} (${a.username})` : a.label;
 }
@@ -647,11 +781,12 @@ export async function handleCfRemoveSession(deps: RemovalDeps = defaultRemovalDe
   await deps.send(view.text, view.buttons.length ? view.buttons : undefined);
 }
 
-/** Handles a tap on one of the inline buttons above (rm:* and qr:*). */
+/** Handles a tap on one of the inline buttons above. */
 export async function handleCallbackQuery(
   q: TgCallbackQuery,
   deps: RemovalDeps = defaultRemovalDeps,
   ui: RangeUiDeps = defaultRangeUiDeps,
+  codeforcesUi: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
 ): Promise<void> {
   const chatId = q.message?.chat.id;
   const messageId = q.message?.message_id;
@@ -665,6 +800,11 @@ export async function handleCallbackQuery(
 
   if (data.startsWith('qr:')) {
     await handleRangeButton(chatId, messageId, q.id, data, deps, ui);
+    return;
+  }
+
+  if (data.startsWith('cfsub:')) {
+    await handleCodeforcesSubmitButton(chatId, messageId, q.id, data, codeforcesUi);
     return;
   }
 
