@@ -29,9 +29,11 @@ jobs:
       # resources remain available. This keeps residential-proxy data low.
       CODEFORCES_BLOCK_ASSETS: 'true'
       CODEFORCES_BROWSER: chromium
-      # Store the complete residential endpoint only in GitHub Actions secrets,
-      # for example http://user:password@host:port or socks5://host:port.
-      CODEFORCES_PROXY: ${{ secrets.CODEFORCES_RESIDENTIAL_PROXY }}
+      # Primary egress: an Android phone advertising itself as a Tailscale exit
+      # node. If it is offline, the existing residential proxy is used.
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      TAILSCALE_EXIT_NODE: ${{ vars.TAILSCALE_EXIT_NODE }}
+      FALLBACK_CODEFORCES_PROXY: ${{ secrets.CODEFORCES_RESIDENTIAL_PROXY }}
     steps:
       - name: Find waiting browser job
         id: lookup
@@ -65,6 +67,39 @@ jobs:
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
       - run: npm run build
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
+      # Connect only after all large downloads finish. Phone/proxy traffic is
+      # then limited to the small Codeforces browser session itself.
+      - name: Connect to phone network
+        id: tailscale
+        if: (inputs.job_id != '' || steps.lookup.outputs.job_id != '') && env.TAILSCALE_AUTHKEY != '' && env.TAILSCALE_EXIT_NODE != ''
+        continue-on-error: true
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+      - name: Select phone exit or residential fallback
+        if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
+        env:
+          TAILSCALE_STEP_OUTCOME: ${{ steps.tailscale.outcome }}
+        run: |
+          phone_ready=false
+          if [ "$TAILSCALE_STEP_OUTCOME" = "success" ] && [ -n "$TAILSCALE_EXIT_NODE" ]; then
+            if sudo tailscale set --exit-node="$TAILSCALE_EXIT_NODE" && timeout 30 curl --fail --silent --show-error --output /dev/null https://www.cloudflare.com/cdn-cgi/trace; then
+              phone_ready=true
+            fi
+          fi
+
+          if [ "$phone_ready" = "true" ]; then
+            echo 'CODEFORCES_PROXY=' >> "$GITHUB_ENV"
+            echo 'Codeforces browser will use the Android Tailscale exit node.'
+          else
+            sudo tailscale set --exit-node= 2>/dev/null || true
+            if [ -z "$FALLBACK_CODEFORCES_PROXY" ]; then
+              echo 'Phone exit node is unavailable and CODEFORCES_RESIDENTIAL_PROXY is not configured.' >&2
+              exit 1
+            fi
+            printf 'CODEFORCES_PROXY=%s\n' "$FALLBACK_CODEFORCES_PROXY" >> "$GITHUB_ENV"
+            echo 'Phone exit node is unavailable; using the residential proxy fallback.'
+          fi
       - name: Submit once and return browser result
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
         env:

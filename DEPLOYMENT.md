@@ -349,6 +349,35 @@ Free Render Postgres databases expire thirty days after creation (14-day grace, 
 
 ### Codeforces submitter verification and WARP
 
+#### Android mobile-data exit with proxy fallback
+
+The GitHub browser can use an Android phone's mobile-data IP without exposing a
+public proxy port. Tailscale creates the private tunnel, and the phone advertises
+itself as an exit node. The workflow tries that route first and uses
+`CODEFORCES_RESIDENTIAL_PROXY` only when the phone cannot be reached.
+
+1. Install Tailscale on Android, sign in, open **Exit Node**, and enable
+   **Run as exit node**. Keep Tailscale connected and exclude it from Android
+   battery optimization.
+2. In the Tailscale admin console, open **Machines**, select the phone, open
+   **Edit route settings**, and approve **Use as exit node**. Disable key expiry
+   for the phone if this option is available.
+3. In the Tailscale admin console, create a reusable, ephemeral auth key for the
+   GitHub runner. Store it as the GitHub Actions repository secret
+   `TAILSCALE_AUTHKEY`. It can be generated and refreshed from the phone browser.
+4. In GitHub **Settings → Secrets and variables → Actions → Variables**, create
+   `TAILSCALE_EXIT_NODE` with the phone's exact Tailscale machine name.
+5. Keep the existing `CODEFORCES_RESIDENTIAL_PROXY` Actions secret. It is now
+   fallback-only and is not used while the phone exit node is reachable.
+6. Keep `CODEFORCES_RUNNER_MODE=github` on Render.
+
+The Codeforces login cookies still come from the account session stored through
+`/renew`; Tailscale supplies the phone's network/IP, not Chrome's private cookie
+database. No Telegram action or manual submission is required on the phone.
+The phone must have internet access and Tailscale must remain connected when a
+submission begins. Android exit nodes use userspace routing and can be slower,
+which is acceptable for the small Codeforces form request.
+
 #### Local PC browser runner
 
 To submit through the PC's own connection without exposing the PC to the
