@@ -10,5 +10,12 @@ export function shouldReleaseDailyAttempt(input: {
   today: string;
 }): boolean {
   if (input.manual) return true;
-  return input.lastAttemptDate === input.today && input.lastVerdict !== 'OK';
+  return input.lastAttemptDate === input.today && !isTerminalCodeforcesVerdict(input.lastVerdict);
+}
+
+/** A judge verdict means the source was submitted and its cursor can advance.
+ * Only these states mean Codeforces has not finished judging it yet. */
+export function isTerminalCodeforcesVerdict(verdict: string | null | undefined): boolean {
+  const normalized = verdict?.trim().toUpperCase();
+  return !!normalized && !['TESTING', 'QUEUE', 'QUEUED', 'RUNNING', 'SUBMISSION_ERROR'].includes(normalized);
 }

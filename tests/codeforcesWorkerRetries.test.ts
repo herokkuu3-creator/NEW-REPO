@@ -69,3 +69,16 @@ it('reconciles an uncertain POST without dispatching another job', async () => {
   expect(mocks.complete).toHaveBeenCalledTimes(1);
   expect(report?.totals).toMatchObject({ solved: 1, failed: 1 });
 });
+
+it('marks every Codeforces final verdict as performed and advances its source cursor', async () => {
+  for (const verdict of ['WRONG_ANSWER', 'TIME_LIMIT_EXCEEDED', 'RUNTIME_ERROR', 'COMPILATION_ERROR']) {
+    vi.clearAllMocks();
+    mocks.post.mockResolvedValue(posted);
+    mocks.poll.mockResolvedValue({ id: 1000 + verdict.length, verdict });
+    const report = await runCodeforcesNow('manual', { forceDailyAttempt: true });
+    expect(report?.accounts).toHaveLength(2);
+    expect(report?.accounts.every(row => row.performed && row.verdict === verdict)).toBe(true);
+    expect(mocks.complete).toHaveBeenCalledTimes(2);
+    expect(mocks.complete).toHaveBeenLastCalledWith('a2', expect.objectContaining({ completedKey: '8B', nextKey: '9A', verdict }));
+  }
+});

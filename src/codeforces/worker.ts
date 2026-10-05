@@ -15,7 +15,7 @@ import {
   releaseDailyAttempt,
 } from './storage';
 import { loadRuntimeSourceIndex, fetchSourceCode, SourceIndexEntry } from './sourceRepo';
-import { shouldReleaseDailyAttempt } from './dailyGate';
+import { isTerminalCodeforcesVerdict, shouldReleaseDailyAttempt } from './dailyGate';
 import { fetchSolvedProblemKeys } from './api';
 import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
 import type { HttpSubmitResult } from './httpSubmit';
@@ -380,9 +380,7 @@ async function runForAccount(
     const verdictCode = result.verdict ?? result.kind.toUpperCase().replace(/-/g, '_');
     await recordAttempt(account.id, { submissionId: result.submissionId ?? null, verdict: verdictCode });
     const duplicateSubmission = isAlreadySubmittedCodeError(result.error);
-    const finalVerdict = Boolean(
-      result.submissionId && result.verdict && !['TESTING', 'QUEUE', 'QUEUED'].includes(result.verdict.toUpperCase()),
-    );
+    const finalVerdict = Boolean(result.submissionId && isTerminalCodeforcesVerdict(result.verdict));
     if (finalVerdict || duplicateSubmission) {
       const index = source.queue.findIndex((e) => e.key === entry.key);
       await completeCurrentProblem(account.id, {

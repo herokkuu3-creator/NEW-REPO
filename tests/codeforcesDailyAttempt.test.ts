@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { shouldReleaseDailyAttempt } from '../src/codeforces/dailyGate';
+import { isTerminalCodeforcesVerdict, shouldReleaseDailyAttempt } from '../src/codeforces/dailyGate';
 import { isAfterCodeforcesSchedule, isAlreadySubmittedCodeError } from '../src/codeforces/worker';
 
 /** The reported bug: a failed attempt consumed the whole day. */
@@ -11,16 +11,22 @@ describe('shouldReleaseDailyAttempt', () => {
     expect(shouldReleaseDailyAttempt({ manual: true, lastAttemptDate: today, lastVerdict: null, today })).toBe(true);
   });
 
-  it('retries an automatic run when today did not succeed', () => {
+  it('retries an automatic run when today has no submitted final verdict', () => {
     expect(
       shouldReleaseDailyAttempt({ manual: false, lastAttemptDate: today, lastVerdict: 'SUBMISSION_ERROR', today }),
     ).toBe(true);
     expect(shouldReleaseDailyAttempt({ manual: false, lastAttemptDate: today, lastVerdict: null, today })).toBe(true);
-    expect(shouldReleaseDailyAttempt({ manual: false, lastAttemptDate: today, lastVerdict: 'WRONG_ANSWER', today })).toBe(true);
+    expect(shouldReleaseDailyAttempt({ manual: false, lastAttemptDate: today, lastVerdict: 'TESTING', today })).toBe(true);
   });
 
-  it('keeps the throttle after a successful attempt today', () => {
-    expect(shouldReleaseDailyAttempt({ manual: false, lastAttemptDate: today, lastVerdict: 'OK', today })).toBe(false);
+  it('keeps the throttle after every final verdict today', () => {
+    for (const verdict of ['OK', 'WRONG_ANSWER', 'TIME_LIMIT_EXCEEDED', 'RUNTIME_ERROR', 'COMPILATION_ERROR', 'DUPLICATE_CODE']) {
+      expect(isTerminalCodeforcesVerdict(verdict)).toBe(true);
+      expect(shouldReleaseDailyAttempt({ manual: false, lastAttemptDate: today, lastVerdict: verdict, today })).toBe(false);
+    }
+    for (const verdict of ['TESTING', 'QUEUE', 'QUEUED', 'RUNNING', 'SUBMISSION_ERROR']) {
+      expect(isTerminalCodeforcesVerdict(verdict)).toBe(false);
+    }
   });
 
   it('leaves another day alone', () => {
