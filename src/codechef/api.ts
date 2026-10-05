@@ -1,96 +1,124 @@
-import { chromium } from 'playwright';
-import { logger } from '../logger';
+import type { Page, Response } from 'playwright';
+import { withCodeChefPage, type CodeChefState } from './browser';
 
 export interface CodeChefSubmitResult {
   ok: boolean;
+  performed?: boolean;
+  clicked?: boolean;
+  kind?: 'signed-out' | 'blocked' | 'error';
   submissionId?: string;
   verdict?: string;
   error?: string;
 }
 
-export async function submitToCodeChef(
-  storageState: any,
-  problemUrl: string,
-  code: string,
-  language: string = 'C++17' // Adjust based on CodeChef's dropdown if necessary
-): Promise<CodeChefSubmitResult> {
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ storageState });
-  const page = await context.newPage();
+export function normalizeCodeChefVerdict(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const text = value.trim().replace(/\s+/g, ' ').toLowerCase();
+  const names: Record<string, string> = {
+    ac: 'Accepted', accepted: 'Accepted', 'correct answer': 'Accepted',
+    wa: 'Wrong Answer', 'wrong answer': 'Wrong Answer',
+    tle: 'Time Limit Exceeded', 'time limit exceeded': 'Time Limit Exceeded',
+    ce: 'Compilation Error', 'compilation error': 'Compilation Error',
+    re: 'Runtime Error', rte: 'Runtime Error', 'runtime error': 'Runtime Error',
+    'partially correct': 'Partially Correct', 'internal error': 'Internal Error',
+  };
+  return names[text] ?? null;
+}
 
-  try {
-    logger.info({ problemUrl }, 'Navigating to CodeChef problem page');
-    await page.goto(problemUrl, { waitUntil: 'networkidle' });
+function responseDetails(value: unknown, depth = 0): { id?: string; verdict?: string } {
+  if (!value || typeof value !== 'object' || depth > 5) return {};
+  const object = value as Record<string, unknown>;
+  const idValue = object.submission_id ?? object.submissionId ?? object.solution_id;
+  const id = (typeof idValue === 'number' || typeof idValue === 'string') && /^[1-9]\d{0,18}$/.test(String(idValue)) ? String(idValue) : undefined;
+  const verdict = normalizeCodeChefVerdict(object.verdict ?? object.result ?? object.status) ?? undefined;
+  const child = responseDetails(object.data ?? object.result, depth + 1);
+  return { id: id ?? child.id, verdict: verdict ?? child.verdict };
+}
 
-    // Wait for the submit button or IDE to load. CodeChef has a specific IDE URL.
-    // Normally, the submit URL is https://www.codechef.com/submit/<problemCode>
-    const match = problemUrl.match(/codechef\.com\/problems\/([A-Za-z0-9_]+)/i);
-    if (!match) {
-      throw new Error('Invalid problem URL');
-    }
-    const problemCode = match[1];
-    
-    await page.goto(`https://www.codechef.com/submit/${problemCode}`, { waitUntil: 'networkidle' });
-
-    // Ensure the editor is ready
-    await page.waitForSelector('.monaco-editor', { timeout: 30000 });
-
-    // Click on the editor and paste the code
-    await page.click('.monaco-editor');
-    await page.keyboard.down('Control'); // Or Meta for Mac, assuming Windows/Linux container here
-    await page.keyboard.press('A');
-    await page.keyboard.up('Control');
-    await page.keyboard.press('Backspace');
-    
-    // Instead of typing which is slow, we can use clipboard or evaluate to set value if possible, 
-    // but Playwright can type fast or we can paste.
-    // For Monaco, typing line by line or pasting is needed. 
-    // Let's inject into the clipboard and paste, or use evaluate.
-    await page.evaluate((codeContent) => {
-      // Find the Monaco model and set its value directly
-      const models = (window as any).monaco.editor.getModels();
-      if (models && models.length > 0) {
-        models[0].setValue(codeContent);
-      }
-    }, code);
-
-    // Click the submit button
-    const submitBtn = await page.$('button:has-text("Submit")');
-    if (!submitBtn) {
-       // Look for the specific submit button class or id if text fails
-       await page.click('#submitBtn'); // Fallback id, adjust if CodeChef changes
-    } else {
-       await submitBtn.click();
-    }
-
-    // Wait for verdict
-    await page.waitForSelector('.verdict-text, .toaster', { timeout: 60000 }).catch(() => {});
-    
-    // Try to extract the verdict
-    const verdictEl = await page.$('.verdict-text');
-    let verdict = 'UNKNOWN';
-    if (verdictEl) {
-      verdict = await verdictEl.innerText();
-    } else {
-      // If no verdict text, look for common notification
-      const html = await page.content();
-      if (html.includes('Correct Answer')) verdict = 'Accepted';
-      else if (html.includes('Wrong Answer')) verdict = 'Wrong Answer';
-      else if (html.includes('Time Limit Exceeded')) verdict = 'TLE';
-      else if (html.includes('Compilation Error')) verdict = 'Compilation Error';
-    }
-
-    return {
-      ok: verdict.toLowerCase().includes('accepted') || verdict.toLowerCase().includes('correct'),
-      verdict: verdict.trim()
-    };
-  } catch (err) {
-    logger.error({ err: err instanceof Error ? err.message : String(err) }, 'CodeChef submission failed');
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err)
-    };
-  } finally {
-    await browser.close();
+export async function selectCodeChefLanguage(page: Page, language: string): Promise<void> {
+  if (!/^(cpp|c\+\+(?:17|20|23)?)$/i.test(language)) throw new Error(`Unsupported CodeChef source language: ${language}`);
+  const native = page.locator('select').first();
+  if (await native.count()) {
+    const options = await native.locator('option').evaluateAll(nodes => nodes.map(el => ({ value: (el as HTMLOptionElement).value, text: el.textContent ?? '' })));
+    const chosen = options.find(el => /C\+\+17/i.test(el.text)) ?? options.find(el => /C\+\+/i.test(el.text));
+    if (!chosen) throw new Error('CodeChef C++ language option was not found');
+    await native.selectOption(chosen.value);
+    return;
   }
+  const dropdown = page.locator('#language-select, [role="combobox"]').first();
+  await dropdown.click({ timeout: 15000 });
+  const options = page.getByRole('option');
+  const labels = await options.allTextContents();
+  const index = labels.findIndex(text => /^C\+\+(?:17|20|23)?(?:\s|$)/i.test(text.trim()));
+  if (index < 0) throw new Error('CodeChef C++ language option was not found');
+  await options.nth(index).click();
+}
+
+export async function fillCodeChefSource(page: Page, code: string): Promise<void> {
+  await page.locator('.ace_editor, .monaco-editor').first().waitFor({ state: 'visible', timeout: 15000 });
+  await page.evaluate(content => {
+    const app = window as unknown as {
+      ace?: { edit: (element: Element) => { setValue: (text: string, cursor?: number) => void; getValue: () => string } };
+      monaco?: { editor: { getModels: () => Array<{ setValue: (text: string) => void; getValue: () => string }> } };
+    };
+    const aceElement = document.querySelector('.ace_editor');
+    const editor = aceElement && app.ace ? app.ace.edit(aceElement) : app.monaco?.editor.getModels()[0];
+    if (!editor) throw new Error('CodeChef editor API is not ready');
+    editor.setValue(content);
+    if (editor.getValue() !== content) throw new Error('CodeChef editor did not retain the source');
+  }, code);
+}
+
+export async function submitOnCodeChefPage(page: Page, problemUrl: string, code: string, language = 'cpp', timeoutMs = 90000): Promise<CodeChefSubmitResult> {
+  let clicked = false;
+  let submissionId: string | undefined;
+  let verdict: string | undefined;
+  const observe = async (response: Response) => {
+    if (!clicked) return;
+    const url = new URL(response.url());
+    if (!/(^|\.)codechef\.com$/.test(url.hostname) || !/submit|submission|result|status/i.test(url.pathname)) return;
+    const details = responseDetails(await response.json().catch(() => null));
+    // Anchor the judge result to the ID returned by this submission's POST.
+    if (response.request().method() === 'POST' && details.id) submissionId ??= details.id;
+    if (submissionId && details.verdict && (details.id === submissionId || url.href.includes(submissionId))) verdict = details.verdict;
+  };
+  const onResponse = (response: Response) => { void observe(response).catch(() => undefined); };
+  try {
+    const url = new URL(problemUrl);
+    const match = /^\/(?:[^/]+\/)?problems\/([a-z0-9_]+)\/?$/i.exec(url.pathname);
+    if (!/(^|\.)codechef\.com$/.test(url.hostname) || !match) throw new Error('Invalid CodeChef problem URL');
+    const response = await page.goto(`https://www.codechef.com/submit/${match[1]}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (response && response.status() >= 400) return { ok: false, clicked: false, kind: response.status() === 401 ? 'signed-out' : response.status() === 403 ? 'blocked' : 'error', error: `CodeChef submit page returned HTTP ${response.status()}` };
+    if (/\/login(?:[/?#]|$)/.test(page.url())) return { ok: false, clicked: false, kind: 'signed-out', error: 'CodeChef session redirected to login' };
+    await selectCodeChefLanguage(page, language);
+    await fillCodeChefSource(page, code);
+    page.on('response', onResponse);
+    const control = page.locator('#submit_btn, #submitBtn').first();
+    const button = await control.count() ? control : page.getByRole('button', { name: 'Submit', exact: true });
+    if (!await button.isEnabled()) throw new Error('CodeChef Submit is disabled');
+    clicked = true;
+    await button.click();
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (submissionId && verdict) return { ok: verdict === 'Accepted', performed: true, clicked, submissionId, verdict };
+      // Read only the judge's result panel, never the problem text/editor HTML.
+      const result = page.locator('.verdict-text, [data-verdict], #solution-status, .submission-result').first();
+      if (await result.count()) {
+        const text = await result.innerText().catch(() => '');
+        const terminal = normalizeCodeChefVerdict(text);
+        if (submissionId && terminal) return { ok: terminal === 'Accepted', performed: true, clicked, submissionId, verdict: terminal };
+      }
+      if (await page.getByText(/please log ?in to submit|login to submit/i).count()) {
+        return { ok: false, clicked, kind: 'signed-out', error: 'CodeChef requires login before submitting' };
+      }
+      await page.waitForTimeout(250);
+    }
+    return { ok: false, clicked, submissionId, verdict: 'UNKNOWN', error: 'CodeChef did not return a confirmed submission ID and terminal verdict. The submit click was not retried.' };
+  } catch (err) {
+    return { ok: false, clicked, submissionId, kind: 'error', error: err instanceof Error ? err.message : String(err) };
+  } finally { page.off('response', onResponse); }
+}
+
+export async function submitToCodeChef(state: CodeChefState, problemUrl: string, code: string, language = 'cpp'): Promise<CodeChefSubmitResult> {
+  return withCodeChefPage(state, page => submitOnCodeChefPage(page, problemUrl, code, language));
 }

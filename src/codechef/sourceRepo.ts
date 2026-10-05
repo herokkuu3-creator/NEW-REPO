@@ -3,6 +3,7 @@ import path from 'node:path';
 import { CodeChefSourceKind } from '@prisma/client';
 import { logger } from '../logger';
 import { prisma } from '../database/prisma';
+import { getSystemState, setSystemState } from '../database/models';
 
 export interface CodeChefSourceEntry {
   path: string;
@@ -35,14 +36,15 @@ export async function loadCodeChefSourceIndex(force = false): Promise<CodeChefSo
 
   let rows = await readRows();
 
-  if (rows.length === 0 || force) {
+  if (rows.length === 0 || force || await getSystemState('codechef.source-index-version') !== '2') {
     logger.info('Building CodeChef source index from local files...');
     const entries = await buildLocalIndex();
     await persistAudit(entries);
+    await setSystemState('codechef.source-index-version', '2');
     rows = await readRows();
   }
 
-  const queue: CodeChefSourceEntry[] = rows.map((row) => ({
+  const sorted: CodeChefSourceEntry[] = rows.map((row) => ({
     path: row.path,
     fileName: row.fileName,
     language: row.language,
@@ -51,17 +53,25 @@ export async function loadCodeChefSourceIndex(force = false): Promise<CodeChefSo
     problemUrl: row.problemUrl ?? undefined,
     reason: row.reason,
   })).sort((a, b) => a.problemCode!.localeCompare(b.problemCode!));
+  const seen = new Set<string>();
+  const queue = sorted.filter(entry => {
+    if (seen.has(entry.problemCode!)) return false;
+    seen.add(entry.problemCode!);
+    return true;
+  });
 
   logger.info({ queue: queue.length }, 'CodeChef source queue loaded');
   return queue;
 }
 
 export async function fetchSourceCode(entry: CodeChefSourceEntry): Promise<string> {
-  const fullPath = path.join(SOLUTIONS_DIR, entry.path);
+  const fullPath = path.resolve(SOLUTIONS_DIR, entry.path.replace(/[\\/]/g, path.sep));
+  const relative = path.relative(SOLUTIONS_DIR, fullPath);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('CodeChef source path is outside the solution directory');
   return fs.readFile(fullPath, 'utf8');
 }
 
-async function buildLocalIndex(): Promise<CodeChefSourceEntry[]> {
+export async function buildLocalIndex(root = SOLUTIONS_DIR): Promise<CodeChefSourceEntry[]> {
   const entries: CodeChefSourceEntry[] = [];
   
   async function walk(dir: string) {
@@ -75,11 +85,11 @@ async function buildLocalIndex(): Promise<CodeChefSourceEntry[]> {
         } else if (file.name.toLowerCase() === 'readme.md') {
           // Check if there is a cpp file in this directory
           const dirFiles = await fs.readdir(dir);
-          const cppFile = dirFiles.find(f => f.endsWith('.cpp'));
+          const cppFile = dirFiles.sort().find(f => f.toLowerCase().endsWith('.cpp'));
           if (cppFile) {
             const readmeContent = await fs.readFile(res, 'utf8');
-            const match = readmeContent.match(/https?:\/\/(?:www\.)?codechef\.com\/problems\/([A-Za-z0-9_]+)/i);
-            const relativePath = path.relative(SOLUTIONS_DIR, path.join(dir, cppFile));
+            const match = readmeContent.match(/https?:\/\/(?:www\.)?codechef\.com\/(?:[A-Za-z0-9_-]+\/)?problems\/([A-Za-z0-9_]+)/i);
+            const relativePath = path.relative(root, path.join(dir, cppFile)).split(path.sep).join('/');
             
             if (match && match[1]) {
               entries.push({
@@ -87,8 +97,8 @@ async function buildLocalIndex(): Promise<CodeChefSourceEntry[]> {
                 fileName: cppFile,
                 language: 'cpp',
                 kind: 'CODECHEF' as const,
-                problemCode: match[1],
-                problemUrl: match[0],
+                problemCode: match[1].toUpperCase(),
+                problemUrl: `https://www.codechef.com/problems/${match[1].toUpperCase()}`,
                 reason: 'Resolved from local directory readme.md',
               });
             } else {
@@ -108,12 +118,12 @@ async function buildLocalIndex(): Promise<CodeChefSourceEntry[]> {
     }
   }
 
-  await walk(SOLUTIONS_DIR);
+  await walk(root);
   return entries;
 }
 
 async function persistAudit(entries: CodeChefSourceEntry[]): Promise<void> {
-  if (entries.length === 0) return;
+  if (entries.length === 0) throw new Error('No CodeChef C++ solutions with README files were found in the deployed solution directory');
   const rows = entries.map((entry) => ({
     path: entry.path,
     fileName: entry.fileName,
@@ -123,5 +133,9 @@ async function persistAudit(entries: CodeChefSourceEntry[]): Promise<void> {
     problemUrl: entry.problemUrl,
     reason: entry.reason,
   }));
-  await prisma.codeChefSourceAudit.createMany({ data: rows, skipDuplicates: true });
+  // This table is a derived file index; rebuild atomically without touching progress.
+  await prisma.$transaction([
+    prisma.codeChefSourceAudit.deleteMany(),
+    prisma.codeChefSourceAudit.createMany({ data: rows, skipDuplicates: true }),
+  ]);
 }

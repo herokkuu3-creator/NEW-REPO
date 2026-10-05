@@ -4,14 +4,14 @@ import { logger } from '../src/logger';
 
 async function main(): Promise<void> {
   await connectDatabase();
-  logger.info('Starting manual CodeChef run...');
-  await runCodeChefNow();
-  logger.info('Manual CodeChef run finished.');
-  await disconnectDatabase();
-  process.exit(0);
+  try {
+    logger.info('Starting manual CodeChef run...');
+    await runCodeChefNow('manual');
+    logger.info('Manual CodeChef run finished.');
+  } finally { await disconnectDatabase(); }
 }
 
 main().catch((err) => {
   console.error(err);
-  process.exit(1);
+  process.exitCode = 1;
 });

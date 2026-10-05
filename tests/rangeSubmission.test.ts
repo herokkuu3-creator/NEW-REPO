@@ -241,7 +241,11 @@ describe('range engine', () => {
       expect(third.position).toBe(2);
     }
     expect(rangeQueueLength()).toBe(2);
-    expect(log.filter((x) => x.startsWith('submit:'))).toEqual(['submit:slug-200']);
+    // The queued runner starts asynchronously; wait for the first submit
+    // before asserting that the remaining jobs are still blocked behind it.
+    await vi.waitFor(() => {
+      expect(log.filter((x) => x.startsWith('submit:'))).toEqual(['submit:slug-200']);
+    });
 
     release();
     await first.done;

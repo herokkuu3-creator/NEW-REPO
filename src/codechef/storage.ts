@@ -29,13 +29,7 @@ export async function patchCodeChefAccount(
 }
 
 export async function getCodeChefProgress(accountId: string): Promise<CodeChefProgress> {
-  const progress = await prisma.codeChefProgress.findUnique({
-    where: { accountId },
-  });
-  if (progress) return progress;
-  return prisma.codeChefProgress.create({
-    data: { accountId },
-  });
+  return prisma.codeChefProgress.upsert({ where: { accountId }, create: { accountId }, update: {} });
 }
 
 export async function completeCurrentProblem(
@@ -61,8 +55,7 @@ export async function completeCurrentProblem(
 }
 
 export async function claimDailyAttempt(accountId: string, today: string, key: string): Promise<boolean> {
-  try {
-    const updated = await prisma.codeChefProgress.updateMany({
+  const updated = await prisma.codeChefProgress.updateMany({
       where: {
         accountId,
         OR: [
@@ -75,10 +68,7 @@ export async function claimDailyAttempt(accountId: string, today: string, key: s
         lastAttemptKey: key,
       },
     });
-    return updated.count > 0;
-  } catch {
-    return false;
-  }
+  return updated.count > 0;
 }
 
 export async function releaseDailyAttempt(accountId: string, today: string): Promise<void> {
@@ -102,14 +92,16 @@ export async function recordAttempt(
 }
 
 export async function ensureCodeChefAccountsSeeded(): Promise<void> {
-  const envKeys = Object.keys(process.env).filter((k) => k.startsWith('CODECHEF_') || k.startsWith('CC_'));
+  const envKeys = Object.keys(process.env).filter((k) => /^(?:CODECHEF|CC)_\d+$/.test(k));
   
   for (const key of envKeys) {
     const value = process.env[key];
     if (!value) continue;
-    const parts = value.split('::');
-    if (parts.length !== 2) continue;
-    const username = parts[0]!;
+    const separator = value.indexOf('::');
+    if (separator < 1 || separator === value.length - 2) continue;
+    const username = value.slice(0, separator).trim();
+    const password = value.slice(separator + 2);
+    if (!username) continue;
     // Note: We use username as label
     const existing = await prisma.codeChefAccount.findUnique({ where: { label: username } });
     if (!existing) {
@@ -118,13 +110,18 @@ export async function ensureCodeChefAccountsSeeded(): Promise<void> {
           label: username,
           username,
           storageState: JSON.stringify({
-            username: parts[0],
-            password: parts[1],
+            username,
+            password,
             cookies: []
           }),
           status: CodeChefAccountStatus.ACTIVE,
         },
       });
+    } else {
+      const stored = JSON.parse(existing.storageState) as { password?: string };
+      if (stored.password !== password) {
+        await patchCodeChefAccount(existing.id, { storageState: JSON.stringify({ username, password, cookies: [], origins: [] }) });
+      }
     }
   }
 }

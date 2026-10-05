@@ -50,6 +50,7 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/prisma ./prisma
 COPY package.json ./
+COPY --chown=pwuser:pwuser codechef-solutions ./codechef-solutions
 
 # Firefox for the Codeforces submit path. Cloudflare bounces every POST from
 # this instance's IP unless the client passed its challenge, which only a real
