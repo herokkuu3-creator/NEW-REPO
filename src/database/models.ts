@@ -65,6 +65,21 @@ export async function latestRun(): Promise<DailyRunRecord | null> {
   return prisma.dailyRun.findFirst({ orderBy: { createdAt: 'desc' } });
 }
 
+export async function latestAcceptedRun(): Promise<DailyRunRecord | null> {
+  return prisma.dailyRun.findFirst({
+    where: { state: RunState.SUCCESS, submissionId: { not: null } },
+    orderBy: { updatedAt: 'desc' },
+  });
+}
+
+/** Latest submission that the judge actually accepted for one account. */
+export async function latestAcceptedRunForAccount(accountId: string): Promise<DailyRunRecord | null> {
+  return prisma.dailyRun.findFirst({
+    where: { accountId, state: RunState.SUCCESS, submissionId: { not: null } },
+    orderBy: { updatedAt: 'desc' },
+  });
+}
+
 // --- SystemState (key/value) ----------------------------------------------
 
 export const SystemKeys = {

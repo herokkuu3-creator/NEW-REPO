@@ -90,6 +90,11 @@ export function todayInTimezone(): string {
   return `${get('year')}-${get('month')}-${get('day')}`;
 }
 
+/** LeetCode rotates the daily challenge at 00:00 UTC (05:30 IST). */
+export function leetcodeDayKey(now: Date = new Date()): string {
+  return now.toISOString().slice(0, 10);
+}
+
 export interface RunTriggerResult {
   started: boolean;
   message: string;
@@ -121,25 +126,32 @@ function isForceReason(reason: string): boolean {
 /**
  * Returns whether an existing daily row must be skipped.
  *
- * Session renewal is intentionally stricter than a normal run: if a row for
- * today already exists, the account has already entered today's daily pipeline,
- * so renewing its cookies must never cause another submission. A brand-new
- * account, or an account whose expired session prevented today's row from being
- * created, has no row and therefore proceeds normally.
+ * Session renewal is intentionally stricter than a normal run, but a row for a
+ * different challenge must never suppress the current daily. Normal runs skip
+ * only an accepted submission ID for the exact current challenge.
  */
 export function shouldSkipExistingDailyRun(
-  existing: Pick<DailyRunRecord, 'state' | 'submissionStatus'> | null,
+  existing: (Pick<DailyRunRecord, 'state' | 'submissionStatus'> &
+    Partial<Pick<DailyRunRecord, 'submissionId' | 'problemSlug'>>) | null,
   forceRun: boolean,
   renewalTriggered = false,
+  expectedProblemSlug?: string,
 ): boolean {
   if (!existing) return false;
-  if (renewalTriggered) return true;
+  const matchesCurrentProblem = !expectedProblemSlug || existing.problemSlug === expectedProblemSlug;
+  if (renewalTriggered) return matchesCurrentProblem;
 
   const previousRunWasNotSubmitted =
     existing.state === RunState.SUCCESS &&
     /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(existing.submissionStatus ?? '');
 
-  return Boolean(!forceRun && !previousRunWasNotSubmitted && existing.state === RunState.SUCCESS);
+  return Boolean(
+    !forceRun &&
+      !previousRunWasNotSubmitted &&
+      matchesCurrentProblem &&
+      existing.state === RunState.SUCCESS &&
+      existing.submissionId,
+  );
 }
 
 /**
@@ -181,7 +193,7 @@ export async function executeDailyRun(
   if (runInProgress) {
     logger.warn({ reason }, 'run skipped — already in progress');
     return buildReport({
-      date: todayInTimezone(),
+      date: leetcodeDayKey(),
       reason,
       startedAt: isoLocal(),
       outcomes: [],
@@ -195,7 +207,7 @@ export async function executeDailyRun(
     pruneDiagnostics();
     await ensureAccountsSeeded();
 
-    const today = todayInTimezone();
+    const today = leetcodeDayKey();
     const accounts = await listEnabledAccounts();
     logger.info(
       { today, reason, accounts: accounts.length, transport: config.transport, forceRun },
@@ -336,35 +348,7 @@ async function runForAccount(
     });
     logger.info({ label, username }, 'account authenticated');
 
-    // --- 2) Per-account duplicate guard ------------------------------------
-    const existing = await findRunByDate(account.id, today);
-    if (shouldSkipExistingDailyRun(existing, forceRun, renewalTriggered)) {
-      logger.info(
-        { label, today, state: existing?.state, renewalTriggered },
-        renewalTriggered ? 'session renewal — account already has a daily row, skipping' : 'account already handled today — skipping',
-      );
-      await patchAccount(account.id, { ran: true });
-      return {
-        label,
-        username,
-        kind:
-          existing!.state === RunState.SUCCESS
-            ? 'solved'
-            : existing!.state === RunState.PENDING
-              ? 'skipped'
-              : 'failed',
-        state: existing!.state,
-        submissionStatus: existing!.submissionStatus,
-        runtime: existing!.runtime,
-        memory: existing!.memory,
-        error:
-          existing!.state === RunState.SUCCESS
-            ? null
-            : existing!.error ?? 'today already has a daily run record',
-      };
-    }
-
-    // --- 3) Locate today's daily challenge ---------------------------------
+    // --- 2) Locate the current LeetCode daily challenge --------------------
     let daily;
     try {
       daily = await fetchDailyChallenge(api);
@@ -384,6 +368,29 @@ async function runForAccount(
       throw err;
     }
 
+    // --- 3) Proof-based duplicate guard ------------------------------------
+    // A local calendar date is insufficient because LeetCode rotates the
+    // challenge at 00:00 UTC. Skip only when this exact challenge already has
+    // a stored accepted submission ID for the account.
+    const existing = await findRunByDate(account.id, today);
+    if (shouldSkipExistingDailyRun(existing, forceRun, renewalTriggered, daily.slug)) {
+      logger.info(
+        { label, today, problemSlug: daily.slug, submissionId: existing?.submissionId, renewalTriggered },
+        'current LeetCode daily already accepted — skipping submission',
+      );
+      return {
+        label,
+        username,
+        kind: existing!.state === RunState.SUCCESS ? 'solved' : existing!.state === RunState.PENDING ? 'skipped' : 'failed',
+        state: existing!.state,
+        submissionId: existing!.submissionId,
+        submissionStatus: existing!.submissionStatus,
+        runtime: existing!.runtime,
+        memory: existing!.memory,
+        error: existing!.state === RunState.SUCCESS ? null : existing!.error ?? 'today already has a daily run record',
+      };
+    }
+
     let run =
       existing ??
       (await createRun({
@@ -395,10 +402,16 @@ async function runForAccount(
         language: config.llm.language,
       }));
     run = await updateRun(run.id, {
+      state: RunState.PENDING,
       problemSlug: daily.slug,
       title: daily.title,
       difficulty: daily.difficulty,
       language: config.llm.language,
+      submissionId: null,
+      submissionStatus: null,
+      runtime: null,
+      memory: null,
+      error: null,
       attempts: { increment: 1 },
     });
 
@@ -821,7 +834,7 @@ const DAILY_RETRY_LIMIT = 10;
 
 async function triggerDailyRetry(): Promise<void> {
   if (runInProgress) return;
-  const today = todayInTimezone();
+  const today = leetcodeDayKey();
   const accounts = await listEnabledAccounts().catch(() => []);
   if (accounts.length === 0) return;
 

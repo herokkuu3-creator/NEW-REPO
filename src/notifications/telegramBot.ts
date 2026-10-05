@@ -7,6 +7,8 @@ import {
   deleteSystemState,
   getAllSystemState,
   getSystemState,
+  latestAcceptedRun,
+  latestAcceptedRunForAccount,
   latestRun,
   setSystemState,
   SystemKeys,
@@ -1300,10 +1302,12 @@ async function accountsText(): Promise<string> {
   const lines = [`👥 Accounts: ${accounts.length}`, ''];
   for (const a of accounts) {
     const who = a.username ? ` (${a.username})` : '';
-    const when = a.lastRunAt
-      ? `, last run ${humanLocal(a.lastRunAt)}`
-      : '';
-    lines.push(`▪️ ${a.label}${who}: ${a.status}${when}`);
+    const accepted = await latestAcceptedRunForAccount(a.id);
+    const acceptedText = accepted
+      ? `, last accepted ${humanLocal(accepted.updatedAt)}`
+      : ', no accepted submission recorded';
+    const checkedText = a.lastCheckedAt ? `, checked ${humanLocal(a.lastCheckedAt)}` : '';
+    lines.push(`▪️ ${a.label}${who}: ${a.status}${acceptedText}${checkedText}`);
     if (a.lastError) lines.push(`  ⚠️ error: ${a.lastError.slice(0, 150)}`);
   }
   return lines.join('\n');
@@ -1326,7 +1330,12 @@ async function codeforcesAccountsText(): Promise<string> {
 }
 
 async function statusText(): Promise<string> {
-  const [sys, last, accounts] = await Promise.all([getAllSystemState(), latestRun(), listAccounts()]);
+  const [sys, last, lastAccepted, accounts] = await Promise.all([
+    getAllSystemState(),
+    latestRun(),
+    latestAcceptedRun(),
+    listAccounts(),
+  ]);
   const active = accounts.filter((a) => a.status === AccountStatus.ACTIVE).length;
   const expired = accounts.filter((a) => a.status === AccountStatus.EXPIRED).length;
   const rejected = accounts.filter((a) => a.status === AccountStatus.REJECTED).length;
@@ -1336,14 +1345,14 @@ async function statusText(): Promise<string> {
     `👥 Accounts: ${accounts.length}${accounts.length ? ` (${active} active, ${expired} expired, ${rejected} rejected)` : ''}`,
     `🔐 Auth: ${sys['authStatus'] ?? 'unknown'}${sys['authUsername'] ? ` (${sys['authUsername']})` : ''}`,
   ];
-  if (last) {
+  if (lastAccepted) {
     lines.push(
-      `🕹️ Last run: ${last.date} - ${last.title} - ${last.state}${last.submissionStatus ? ` (${last.submissionStatus})` : ''}`,
+      `✅ Last accepted: ${lastAccepted.title}${lastAccepted.submissionStatus ? ` (${lastAccepted.submissionStatus})` : ''} - ${humanLocal(lastAccepted.updatedAt)}`,
     );
   } else {
-    lines.push('🕹️ Last run: none yet');
+    lines.push('✅ Last accepted: none recorded');
   }
-  if (sys['lastError']) lines.push(`❗ Last error: ${sys['lastError'].slice(0, 300)}`);
+  if (last && last.state !== 'SUCCESS' && last.error) lines.push(`❗ Latest run error: ${last.error.slice(0, 300)}`);
   return lines.join('\n');
 }
 
