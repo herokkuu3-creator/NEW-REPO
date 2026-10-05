@@ -76,6 +76,7 @@ export const SystemKeys = {
   lastRunSummary: 'lastRunSummary',
   lastReport: 'lastMultiRunReport', // JSON RunReport of the latest multi-account batch
   storageState: 'storageStateJson', // Playwright storageState snapshot (DB-persisted, legacy single-session)
+  codeforcesNetworkMode: 'codeforcesNetworkMode', // 'proxy' | 'tailscale'
 } as const;
 
 /**

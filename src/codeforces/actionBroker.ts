@@ -12,6 +12,8 @@ interface Job {
   result: unknown | null;
 }
 
+type NetworkMode = 'proxy' | 'tailscale';
+
 const JOB_LIFETIME_MS = 25 * 60_000;
 
 export class ActionBroker {
@@ -30,6 +32,20 @@ export class ActionBroker {
   get nextId(): string | null {
     this.expire();
     return this.job && this.job.ready && !this.job.claimed && this.job.result === null ? this.job.id : null;
+  }
+
+  get nextNetworkMode(): NetworkMode {
+    this.expire();
+    if (!this.job || !this.job.ready || this.job.claimed || this.job.result !== null) return 'proxy';
+    const payload = this.job.payload as { networkMode?: unknown };
+    return payload.networkMode === 'tailscale' ? 'tailscale' : 'proxy';
+  }
+
+  networkMode(id: string): NetworkMode | null {
+    this.expire();
+    if (!this.job || this.job.id !== id) return null;
+    const payload = this.job.payload as { networkMode?: unknown };
+    return payload.networkMode === 'tailscale' ? 'tailscale' : 'proxy';
   }
 
   async enqueue(payload: unknown, requestedId?: string): Promise<string> {

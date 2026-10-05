@@ -4,6 +4,7 @@ import { logMemory } from '../memory';
 import type { StorageStateShape } from '../browser/cookiePayload';
 import type { SourceIndexEntry } from './sourceRepo';
 import type { BrowserPostOutcome } from './submission';
+import type { CodeforcesNetworkMode } from './worker';
 
 /**
  * Client for the isolated Codeforces submitter.
@@ -81,6 +82,7 @@ export async function submitViaRemoteSubmitter(
   handle: string,
   entry: SourceIndexEntry,
   code: string,
+  networkMode: CodeforcesNetworkMode = 'proxy',
 ): Promise<PostedResult | null> {
   const url = remoteSubmitterUrl();
   const token = process.env.CODEFORCES_SUBMITTER_TOKEN?.trim() ?? '';
@@ -122,6 +124,7 @@ export async function submitViaRemoteSubmitter(
       language: entry.language,
     },
     state: { cookies: state.cookies, origins: state.origins ?? [] },
+    networkMode,
   };
 
   const submittedAt = Math.floor(Date.now() / 1000);

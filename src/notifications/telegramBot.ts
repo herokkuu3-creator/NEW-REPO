@@ -15,7 +15,7 @@ import { AccountRecord, deleteAccountById, deleteAllAccounts, listAccounts } fro
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
-import { CODEFORCES_MANUAL_REASON, isCodeforcesRunInProgress, resolveCurrentEntry, runCodeforcesNow } from '../codeforces/worker';
+import { CODEFORCES_MANUAL_REASON, isCodeforcesRunInProgress, resolveCurrentEntry, runCodeforcesNow, type CodeforcesNetworkMode } from '../codeforces/worker';
 import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts, getCodeforcesProgress, listCodeforcesAccounts } from '../codeforces/storage';
 import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../codeforces/report';
 import { loadRuntimeSourceIndex, SourceIndexEntry } from '../codeforces/sourceRepo';
@@ -110,6 +110,7 @@ const HELP_TEXT = [
   '⚡ /triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
   '🏆 /submitnextsolution - submit the next Codeforces source solution for every Codeforces account',
   '🎯 /nextsubcustomaccount - choose one Codeforces account, or all, for the next source solution',
+  '🌐 /cfnetwork - choose residential proxy or phone Tailscale for Codeforces',
   '📱 /cfmanualnext - send the next source and submit link for a phone-browser fallback',
   '📋 /cfaccounts - list Codeforces accounts, cursor and last verdict',
   '🗑️ /cf_clear_cookies - list every Codeforces account with a Remove button, plus a Remove All option',
@@ -316,6 +317,11 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cf_manual_next':
         await handleCodeforcesManualNext();
         return;
+      case '/cfnetwork':
+      case '/cf_network':
+      case '/cftransport':
+        await handleCodeforcesNetworkCommand();
+        return;
       case '/cfaccounts':
       case '/cf_accounts':
         await reply(await codeforcesAccountsText());
@@ -363,7 +369,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /submitnextsolution, /nextsubcustomaccount, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /submitnextsolution, /nextsubcustomaccount, /cfnetwork, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -583,6 +589,81 @@ const defaultCodeforcesSubmitUiDeps: CodeforcesSubmitUiDeps = {
     await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text } : {}) });
   },
 };
+
+export interface CodeforcesNetworkUiDeps {
+  getMode: () => Promise<CodeforcesNetworkMode | null>;
+  setMode: (mode: CodeforcesNetworkMode) => Promise<void>;
+  send: (text: string, buttons?: InlineButton[][]) => Promise<void>;
+  edit: (chatId: number | string, messageId: number, text: string, buttons?: InlineButton[][]) => Promise<void>;
+  answer: (callbackId: string, text?: string) => Promise<void>;
+}
+
+const defaultCodeforcesNetworkUiDeps: CodeforcesNetworkUiDeps = {
+  getMode: async () => {
+    const value = await getSystemState(SystemKeys.codeforcesNetworkMode);
+    return value === 'tailscale' || value === 'proxy' ? value : null;
+  },
+  setMode: (mode) => setSystemState(SystemKeys.codeforcesNetworkMode, mode),
+  send: defaultCodeforcesSubmitUiDeps.send,
+  edit: defaultCodeforcesSubmitUiDeps.edit,
+  answer: defaultCodeforcesSubmitUiDeps.answer,
+};
+
+export function buildCodeforcesNetworkPicker(mode: CodeforcesNetworkMode | null): { text: string; buttons: InlineButton[][] } {
+  const selected = mode ?? 'proxy';
+  return {
+    text: [
+      '🌐 Codeforces submission network',
+      '',
+      `Current route: ${selected === 'proxy' ? '🏠 Residential proxy' : '📱 Phone Tailscale'}`,
+      'Choose the route used by automatic and Telegram-triggered submissions:',
+      selected === 'tailscale'
+        ? 'Tailscale is strict: if the phone is offline, the job reports an error instead of silently using the proxy.'
+        : 'Proxy is strict: this run will not connect to Tailscale.',
+    ].join('\n'),
+    buttons: [
+      [{ text: `${selected === 'proxy' ? '✅ ' : ''}🏠 Residential proxy`, callback_data: 'cfnet:proxy' }],
+      [{ text: `${selected === 'tailscale' ? '✅ ' : ''}📱 Phone Tailscale`, callback_data: 'cfnet:tailscale' }],
+      [{ text: '✖️ Cancel', callback_data: 'cfnet:x' }],
+    ],
+  };
+}
+
+export async function handleCodeforcesNetworkCommand(
+  deps: CodeforcesNetworkUiDeps = defaultCodeforcesNetworkUiDeps,
+): Promise<void> {
+  const picker = buildCodeforcesNetworkPicker(await deps.getMode());
+  await deps.send(picker.text, picker.buttons);
+}
+
+async function handleCodeforcesNetworkButton(
+  chatId: number | string,
+  messageId: number,
+  callbackId: string,
+  data: string,
+  deps: CodeforcesNetworkUiDeps,
+): Promise<void> {
+  if (data === 'cfnet:x') {
+    await deps.answer(callbackId, 'Cancelled');
+    await deps.edit(chatId, messageId, '✖️ Network selection cancelled.');
+    return;
+  }
+  const mode = data === 'cfnet:tailscale' ? 'tailscale' : data === 'cfnet:proxy' ? 'proxy' : null;
+  if (!mode) {
+    await deps.answer(callbackId, 'This button is no longer valid');
+    await deps.edit(chatId, messageId, '🔍 That network choice is no longer valid. Send /cfnetwork again.');
+    return;
+  }
+  await deps.setMode(mode);
+  await deps.answer(callbackId, mode === 'proxy' ? 'Residential proxy selected' : 'Phone Tailscale selected');
+  await deps.edit(
+    chatId,
+    messageId,
+    mode === 'proxy'
+      ? '✅ Codeforces route set to residential proxy. Tailscale will not be used.'
+      : '✅ Codeforces route set to phone Tailscale. The job will fail clearly if the phone exit node is offline.',
+  );
+}
 
 /** One account per button, followed by the explicit all-accounts choice. */
 export function buildCodeforcesSubmitPicker(
@@ -881,6 +962,7 @@ export async function handleCallbackQuery(
   ui: RangeUiDeps = defaultRangeUiDeps,
   codeforcesUi: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
   codeforcesManualUi: CodeforcesManualUiDeps = defaultCodeforcesManualUiDeps,
+  codeforcesNetworkUi: CodeforcesNetworkUiDeps = defaultCodeforcesNetworkUiDeps,
 ): Promise<void> {
   const chatId = q.message?.chat.id;
   const messageId = q.message?.message_id;
@@ -904,6 +986,11 @@ export async function handleCallbackQuery(
 
   if (data.startsWith('cfmanual:')) {
     await handleCodeforcesManualButton(chatId, messageId, q.id, data, codeforcesManualUi);
+    return;
+  }
+
+  if (data.startsWith('cfnet:')) {
+    await handleCodeforcesNetworkButton(chatId, messageId, q.id, data, codeforcesNetworkUi);
     return;
   }
 

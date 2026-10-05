@@ -68,6 +68,7 @@ interface SubmitRequest {
   code: string;
   entry: SubmitterEntry;
   state: { cookies: unknown[]; origins?: unknown[] };
+  networkMode?: 'proxy' | 'tailscale';
 }
 
 interface SubmitResponse {
@@ -178,10 +179,12 @@ function proxyLabel(proxy: ReturnType<typeof browserProxy>): string {
   try { return new URL(proxy.server).origin; } catch { return 'configured'; }
 }
 
-async function launchFirefox(state: SubmitRequest['state'], label: string): Promise<Session> {
+async function launchFirefox(state: SubmitRequest['state'], label: string, networkMode: SubmitRequest['networkMode'] = 'proxy'): Promise<Session> {
   let browser: Browser | null = null;
-  const proxy = browserProxy(PROXY_SERVER);
-  if (PROXY_SERVER && !proxy) throw new Error('CODEFORCES_PROXY must be a http(s), socks4, or socks5 endpoint');
+  const proxy = networkMode === 'tailscale' ? undefined : browserProxy(PROXY_SERVER);
+  if (networkMode !== 'tailscale' && PROXY_SERVER && !proxy) {
+    throw new Error('CODEFORCES_PROXY must be a http(s), socks4, or socks5 endpoint');
+  }
   try {
     const active = (browser = await (BROWSER_ENGINE === 'chromium' ? chromium : firefox).launch({
       headless: HEADLESS,
@@ -468,7 +471,7 @@ export async function submit(request: SubmitRequest): Promise<SubmitResponse> {
   }
 
   releaseHeap();
-  const session = await launchFirefox(request.state, label);
+  const session = await launchFirefox(request.state, label, request.networkMode);
   log({ label, browser: BROWSER_ENGINE, usedMb: cgroupUsedMb() }, 'browser launched for isolated Codeforces submission');
 
   const flags = { turnstile: false, interactive: false };
@@ -617,10 +620,10 @@ export const server = http.createServer((req, res) => {
     return;
   }
 
-  const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result))?$/.exec(url);
+  const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result|network))?$/.exec(url);
   if (broker && req.method === 'GET' && url === '/jobs/next') {
     if (!runnerAuthorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
-    json(res, 200, { jobId: broker.nextId });
+    json(res, 200, { jobId: broker.nextId, networkMode: broker.nextId ? broker.nextNetworkMode : null });
     return;
   }
   if (broker && jobRoute) {
@@ -630,6 +633,11 @@ export const server = http.createServer((req, res) => {
     if (req.method === 'GET' && !action) {
       const status = broker.status(id);
       json(res, status ? 200 : 404, status ?? { error: 'job not found or expired' });
+      return;
+    }
+    if (req.method === 'GET' && action === 'network') {
+      const networkMode = broker.networkMode(id);
+      json(res, networkMode ? 200 : 404, networkMode ? { networkMode } : { error: 'job not found or expired' });
       return;
     }
     if (req.method === 'POST' && action === 'claim') {

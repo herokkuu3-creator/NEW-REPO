@@ -349,12 +349,13 @@ Free Render Postgres databases expire thirty days after creation (14-day grace, 
 
 ### Codeforces submitter verification and WARP
 
-#### Android mobile-data exit with proxy fallback
+#### Choose the Codeforces network from Telegram
 
 The GitHub browser can use an Android phone's mobile-data IP without exposing a
 public proxy port. Tailscale creates the private tunnel, and the phone advertises
-itself as an exit node. The workflow tries that route first and uses
-`CODEFORCES_RESIDENTIAL_PROXY` only when the phone cannot be reached.
+itself as an exit node. The route is selected from Telegram with `/cfnetwork`.
+The choice is stored in Postgres and applies to scheduled and manual
+submissions until changed.
 
 1. Install Tailscale on Android, sign in, open **Exit Node**, and enable
    **Run as exit node**. Keep Tailscale connected and exclude it from Android
@@ -367,9 +368,13 @@ itself as an exit node. The workflow tries that route first and uses
    `TAILSCALE_AUTHKEY`. It can be generated and refreshed from the phone browser.
 4. In GitHub **Settings → Secrets and variables → Actions → Variables**, create
    `TAILSCALE_EXIT_NODE` with the phone's exact Tailscale machine name.
-5. Keep the existing `CODEFORCES_RESIDENTIAL_PROXY` Actions secret. It is now
-   fallback-only and is not used while the phone exit node is reachable.
+5. Keep the existing `CODEFORCES_RESIDENTIAL_PROXY` Actions secret.
 6. Keep `CODEFORCES_RUNNER_MODE=github` on Render.
+
+Send `/cfnetwork` in Telegram and tap **Residential proxy** or **Phone
+Tailscale**. Proxy mode never joins Tailscale. Tailscale mode never silently
+falls back to the proxy; if the phone is offline, that submission reports a
+clear route-unavailable error and can be retried after the phone reconnects.
 
 The Codeforces login cookies still come from the account session stored through
 `/renew`; Tailscale supplies the phone's network/IP, not Chrome's private cookie

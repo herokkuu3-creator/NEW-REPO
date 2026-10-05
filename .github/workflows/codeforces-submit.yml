@@ -29,28 +29,34 @@ jobs:
       # resources remain available. This keeps residential-proxy data low.
       CODEFORCES_BLOCK_ASSETS: 'true'
       CODEFORCES_BROWSER: chromium
-      # Primary egress: an Android phone advertising itself as a Tailscale exit
-      # node. If it is offline, the existing residential proxy is used.
+      # The Telegram-selected route is read from the Render job before this
+      # runner joins Tailscale. Both routes remain available as explicit choices.
       TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
       TAILSCALE_EXIT_NODE: ${{ vars.TAILSCALE_EXIT_NODE }}
       FALLBACK_CODEFORCES_PROXY: ${{ secrets.CODEFORCES_RESIDENTIAL_PROXY }}
+      CODEFORCES_INPUT_JOB_ID: ${{ inputs.job_id }}
     steps:
       - name: Find waiting browser job
         id: lookup
-        if: github.event_name == 'schedule' || inputs.job_id == ''
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
           node <<'NODE'
           const fs = require('node:fs');
           const base = process.env.CODEFORCES_SUBMITTER_URL;
-          fetch(`${base}/jobs/next`, {
+          const requested = process.env.CODEFORCES_INPUT_JOB_ID;
+          const lookupUrl = requested ? `${base}/jobs/${requested}/network` : `${base}/jobs/next`;
+          fetch(lookupUrl, {
             headers: { authorization: `Bearer ${process.env.CODEFORCES_SUBMITTER_TOKEN}` },
             signal: AbortSignal.timeout(30000),
           }).then(async response => {
             if (!response.ok) throw new Error(`Render job lookup failed: HTTP ${response.status}`);
-            const { jobId } = await response.json();
+            const body = await response.json();
+            const jobId = requested || body.jobId;
             if (jobId) {
               if (!/^[a-f0-9-]{36}$/.test(jobId)) throw new Error('invalid broker job id');
               fs.appendFileSync(process.env.GITHUB_OUTPUT, `job_id=${jobId}\n`);
+              const networkMode = body.networkMode;
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `network_mode=${networkMode === 'tailscale' ? 'tailscale' : 'proxy'}\n`);
             }
           }).catch(error => { console.error(error.message); process.exitCode = 1; });
           NODE
@@ -71,34 +77,32 @@ jobs:
       # then limited to the small Codeforces browser session itself.
       - name: Connect to phone network
         id: tailscale
-        if: (inputs.job_id != '' || steps.lookup.outputs.job_id != '') && env.TAILSCALE_AUTHKEY != '' && env.TAILSCALE_EXIT_NODE != ''
+        if: (inputs.job_id != '' || steps.lookup.outputs.job_id != '') && steps.lookup.outputs.network_mode == 'tailscale' && env.TAILSCALE_AUTHKEY != '' && env.TAILSCALE_EXIT_NODE != ''
         continue-on-error: true
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-      - name: Select phone exit or residential fallback
+      - name: Select Codeforces network route
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
         env:
           TAILSCALE_STEP_OUTCOME: ${{ steps.tailscale.outcome }}
+          CODEFORCES_NETWORK_MODE: ${{ steps.lookup.outputs.network_mode }}
         run: |
-          phone_ready=false
-          if [ "$TAILSCALE_STEP_OUTCOME" = "success" ] && [ -n "$TAILSCALE_EXIT_NODE" ]; then
-            if sudo tailscale set --exit-node="$TAILSCALE_EXIT_NODE" && timeout 30 curl --fail --silent --show-error --output /dev/null https://www.cloudflare.com/cdn-cgi/trace; then
-              phone_ready=true
-            fi
-          fi
-
-          if [ "$phone_ready" = "true" ]; then
+          if [ "$CODEFORCES_NETWORK_MODE" = "tailscale" ] && [ "$TAILSCALE_STEP_OUTCOME" = "success" ] && [ -n "$TAILSCALE_EXIT_NODE" ] && sudo tailscale set --exit-node="$TAILSCALE_EXIT_NODE" && timeout 30 curl --fail --silent --show-error --output /dev/null https://www.cloudflare.com/cdn-cgi/trace; then
             echo 'CODEFORCES_PROXY=' >> "$GITHUB_ENV"
             echo 'Codeforces browser will use the Android Tailscale exit node.'
           else
             sudo tailscale set --exit-node= 2>/dev/null || true
+            if [ "$CODEFORCES_NETWORK_MODE" = "tailscale" ]; then
+              echo 'Tailscale was selected, but the phone exit node is unavailable.' >&2
+              exit 1
+            fi
             if [ -z "$FALLBACK_CODEFORCES_PROXY" ]; then
-              echo 'Phone exit node is unavailable and CODEFORCES_RESIDENTIAL_PROXY is not configured.' >&2
+              echo 'Residential proxy mode was selected but CODEFORCES_RESIDENTIAL_PROXY is not configured.' >&2
               exit 1
             fi
             printf 'CODEFORCES_PROXY=%s\n' "$FALLBACK_CODEFORCES_PROXY" >> "$GITHUB_ENV"
-            echo 'Phone exit node is unavailable; using the residential proxy fallback.'
+            echo 'Codeforces browser will use the configured residential proxy.'
           fi
       - name: Submit once and return browser result
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''

@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { CodeforcesAccount } from '@prisma/client';
 import {
   buildCodeforcesSubmitPicker,
+  buildCodeforcesNetworkPicker,
+  CodeforcesNetworkUiDeps,
   CodeforcesManualUiDeps,
   CodeforcesSubmitUiDeps,
   handleCallbackQuery,
@@ -136,5 +138,36 @@ describe('/cfmanualnext', () => {
     expect(edits[0]).toContain('https://raw.example/2A.cpp');
     expect(edits[0]).toContain('https://codeforces.com/problemset/submit/2/A');
     expect(edits[0]).toContain('Paste the source and submit');
+  });
+});
+
+describe('/cfnetwork', () => {
+  it('shows the persisted route and both choices', () => {
+    const picker = buildCodeforcesNetworkPicker('tailscale');
+    expect(picker.text).toContain('Phone Tailscale');
+    expect(picker.buttons).toContainEqual([{ text: '✅ 📱 Phone Tailscale', callback_data: 'cfnet:tailscale' }]);
+    expect(picker.buttons).toContainEqual([{ text: '🏠 Residential proxy', callback_data: 'cfnet:proxy' }]);
+  });
+
+  it('persists the selected route from the callback', async () => {
+    const setMode = vi.fn(async (_mode: 'proxy' | 'tailscale') => undefined);
+    const edits: string[] = [];
+    const networkUi: CodeforcesNetworkUiDeps = {
+      getMode: async () => 'proxy',
+      setMode,
+      send: async () => undefined,
+      edit: async (_chat, _message, text) => void edits.push(text),
+      answer: async () => undefined,
+    };
+    await handleCallbackQuery(
+      { id: 'network-1', data: 'cfnet:tailscale', message: { message_id: 7, chat: { id: '555' } } },
+      removalDeps,
+      rangeUi,
+      undefined,
+      undefined,
+      networkUi,
+    );
+    expect(setMode).toHaveBeenCalledWith('tailscale');
+    expect(edits[0]).toContain('phone Tailscale');
   });
 });

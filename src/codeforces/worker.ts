@@ -2,7 +2,7 @@ import cron from 'node-cron';
 import { CodeforcesAccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
-import { setSystemState } from '../database/models';
+import { getSystemState, setSystemState, SystemKeys } from '../database/models';
 import { todayInTimezone } from '../scheduler/dailyWorker';
 import {
   claimDailyAttempt,
@@ -63,7 +63,10 @@ export interface CodeforcesRunOptions {
   forceDailyAttempt?: boolean;
   /** When present, run only these active Codeforces account IDs. */
   accountIds?: readonly string[];
+  networkMode?: CodeforcesNetworkMode;
 }
+
+export type CodeforcesNetworkMode = 'proxy' | 'tailscale';
 
 export interface CodeforcesTriggerResult {
   started: boolean;
@@ -104,6 +107,7 @@ export async function executeCodeforcesRun(
   try {
     const source = await loadRuntimeSourceIndex();
     const requestedAccountIds = options.accountIds ? new Set(options.accountIds) : null;
+    const networkMode = options.networkMode ?? await configuredNetworkMode();
     const accounts = (await listCodeforcesAccounts(false)).filter(
       (account) => !requestedAccountIds || requestedAccountIds.has(account.id),
     );
@@ -116,7 +120,7 @@ export async function executeCodeforcesRun(
     }
 
     for (const account of accounts) {
-      const outcome = await runForAccount(account, today, source, forceDailyAttempt);
+      const outcome = await runForAccount(account, today, source, forceDailyAttempt, networkMode);
       outcomes.push(outcome);
       if (options.onAccountOutcome) {
         await Promise.resolve(options.onAccountOutcome(outcome, outcomes.length, accounts.length)).catch((err) =>
@@ -139,6 +143,7 @@ async function runForAccount(
   today: string,
   source: Awaited<ReturnType<typeof loadRuntimeSourceIndex>>,
   forceDailyAttempt = false,
+  networkMode: CodeforcesNetworkMode = 'proxy',
 ): Promise<CodeforcesAccountOutcome> {
   const label = account.label;
   const stored = parseStoredCodeforcesState(account.storageState);
@@ -244,6 +249,7 @@ async function runForAccount(
           attemptUsername,
           entry,
           submissionCode,
+          networkMode,
         );
         if (viaBrowser) {
           attempt = viaBrowser;
@@ -412,6 +418,7 @@ async function submitViaBrowser(
   handle: string | null,
   entry: SourceIndexEntry,
   code: string,
+  networkMode: CodeforcesNetworkMode = 'proxy',
 ): Promise<(HttpSubmitResult & { handle?: string }) | null> {
   const user = handle ?? label;
 
@@ -429,7 +436,7 @@ async function submitViaBrowser(
   }
 
   const posted = isRemoteSubmitterConfigured()
-    ? await submitViaRemoteSubmitter(state, label, user, entry, code)
+    ? await submitViaRemoteSubmitter(state, label, user, entry, code, networkMode)
     : await postViaLocalBrowser(state, label, entry, code);
 
   if (!posted) {
@@ -481,6 +488,11 @@ async function submitViaBrowser(
     verdict,
     handle: user,
   } as HttpSubmitResult & { handle?: string };
+}
+
+async function configuredNetworkMode(): Promise<CodeforcesNetworkMode> {
+  const value = await getSystemState(SystemKeys.codeforcesNetworkMode);
+  return value === 'tailscale' ? 'tailscale' : 'proxy';
 }
 
 /**
