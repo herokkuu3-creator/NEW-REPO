@@ -11,8 +11,20 @@ export async function loginOnCodeChefPage(page: Page, username: string, password
   try { await form.locator('input[name="pass"]').fill(password); }
   catch { throw new Error('CodeChef password field could not be filled; authentication was not attempted.'); }
   await form.locator('input[type="submit"], button[type="submit"]').first().click();
-  await page.waitForFunction(() => !document.querySelector('form input[name="pass"]')
-    || !!document.querySelector('.messages.error, .login-error, .error'), undefined, { timeout: waitMs }).catch(() => undefined);
+
+  // Wait for either a successful redirect to dashboard or an error message to appear
+  try {
+    await Promise.race([
+      page.waitForURL('**/dashboard*', { timeout: waitMs }),
+      page.waitForFunction(() => {
+        const errs = document.querySelectorAll('.messages.error, .login-error, .error');
+        for (const e of Array.from(errs)) if ((e.textContent || '').trim()) return true;
+        return false;
+      }, undefined, { timeout: waitMs })
+    ]);
+  } catch {
+    // Proceed to check for errors or verify manually
+  }
     
   const errorText = await page.evaluate(() => {
     return Array.from(document.querySelectorAll('.messages.error, .login-error, .error'))
@@ -21,6 +33,9 @@ export async function loginOnCodeChefPage(page: Page, username: string, password
   if (errorText) throw new Error(`CodeChef login failed: ${errorText}`);
 
   await page.goto('https://www.codechef.com/practice', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // Wait for React to render either a logged-in element or a login button
+  await page.waitForSelector('a[href*="/logout"], a[href*="/edit"], .logged-in-user, #user-menu, .user-avatar, a[href*="/login"]', { timeout: 15000 }).catch(() => undefined);
+  
   const loggedIn = await page.locator('a[href*="/logout"], a[href*="/edit"], .logged-in-user, #user-menu, .user-avatar').count();
   if (!loggedIn) throw new Error('CodeChef login was not verified. Check credentials or complete any required verification in your browser.');
   return page.context().storageState();
