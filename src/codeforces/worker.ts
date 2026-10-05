@@ -22,6 +22,7 @@ import type { HttpSubmitResult } from './httpSubmit';
 import { captureBefore, pollForVerdict, postSubmitForm, type BrowserPostOutcome } from './submission';
 import { isRemoteSubmitterConfigured, submitViaRemoteSubmitter } from './remoteSubmitter';
 import { shouldRetryWithOriginal, stripCppComments } from './codeSanitizer';
+import { runSubmissionAttempts, readBeforeDeadline, CODEFORCES_ATTEMPT_MS } from './attempts';
 import { launchFirefoxWithStorageStateObject } from '../browser/playwright';
 import { logMemory, memoryReading, MemoryWatch, releaseHeap } from '../memory';
 import {
@@ -65,12 +66,13 @@ export function isCodeforcesRunInProgress(): boolean {
 export interface CodeforcesRunOptions {
   onAccountOutcome?: (outcome: CodeforcesAccountOutcome, index: number, total: number) => Promise<void> | void;
   onAccountProgress?: (progress: {
-    phase: 'checking' | 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict';
+    phase: 'checking' | 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict' | 'attempt' | 'retry' | 'queued' | 'running';
     label: string;
     username?: string | null;
     index: number;
     total: number;
     networkMode?: CodeforcesNetworkMode;
+    attempt?: number;
   }) => Promise<void> | void;
   /** Manual triggers may reuse a day's single attempt after it failed. */
   forceDailyAttempt?: boolean;
@@ -134,8 +136,8 @@ export async function executeCodeforcesRun(
 
     for (const account of accounts) {
       await Promise.resolve(options.onAccountProgress?.({ phase: 'checking', label: account.label, username: account.username, index: outcomes.length + 1, total: accounts.length }));
-      const outcome = await runForAccount(account, today, source, forceDailyAttempt, networkMode, (phase, username) =>
-        options.onAccountProgress?.({ phase, label: account.label, username, index: outcomes.length + 1, total: accounts.length, networkMode }),
+      const outcome = await runForAccount(account, today, source, forceDailyAttempt, networkMode, (phase, username, attempt) =>
+        options.onAccountProgress?.({ phase, label: account.label, username, index: outcomes.length + 1, total: accounts.length, networkMode, attempt }),
       );
       outcomes.push(outcome);
       if (options.onAccountOutcome) {
@@ -160,7 +162,7 @@ async function runForAccount(
   source: Awaited<ReturnType<typeof loadRuntimeSourceIndex>>,
   forceDailyAttempt = false,
   networkMode: CodeforcesNetworkMode = 'proxy',
-  onProgress?: (phase: 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict', username: string | null) => Promise<void> | void,
+  onProgress?: (phase: 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict' | 'attempt' | 'retry' | 'queued' | 'running', username: string | null, attempt?: number) => Promise<void> | void,
 ): Promise<CodeforcesAccountOutcome> {
   const label = account.label;
   const stored = parseStoredCodeforcesState(account.storageState);
@@ -265,14 +267,16 @@ async function runForAccount(
       let attemptUsername = attempt.handle ?? username;
       if (!attempt.ok && attempt.kind === 'blocked') {
         logger.warn({ label, problem: problemLabel(entry), error: attempt.error }, 'Codeforces HTTP submission blocked; falling back to browser transport');
-        const viaBrowser = await submitViaBrowser(
+        const viaBrowser = await runSubmissionAttempts((deadline, attemptNumber) => submitViaBrowser(
           stored.state,
           label,
           attemptUsername,
           entry,
           submissionCode,
           networkMode,
-        );
+          deadline,
+          (phase) => onProgress?.(phase, attemptUsername, attemptNumber),
+        ), (phase, attemptNumber) => onProgress?.(phase, attemptUsername, attemptNumber));
         if (viaBrowser) {
           attempt = viaBrowser;
           attemptUsername = viaBrowser.handle ?? attemptUsername;
@@ -460,25 +464,28 @@ async function submitViaBrowser(
   entry: SourceIndexEntry,
   code: string,
   networkMode: CodeforcesNetworkMode = 'proxy',
-): Promise<(HttpSubmitResult & { handle?: string }) | null> {
+  deadline = Date.now() + CODEFORCES_ATTEMPT_MS,
+  onProgress?: (phase: 'queued' | 'running' | 'verdict') => Promise<void> | void,
+): Promise<HttpSubmitResult & { handle?: string; safeToRetry?: boolean }> {
   const user = handle ?? label;
 
   // All API work happens before any browser exists, local or remote.
   let before: Set<number>;
   try {
-    before = await captureBefore(user, entry);
+    before = await readBeforeDeadline(captureBefore(user, entry), deadline);
   } catch (err) {
     return {
       ok: false,
       kind: 'error',
       error: `could not snapshot Codeforces submissions before submitting: ${err instanceof Error ? err.message : String(err)}`,
       handle: user,
+      safeToRetry: true,
     };
   }
 
   const posted = isRemoteSubmitterConfigured()
-    ? await submitViaRemoteSubmitter(state, label, user, entry, code, networkMode)
-    : await postViaLocalBrowser(state, label, entry, code);
+    ? await submitViaRemoteSubmitter(state, label, user, entry, code, networkMode, { deadline, onProgress })
+    : await postViaLocalBrowser(state, label, entry, code, deadline);
 
   if (!posted) {
     return {
@@ -486,6 +493,7 @@ async function submitViaBrowser(
       kind: 'error',
       error: 'no Codeforces browser transport is available (neither an isolated submitter URL nor a launchable local Firefox)',
       handle: user,
+      safeToRetry: true,
     };
   }
 
@@ -494,7 +502,10 @@ async function submitViaBrowser(
     // Codeforces POST. Reconcile against the pre-submit snapshot before saying
     // the job failed. Never fire another POST from this path.
     if (posted.clicked || /outcome is uncertain|not JSON|call failed/i.test(posted.error ?? '')) {
-      const discovered = await pollForVerdict(user, entry, before, posted.submittedAt).catch(() => null);
+      await onProgress?.('verdict');
+      const discovered = Date.now() < deadline ? await readBeforeDeadline(
+        pollForVerdict(user, entry, before, posted.submittedAt, { windowMs: Math.min(180_000, deadline - Date.now()) }), deadline,
+      ).catch(() => null) : null;
       if (discovered) {
         const verdict = discovered.verdict ?? 'TESTING';
         return verdict === 'OK'
@@ -507,10 +518,14 @@ async function submitViaBrowser(
       kind: posted.kind === 'submission-error' ? 'rejected' : (posted.kind ?? 'error'),
       error: `${posted.error ?? 'Codeforces rejected the submission form'} (${posted.transport})`,
       handle: user,
-    } as HttpSubmitResult & { handle?: string };
+      safeToRetry: 'safeToRetry' in posted ? posted.safeToRetry === true : false,
+    } as HttpSubmitResult & { handle?: string; safeToRetry?: boolean };
   }
 
-  const submission = await pollForVerdict(user, entry, before, posted.submittedAt).catch(() => null);
+  await onProgress?.('verdict');
+  const submission = Date.now() < deadline ? await readBeforeDeadline(
+    pollForVerdict(user, entry, before, posted.submittedAt, { windowMs: Math.min(180_000, deadline - Date.now()) }), deadline,
+  ).catch(() => null) : null;
   if (!submission) {
     return {
       ok: false,
@@ -558,6 +573,7 @@ async function postViaLocalBrowser(
   label: string,
   entry: SourceIndexEntry,
   code: string,
+  deadline = Date.now() + CODEFORCES_ATTEMPT_MS,
 ): Promise<LocalPostOutcome | null> {
   releaseHeap();
   await new Promise<void>((resolve) => setTimeout(resolve, 100));
@@ -596,6 +612,7 @@ async function postViaLocalBrowser(
     };
   }
   logMemory('codeforces firefox launched');
+  const attemptTimer = setTimeout(() => { void session.close().catch(() => undefined); }, Math.max(1, deadline - Date.now()));
 
   let pressured = false;
   let posted: BrowserPostOutcome;
@@ -639,6 +656,7 @@ async function postViaLocalBrowser(
       transport: 'Firefox transport',
     };
   } finally {
+    clearTimeout(attemptTimer);
     const closing = session.close().catch(() => undefined);
     const bail = new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 15_000);

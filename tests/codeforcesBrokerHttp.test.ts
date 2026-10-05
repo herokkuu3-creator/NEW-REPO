@@ -4,7 +4,7 @@ import type { AddressInfo } from 'node:net';
 
 let server: Server;
 let origin: string;
-const headers = { authorization: 'Bearer test-broker-token', 'content-type': 'application/json' };
+const headers = { authorization: 'Bearer test-broker-token', 'content-type': 'application/json', 'x-codeforces-post-guard': '1' };
 
 beforeAll(async () => {
   vi.stubEnv('CODEFORCES_RUNNER_REPOSITORY', 'owner/repo');
@@ -27,6 +27,22 @@ afterAll(async () => {
 });
 
 describe('authenticated scheduled runner broker', () => {
+  it('guards the POST and cancels a claimed runner only before authorization', async () => {
+    const request = { requestId: 'cccccccc-cccc-4ccc-cccc-cccccccccccc', requiresPostAuthorization: true,
+      code: 'int main(){}', entry: { contestId: 1, problemIndex: 'A' }, state: { cookies: [] } };
+    await fetch(`${origin}/submit`, { method: 'POST', headers, body: JSON.stringify(request) });
+    await fetch(`${origin}/jobs/${request.requestId}/claim`, { method: 'POST', headers });
+    expect(await (await fetch(`${origin}/jobs/${request.requestId}/authorize-post`, { method: 'POST', headers })).json()).toEqual({ authorized: true });
+    expect(await (await fetch(`${origin}/jobs/${request.requestId}/cancel`, { method: 'POST', headers })).json()).toEqual({ cancelled: false });
+    await fetch(`${origin}/jobs/${request.requestId}/result`, { method: 'POST', headers, body: JSON.stringify({ ok: false, clicked: true }) });
+  });
+  it('cancels a waiting job before a runner can claim it', async () => {
+    const request = { requestId: 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb', code: 'int main(){}', entry: { contestId: 1, problemIndex: 'A' }, state: { cookies: [] } };
+    await fetch(`${origin}/submit`, { method: 'POST', headers, body: JSON.stringify(request) });
+    expect(await (await fetch(`${origin}/jobs/${request.requestId}`, { headers })).json()).toEqual({ pending: true, claimed: false });
+    expect(await (await fetch(`${origin}/jobs/${request.requestId}/cancel`, { method: 'POST', headers })).json()).toEqual({ cancelled: true });
+    expect((await fetch(`${origin}/jobs/${request.requestId}/claim`, { method: 'POST', headers })).status).toBe(404);
+  });
   it('hands one job to one runner and returns its result without launching Firefox on Render', async () => {
     const unauthorized = await fetch(`${origin}/jobs/next`);
     expect(unauthorized.status).toBe(401);

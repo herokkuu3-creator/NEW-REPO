@@ -62,6 +62,8 @@ interface SubmitterEntry {
 }
 
 interface SubmitRequest {
+  attemptDeadline?: number;
+  requiresPostAuthorization?: boolean;
   requestId?: string;
   label?: string;
   handle?: string;
@@ -453,7 +455,11 @@ function compactBodyError(body: string): string {
   return useful?.slice(0, 500) ?? 'Codeforces rejected the submission form';
 }
 
-export async function submit(request: SubmitRequest): Promise<SubmitResponse> {
+export async function submit(request: SubmitRequest, authorizePost?: () => Promise<boolean>): Promise<SubmitResponse> {
+  // Leave one minute for result delivery and browserless judge polling.
+  const deadline = Math.min(Date.now() + 7 * 60_000,
+    typeof request.attemptDeadline === 'number' ? request.attemptDeadline - 60_000 : Infinity);
+  if (Date.now() >= deadline) throw new BrowserFormError('Browser attempt expired before starting; no submission was sent.', 'blocked');
   const label = request.label ?? request.handle ?? 'account';
   const available = freeMemoryMb();
   log({ label, availableMb: available, minimumFreeMb: BROWSER_MIN_FREE_MB }, 'isolated Codeforces browser preflight');
@@ -475,12 +481,24 @@ export async function submit(request: SubmitRequest): Promise<SubmitResponse> {
   log({ label, browser: BROWSER_ENGINE, usedMb: cgroupUsedMb() }, 'browser launched for isolated Codeforces submission');
 
   const flags = { turnstile: false, interactive: false };
+  let clickStarted = false;
+  let expired = false;
+  const timer = setTimeout(() => {
+    expired = true;
+    void session.browser.close().catch(() => undefined);
+  }, Math.max(1, deadline - Date.now()));
   try {
     await openSubmitForm(session.page, request.entry);
     const ts = await fillSubmitForm(session.page, request.entry, request.code);
     flags.turnstile = ts.turnstile;
     flags.interactive = ts.interactive;
 
+    if (expired || Date.now() >= deadline) throw new BrowserFormError('Browser attempt expired before submission.', 'blocked');
+    if (request.requiresPostAuthorization && (!authorizePost || !await authorizePost())) {
+      throw new BrowserFormError('The attempt was cancelled before submission; no POST was sent.', 'blocked');
+    }
+    if (expired || Date.now() >= deadline) throw new BrowserFormError('Browser attempt expired before submission.', 'blocked');
+    clickStarted = true;
     const click = await clickSubmitForm(session.page);
     if (!click.clicked) {
       return {
@@ -556,15 +574,20 @@ export async function submit(request: SubmitRequest): Promise<SubmitResponse> {
     }
     return { ok: true, status: click.status, finalUrl, clicked: true, ...flags };
   } catch (err) {
+    if (expired) throw new BrowserFormError('Browser attempt timed out and was closed.', clickStarted ? 'submission-error' : 'blocked', flags, clickStarted);
     if (err instanceof BrowserFormError) {
       throw new BrowserFormError(err.message, err.kind, {
         turnstile: flags.turnstile || err.flags.turnstile,
         interactive: flags.interactive || err.flags.interactive,
       }, err.clicked);
     }
-    throw err;
+    throw new BrowserFormError(err instanceof Error ? err.message : String(err), 'submission-error', flags, clickStarted);
   } finally {
-    await session.close();
+    clearTimeout(timer);
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([session.close(), new Promise<void>(resolve => { closeTimer = setTimeout(resolve, 3000); })]);
+    } finally { if (closeTimer) clearTimeout(closeTimer); }
     log({ usedMb: cgroupUsedMb() }, 'isolated Codeforces browser closed');
   }
 }
@@ -620,7 +643,7 @@ export const server = http.createServer((req, res) => {
     return;
   }
 
-  const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result|network))?$/.exec(url);
+  const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result|network|cancel|authorize-post))?$/.exec(url);
   if (broker && req.method === 'GET' && url === '/jobs/next') {
     if (!runnerAuthorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
     json(res, 200, { jobId: broker.nextId, networkMode: broker.nextId ? broker.nextNetworkMode : null });
@@ -632,7 +655,7 @@ export const server = http.createServer((req, res) => {
     const action = jobRoute[2];
     if (req.method === 'GET' && !action) {
       const status = broker.status(id);
-      json(res, status ? 200 : 404, status ?? { error: 'job not found or expired' });
+      json(res, status ? 200 : 404, status?.pending ? { ...status, claimed: broker.isClaimed(id) } : status ?? { error: 'job not found or expired' });
       return;
     }
     if (req.method === 'GET' && action === 'network') {
@@ -641,8 +664,16 @@ export const server = http.createServer((req, res) => {
       return;
     }
     if (req.method === 'POST' && action === 'claim') {
-      const payload = broker.claim(id);
+      const payload = broker.claim(id, req.headers['x-codeforces-post-guard'] === '1');
       json(res, payload ? 200 : 404, payload ?? { error: 'job not found or already claimed' });
+      return;
+    }
+    if (req.method === 'POST' && action === 'cancel') {
+      json(res, 200, { cancelled: broker.cancelUnclaimed(id) });
+      return;
+    }
+    if (req.method === 'POST' && action === 'authorize-post') {
+      json(res, 200, { authorized: broker.authorizePost(id) });
       return;
     }
     if (req.method === 'POST' && action === 'result') {
@@ -722,7 +753,8 @@ export const server = http.createServer((req, res) => {
     }
     busy = true;
     const startedAt = Date.now();
-    void submit(parsed)
+    // Direct service mode has no deferred runner that can outlive this request.
+    void submit(parsed, async () => true)
       .then((result) => {
         log({ result, ms: Date.now() - startedAt }, 'isolated Codeforces browser submitter finished');
         json(res, 200, result);

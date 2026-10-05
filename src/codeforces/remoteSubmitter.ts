@@ -5,6 +5,7 @@ import type { StorageStateShape } from '../browser/cookiePayload';
 import type { SourceIndexEntry } from './sourceRepo';
 import type { BrowserPostOutcome } from './submission';
 import type { CodeforcesNetworkMode } from './worker';
+import { CODEFORCES_ATTEMPT_MS } from './attempts';
 
 /**
  * Client for the isolated Codeforces submitter.
@@ -27,12 +28,13 @@ export interface PostedResult extends BrowserPostOutcome {
   submittedAt: number;
   /** Which transport did the POST, for the log line and error text. */
   transport: string;
+  /** Confirmed that the browser never sent a submission. */
+  safeToRetry?: boolean;
 }
 
 const WAKE_TIMEOUT_MS = Number(process.env.CODEFORCES_SUBMITTER_WAKE_MS ?? 120_000);
 const WAKE_INTERVAL_MS = 3_000;
 const SUBMIT_TIMEOUT_MS = Number(process.env.CODEFORCES_SUBMITTER_TIMEOUT_MS ?? 300_000);
-const ACTION_TIMEOUT_MS = Number(process.env.CODEFORCES_ACTION_TIMEOUT_MS ?? 22 * 60_000);
 
 export function remoteSubmitterUrl(): string | null {
   const raw = process.env.CODEFORCES_SUBMITTER_URL?.trim();
@@ -44,19 +46,19 @@ export function isRemoteSubmitterConfigured(): boolean {
 }
 
 /** Waits out the submitter's cold start. Returns true once /health answers. */
-async function wakeSubmitter(url: string): Promise<boolean> {
-  const deadline = Date.now() + WAKE_TIMEOUT_MS;
+async function wakeSubmitter(url: string, attemptDeadline: number): Promise<boolean> {
+  const deadline = Math.min(attemptDeadline, Date.now() + WAKE_TIMEOUT_MS);
   let attempts = 0;
   while (Date.now() < deadline) {
     attempts += 1;
     try {
-      const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(15_000) });
+      const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(Math.max(1, Math.min(15_000, deadline - Date.now()))) });
       if (response.ok) {
         const payload = (await response.json().catch(() => ({}))) as { busy?: boolean };
         logger.info({ url, attempts, busy: payload.busy ?? false }, 'isolated Codeforces submitter is awake');
         if (payload.busy) {
           // Another submission is still running there; give it a moment.
-          await sleep(WAKE_INTERVAL_MS);
+          await sleep(Math.max(0, Math.min(WAKE_INTERVAL_MS, deadline - Date.now())));
           continue;
         }
         return true;
@@ -64,7 +66,7 @@ async function wakeSubmitter(url: string): Promise<boolean> {
     } catch {
       // Cold start / still booting — keep waiting.
     }
-    await sleep(WAKE_INTERVAL_MS);
+    await sleep(Math.max(0, Math.min(WAKE_INTERVAL_MS, deadline - Date.now())));
   }
   logger.warn({ url, attempts: attempts - 1, wakeTimeoutMs: WAKE_TIMEOUT_MS }, 'isolated Codeforces submitter did not wake');
   return false;
@@ -83,12 +85,14 @@ export async function submitViaRemoteSubmitter(
   entry: SourceIndexEntry,
   code: string,
   networkMode: CodeforcesNetworkMode = 'proxy',
+  options: { deadline?: number; onProgress?: (phase: 'queued' | 'running') => Promise<void> | void } = {},
 ): Promise<PostedResult | null> {
+  const deadline = options.deadline ?? Date.now() + CODEFORCES_ATTEMPT_MS;
   const url = remoteSubmitterUrl();
   const token = process.env.CODEFORCES_SUBMITTER_TOKEN?.trim() ?? '';
   if (!url || !token) return null;
 
-  const failed = (error: string): PostedResult => ({
+  const failed = (error: string, safeToRetry = true): PostedResult => ({
     ok: false,
     kind: 'blocked',
     error,
@@ -99,13 +103,14 @@ export async function submitViaRemoteSubmitter(
     interactive: false,
     submittedAt: Math.floor(Date.now() / 1000),
     transport: 'isolated browser',
+    safeToRetry,
   });
 
   if (entry.contestId === undefined || !entry.problemIndex) {
     return failed('source entry has no contestId/problemIndex');
   }
 
-  if (!(await wakeSubmitter(url))) {
+  if (!(await wakeSubmitter(url, deadline))) {
     return failed(
       `the isolated submitter at ${url} did not answer /health within ${Math.round(WAKE_TIMEOUT_MS / 1000)}s`,
     );
@@ -125,6 +130,8 @@ export async function submitViaRemoteSubmitter(
     },
     state: { cookies: state.cookies, origins: state.origins ?? [] },
     networkMode,
+    attemptDeadline: deadline,
+    requiresPostAuthorization: true,
   };
 
   const submittedAt = Math.floor(Date.now() / 1000);
@@ -134,17 +141,17 @@ export async function submitViaRemoteSubmitter(
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(SUBMIT_TIMEOUT_MS),
+      signal: AbortSignal.timeout(Math.max(1, Math.min(SUBMIT_TIMEOUT_MS, deadline - Date.now()))),
     });
   } catch (err) {
     // Deliberately NOT retried: the POST may have reached Codeforces.
-    const recovered = await waitForActionResult(url, token, payload.requestId);
+    const recovered = await waitForActionResult(url, token, payload.requestId, deadline, options.onProgress);
     if (recovered) return normalizeOutcome(recovered, submittedAt, 'GitHub browser');
     return {
       ...failed(
         `the isolated submitter call failed and was not retried (a retry could duplicate the submission): ${
           err instanceof Error ? err.message : String(err)
-        }`,
+        }`, false,
       ),
       submittedAt,
     };
@@ -154,19 +161,19 @@ export async function submitViaRemoteSubmitter(
     | (Partial<PostedResult> & { error?: string; kind?: string })
     | null;
   if (!body && response.status >= 500) {
-    body = await waitForActionResult(url, token, payload.requestId);
+    body = await waitForActionResult(url, token, payload.requestId, deadline, options.onProgress);
     if (body) return normalizeOutcome(body, submittedAt, 'GitHub browser');
   }
   if (response.status === 202 && typeof (body as { jobId?: unknown } | null)?.jobId === 'string') {
     const id = (body as { jobId: string }).jobId;
-    body = await waitForActionResult(url, token, id);
+    body = await waitForActionResult(url, token, id, deadline, options.onProgress);
     if (!body || 'jobId' in body) {
-      return { ...failed(`GitHub browser job ${id} did not return a result; its Codeforces outcome is uncertain`), submittedAt };
+      return { ...failed(`GitHub browser job ${id} did not return a result; its Codeforces outcome is uncertain`, false), submittedAt };
     }
   }
   if (!body) {
     return {
-      ...failed(`the isolated submitter answered HTTP ${response.status} with a body that was not JSON`),
+      ...failed(`the isolated submitter answered HTTP ${response.status} with a body that was not JSON`, false),
       submittedAt,
     };
   }
@@ -201,25 +208,43 @@ function normalizeOutcome(body: Partial<PostedResult>, submittedAt: number, tran
     interactive: body.interactive === true,
     submittedAt,
     transport,
+    safeToRetry: body.safeToRetry === true || (body.clicked === false && body.ok === false && (body.kind === 'blocked' || body.kind === 'submission-error')),
   };
 }
 
-async function waitForActionResult(url: string, token: string, id: string): Promise<Partial<PostedResult> | null> {
-  const deadline = Date.now() + ACTION_TIMEOUT_MS;
+export async function waitForActionResult(url: string, token: string, id: string, deadline: number,
+  onProgress?: (phase: 'queued' | 'running') => Promise<void> | void): Promise<Partial<PostedResult> | null> {
+  let lastProgress = -Infinity;
+  let lastPhase: 'queued' | 'running' | undefined;
   while (Date.now() < deadline) {
-    await sleep(3_000);
+    await sleep(Math.max(0, Math.min(3_000, deadline - Date.now())));
+    if (Date.now() >= deadline) break;
     try {
       const poll = await fetch(`${url}/jobs/${id}`, {
         headers: { authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(15_000),
+        signal: AbortSignal.timeout(Math.max(1, Math.min(15_000, deadline - Date.now()))),
       });
       if (poll.status === 404) return null;
       if (!poll.ok) continue;
-      const state = await poll.json() as { pending?: boolean; result?: Partial<PostedResult> };
+      const state = await poll.json() as { pending?: boolean; claimed?: boolean; result?: Partial<PostedResult> };
       if (state.pending === false && state.result) return state.result;
+      const phase = state.claimed ? 'running' : 'queued';
+      if (phase !== lastPhase || Date.now() - lastProgress >= 30_000) {
+        lastProgress = Date.now();
+        lastPhase = phase;
+        await onProgress?.(phase);
+      }
     } catch { /* Keep polling the same job. Never enqueue another submission. */ }
   }
-  return null;
+  // Cancellation is atomic with the runner's pre-click authorization. A late
+  // guarded runner cannot POST a cancelled job. Legacy claimed jobs are not cancelled.
+  const response = await fetch(`${url}/jobs/${id}/cancel`, {
+    method: 'POST', headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(3000),
+  }).catch(() => null);
+  const cancelled = response?.ok && (await response.json().catch(() => ({})) as { cancelled?: boolean }).cancelled === true;
+  return { ok: false, kind: 'blocked', clicked: !cancelled, safeToRetry: !!cancelled,
+    error: cancelled ? 'Eight-minute limit reached; browser job cancelled before submission'
+      : 'Eight-minute limit reached; the runner may have submitted. No duplicate submission was started; checking Codeforces history.' };
 }
 
 function sleep(ms: number): Promise<void> {

@@ -8,7 +8,7 @@ const pollMs = Math.max(1_000, Number(process.env.CODEFORCES_LOCAL_RUNNER_POLL_M
 
 if (!base || !token) throw new Error('CODEFORCES_SUBMITTER_URL and CODEFORCES_LOCAL_RUNNER_TOKEN are required');
 
-const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'x-codeforces-post-guard': '1' };
 
 async function sleep(ms: number): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -34,7 +34,10 @@ async function run(id: string): Promise<void> {
   const request = await claim.json() as Parameters<typeof submit>[0];
   let result: Awaited<ReturnType<typeof submit>>;
   try {
-    result = await submit(request);
+    result = await submit(request, async () => {
+      const response = await fetch(`${base}/jobs/${id}/authorize-post`, { method: 'POST', headers, signal: AbortSignal.timeout(5000) });
+      return response.ok && (await response.json() as { authorized?: boolean }).authorized === true;
+    });
   } catch (err) {
     const form = err instanceof BrowserFormError ? err : null;
     result = {

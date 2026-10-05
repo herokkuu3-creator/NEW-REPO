@@ -556,6 +556,22 @@ export async function handleTriggerSubmission(
 }
 
 /** /submitnextsolution — run the next queued Codeforces source solution once per account. */
+export function renderCodeforcesProgressLines(progress: ReadonlyMap<number, string>): string[] {
+  const rows = [...progress.entries()].sort(([a], [b]) => a - b);
+  const selected: string[] = [];
+  let size = 0;
+  // Keep the currently running/last account visible. Fit complete HTML rows,
+  // never cut through a tag/entity when respecting Telegram's message limit.
+  for (const [index, text] of rows.reverse()) {
+    const row = text.length <= 1800 ? text : `Account ${index}: result recorded; see /accounts for details.`;
+    if (size + row.length > 3400) break;
+    selected.unshift(row);
+    size += row.length + 1;
+  }
+  if (selected.length < rows.length) selected.unshift(`<i>${rows.length - selected.length} earlier account result(s) recorded · /accounts</i>`);
+  return selected;
+}
+
 export async function handleCodeforcesSubmitNext(
   runner: typeof runCodeforcesNow = runCodeforcesNow,
   inProgress: () => boolean = isCodeforcesRunInProgress,
@@ -572,20 +588,25 @@ export async function handleCodeforcesSubmitNext(
   });
   const progressLines = new Map<number, string>();
   const html = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const editProgress = async (): Promise<void> => {
-    const lines = [...progressLines.entries()].sort(([a], [b]) => a - b).map(([, line]) => line);
-    await tgApi('editMessageText', {
+  const editProgress = async (): Promise<boolean> => {
+    const lines = renderCodeforcesProgressLines(progressLines);
+    const updated = await tgApi('editMessageText', {
       chat_id: config.telegram.chatId,
       message_id: statusMessage.message_id,
       text: ['<b>🏆 CODEFORCES SUBMISSION</b>', '<code>━━━━━━━━━━━━━━━━━━━━</code>', ...lines].join('\n'),
       parse_mode: 'HTML',
       disable_web_page_preview: true,
-    }).catch((err) => logger.warn({ err: errText(err) }, 'could not update Codeforces progress message'));
+    }).then(() => true).catch((err) => {
+      if (/message is not modified/i.test(errText(err))) return true;
+      logger.warn({ err: errText(err) }, 'could not update Codeforces progress message');
+      return false;
+    });
+    return updated;
   };
   const done = (async () => {
     const report = await runner(CODEFORCES_MANUAL_REASON, {
       forceDailyAttempt: true,
-      onAccountProgress: async ({ phase, label, username, index, total, networkMode }) => {
+      onAccountProgress: async ({ phase, label, username, index, total, networkMode, attempt }) => {
         const account = html(username ?? label);
         const route = networkMode === 'tailscale' ? '📱 PHONE TAILSCALE' : '🏠 RESIDENTIAL PROXY';
         const phaseText = {
@@ -596,6 +617,10 @@ export async function handleCodeforcesSubmitNext(
           opening: `🖥️ <b>Account ${index}/${total}</b> · opening Codeforces submit page`,
           submitting: `🚀 <b>Account ${index}/${total}</b> · submitting signed form`,
           verdict: `⏳ <b>Account ${index}/${total}</b> · waiting for Codeforces verdict`,
+          attempt: `⏱️ <b>${account}</b> · attempt ${attempt ?? 1}/3 · limit: 8 minutes`,
+          retry: `🔄 <b>${account}</b> · no submission sent · retrying the same source · attempt ${attempt ?? 1}/3`,
+          queued: `🕓 <b>${account}</b> · attempt ${attempt ?? 1}/3 · waiting for GitHub Actions`,
+          running: `🖥️ <b>${account}</b> · attempt ${attempt ?? 1}/3 · cloud browser is running`,
           'session-restored': `💾 <b>${account}</b> · saved browser session restored`,
           'session-fresh': `🍪 <b>${account}</b> · starting from uploaded session cookies`,
           verification: `🔐 <b>${account}</b> · checking verification · waiting for the page to complete normally`,
@@ -610,9 +635,12 @@ export async function handleCodeforcesSubmitNext(
         );
         await editProgress();
       },
-      onAccountOutcome: (outcome, index, total) => {
-        progressLines.set(index, html(formatCodeforcesAccountMessage(outcome, index, total)));
-        return editProgress();
+      onAccountOutcome: async (outcome, index, total) => {
+        const line = html(formatCodeforcesAccountMessage({ ...outcome,
+          error: outcome.error ? outcome.error.slice(0, 450) : outcome.error,
+        }, index, total).slice(0, 1600));
+        progressLines.set(index, line);
+        if (!await editProgress()) await replyHtml(line).catch(() => undefined);
       },
     });
     if (!report) {
@@ -622,6 +650,9 @@ export async function handleCodeforcesSubmitNext(
       progressLines.set(0, '📭 No Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
       await editProgress();
     } else {
+      report.accounts.forEach((outcome, index) => progressLines.set(index + 1,
+        html(formatCodeforcesAccountMessage({ ...outcome, error: outcome.error?.slice(0, 450) }, index + 1, report.totals.accounts).slice(0, 1600))));
+      await editProgress();
       logger.info({ summary: summarizeCodeforcesReport(report) }, 'telegram /submitnextsolution finished');
     }
   })().catch(async (err) => {

@@ -10,6 +10,8 @@ interface Job {
   ready: boolean;
   claimed: boolean;
   result: unknown | null;
+  guarded: boolean;
+  postStarted: boolean;
 }
 
 type NetworkMode = 'proxy' | 'tailscale';
@@ -52,7 +54,8 @@ export class ActionBroker {
     if (requestedId && this.job?.id === requestedId) return requestedId;
     if (this.busy) throw new Error('a Codeforces submission is already running');
     const id = requestedId && /^[a-f0-9-]{36}$/.test(requestedId) ? requestedId : randomUUID();
-    this.job = { id, payload, createdAt: this.now(), ready: false, claimed: false, result: null };
+    this.job = { id, payload, createdAt: this.now(), ready: false, claimed: false, result: null,
+      guarded: (payload as { requiresPostAuthorization?: boolean } | null)?.requiresPostAuthorization === true, postStarted: false };
     try {
       await this.dispatch(id);
       if (this.job?.id === id) this.job.ready = true;
@@ -64,9 +67,10 @@ export class ActionBroker {
   }
 
   /** The browser can claim the source and session only once. */
-  claim(id: string): unknown | null {
+  claim(id: string, supportsPostGuard = false): unknown | null {
     this.expire();
-    if (!this.job || this.job.id !== id || !this.job.ready || this.job.claimed) return null;
+    if (!this.job || this.job.id !== id || !this.job.ready || this.job.claimed
+      || (this.job.guarded && !supportsPostGuard)) return null;
     this.job.claimed = true;
     const payload = this.job.payload;
     this.job.payload = null;
@@ -85,6 +89,29 @@ export class ActionBroker {
     this.expire();
     if (!this.job || this.job.id !== id) return null;
     return this.job.result === null ? { pending: true } : { pending: false, result: this.job.result };
+  }
+
+  isClaimed(id: string): boolean {
+    this.expire();
+    return this.job?.id === id && this.job.claimed;
+  }
+
+  /** Atomic with claim/authorizePost: a cancelled job cannot submit later. */
+  cancelUnclaimed(id: string): boolean {
+    this.expire();
+    if (!this.job || this.job.id !== id || this.job.result !== null
+      || (this.job.claimed && (!this.job.guarded || this.job.postStarted))) return false;
+    this.job = null;
+    return true;
+  }
+
+  /** Atomic with cancellation: a timed-out guarded runner cannot POST later. */
+  authorizePost(id: string): boolean {
+    this.expire();
+    if (!this.job || this.job.id !== id || !this.job.claimed || !this.job.guarded
+      || this.job.result !== null || this.job.postStarted) return false;
+    this.job.postStarted = true;
+    return true;
   }
 
   private expire(): void {

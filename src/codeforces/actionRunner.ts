@@ -7,13 +7,16 @@ async function main(): Promise<void> {
   const token = process.env.CODEFORCES_SUBMITTER_TOKEN;
   const id = process.env.CODEFORCES_JOB_ID;
   if (!base || !token || !id) throw new Error('runner job configuration is incomplete');
-  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'x-codeforces-post-guard': '1' };
   const claim = await fetch(`${base}/jobs/${id}/claim`, { method: 'POST', headers, signal: AbortSignal.timeout(30_000) });
   if (!claim.ok) throw new Error(`could not claim browser job (HTTP ${claim.status})`);
   const request = await claim.json() as Parameters<typeof submit>[0];
   let result: Awaited<ReturnType<typeof submit>>;
   try {
-    result = await submit(request);
+    result = await submit(request, async () => {
+      const response = await fetch(`${base}/jobs/${id}/authorize-post`, { method: 'POST', headers, signal: AbortSignal.timeout(5000) });
+      return response.ok && (await response.json() as { authorized?: boolean }).authorized === true;
+    });
   } catch (err) {
     const formError = err instanceof BrowserFormError ? err : null;
     result = {
