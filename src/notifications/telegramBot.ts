@@ -29,6 +29,7 @@ import {
   TRIGGER_SUBMISSION_REASON,
 } from '../scheduler/dailyWorker';
 import { formatAccountMessage, summarizeReport } from '../scheduler/report';
+import { claimContestRewardForAccount, ContestRewardResult } from '../leetcode/contestReward';
 import { humanLocal } from '../time';
 import {
   cancelRangeJob,
@@ -110,6 +111,7 @@ const HELP_TEXT = [
   '',
   '🚀 Submissions',
   '⚡ /triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
+  '🎁 /claimcoins - check and collect the contest-page coin offer for selected LeetCode accounts',
   '🏆 /submitnextsolution - submit the next Codeforces source solution for every Codeforces account',
   '🎯 /nextsubcustomaccount - choose one Codeforces account, or all, for the next source solution',
   '🌐 /cfnetwork - choose residential proxy or phone Tailscale for Codeforces',
@@ -332,6 +334,12 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/trigger_submission':
         await handleTriggerSubmission();
         return;
+      case '/claimcoins':
+      case '/claim_coins':
+      case '/claimoffer':
+      case '/claimreward':
+        await handleCoinClaimCommand();
+        return;
       case '/removesession':
       case '/remove_session':
         await handleRemoveSession();
@@ -371,7 +379,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /submitnextsolution, /nextsubcustomaccount, /cfnetwork, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /nextsubcustomaccount, /cfnetwork, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -892,6 +900,201 @@ async function handleCodeforcesManualButton(
 
 type InlineButton = { text: string; callback_data: string };
 
+// ---------------------------------------------------------------------------
+// LeetCode contest reward (/claimcoins) — multi-account inline picker
+// ---------------------------------------------------------------------------
+
+export interface CoinClaimUiDeps {
+  listAccounts: () => Promise<AccountRecord[]>;
+  claim: (account: AccountRecord) => Promise<ContestRewardResult>;
+  busy: () => boolean;
+  send: (text: string, buttons?: InlineButton[][]) => Promise<void>;
+  edit: (chatId: number | string, messageId: number, text: string, buttons?: InlineButton[][]) => Promise<void>;
+  answer: (callbackId: string, text?: string) => Promise<void>;
+}
+
+const coinClaimSelections = new Map<string, Set<string>>();
+let coinClaimInProgress = false;
+
+function coinHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+const defaultCoinClaimUiDeps: CoinClaimUiDeps = {
+  listAccounts: async () => (await listAccounts()).filter((account) => account.status !== AccountStatus.DISABLED),
+  claim: claimContestRewardForAccount,
+  busy: () => isRunInProgress() || Boolean(currentRangeJob()) || coinClaimInProgress,
+  send: async (text, buttons) => {
+    await tgApi('sendMessage', {
+      chat_id: config.telegram.chatId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+    });
+  },
+  edit: async (chatId, messageId, text, buttons) => {
+    await tgApi('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: buttons ?? [] },
+    });
+  },
+  answer: async (callbackId, text) => {
+    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text } : {}) });
+  },
+};
+
+export function buildCoinClaimPicker(
+  accounts: AccountRecord[],
+  selected: ReadonlySet<string>,
+): { text: string; buttons: InlineButton[][] } {
+  const allSelected = accounts.length > 0 && accounts.every((account) => selected.has(account.id));
+  const buttons = accounts.map((account) => [{
+    text: `${selected.has(account.id) ? '✅' : '▫️'} ${accountName(account)}`.slice(0, 60),
+    callback_data: `lccoin:a:${account.id}`,
+  }]);
+  buttons.push([{
+    text: `${allSelected ? '✅' : '👥'} ALL (${accounts.length})`,
+    callback_data: 'lccoin:all',
+  }]);
+  buttons.push([
+    { text: `🎁 Claim selected (${selected.size})`, callback_data: 'lccoin:run' },
+    { text: '✖️ Cancel', callback_data: 'lccoin:x' },
+  ]);
+  return {
+    text: [
+      '<b>🎁 LEETCODE CONTEST REWARD</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+      'Select one or more accounts, or choose ALL.',
+      'The check only opens the contest reward area; daily submissions are not changed.',
+    ].join('\n'),
+    buttons,
+  };
+}
+
+export async function handleCoinClaimCommand(
+  deps: CoinClaimUiDeps = defaultCoinClaimUiDeps,
+): Promise<void> {
+  if (deps.busy()) {
+    await deps.send('🚧 A LeetCode process is already running. Try /claimcoins again after it finishes.');
+    return;
+  }
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    await deps.send('📭 No active LeetCode accounts configured. Add one with /renew first.');
+    return;
+  }
+  coinClaimSelections.set(config.telegram.chatId, new Set());
+  const picker = buildCoinClaimPicker(accounts, new Set());
+  await deps.send(picker.text, picker.buttons);
+}
+
+async function handleCoinClaimButton(
+  chatId: number | string,
+  messageId: number,
+  callbackId: string,
+  data: string,
+  deps: CoinClaimUiDeps,
+): Promise<void> {
+  const key = String(chatId);
+  if (data === 'lccoin:x') {
+    coinClaimSelections.delete(key);
+    await deps.answer(callbackId, 'Cancelled');
+    await deps.edit(chatId, messageId, '✖️ Contest reward check cancelled.');
+    return;
+  }
+  if (deps.busy()) {
+    await deps.answer(callbackId, 'A LeetCode process is already running');
+    await deps.edit(chatId, messageId, '🚧 A LeetCode process is already running. Send /claimcoins again after it finishes.');
+    return;
+  }
+  const accounts = await deps.listAccounts();
+  const selection = coinClaimSelections.get(key);
+  if (!selection) {
+    await deps.answer(callbackId, 'This picker expired');
+    await deps.edit(chatId, messageId, '⌛ This account picker expired. Send /claimcoins again.');
+    return;
+  }
+
+  if (data === 'lccoin:all') {
+    const allSelected = accounts.every((account) => selection.has(account.id));
+    selection.clear();
+    if (!allSelected) accounts.forEach((account) => selection.add(account.id));
+    await deps.answer(callbackId, allSelected ? 'Cleared' : 'All accounts selected');
+    const picker = buildCoinClaimPicker(accounts, selection);
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data.startsWith('lccoin:a:')) {
+    const id = data.slice('lccoin:a:'.length);
+    if (!accounts.some((account) => account.id === id)) {
+      await deps.answer(callbackId, 'Account no longer available');
+      return;
+    }
+    if (selection.has(id)) selection.delete(id);
+    else selection.add(id);
+    await deps.answer(callbackId, selection.has(id) ? 'Selected' : 'Unselected');
+    const picker = buildCoinClaimPicker(accounts, selection);
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data !== 'lccoin:run') {
+    await deps.answer(callbackId);
+    return;
+  }
+  const selectedAccounts = accounts.filter((account) => selection.has(account.id));
+  if (selectedAccounts.length === 0) {
+    await deps.answer(callbackId, 'Select at least one account');
+    return;
+  }
+
+  coinClaimSelections.delete(key);
+  coinClaimInProgress = true;
+  await deps.answer(callbackId, 'Reward check started 🎁');
+  await deps.edit(
+    chatId,
+    messageId,
+    `<b>🎁 LEETCODE CONTEST REWARD</b>\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n🔎 Checking 0/${selectedAccounts.length} accounts…`,
+  );
+  void (async () => {
+    const lines: string[] = [];
+    try {
+      for (let i = 0; i < selectedAccounts.length; i += 1) {
+        const account = selectedAccounts[i]!;
+        await deps.edit(
+          chatId,
+          messageId,
+          [
+            '<b>🎁 LEETCODE CONTEST REWARD</b>',
+            '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+            ...lines,
+            `🔎 Checking ${i + 1}/${selectedAccounts.length} · ${coinHtml(accountName(account))}…`,
+          ].join('\n'),
+        );
+        const result = await deps.claim(account);
+        if (result.claimed) lines.push(`✅ ${coinHtml(accountName(account))} — Coins offered collected`);
+        else if (result.error) lines.push(`❌ ${coinHtml(accountName(account))} — ${coinHtml(result.error.slice(0, 180))}`);
+        else lines.push(`▫️ ${coinHtml(accountName(account))} — No coin offer available`);
+      }
+      await deps.edit(
+        chatId,
+        messageId,
+        ['<b>🎁 LEETCODE CONTEST REWARD</b>', '<code>━━━━━━━━━━━━━━━━━━━━</code>', ...lines].join('\n'),
+      );
+    } catch (err) {
+      await deps.edit(chatId, messageId, `⚠️ Reward check stopped: ${errText(err)}`).catch(() => undefined);
+    } finally {
+      coinClaimInProgress = false;
+    }
+  })();
+}
+
 /** Everything session removal touches — injectable for tests. */
 export interface RemovalDeps {
   listAccounts: () => Promise<AccountRecord[]>;
@@ -1005,6 +1208,7 @@ export async function handleCallbackQuery(
   codeforcesUi: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
   codeforcesManualUi: CodeforcesManualUiDeps = defaultCodeforcesManualUiDeps,
   codeforcesNetworkUi: CodeforcesNetworkUiDeps = defaultCodeforcesNetworkUiDeps,
+  coinClaimUi: CoinClaimUiDeps = defaultCoinClaimUiDeps,
 ): Promise<void> {
   const chatId = q.message?.chat.id;
   const messageId = q.message?.message_id;
@@ -1033,6 +1237,11 @@ export async function handleCallbackQuery(
 
   if (data.startsWith('cfnet:')) {
     await handleCodeforcesNetworkButton(chatId, messageId, q.id, data, codeforcesNetworkUi);
+    return;
+  }
+
+  if (data.startsWith('lccoin:')) {
+    await handleCoinClaimButton(chatId, messageId, q.id, data, coinClaimUi);
     return;
   }
 

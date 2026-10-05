@@ -26,6 +26,8 @@ export interface AccountOutcome {
   submissionStatus?: string | null;
   runtime?: string | null;
   memory?: string | null;
+  /** True only when the optional contest-page LeetCoin offer was collected. */
+  coinsCollected?: boolean;
   error?: string | null;
 }
 
@@ -121,7 +123,7 @@ export function formatOutcomeLine(o: AccountOutcome): string {
       const parts = [o.submissionStatus ?? 'done'];
       if (o.runtime) parts.push(o.runtime);
       if (o.memory) parts.push(o.memory);
-      return `✅ ${who} — ${parts.filter(Boolean).join(' · ')}`;
+      return `✅ ${who} — ${parts.filter(Boolean).join(' · ')}${o.coinsCollected ? ' || Coins offered collected' : ''}`;
     }
     case 'expired':
       return `⏰ ${who} — ${firstLine(o.error) ?? 'session token itself is expired — re-capture fresh cookies'}`;

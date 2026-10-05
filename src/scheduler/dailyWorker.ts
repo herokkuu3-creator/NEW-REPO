@@ -22,6 +22,7 @@ import {
 } from '../database/accounts';
 import { AccountOutcome, buildReport, RunReport, summarizeReport } from './report';
 import { BrowserSession, launchWithStorageStateObject } from '../browser/playwright';
+import { claimContestReward } from '../leetcode/contestReward';
 import { checkSession } from '../browser/sessionCheck';
 import { detectVerificationPage } from '../browser/cloudflareDetector';
 import { captureDiagnostics, pruneDiagnostics } from '../browser/diagnostics';
@@ -348,6 +349,11 @@ async function runForAccount(
     });
     logger.info({ label, username }, 'account authenticated');
 
+    // Reward collection uses its own tab and is deliberately best-effort:
+    // missing offers, page changes, and navigation failures never interrupt
+    // the daily submission pipeline.
+    const contestReward = await claimContestReward(activeSession.context, label);
+
     // --- 2) Locate the current LeetCode daily challenge --------------------
     let daily;
     try {
@@ -387,6 +393,7 @@ async function runForAccount(
         submissionStatus: existing!.submissionStatus,
         runtime: existing!.runtime,
         memory: existing!.memory,
+        coinsCollected: contestReward.claimed,
         error: existing!.state === RunState.SUCCESS ? null : existing!.error ?? 'today already has a daily run record',
       };
     }
@@ -442,7 +449,7 @@ async function runForAccount(
     run = await updateRun(run.id, { solution: solution.code });
 
     // --- 6) Apply the solution ---------------------------------------------
-    return await submitDailySolutionWithCommentFallback(
+    const outcome = await submitDailySolutionWithCommentFallback(
       solution.code,
       (code) =>
         config.transport === 'api'
@@ -451,6 +458,7 @@ async function runForAccount(
       label,
       problem.slug,
     );
+    return contestReward.claimed ? { ...outcome, coinsCollected: true } : outcome;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ label, err: msg }, 'account run failed with unexpected error');
