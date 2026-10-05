@@ -4,7 +4,12 @@ import { config } from '../config';
 import { logger } from '../logger';
 
 /** Low-level Telegram Bot API sender. Never throws — notifications are best-effort. */
-export async function sendTelegramMessage(text: string): Promise<boolean> {
+export interface TelegramMessageOptions {
+  parseMode?: 'HTML' | 'MarkdownV2';
+  disableWebPagePreview?: boolean;
+}
+
+export async function sendTelegramMessage(text: string, options: TelegramMessageOptions = {}): Promise<boolean> {
   const { botToken, chatId, enabled } = config.telegram;
   if (!enabled) {
     logger.debug('telegram not configured — skipping notification');
@@ -17,7 +22,8 @@ export async function sendTelegramMessage(text: string): Promise<boolean> {
       body: JSON.stringify({
         chat_id: chatId,
         text,
-        disable_web_page_preview: true,
+        disable_web_page_preview: options.disableWebPagePreview ?? true,
+        ...(options.parseMode ? { parse_mode: options.parseMode } : {}),
       }),
       signal: AbortSignal.timeout(15_000),
     });

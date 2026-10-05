@@ -302,10 +302,10 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         return;
       }
       case '/accounts':
-        await reply(await accountsText());
+        await replyHtml(await accountsText());
         return;
       case '/status':
-        await reply(await statusText());
+        await replyHtml(await statusText());
         return;
       case '/submitnextsolution':
       case '/submit_next_solution':
@@ -1504,20 +1504,37 @@ export async function handleRangeStatus(ui: RangeUiDeps = defaultRangeUiDeps): P
 let pendingRenewalLabel: string | undefined;
 
 async function accountsText(): Promise<string> {
-  const accounts = await listAccounts();
+  const [accounts, codeforces] = await Promise.all([listAccounts(), listCodeforcesAccounts(true)]);
+  const lines = [
+    '<b>👥 ACCOUNT CENTER</b>',
+    '<i>Live account health and submission progress</i>',
+    '',
+    `<b>🟩 LEETCODE · ${accounts.length}</b>`,
+  ];
   if (accounts.length === 0) {
-    return '📭 No accounts configured yet. Send /renew (or /renew <label>) with your cookies, or use POST /admin/accounts.';
+    lines.push('📭 No LeetCode accounts configured. Send /renew with a cookie export.');
   }
-  const lines = [`👥 Accounts: ${accounts.length}`, ''];
   for (const a of accounts) {
-    const who = a.username ? ` (${a.username})` : '';
+    const who = a.username ? ` (${escapeHtml(a.username)})` : '';
     const accepted = await latestAcceptedRunForAccount(a.id);
     const acceptedText = accepted
       ? `, last accepted ${humanLocal(accepted.updatedAt)}`
       : ', no accepted submission recorded';
     const checkedText = a.lastCheckedAt ? `, checked ${humanLocal(a.lastCheckedAt)}` : '';
-    lines.push(`▪️ ${a.label}${who}: ${a.status}${acceptedText}${checkedText}`);
-    if (a.lastError) lines.push(`  ⚠️ error: ${a.lastError.slice(0, 150)}`);
+    lines.push(`▪️ <b>${escapeHtml(a.label)}</b>${who}: <i>${escapeHtml(a.status)}</i>${escapeHtml(acceptedText)}${escapeHtml(checkedText)}`);
+    if (a.lastError) lines.push(`  ⚠️ <i>error: ${escapeHtml(a.lastError.slice(0, 150))}</i>`);
+  }
+  lines.push('', `<b>🏆 CODEFORCES · ${codeforces.length}</b>`);
+  if (codeforces.length === 0) lines.push('📭 No Codeforces accounts configured.');
+  for (const account of codeforces) {
+    const progress = await getCodeforcesProgress(account.id);
+    const who = account.username ? ` (${escapeHtml(account.username)})` : '';
+    lines.push(`▪️ <b>${escapeHtml(account.label)}</b>${who}: <i>${escapeHtml(account.status)}</i>`);
+    lines.push(`  📍 Next: <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>`);
+    if (progress.lastCompletedKey) lines.push(`  ✅ Last completed: <code>${escapeHtml(progress.lastCompletedKey)}</code>`);
+    if (progress.lastAttemptDate) lines.push(`  🗓️ Last attempt: ${escapeHtml(progress.lastAttemptDate)}${progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : ''}`);
+    if (progress.lastSubmissionId) lines.push(`  🆔 Submission: <code>${escapeHtml(progress.lastSubmissionId)}</code>`);
+    if (account.lastError) lines.push(`  ⚠️ <i>${escapeHtml(account.lastError.slice(0, 180))}</i>`);
   }
   return lines.join('\n');
 }
@@ -1525,44 +1542,62 @@ async function accountsText(): Promise<string> {
 async function codeforcesAccountsText(): Promise<string> {
   const accounts = await listCodeforcesAccounts(true);
   if (accounts.length === 0) return '📭 No Codeforces accounts configured. Send /renew with a Codeforces session JSON.';
-  const lines = [`🏆 Codeforces accounts: ${accounts.length}`, ''];
+  const lines = [`<b>🏆 CODEFORCES ACCOUNTS · ${accounts.length}</b>`, '<i>Submission queue and latest verdict</i>', ''];
   for (const account of accounts) {
     const progress = await (await import('../codeforces/storage')).getCodeforcesProgress(account.id);
-    lines.push(`▪️ ${account.label}${account.username ? ` (${account.username})` : ''}: ${account.status}`);
-    lines.push(`  📍 Next: ${progress.nextKey ?? 'first queued source'}`);
-    if (progress.lastCompletedKey) lines.push(`  ✅ Last accepted: ${progress.lastCompletedKey}`);
-    if (progress.lastAttemptDate) lines.push(`  🗓️ Last attempt: ${progress.lastAttemptDate}${progress.lastVerdict ? ` — ${progress.lastVerdict}` : ''}`);
-    if (progress.lastSubmissionId) lines.push(`  🆔 Submission: ${progress.lastSubmissionId}`);
-    if (account.lastError) lines.push(`  ⚠️ ${account.lastError.slice(0, 180)}`);
+    lines.push(`▪️ <b>${escapeHtml(account.label)}</b>${account.username ? ` (${escapeHtml(account.username)})` : ''}: <i>${escapeHtml(account.status)}</i>`);
+    lines.push(`  📍 Next: <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>`);
+    if (progress.lastCompletedKey) lines.push(`  ✅ Last accepted: <code>${escapeHtml(progress.lastCompletedKey)}</code>`);
+    if (progress.lastAttemptDate) lines.push(`  🗓️ Last attempt: ${escapeHtml(progress.lastAttemptDate)}${progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : ''}`);
+    if (progress.lastSubmissionId) lines.push(`  🆔 Submission: <code>${escapeHtml(progress.lastSubmissionId)}</code>`);
+    if (account.lastError) lines.push(`  ⚠️ <i>${escapeHtml(account.lastError.slice(0, 180))}</i>`);
   }
   return lines.join('\n');
 }
 
 async function statusText(): Promise<string> {
-  const [sys, last, lastAccepted, accounts] = await Promise.all([
+  const [sys, last, lastAccepted, accounts, codeforces] = await Promise.all([
     getAllSystemState(),
     latestRun(),
     latestAcceptedRun(),
     listAccounts(),
+    listCodeforcesAccounts(true),
   ]);
   const active = accounts.filter((a) => a.status === AccountStatus.ACTIVE).length;
   const expired = accounts.filter((a) => a.status === AccountStatus.EXPIRED).length;
   const rejected = accounts.filter((a) => a.status === AccountStatus.REJECTED).length;
   const lines = [
-    '📊 Agent status',
+    '<b>📊 AGENT STATUS</b>',
+    '<i>Platform health and latest activity</i>',
     '',
-    `👥 Accounts: ${accounts.length}${accounts.length ? ` (${active} active, ${expired} expired, ${rejected} rejected)` : ''}`,
-    `🔐 Auth: ${sys['authStatus'] ?? 'unknown'}${sys['authUsername'] ? ` (${sys['authUsername']})` : ''}`,
+    '<b>🟩 LEETCODE</b>',
+    `👥 Accounts: <b>${accounts.length}</b>${accounts.length ? ` <i>(${active} active, ${expired} expired, ${rejected} rejected)</i>` : ''}`,
+    `🔐 Auth: <i>${escapeHtml(String(sys['authStatus'] ?? 'unknown'))}</i>${sys['authUsername'] ? ` (${escapeHtml(String(sys['authUsername']))})` : ''}`,
   ];
   if (lastAccepted) {
     lines.push(
-      `✅ Last accepted: ${lastAccepted.title}${lastAccepted.submissionStatus ? ` (${lastAccepted.submissionStatus})` : ''} - ${humanLocal(lastAccepted.updatedAt)}`,
+      `✅ Last accepted: <b>${escapeHtml(lastAccepted.title)}</b>${lastAccepted.submissionStatus ? ` (<i>${escapeHtml(lastAccepted.submissionStatus)}</i>)` : ''} — ${escapeHtml(humanLocal(lastAccepted.updatedAt))}`,
     );
   } else {
-    lines.push('✅ Last accepted: none recorded');
+    lines.push('✅ Last accepted: <i>none recorded</i>');
   }
-  if (last && last.state !== 'SUCCESS' && last.error) lines.push(`❗ Latest run error: ${last.error.slice(0, 300)}`);
+  if (last && last.state !== 'SUCCESS' && last.error) lines.push(`❗ Latest run error: <i>${escapeHtml(last.error.slice(0, 300))}</i>`);
+  lines.push('', '<b>🏆 CODEFORCES</b>', `👥 Accounts: <b>${codeforces.length}</b>`);
+  if (codeforces.length === 0) {
+    lines.push('📭 No Codeforces accounts configured.');
+  } else {
+    for (const account of codeforces) {
+      const progress = await getCodeforcesProgress(account.id);
+      const who = account.username ? ` (${escapeHtml(account.username)})` : '';
+      const verdict = progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
+      lines.push(`▪️ <b>${escapeHtml(account.label)}</b>${who}: <i>${escapeHtml(account.status)}</i> · next <code>${escapeHtml(progress.nextKey ?? 'queued')}</code>${verdict}`);
+    }
+  }
   return lines.join('\n');
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function looksLikeCookiePayload(text: string): boolean {
@@ -1591,6 +1626,10 @@ async function downloadDocument(doc: TgDocument): Promise<string> {
 
 async function reply(text: string): Promise<void> {
   await sendTelegramMessage(text);
+}
+
+async function replyHtml(text: string): Promise<void> {
+  await sendTelegramMessage(text, { parseMode: 'HTML', disableWebPagePreview: true });
 }
 
 async function tgApi<T = unknown>(
