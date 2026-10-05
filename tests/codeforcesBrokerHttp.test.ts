@@ -50,27 +50,8 @@ describe('authenticated scheduled runner broker', () => {
     expect(await (await fetch(`${origin}/jobs/${jobId}`, { headers })).json()).toEqual({ pending: true, progress: 'verification' });
     expect((await fetch(`${origin}/jobs/${jobId}/progress`, { method: 'POST', headers, body: JSON.stringify({ phase: '<invalid>' }) })).status).toBe(400);
 
-    const verificationUrl = `${origin}/jobs/${jobId}/verification`;
-    const frame = { image: Buffer.from([0xff, 0xd8, 0xff, 0]).toString('base64'), width: 900, height: 600 };
-    expect((await fetch(verificationUrl, { method: 'POST', body: JSON.stringify(frame) })).status).toBe(401);
-    const published = await fetch(verificationUrl, { method: 'POST', headers, body: JSON.stringify(frame) });
-    expect(published.status).toBe(200);
-    const { token } = await published.json() as { token: string };
-    const phoneHeaders = { 'x-verification-token': token, 'content-type': 'application/json' };
-    expect((await fetch(`${origin}/verification/frame`)).status).toBe(410);
-    const phoneFrame = await fetch(`${origin}/verification/frame`, { headers: phoneHeaders });
-    expect(phoneFrame.status).toBe(200);
-    expect(phoneFrame.headers.get('cache-control')).toBe('no-store');
-    expect((await fetch(`${origin}/verification/action`, { method: 'POST', headers: phoneHeaders, body: JSON.stringify({ type: 'click', x: 10, y: 10 }) })).status).toBe(200);
-    const refreshed = await fetch(verificationUrl, { method: 'POST', headers, body: JSON.stringify(frame) });
-    expect((await refreshed.json() as { actions: unknown[] }).actions).toEqual([{ type: 'click', x: 10, y: 10 }]);
-    const ui = await fetch(`${origin}/verify`);
-    expect(ui.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
-
     const result = { ok: true, status: 302, finalUrl: 'https://codeforces.com/contest/1/my', clicked: true, turnstile: true, interactive: false };
     expect((await fetch(`${origin}/jobs/${jobId}/result`, { method: 'POST', headers, body: JSON.stringify(result) })).status).toBe(200);
     expect(await (await fetch(`${origin}/jobs/${jobId}`, { headers })).json()).toEqual({ pending: false, result });
-    expect((await fetch(`${origin}/verification/frame`, { headers: phoneHeaders })).status).toBe(410);
-    expect((await fetch(verificationUrl, { method: 'POST', headers, body: JSON.stringify(frame) })).status).toBe(409);
   });
 });

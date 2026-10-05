@@ -1,7 +1,6 @@
 /** GitHub Actions entry point. Job inputs contain only an opaque id. */
 import { BrowserFormError } from './browserForm';
 import { submit } from './submitterService';
-import { createPhoneVerification } from './phoneVerification';
 
 async function main(): Promise<void> {
   const base = process.env.CODEFORCES_SUBMITTER_URL?.replace(/\/+$/, '');
@@ -20,7 +19,7 @@ async function main(): Promise<void> {
           method: 'POST', headers, body: JSON.stringify({ phase }), signal: AbortSignal.timeout(5_000),
         });
       } catch { /* Progress delivery must not interrupt the browser. */ }
-    }, createPhoneVerification(base, id, headers));
+    });
   } catch (err) {
     const formError = err instanceof BrowserFormError ? err : null;
     result = {

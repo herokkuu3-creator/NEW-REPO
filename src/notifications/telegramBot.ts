@@ -589,7 +589,6 @@ export async function handleCodeforcesSubmitNext(
         const account = html(username ?? label);
         const route = networkMode === 'tailscale' ? '📱 PHONE TAILSCALE' : '🏠 RESIDENTIAL PROXY';
         const phaseText = {
-          'verification-required': `📱 <b>${account}</b> · waiting for you to verify · open the private browser link sent below`,
           checking: `🔎 <b>Account ${index}/${total}</b> · checking <code>${account}</code>…`,
           verified: `✅ <b>Account ${index}/${total}</b> · verified <code>${account}</code>`,
           source: `📦 <b>Account ${index}/${total}</b> · source loaded for <code>${account}</code>`,
