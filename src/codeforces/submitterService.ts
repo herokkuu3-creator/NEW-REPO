@@ -591,9 +591,11 @@ export async function submit(request: SubmitRequest, progress: (phase: string) =
       const returnedForm = await session.page.locator('form:has(textarea[name="source"])').count() > 0;
       const path = new URL(finalUrl).pathname;
       log({ status: click.status, path, returnedForm, feedback }, 'Codeforces POST returned without submission history');
-      return { ok: false, kind: 'submission-error', error: feedback
+      const verificationRequired = !!feedback && /anti.?bot|verification|turnstile|captcha/i.test(feedback);
+      if (verificationRequired) await progress('verification-blocked');
+      return { ok: false, kind: verificationRequired ? 'blocked' : 'submission-error', error: feedback
         ? `Codeforces returned the submit form: ${feedback}`
-        : `Codeforces did not redirect to submission history after the POST (HTTP ${click.status ?? '?'}, path ${path}, submit form ${returnedForm ? 'present' : 'absent'}); acceptance is uncertain and the POST was not retried.`, status: click.status, finalUrl, clicked: true, ...flags };
+        : `Codeforces did not redirect to submission history after the POST (HTTP ${click.status ?? '?'}, path ${path}, submit form ${returnedForm ? 'present' : 'absent'}); acceptance is uncertain and the POST was not retried.`, status: click.status, finalUrl, clicked: true, ...flags, ...(verificationRequired ? { turnstile: true } : {}) };
     }
     return { ok: true, status: click.status, finalUrl, clicked: true, ...flags };
   } catch (err) {

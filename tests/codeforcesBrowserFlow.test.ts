@@ -113,7 +113,7 @@ describe('Codeforces native browser submission', () => {
 
   it('stops without clicking or posting when a Turnstile widget never produces a token', async () => {
     await fixture({ disabled: true, callback: true });
-    await expect(ensureFormTurnstile(page, 25)).rejects.toMatchObject({ kind: 'blocked', clicked: false, flags: { turnstile: false } });
+    await expect(ensureFormTurnstile(page, 25)).rejects.toMatchObject({ kind: 'blocked', clicked: false, flags: { turnstile: true } });
     expect(posts).toHaveLength(0);
   });
 
@@ -125,53 +125,71 @@ describe('Codeforces native browser submission', () => {
     expect(await ensureFormTurnstile(page, 1_000)).toEqual({ turnstile: true, interactive: false });
   });
 
-  it('renders an uninitialized Turnstile widget with the real page API', async () => {
-    await fixture({ disabled: true, callback: true });
+  it('detects a widget outside the form even without a custom token field', async () => {
+    await fixture();
     await page.evaluate(() => {
-      (window as any).turnstile = {
-        render: (_widget: HTMLElement, options: { callback: (token: string) => void }) => {
-          setTimeout(() => options.callback('native-render-token'), 10);
-          return 'widget-id';
-        },
-      };
+      document.querySelector('[name=turnstileToken]')?.remove();
+      const widget = document.createElement('div');
+      widget.className = 'cf-turnstile';
+      document.body.append(widget);
     });
-    expect(await ensureFormTurnstile(page, 3_500)).toEqual({ turnstile: true, interactive: false });
-    expect(await page.locator('#solution input[type=submit]').isEnabled()).toBe(true);
+    await expect(ensureFormTurnstile(page, 50)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
     expect(posts).toHaveLength(0);
   });
 
-  it('executes a rendered widget when verification remains idle', async () => {
-    await fixture({ disabled: true, callback: true });
+  it('accepts the standard native response only when Submit becomes ready', async () => {
+    await fixture({ disabled: true });
     await page.evaluate(() => {
-      let verified: ((token: string) => void) | undefined;
-      (window as any).turnstile = {
-        render: (_widget: HTMLElement, options: { callback: (token: string) => void }) => {
-          verified = options.callback;
-          return 'widget-id';
-        },
-        execute: () => verified?.('executed-token'),
-      };
+      const field = document.querySelector('[name=turnstileToken]') as HTMLInputElement;
+      field.name = 'cf-turnstile-response';
+      setTimeout(() => {
+        field.value = 'native-standard-response';
+        (document.querySelector('#solution input[type=submit]') as HTMLInputElement).disabled = false;
+      }, 40);
     });
-    expect(await ensureFormTurnstile(page, 6_500)).toEqual({ turnstile: true, interactive: false });
-    expect(await page.locator('input[name="turnstileToken"]').inputValue()).toBe('executed-token');
+    expect(await ensureFormTurnstile(page, 1_000)).toEqual({ turnstile: true, interactive: false });
     expect(posts).toHaveLength(0);
   });
 
-  it('never turns a disabled button into a successful click', async () => {
+  it('waits for a late widget instead of mistaking missing fields for no verification', async () => {
+    await fixture();
+    await page.evaluate(() => {
+      document.querySelector('[name=turnstileToken]')?.remove();
+      setTimeout(() => {
+        const widget = document.createElement('div');
+        widget.className = 'cf-turnstile';
+        document.body.append(widget);
+      }, 30);
+    });
+    await expect(ensureFormTurnstile(page, 500)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
+    expect(posts).toHaveLength(0);
+  });
+
+  it('blocks when verification script exists but its widget has not initialized', async () => {
+    await fixture();
+    await page.evaluate(() => {
+      const script = document.createElement('script');
+      script.type = 'text/plain';
+      script.textContent = 'turnstile.render(container)';
+      document.body.append(script);
+    });
+    await expect(ensureFormTurnstile(page, 50)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
+    expect(posts).toHaveLength(0);
+  });
+
+  it('never submits with a token while the native Submit control remains disabled', async () => {
     await fixture({ token: 'verified', disabled: true });
+    await expect(ensureFormTurnstile(page, 50)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
     await expect(clickSubmitForm(page, 300)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
     expect(posts).toHaveLength(0);
   });
 
-  it('lets a solver update the native callback without submitting the search or solution form', async () => {
-    await fixture({ disabled: true, callback: true });
-    vi.stubEnv('TURNSTILE_SOLVER_URL', 'https://solver.example');
-    const solve = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ token: 'solver-token' }) });
-    vi.stubGlobal('fetch', solve);
-    expect(await ensureFormTurnstile(page, 25)).toEqual({ turnstile: true, interactive: false });
-    expect(solve).toHaveBeenCalledOnce();
+  it('never forces a hidden Submit control into sending a POST', async () => {
+    await fixture({ token: 'verified' });
+    await page.locator('#solution input[type=submit]').evaluate(element => (element as HTMLElement).style.display = 'none');
+    await expect(ensureFormTurnstile(page, 50)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
+    await expect(clickSubmitForm(page, 300)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
     expect(posts).toHaveLength(0);
-    expect(await page.locator('#solution input[type=submit]').isEnabled()).toBe(true);
   });
 
   it('submits the source once through native signing handlers and follows the redirect', async () => {

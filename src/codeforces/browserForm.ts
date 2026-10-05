@@ -56,140 +56,52 @@ export async function submissionFeedback(page: Page): Promise<string | null> {
 }
 
 export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promise<VerificationFlags> {
-  const form = page.locator('form:has(textarea[name="source"])').first();
-  const field = form.locator('input[name="turnstileToken"]');
-  if (await field.count() === 0) return { turnstile: false, interactive: false };
-
-  // Codeforces leaves an empty hidden turnstileToken input on some accounts even
-  // when the form has no Turnstile challenge. The widget itself, rather than the
-  // hidden input, tells us whether verification is required.
-  const widget = form.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
-  const noWidgetGraceMs = Math.min(1_500, timeoutMs);
+  // Put the bottom of the form in view so the site's lazy-loaded widget can initialize.
+  await page.evaluate(() => document.querySelector('form:has(textarea[name="source"])')?.scrollIntoView({ block: 'end' }));
   const deadline = Date.now() + timeoutMs;
-  const startedAt = Date.now();
-  let renderAttempt = 'not-needed';
-  let renderChecked = false;
-  let executeAttempt = 'not-needed';
-  let executeChecked = false;
-  const hasToken = async () => !!(await field.first().inputValue({ timeout: 1_000 }).catch(() => '')).trim();
-  while (Date.now() < deadline) {
-    if (await hasToken()) return { turnstile: true, interactive: false };
-    if (Date.now() - startedAt >= noWidgetGraceMs && await widget.count() === 0) {
+  const started = Date.now();
+  let seenVerification = false;
+  let last: Awaited<ReturnType<typeof verificationState>> | undefined;
+  do {
+    last = await verificationState(page);
+    seenVerification ||= last.required;
+    // A token is insufficient while the site's own callback still hides/disables Submit.
+    if (last.tokenInForm && last.submitReady) return { turnstile: true, interactive: false };
+    // Give scripts time to insert widgets, including widgets outside the form.
+    if (!seenVerification && last.submitReady && Date.now() - started >= Math.min(5_000, timeoutMs)) {
       return { turnstile: false, interactive: false };
     }
-    if (!renderChecked && Date.now() - startedAt >= 2_000) {
-      renderChecked = true;
-      // Codeforces sometimes leaves the container unrendered even though api.js
-      // loaded. Ask the real Turnstile API to render it once; never fabricate a token.
-      renderAttempt = await form.evaluate((element) => {
-        const widget = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
-        const api = (window as unknown as { turnstile?: {
-          render?: (container: HTMLElement, options: { sitekey: string; callback: (token: string) => void }) => string;
-          execute?: (container: HTMLElement) => void;
-        } }).turnstile;
-        if (!widget || !api?.render || widget.querySelector('iframe')) return 'not-needed';
-        const sitekey = widget.dataset.sitekey;
-        if (!sitekey) return 'no-sitekey';
-        try {
-          api.render(widget, {
-            sitekey,
-            callback: (token) => {
-              const callbackName = widget.getAttribute('data-callback');
-              if (callbackName) {
-                const fn = callbackName.split('.').reduce<unknown>((value, key) =>
-                  value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
-                if (typeof fn === 'function') (fn as (value: string) => void)(token);
-              }
-              const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
-              if (input && !input.value) {
-                input.value = token;
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-            },
-          });
-          return 'rendered';
-        } catch {
-          return 'render-error';
-        }
-      }).catch(() => 'page-error');
-    }
-    if (!executeChecked && Date.now() - startedAt >= 5_000) {
-      executeChecked = true;
-      executeAttempt = await form.evaluate((element) => {
-        const widget = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
-        const api = (window as unknown as { turnstile?: { execute?: (container: HTMLElement) => void } }).turnstile;
-        if (!widget || !api?.execute) return 'unavailable';
-        try {
-          api.execute(widget);
-          return 'executed';
-        } catch {
-          return 'execute-error';
-        }
-      }).catch(() => 'page-error');
-    }
-    await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
-  }
-  if (await hasToken()) return { turnstile: true, interactive: false };
-  if (await widget.count() === 0) return { turnstile: false, interactive: false };
-
-  // Retain the optional solver contract, but never submit any form from here.
-  const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
-  if (solverUrl) {
-    const widget = await page.evaluate(() => {
-      const element = document.querySelector('.cf-turnstile[data-sitekey]');
-      const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
-      const sitekey = element?.getAttribute('data-sitekey') ?? /["']?sitekey["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
-      return { sitekey, callback: element?.getAttribute('data-callback') ?? null };
-    });
-    if (widget.sitekey) {
-      try {
-        const response = await fetch(`${solverUrl.replace(/\/+$/, '')}/solve`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ siteurl: page.url(), sitekey: widget.sitekey }),
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-        if (response.ok) {
-          const data = await response.json() as { token?: unknown };
-          if (typeof data.token === 'string' && data.token.trim()) {
-            await form.evaluate((element, { token, callback }) => {
-              const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
-              if (!input) throw new Error('Turnstile input disappeared');
-              input.value = token;
-              input.dispatchEvent(new Event('input', { bubbles: true }));
-              input.dispatchEvent(new Event('change', { bubbles: true }));
-              // Named callbacks update the site's own enabled/verified state.
-              if (callback) {
-                const fn = callback.split('.').reduce<unknown>((value, key) =>
-                  value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
-                if (typeof fn === 'function') fn(token);
-              }
-            }, { token: data.token, callback: widget.callback });
-            if (await hasToken()) return { turnstile: true, interactive: false };
-          }
-        }
-      } catch {
-        // Return the same actionable verification error; never log solver tokens.
-      }
-    }
-  }
-
-  const diagnostics = await page.evaluate(() => ({
-    apiLoaded: typeof (window as unknown as { turnstile?: unknown }).turnstile !== 'undefined',
-    iframePresent: !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
-    widgetPresent: !!document.querySelector('.cf-turnstile'),
-    widgetInForm: !!document.querySelector('form:has(textarea[name="source"]) .cf-turnstile'),
-    sitekeyInForm: !!document.querySelector('form:has(textarea[name="source"]) .cf-turnstile[data-sitekey]'),
-    execution: document.querySelector('form:has(textarea[name="source"]) .cf-turnstile')?.getAttribute('data-execution') ?? null,
-    responseInputPresent: !!document.querySelector('form:has(textarea[name="source"]) input[name="cf-turnstile-response"]'),
-  }));
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(250, deadline - Date.now())));
+  } while (true);
+  if (last && !seenVerification && last.submitReady) return { turnstile: false, interactive: false };
   throw new BrowserFormError(
-    `Codeforces Turnstile did not issue a token within ${timeoutMs}ms (${JSON.stringify({ ...diagnostics, renderAttempt, executeAttempt })}). ` +
-    'No submission was sent. Complete verification in a supported browser or use an accessible submitter connection.',
+    `Codeforces verification did not complete normally within ${timeoutMs}ms. No submission was sent. ` +
+    `Widget: ${last?.widgetPresent ? 'present' : 'not detected'}; script: ${last?.scriptPresent ? 'present' : 'not detected'}; ` +
+    `response in submit form: ${last?.tokenInForm ? 'present' : 'missing'}; Submit: ${last?.submitReady ? 'ready' : 'hidden or disabled'}.`,
     'blocked',
-    { turnstile: false, interactive: diagnostics.iframePresent },
+    { turnstile: seenVerification, interactive: last?.iframePresent ?? false },
   );
+}
+
+/** Read only booleans; leave verification tokens and callbacks entirely to the site. */
+async function verificationState(page: Page) {
+  return page.evaluate(() => {
+    const form = document.querySelector('form:has(textarea[name="source"])') as HTMLFormElement | null;
+    const fields = form ? Array.from(form.elements).filter((element) =>
+      /^(turnstileToken|cf-turnstile-response)$/.test((element as HTMLInputElement).name ?? '')) : [];
+    const tokenInForm = fields.some((element) => !!(element as HTMLInputElement).value?.trim());
+    const iframePresent = !!document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+    const widgetPresent = iframePresent || !!document.querySelector('.cf-turnstile, [data-sitekey][data-callback]');
+    const scriptPresent = Array.from(document.scripts).some((script) =>
+      /challenges\.cloudflare\.com\/turnstile/i.test(script.src) ||
+      /turnstile\.(?:render|execute)\s*\(/i.test(script.textContent ?? ''));
+    const control = form?.querySelector('input[type="submit"], button[type="submit"], button:not([type])') as HTMLInputElement | HTMLButtonElement | null;
+    const submitReady = !!control && !control.disabled && control.getClientRects().length > 0 &&
+      getComputedStyle(control).visibility !== 'hidden' && getComputedStyle(control).display !== 'none';
+    return { tokenInForm, iframePresent, widgetPresent, scriptPresent, submitReady,
+      required: widgetPresent || scriptPresent || tokenInForm };
+  });
 }
 
 /** One native click, with evidence from the actual POST. Never retry an ambiguous POST. */
@@ -197,8 +109,8 @@ export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{
   const form = page.locator('form:has(textarea[name="source"])').first();
   const control = form.locator('input[type="submit"], button[type="submit"], button:not([type])').first();
   if (await control.count() === 0) return { clicked: false, status: null };
-  if (!await control.isEnabled()) {
-    throw new BrowserFormError('Codeforces submit button is disabled; verification or form initialization is incomplete. No submission was sent.', 'blocked');
+  if (!await control.isEnabled() || !await control.isVisible()) {
+    throw new BrowserFormError('Codeforces submit button is hidden or disabled; verification or form initialization is incomplete. No submission was sent.', 'blocked');
   }
 
   let posted: Request | undefined;

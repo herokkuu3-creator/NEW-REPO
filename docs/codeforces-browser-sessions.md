@@ -23,6 +23,14 @@ retried here. Existing daily retries remain bounded by the scheduler and its
 submission-history checks. Interactive verification is reported as blocked;
 tokens are never forged and challenges are not solved by external services.
 
+Verification readiness is checked across the whole page, including widgets
+outside the solution form and delayed script initialization. The form is
+scrolled into view; only the site's native response fields are read. The bot
+waits for a visible, enabled Submit control and leaves widget initialization,
+execution and token callbacks to the site's scripts. It does not force-click
+hidden controls or use externally supplied solver tokens. A bare empty legacy
+token field does not itself establish that verification is required.
+
 Runner phases are delivered to the authenticated broker and polled by the bot
 to edit `/submitnextsolution` progress. Progress delivery failures do not change
 submission results. Daily summaries continue to report account failures.
