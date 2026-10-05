@@ -18,7 +18,8 @@ import { describeIngest, ingestCookiePayload, Validator } from '../accounts/inge
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
 import { CODEFORCES_MANUAL_REASON, isCodeforcesRunInProgress, resolveCurrentEntry, runCodeforcesNow, type CodeforcesNetworkMode } from '../codeforces/worker';
-import { isCodeChefRunInProgress, runCodeChefNow } from '../codechef/worker';
+import { isCodeChefRunInProgress, runCodeChefNow, formatCodeChefAccountMessage } from '../codechef/worker';
+import { listCodeChefAccounts, getCodeChefProgress as getCodeChefAccountProgress } from '../codechef/storage';
 import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts, getCodeforcesProgress, listCodeforcesAccounts } from '../codeforces/storage';
 import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../codeforces/report';
 import { loadRuntimeSourceIndex, SourceIndexEntry } from '../codeforces/sourceRepo';
@@ -119,7 +120,10 @@ const HELP_TEXT = [
   '📱 /cfmanualnext - send the next source and submit link for a phone-browser fallback',
   '📋 /cfaccounts - list Codeforces accounts, cursor and last verdict',
   '🗑️ /cf_clear_cookies - list every Codeforces account with a Remove button, plus a Remove All option',
-  '👨‍🍳 /codechef - trigger CodeChef submissions for all configured accounts',
+  '👨‍🍳 /codechef - trigger CodeChef daily submissions for all accounts',
+  '⚡ /ccnextsubmit - force submit the next CodeChef solution (advances queue)',
+  '🔢 /ccrange <count> - batch submit next N CodeChef solutions (e.g. /ccrange 5)',
+  '📋 /ccaccounts - list CodeChef accounts, current cursor and last verdict',
   '🎯 /questionrangesubmission 200-400 - submit every question in a range (pick one account or All)',
   '📍 /rangestatus - progress of the running range job',
   '🛑 /cancelrange - stop the running range job',
@@ -310,7 +314,41 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         await replyHtml(await statusText());
         return;
       case '/codechef':
-        await handleCodeChefTrigger();
+        await handleCodeChefTrigger({ forceNext: false });
+        return;
+      case '/ccnextsubmit':
+      case '/cc_next_submit':
+      case '/ccnext':
+      case '/cc_next':
+      case '/ccsubmit':
+      case '/cc_submit':
+        await handleCodeChefTrigger({ forceNext: true });
+        return;
+      case '/ccrange':
+      case '/cc_range':
+      case '/ccbatch':
+      case '/cc_batch': {
+        const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
+        const parsedCount = Number.parseInt(arg, 10);
+        if (!Number.isFinite(parsedCount) || parsedCount <= 0) {
+          await replyHtml(
+            [
+              '<b>🔢 CodeChef Batch Submission</b>',
+              '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+              'Please specify how many questions to submit:',
+              '👉 <code>/ccrange 5</code> (submit next 5 questions)',
+              '👉 <code>/ccrange 10</code> (submit next 10 questions)',
+            ].join('\n'),
+          );
+          return;
+        }
+        const count = Math.min(50, Math.max(1, parsedCount));
+        await handleCodeChefTrigger({ forceNext: true, count });
+        return;
+      }
+      case '/ccaccounts':
+      case '/cc_accounts':
+        await replyHtml(await codechefAccountsText());
         return;
       case '/submitnextsolution':
       case '/submit_next_solution':
@@ -511,18 +549,130 @@ function scheduleBatchRun(): void {
  * The run is started in the background so the bot keeps answering other
  * commands (/status etc.) while the submissions are in progress.
  */
+export function renderCodeChefProgressLines(progress: ReadonlyMap<number, string>): string[] {
+  const rows = [...progress.entries()].sort(([a], [b]) => a - b);
+  const selected: string[] = [];
+  let size = 0;
+  for (const [, text] of rows.reverse()) {
+    const row = text.length <= 1800 ? text : `Result recorded; see /accounts for details.`;
+    if (size + row.length > 3400) break;
+    selected.unshift(row);
+    size += row.length + 1;
+  }
+  return selected;
+}
+
 export async function handleCodeChefTrigger(
-  runner: typeof runCodeChefNow = runCodeChefNow,
-  isBusy: () => boolean = isCodeChefRunInProgress,
-  send: (text: string) => Promise<void> = reply,
+  runnerOrOptions?: typeof runCodeChefNow | { forceNext?: boolean; count?: number },
+  isBusyOrRunner?: (() => boolean) | typeof runCodeChefNow,
+  sendOrIsBusy?: ((text: string) => Promise<void>) | (() => boolean),
 ): Promise<{ done: Promise<void> } | null> {
-  if (isBusy()) { await send('A CodeChef run is already active. Please wait for its result.'); return null; }
-  await send('👨‍🍳 CodeChef: checking configured accounts and submitting the next pending source.');
-  const done = runner('manual').then(async report => {
-    if (!report) await send('Another CodeChef run started; this command did not create a second run.');
-  }).catch(async err => {
-    await send(`CodeChef could not start: ${err instanceof Error ? err.message : String(err)}`);
+  let options: { forceNext?: boolean; count?: number } = {};
+  let runner: typeof runCodeChefNow = runCodeChefNow;
+  let isBusy: () => boolean = isCodeChefRunInProgress;
+  let send: ((text: string) => Promise<void>) | undefined;
+
+  if (typeof runnerOrOptions === 'function') {
+    runner = runnerOrOptions;
+    if (typeof isBusyOrRunner === 'function') isBusy = isBusyOrRunner as () => boolean;
+    if (typeof sendOrIsBusy === 'function') send = sendOrIsBusy as (text: string) => Promise<void>;
+  } else if (typeof runnerOrOptions === 'object' && runnerOrOptions !== null) {
+    options = runnerOrOptions;
+    if (typeof isBusyOrRunner === 'function') runner = isBusyOrRunner as typeof runCodeChefNow;
+    if (typeof sendOrIsBusy === 'function') isBusy = sendOrIsBusy as () => boolean;
+  }
+
+  if (isBusy()) {
+    if (send) await send('A CodeChef run is already active. Please wait for its result.');
+    else await reply('🚧 A CodeChef run is already in progress — wait for its report, then try again.');
+    return null;
+  }
+
+  if (send) {
+    await send('👨‍🍳 CodeChef: checking configured accounts and submitting the next pending source.');
+    const done = runner('manual').then(async (report) => {
+      if (!report) await send!('Another CodeChef run started; this command did not create a second run.');
+    }).catch(async (err) => {
+      await send!(`CodeChef could not start: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return { done };
+  }
+
+  const title = options.count && options.count > 1
+    ? `<b>👨‍🍳 CODECHEF BATCH (${options.count} Questions)</b>`
+    : options.forceNext
+      ? `<b>👨‍🍳 CODECHEF NEXT SUBMISSION</b>`
+      : `<b>👨‍🍳 CODECHEF SUBMISSION</b>`;
+
+  const statusMessage = await tgApi<{ message_id: number }>('sendMessage', {
+    chat_id: config.telegram.chatId,
+    text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n🔎 Initializing CodeChef…`,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
   });
+
+  const progressLines = new Map<number, string>();
+  const html = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const editProgress = async (): Promise<boolean> => {
+    const lines = renderCodeChefProgressLines(progressLines);
+    const updated = await tgApi('editMessageText', {
+      chat_id: config.telegram.chatId,
+      message_id: statusMessage.message_id,
+      text: [title, '<code>━━━━━━━━━━━━━━━━━━━━</code>', ...lines].join('\n'),
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    }).then(() => true).catch((err) => {
+      if (/message is not modified/i.test(errText(err))) return true;
+      logger.warn({ err: errText(err) }, 'could not update CodeChef progress message');
+      return false;
+    });
+    return updated;
+  };
+
+  const done = (async () => {
+    const report = await runner('manual', {
+      forceDailyAttempt: options.forceNext ?? false,
+      batchCount: options.count ?? 1,
+      onProgress: async (event) => {
+        const acc = html(event.username ?? event.label);
+        const prob = event.problemCode ? ` · <code>${html(event.problemCode)}</code>` : '';
+        const phaseText: Record<string, string> = {
+          checking: `🔎 <b>Account ${event.index}/${event.total}</b> · checking <code>${acc}</code>…`,
+          'logging-in': `🔑 <b>Account ${event.index}/${event.total}</b> · logging in to CodeChef…`,
+          'session-ready': `🍪 <b>Account ${event.index}/${event.total}</b> · session verified for <code>${acc}</code>`,
+          'loading-source': `📦 <b>Account ${event.index}/${event.total}</b> · source loaded${prob}`,
+          'opening-submit': `🖥️ <b>Account ${event.index}/${event.total}</b> · opening submit page${prob}`,
+          submitting: `🚀 <b>Account ${event.index}/${event.total}</b> · submitting signed form${prob}`,
+          judging: `⏳ <b>Account ${event.index}/${event.total}</b> · waiting for CodeChef verdict${prob}`,
+          completed: `✅ <b>Account ${event.index}/${event.total}</b> · ${acc}${prob} — <b>${html(event.verdict ?? 'Accepted')}</b>${event.submissionId ? ` · #${html(event.submissionId)}` : ''}`,
+          failed: `❌ <b>Account ${event.index}/${event.total}</b> · ${acc}${prob} — <i>${html(event.error ?? 'Failed')}</i>`,
+          skipped: `⏭️ <b>Account ${event.index}/${event.total}</b> · ${acc}${prob} — <i>${html(event.error ?? 'Skipped')}</i>`,
+        };
+        progressLines.set(event.index, phaseText[event.phase] ?? `⚙️ ${event.phase}${prob}`);
+        await editProgress();
+      },
+      onAccountOutcome: async (outcome, index, total) => {
+        const line = formatCodeChefAccountMessage(outcome, index, total);
+        progressLines.set(index, line);
+        await editProgress();
+      },
+    });
+
+    if (!report) {
+      progressLines.set(0, '⏳ Not started: another run began concurrently.');
+      await editProgress();
+    } else if (report.outcomes.length === 0) {
+      progressLines.set(0, '📭 No active CodeChef accounts configured. Add CODECHEF_1 in Render.');
+      await editProgress();
+    } else {
+      logger.info({ summary: report.outcomes.length }, 'telegram /codechef run finished');
+    }
+  })().catch(async (err) => {
+    logger.warn({ err: errText(err) }, 'CodeChef telegram run failed');
+    progressLines.set(999, `⚠️ Error: ${html(errText(err))}`);
+    await editProgress().catch(() => undefined);
+  });
+
   return { done };
 }
 
@@ -1562,7 +1712,11 @@ export async function handleRangeStatus(ui: RangeUiDeps = defaultRangeUiDeps): P
 let pendingRenewalLabel: string | undefined;
 
 async function accountsText(): Promise<string> {
-  const [accounts, codeforces] = await Promise.all([listAccounts(), listCodeforcesAccounts(true)]);
+  const [accounts, codeforces, codechefs] = await Promise.all([
+    listAccounts(),
+    listCodeforcesAccounts(true),
+    listCodeChefAccounts(true),
+  ]);
   const lines = [
     '<b>✦ ACCOUNT HUB</b>  <i>live snapshot</i>',
     '<code>━━━━━━━━━━━━━━━━━━━━</code>',
@@ -1590,6 +1744,36 @@ async function accountsText(): Promise<string> {
     lines.push(`   └ next <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>${progress.lastSubmissionId ? ` · #<code>${escapeHtml(progress.lastSubmissionId)}</code>` : ''}`);
     if (account.lastError) lines.push(`   └ ⚠️ <i>${escapeHtml(account.lastError.slice(0, 140))}</i>`);
   }
+  lines.push('', '<code>━━━━━━━━━━━━━━━━━━━━</code>', '', `<b>👨‍🍳 CODECHEF</b>  <code>${codechefs.length} connected</code>`);
+  if (codechefs.length === 0) lines.push('📭 No CodeChef accounts configured. Add CODECHEF_1 in Render.');
+  for (const account of codechefs) {
+    const progress = await getCodeChefAccountProgress(account.id);
+    const who = account.username ? ` (${escapeHtml(account.username)})` : '';
+    const verdict = progress.lastVerdict ? ` · <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
+    lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
+    lines.push(`   └ next <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>${progress.lastSubmissionId ? ` · #<code>${escapeHtml(progress.lastSubmissionId)}</code>` : ''}`);
+    if (account.lastError) lines.push(`   └ ⚠️ <i>${escapeHtml(account.lastError.slice(0, 140))}</i>`);
+  }
+  return lines.join('\n');
+}
+
+async function codechefAccountsText(): Promise<string> {
+  const accounts = await listCodeChefAccounts(true);
+  if (accounts.length === 0) return '📭 No CodeChef accounts configured. Add CODECHEF_1=username::password in Render.';
+  const lines = [
+    `<b>👨‍🍳 CODECHEF</b>  <code>${accounts.length} connected</code>`,
+    '<i>queue · cursor · last verdict</i>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    '',
+  ];
+  for (const account of accounts) {
+    const progress = await getCodeChefAccountProgress(account.id);
+    const who = account.username ? ` (${escapeHtml(account.username)})` : '';
+    const verdict = progress.lastVerdict ? ` · <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
+    lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
+    lines.push(`   └ next <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>${progress.lastSubmissionId ? ` · #<code>${escapeHtml(progress.lastSubmissionId)}</code>` : ''}`);
+    if (account.lastError) lines.push(`   └ ⚠️ <i>${escapeHtml(account.lastError.slice(0, 140))}</i>`);
+  }
   return lines.join('\n');
 }
 
@@ -1607,12 +1791,13 @@ async function codeforcesAccountsText(): Promise<string> {
 }
 
 async function statusText(): Promise<string> {
-  const [sys, last, lastAccepted, accounts, codeforces] = await Promise.all([
+  const [sys, last, lastAccepted, accounts, codeforces, codechefs] = await Promise.all([
     getAllSystemState(),
     latestRun(),
     latestAcceptedRun(),
     listAccounts(),
     listCodeforcesAccounts(true),
+    listCodeChefAccounts(true),
   ]);
   const active = accounts.filter((a) => a.status === AccountStatus.ACTIVE).length;
   const expired = accounts.filter((a) => a.status === AccountStatus.EXPIRED).length;
@@ -1639,6 +1824,18 @@ async function statusText(): Promise<string> {
   } else {
     for (const account of codeforces) {
       const progress = await getCodeforcesProgress(account.id);
+      const who = account.username ? ` (${escapeHtml(account.username)})` : '';
+      const verdict = progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
+      lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
+      lines.push(`   └ next <code>${escapeHtml(progress.nextKey ?? 'queued')}</code>`);
+    }
+  }
+  lines.push('', '<code>━━━━━━━━━━━━━━━━━━━━</code>', '', `<b>👨‍🍳 CODECHEF</b>  <code>${codechefs.length} total</code>`);
+  if (codechefs.length === 0) {
+    lines.push('📭 No CodeChef accounts configured.');
+  } else {
+    for (const account of codechefs) {
+      const progress = await getCodeChefAccountProgress(account.id);
       const who = account.username ? ` (${escapeHtml(account.username)})` : '';
       const verdict = progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
       lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);

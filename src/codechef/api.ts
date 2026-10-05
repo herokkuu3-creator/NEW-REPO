@@ -29,10 +29,10 @@ export function normalizeCodeChefVerdict(value: unknown): string | null {
 function responseDetails(value: unknown, depth = 0): { id?: string; verdict?: string } {
   if (!value || typeof value !== 'object' || depth > 5) return {};
   const object = value as Record<string, unknown>;
-  const idValue = object.submission_id ?? object.submissionId ?? object.solution_id;
+  const idValue = object.submission_id ?? object.submissionId ?? object.solution_id ?? object.solutionId ?? object.upid ?? object.up_id ?? object.id ?? object.sub_id;
   const id = (typeof idValue === 'number' || typeof idValue === 'string') && /^[1-9]\d{0,18}$/.test(String(idValue)) ? String(idValue) : undefined;
-  const verdict = normalizeCodeChefVerdict(object.verdict ?? object.result ?? object.status) ?? undefined;
-  const child = responseDetails(object.data ?? object.result, depth + 1);
+  const verdict = normalizeCodeChefVerdict(object.verdict ?? object.result ?? object.status ?? object.STATUS ?? object.verdict_code) ?? undefined;
+  const child = responseDetails(object.data ?? object.result ?? object.details, depth + 1);
   return { id: id ?? child.id, verdict: verdict ?? child.verdict };
 }
 
@@ -70,26 +70,40 @@ export async function fillCodeChefSource(page: Page, code: string): Promise<void
   }, code);
 }
 
-export async function submitOnCodeChefPage(page: Page, problemUrl: string, code: string, language = 'cpp', timeoutMs = 90000): Promise<CodeChefSubmitResult> {
+export async function submitOnCodeChefPage(
+  page: Page,
+  problemUrl: string,
+  code: string,
+  language = 'cpp',
+  timeoutMsOrHandle: number | string = 90000,
+  userHandle?: string,
+): Promise<CodeChefSubmitResult> {
+  const timeoutMs = typeof timeoutMsOrHandle === 'number' ? timeoutMsOrHandle : 90000;
+  const targetHandle = typeof timeoutMsOrHandle === 'string' ? timeoutMsOrHandle : userHandle;
   let clicked = false;
   let submissionId: string | undefined;
   let verdict: string | undefined;
   const observe = async (response: Response) => {
     if (!clicked) return;
     const url = new URL(response.url());
-    if (!/(^|\.)codechef\.com$/.test(url.hostname) || !/submit|submission|result|status/i.test(url.pathname)) return;
-    const details = responseDetails(await response.json().catch(() => null));
-    // Anchor the judge result to the ID returned by this submission's POST.
-    if (response.request().method() === 'POST' && details.id) submissionId ??= details.id;
-    if (submissionId && details.verdict && (details.id === submissionId || url.href.includes(submissionId))) verdict = details.verdict;
+    if (!/(^|\.)codechef\.com$/.test(url.hostname)) return;
+    try {
+      const details = responseDetails(await response.json().catch(() => null));
+      // Anchor the judge result to the ID returned by this submission's POST.
+      if (response.request().method() === 'POST' && details.id) submissionId ??= details.id;
+      if (details.id && !submissionId) submissionId = details.id;
+      if (submissionId && details.verdict && (details.id === submissionId || url.href.includes(submissionId))) verdict = details.verdict;
+      else if (details.verdict && !verdict && submissionId) verdict = details.verdict;
+    } catch {}
   };
   const onResponse = (response: Response) => { void observe(response).catch(() => undefined); };
   try {
     const url = new URL(problemUrl);
     const match = /^\/(?:[^/]+\/)?problems\/([a-z0-9_]+)\/?$/i.exec(url.pathname);
-    if (!/(^|\.)codechef\.com$/.test(url.hostname) || !match) throw new Error('Invalid CodeChef problem URL');
+    if (!/(^|\.)codechef\.com$/.test(url.hostname) || !match || !match[1]) throw new Error('Invalid CodeChef problem URL');
+    const problemCode = match[1].toUpperCase();
     const submitUrl = `https://www.codechef.com/submit/${match[1]}`;
-    logger.info({ submitUrl }, 'Navigating to CodeChef submit page...');
+    logger.info({ submitUrl, problemCode }, 'Navigating to CodeChef submit page...');
     const response = await page.goto(submitUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     if (response && response.status() >= 400) return { ok: false, clicked: false, kind: response.status() === 401 ? 'signed-out' : response.status() === 403 ? 'blocked' : 'error', error: `CodeChef submit page returned HTTP ${response.status()}` };
     if (/\/login(?:[/?#]|$)/.test(page.url())) return { ok: false, clicked: false, kind: 'signed-out', error: 'CodeChef session redirected to login' };
@@ -113,11 +127,12 @@ export async function submitOnCodeChefPage(page: Page, problemUrl: string, code:
         return { ok: verdict === 'Accepted', performed: true, clicked, submissionId, verdict };
       }
       // Read only the judge's result panel, never the problem text/editor HTML.
-      const result = page.locator('.verdict-text, [data-verdict], #solution-status, .submission-result').first();
+      const result = page.locator('.verdict-text, [data-verdict], #solution-status, .submission-result, .submission-status, [class*="verdict"], [class*="result"]').first();
       if (await result.count()) {
         const text = await result.innerText().catch(() => '');
         const terminal = normalizeCodeChefVerdict(text);
-        if (submissionId && terminal) {
+        if (terminal && submissionId) {
+          verdict = terminal;
           logger.info({ submissionId, verdict: terminal }, 'CodeChef submission verdict received via UI');
           return { ok: terminal === 'Accepted', performed: true, clicked, submissionId, verdict: terminal };
         }
@@ -127,10 +142,49 @@ export async function submitOnCodeChefPage(page: Page, problemUrl: string, code:
       }
       pollCount++;
       if (pollCount % 20 === 0) {
-        logger.info({ elapsedSec: Math.round((Date.now() - (deadline - timeoutMs)) / 1000), submissionId }, 'Waiting for CodeChef judge verdict...');
+        logger.info({ elapsedSec: Math.round((Date.now() - (deadline - timeoutMs)) / 1000), submissionId, verdict }, 'Waiting for CodeChef judge verdict...');
       }
+
+      // Check recent user submissions table fallback every ~6 seconds
+      if (pollCount % 24 === 0 && (!submissionId || !verdict)) {
+        try {
+          const handle = targetHandle || await page.evaluate(() => {
+            const m = document.cookie.match(/Drupal\.visitor\.name=([^;]+)/);
+            return m && m[1] ? decodeURIComponent(m[1]) : null;
+          }).catch(() => null);
+          if (handle) {
+            const recentHtml = await page.evaluate(async (h) => {
+              const res = await fetch(`/recent/user?page=0&user_handle=${encodeURIComponent(h)}`).catch(() => null);
+              if (!res || !res.ok) return null;
+              const json = await res.json().catch(() => null);
+              return json?.content || null;
+            }, handle).catch(() => null);
+            if (recentHtml) {
+              const rows = recentHtml.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
+              for (const r of (rows ?? [])) {
+                if (r.toUpperCase().includes(problemCode)) {
+                  const solMatch = r.match(/viewsolution\/(\d+)/i);
+                  if (solMatch?.[1]) submissionId ??= solMatch[1];
+                  const vMatch = r.match(/title=['"](accepted|wrong answer|time limit exceeded|compilation error|runtime error)/i);
+                  if (vMatch?.[1]) {
+                    const norm = normalizeCodeChefVerdict(vMatch[1]);
+                    if (norm) verdict = norm;
+                  }
+                  break;
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+
       await page.waitForTimeout(250);
     }
+
+    if (submissionId) {
+      return { ok: verdict === 'Accepted', performed: true, clicked, submissionId, verdict: verdict ?? 'Submitted' };
+    }
+
     return { ok: false, clicked, submissionId, verdict: 'UNKNOWN', error: 'CodeChef did not return a confirmed submission ID and terminal verdict. The submit click was not retried.' };
   } catch (err) {
     logger.error({ err: err instanceof Error ? err.message : String(err) }, 'CodeChef submitOnCodeChefPage failed');
@@ -138,6 +192,6 @@ export async function submitOnCodeChefPage(page: Page, problemUrl: string, code:
   } finally { page.off('response', onResponse); }
 }
 
-export async function submitToCodeChef(state: CodeChefState, problemUrl: string, code: string, language = 'cpp'): Promise<CodeChefSubmitResult> {
-  return withCodeChefPage(state, page => submitOnCodeChefPage(page, problemUrl, code, language));
+export async function submitToCodeChef(state: CodeChefState, problemUrl: string, code: string, language = 'cpp', userHandle?: string): Promise<CodeChefSubmitResult> {
+  return withCodeChefPage(state, page => submitOnCodeChefPage(page, problemUrl, code, language, 90000, userHandle));
 }

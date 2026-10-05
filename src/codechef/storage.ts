@@ -54,7 +54,23 @@ export async function completeCurrentProblem(
   });
 }
 
-export async function claimDailyAttempt(accountId: string, today: string, key: string): Promise<boolean> {
+export function isTerminalCodeChefVerdict(verdict: string | null | undefined): boolean {
+  if (!verdict) return false;
+  const v = verdict.toLowerCase();
+  return /accepted|wrong answer|time limit|runtime|compilation|partially|internal error/i.test(v);
+}
+
+export async function claimDailyAttempt(accountId: string, today: string, key: string, force = false): Promise<boolean> {
+  if (force) {
+    await prisma.codeChefProgress.updateMany({
+      where: { accountId },
+      data: {
+        lastAttemptDate: today,
+        lastAttemptKey: key,
+      },
+    });
+    return true;
+  }
   const updated = await prisma.codeChefProgress.updateMany({
       where: {
         accountId,

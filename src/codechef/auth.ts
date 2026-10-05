@@ -13,34 +13,14 @@ export async function loginOnCodeChefPage(page: Page, username: string, password
   try { await form.locator('input[name="pass"]').fill(password); }
   catch { throw new Error('CodeChef password field could not be filled; authentication was not attempted.'); }
 
-  logger.info('Submitting CodeChef login form via AJAX...');
-
-  const loginApiPromise = page.waitForResponse(
-    res => res.url().includes('/api/codechef/login') && res.request().method() === 'POST',
-    { timeout: waitMs }
-  ).catch(() => null);
-
+  logger.info('Submitting CodeChef login form...');
   await form.locator('input[type="submit"], button[type="submit"]').first().click();
 
-  const apiRes = await loginApiPromise;
-  if (apiRes) {
-    const json = await apiRes.json().catch(() => null);
-    logger.info({ status: apiRes.status(), json: json ? JSON.stringify(json).slice(0, 200) : null }, 'CodeChef login API responded');
-    if (json && (json.status === 'error' || json.message?.error)) {
-      const err = json.message?.error || json.message || JSON.stringify(json);
-      throw new Error(`CodeChef login rejected: ${err}`);
-    }
-  }
-
-  logger.info('Waiting for dashboard redirect or error message...');
-  await Promise.race([
-    page.waitForURL('**/dashboard*', { timeout: 15000 }).catch(() => null),
-    page.waitForFunction(() => {
-      const errs = document.querySelectorAll('.messages.error, .login-error, .error');
-      for (const e of Array.from(errs)) if ((e.textContent || '').trim()) return true;
-      return false;
-    }, undefined, { timeout: 15000 }).catch(() => null)
-  ]);
+  logger.info('Waiting for login to process...');
+  await page.waitForFunction(() => {
+    return !document.querySelector('form input[name="pass"]')
+      || !!document.querySelector('.messages.error, .login-error, .error, [role="alert"]');
+  }, undefined, { timeout: waitMs }).catch(() => null);
 
   const errorText = await page.evaluate(() => {
     return Array.from(document.querySelectorAll('.messages.error, .login-error, .error'))
@@ -51,9 +31,10 @@ export async function loginOnCodeChefPage(page: Page, username: string, password
   const cookies = await page.context().cookies('https://www.codechef.com');
   const hasSession = cookies.some(c => /^(?:S?SESS|remember_me|Drupal\.visitor)/i.test(c.name));
   const currentUrl = page.url();
-  logger.info({ currentUrl, cookieCount: cookies.length, hasSession }, 'CodeChef session verified');
+  const hasLoggedInElement = (await page.locator('a[href*="/logout"], a[href*="/edit"], #user-menu, .logged-in-user, .user-avatar').count()) > 0;
+  logger.info({ currentUrl, cookieCount: cookies.length, hasSession, hasLoggedInElement }, 'CodeChef session verified');
 
-  if (!hasSession && !currentUrl.includes('/dashboard')) {
+  if (!hasSession && !currentUrl.includes('/dashboard') && !hasLoggedInElement) {
     throw new Error('CodeChef login was not verified. Session cookies were not received.');
   }
 
