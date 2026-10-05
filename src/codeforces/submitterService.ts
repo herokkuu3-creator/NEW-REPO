@@ -325,10 +325,18 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
       if (/\/enter(?:[/?#]|$)/i.test(finalUrl)) {
         throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
       }
-      if ((status === 403 || status === 503) && !(await waitOutChallenge(page))) {
-        attempts.push(`${path}: HTTP ${status} (Cloudflare challenge)`);
-        blocked += 1;
-        continue;
+      if (status === 403 || status === 503) {
+        const title = (await page.title().catch(() => '')).replace(/\s+/g, ' ').slice(0, 120);
+        const mitigation = await response?.headerValue('cf-mitigated').catch(() => null);
+        const challengeResources = await page.locator('script[src*="/cdn-cgi/challenge-platform/"], iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0);
+        const challengeDetected = mitigation === 'challenge' || challengeResources > 0 || CHALLENGE_RE.test(title) || CHALLENGE_RE.test(await readBody(page));
+        log({ path, status, title, mitigation: mitigation ?? null, challengeDetected }, 'Codeforces submit page access diagnostics');
+        if (!challengeDetected || !(await waitOutChallenge(page))) {
+          const reason = challengeDetected ? 'detected verification did not complete' : 'access denied or unavailable; no verification widget detected';
+          attempts.push(`${path}: HTTP ${status} (${reason}${title ? `; page title: ${title}` : ''})`);
+          blocked += 1;
+          continue;
+        }
       }
       const body = await readBody(page);
       if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
