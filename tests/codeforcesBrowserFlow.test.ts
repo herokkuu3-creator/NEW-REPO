@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright';
-import { blockCodeforcesResource, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, submissionFeedback } from '../src/codeforces/browserForm';
+import { blockCodeforcesResource, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, submissionFeedback, waitForCodeforcesPage } from '../src/codeforces/browserForm';
 import { postSubmitForm } from '../src/codeforces/submission';
 import type { BrowserSession } from '../src/browser/playwright';
 import type { SourceIndexEntry } from '../src/codeforces/sourceRepo';
@@ -97,6 +97,32 @@ afterAll(async () => {
 });
 
 describe('Codeforces native browser submission', () => {
+  it('does not mistake a generic body container for a completed page', async () => {
+    await page.setContent('<div id="body">Loading...</div>');
+    expect(await waitForCodeforcesPage(page, 'submit', 200)).toBe(false);
+  });
+
+  it('waits for the actual form to appear after the page shell', async () => {
+    await page.setContent(`<div id="body"></div><script>
+      setTimeout(() => document.querySelector('#body').innerHTML =
+        '<form><textarea name="source"></textarea><select name="programTypeId"></select></form>', 150);
+    </script>`);
+    expect(await waitForCodeforcesPage(page, 'submit', 2000)).toBe(true);
+  });
+
+  it('does not accept a challenge title even when form controls exist', async () => {
+    await page.setContent('<title>Just a moment...</title>' + formHtml());
+    expect(await waitForCodeforcesPage(page, 'submit', 200)).toBe(false);
+  });
+
+  it('requires submission rows or a status table on a history URL', async () => {
+    await fixture();
+    await page.goto('https://codeforces.com/contest/1/my');
+    expect(await waitForCodeforcesPage(page, 'result', 200)).toBe(false);
+    await page.locator('#body').evaluate(el => { el.innerHTML = '<table class="status-frame"></table>'; });
+    expect(await waitForCodeforcesPage(page, 'result', 1000)).toBe(true);
+  });
+
   it('retains CSS and every Cloudflare verification resource', async () => {
     expect(blockCodeforcesResource('https://challenges.cloudflare.com/widget/image', 'image')).toBe(false);
     expect(blockCodeforcesResource('https://codeforces.com/cdn-cgi/challenge-platform/image', 'image')).toBe(false);

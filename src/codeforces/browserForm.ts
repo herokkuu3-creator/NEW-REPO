@@ -5,6 +5,28 @@ export interface VerificationFlags {
   interactive: boolean;
 }
 
+/** Wait for application content after navigation; a generic #body is not readiness. */
+export async function waitForCodeforcesPage(page: Page, mode: 'submit' | 'result', timeoutMs: number): Promise<boolean> {
+  if (timeoutMs <= 0) return false;
+  try {
+    const ready = await page.waitForFunction((expected) => {
+      if (/just a moment|checking your browser|verify you are human/i.test(document.title)) return false;
+      // A login redirect must reach the caller so it can report an expired session.
+      if (/^\/enter(?:\/|$)/.test(location.pathname) && document.querySelector('input[type="password"]')) return true;
+      const source = document.querySelector<HTMLTextAreaElement>('textarea[name="source"]');
+      if (source?.form?.querySelector('select[name="programTypeId"]')) return true;
+      return expected === 'result'
+        && /^\/(?:contest\/\d+\/my|gym\/\d+\/my|problemset\/status)\/?$/.test(location.pathname)
+        && !!document.querySelector('#body table.status-frame, #body [data-submission-id]');
+    }, mode, { timeout: timeoutMs, polling: 100 });
+    await ready.dispose();
+    return true;
+  } catch (err) {
+    if (err instanceof Error && err.name === 'TimeoutError') return false;
+    throw err;
+  }
+}
+
 export class BrowserFormError extends Error {
   constructor(
     message: string,

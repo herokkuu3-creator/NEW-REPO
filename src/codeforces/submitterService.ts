@@ -26,7 +26,7 @@ import http from 'node:http';
 import { BrowserStateCache } from './browserStateCache';
 import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
-import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, submissionFeedback } from './browserForm';
+import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, submissionFeedback, waitForCodeforcesPage } from './browserForm';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
 const PORT = Number(process.env.PORT ?? 10000);
@@ -297,18 +297,6 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
   return names.length > 0 ? names.join(', ') : '(no named fields)';
 }
 
-async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    await sleep(1_000);
-    const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
-    if (isCodeforces) return true;
-    
-
-  }
-  return false;
-}
-
 async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> {
   const paths = candidates(entry);
   const attempts: string[] = [];
@@ -331,7 +319,7 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
         const challengeResources = await page.locator('script[src*="/cdn-cgi/challenge-platform/"], iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0);
         const challengeDetected = mitigation === 'challenge' || challengeResources > 0 || CHALLENGE_RE.test(title) || CHALLENGE_RE.test(await readBody(page));
         log({ path, status, title, mitigation: mitigation ?? null, challengeDetected }, 'Codeforces submit page access diagnostics');
-        if (!challengeDetected || !(await waitOutChallenge(page))) {
+        if (!challengeDetected || !(await waitForCodeforcesPage(page, 'submit', CHALLENGE_WAIT_MS))) {
           const reason = challengeDetected ? 'detected verification did not complete' : 'access denied or unavailable; no verification widget detected';
           attempts.push(`${path}: HTTP ${status} (${reason}${title ? `; page title: ${title}` : ''})`);
           blocked += 1;
@@ -339,12 +327,15 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
         }
       }
       const body = await readBody(page);
-      if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
-        if (!(await waitOutChallenge(page))) {
+      if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(page.url())) {
+        if (!(await waitForCodeforcesPage(page, 'submit', CHALLENGE_WAIT_MS))) {
           attempts.push(`${path}: challenge did not clear`);
           blocked += 1;
           continue;
         }
+      }
+      if (/\/enter(?:[/?#]|$)/i.test(page.url())) {
+        throw new Error('Codeforces session is signed out (verification redirected to the login page)');
       }
       const fields = await readFields(page);
       if (hasSubmitForm(fields)) {
@@ -540,7 +531,7 @@ export async function submit(request: SubmitRequest, progress: (phase: string) =
     let finalUrl = session.page.url();
     if (click.status === 403 || click.status === 503 || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl) || /__cf_chl/i.test(finalUrl)) {
       await progress('verification');
-      const cleared = await waitOutChallenge(session.page);
+      const cleared = await waitForCodeforcesPage(session.page, 'result', CHALLENGE_WAIT_MS);
       body = await readBody(session.page);
       finalUrl = session.page.url();
       if (!cleared || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
