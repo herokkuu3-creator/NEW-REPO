@@ -7,8 +7,8 @@ export type CodeChefState = Awaited<ReturnType<BrowserContext['storageState']>>;
 export async function withCodeChefPage<T>(state: CodeChefState | undefined, action: (page: Page) => Promise<T>): Promise<T> {
   releaseHeap();
   const memory = memoryReading();
-  if (memory.usedMb !== null && memoryLimitMb() - memory.usedMb < 120) {
-    throw new Error('Not enough free memory to start CodeChef browser safely. Try again after the other run finishes.');
+  if (memory.usedMb !== null && memoryLimitMb() - memory.usedMb < 60) {
+    throw new Error(`Not enough free memory to start CodeChef browser safely (Used: ${memory.usedMb}MB, Limit: ${memoryLimitMb()}MB). Try again after the other run finishes.`);
   }
   const browser = await chromium.launch({ headless: true, args: buildLaunchArgs() });
   const watch = new MemoryWatch(() => { void browser.close().catch(() => undefined); });
