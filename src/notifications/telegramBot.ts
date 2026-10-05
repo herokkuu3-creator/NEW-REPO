@@ -333,7 +333,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         return;
       case '/cfaccounts':
       case '/cf_accounts':
-        await reply(await codeforcesAccountsText());
+        await replyHtml(await codeforcesAccountsText());
         return;
       case '/triggersubmission':
       case '/trigger_submission':
