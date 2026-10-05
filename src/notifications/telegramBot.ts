@@ -536,33 +536,47 @@ export async function handleCodeforcesSubmitNext(
   }
   const statusMessage = await tgApi<{ message_id: number }>('sendMessage', {
     chat_id: config.telegram.chatId,
-    text: '🏆 Submitting the next Codeforces source solution for all Codeforces accounts.\n\n🔎 Checking accounts…',
+    text: '<b>🏆 CODEFORCES SUBMISSION</b>\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n🔎 Checking all accounts…',
+    parse_mode: 'HTML',
     disable_web_page_preview: true,
   });
   const progressLines = new Map<number, string>();
+  const html = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const editProgress = async (): Promise<void> => {
     const lines = [...progressLines.entries()].sort(([a], [b]) => a - b).map(([, line]) => line);
     await tgApi('editMessageText', {
       chat_id: config.telegram.chatId,
       message_id: statusMessage.message_id,
-      text: ['🏆 Submitting the next Codeforces source solution for all Codeforces accounts.', '', ...lines].join('\n'),
+      text: ['<b>🏆 CODEFORCES SUBMISSION</b>', '<code>━━━━━━━━━━━━━━━━━━━━</code>', ...lines].join('\n'),
+      parse_mode: 'HTML',
       disable_web_page_preview: true,
     }).catch((err) => logger.warn({ err: errText(err) }, 'could not update Codeforces progress message'));
   };
   const done = (async () => {
     const report = await runner(CODEFORCES_MANUAL_REASON, {
       forceDailyAttempt: true,
-      onAccountProgress: async ({ phase, label, username, index, total }) => {
+      onAccountProgress: async ({ phase, label, username, index, total, networkMode }) => {
+        const account = html(username ?? label);
+        const route = networkMode === 'tailscale' ? '📱 PHONE TAILSCALE' : '🏠 RESIDENTIAL PROXY';
+        const phaseText = {
+          checking: `🔎 <b>Account ${index}/${total}</b> · checking <code>${account}</code>…`,
+          verified: `✅ <b>Account ${index}/${total}</b> · verified <code>${account}</code>`,
+          source: `📦 <b>Account ${index}/${total}</b> · source loaded for <code>${account}</code>`,
+          network: `🌐 <b>Account ${index}/${total}</b> · route: <b>${route}</b>`,
+          opening: `🖥️ <b>Account ${index}/${total}</b> · opening Codeforces submit page`,
+          submitting: `🚀 <b>Account ${index}/${total}</b> · submitting signed form`,
+          verdict: `⏳ <b>Account ${index}/${total}</b> · waiting for Codeforces verdict`,
+        }[phase];
         progressLines.set(
           index,
-          phase === 'checking'
-            ? `👤 Account ${index}/${total} — 🔎 Checking ${label}…`
-            : `👤 Account ${index}/${total} — ✅ Account verified ${username ?? label}`,
+          phaseText,
         );
         await editProgress();
       },
-      onAccountOutcome: (outcome, index, total) =>
-        (progressLines.set(index, formatCodeforcesAccountMessage(outcome, index, total)), editProgress()),
+      onAccountOutcome: (outcome, index, total) => {
+        progressLines.set(index, html(formatCodeforcesAccountMessage(outcome, index, total)));
+        return editProgress();
+      },
     });
     if (!report) {
       progressLines.set(0, '⏳ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
@@ -575,7 +589,7 @@ export async function handleCodeforcesSubmitNext(
     }
   })().catch(async (err) => {
     logger.warn({ err: errText(err) }, '/submitnextsolution failed');
-    progressLines.set(0, `⚠️ /submitnextsolution failed: ${errText(err)}`);
+      progressLines.set(0, `⚠️ <b>/submitnextsolution failed:</b> ${html(errText(err))}`);
     await editProgress().catch(() => undefined);
   });
   return { done };

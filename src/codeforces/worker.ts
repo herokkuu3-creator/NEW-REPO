@@ -59,7 +59,14 @@ export function isCodeforcesRunInProgress(): boolean {
 
 export interface CodeforcesRunOptions {
   onAccountOutcome?: (outcome: CodeforcesAccountOutcome, index: number, total: number) => Promise<void> | void;
-  onAccountProgress?: (progress: { phase: 'checking' | 'verified'; label: string; username?: string | null; index: number; total: number }) => Promise<void> | void;
+  onAccountProgress?: (progress: {
+    phase: 'checking' | 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict';
+    label: string;
+    username?: string | null;
+    index: number;
+    total: number;
+    networkMode?: CodeforcesNetworkMode;
+  }) => Promise<void> | void;
   /** Manual triggers may reuse a day's single attempt after it failed. */
   forceDailyAttempt?: boolean;
   /** When present, run only these active Codeforces account IDs. */
@@ -122,8 +129,8 @@ export async function executeCodeforcesRun(
 
     for (const account of accounts) {
       await Promise.resolve(options.onAccountProgress?.({ phase: 'checking', label: account.label, username: account.username, index: outcomes.length + 1, total: accounts.length }));
-      const outcome = await runForAccount(account, today, source, forceDailyAttempt, networkMode, (username) =>
-        options.onAccountProgress?.({ phase: 'verified', label: account.label, username, index: outcomes.length + 1, total: accounts.length }),
+      const outcome = await runForAccount(account, today, source, forceDailyAttempt, networkMode, (phase, username) =>
+        options.onAccountProgress?.({ phase, label: account.label, username, index: outcomes.length + 1, total: accounts.length, networkMode }),
       );
       outcomes.push(outcome);
       if (options.onAccountOutcome) {
@@ -148,7 +155,7 @@ async function runForAccount(
   source: Awaited<ReturnType<typeof loadRuntimeSourceIndex>>,
   forceDailyAttempt = false,
   networkMode: CodeforcesNetworkMode = 'proxy',
-  onVerified?: (username: string | null) => Promise<void> | void,
+  onProgress?: (phase: 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict', username: string | null) => Promise<void> | void,
 ): Promise<CodeforcesAccountOutcome> {
   const label = account.label;
   const stored = parseStoredCodeforcesState(account.storageState);
@@ -195,9 +202,10 @@ async function runForAccount(
   const entry = current;
   const handle = account.username ?? label;
   let username = handle;
-  await Promise.resolve(onVerified?.(username));
+  await Promise.resolve(onProgress?.('verified', username));
   try {
     const originalCode = await fetchSourceCode(entry);
+    await Promise.resolve(onProgress?.('source', username));
     const strippedCode =
       entry.language === 'cpp' ? stripCppComments(originalCode) : originalCode;
     const useCommentStrippedFirst =
@@ -229,6 +237,9 @@ async function runForAccount(
     }
 
     const submitOnce = async (submissionCode: string): Promise<HttpSubmitResult & { handle?: string }> => {
+      await Promise.resolve(onProgress?.('network', username));
+      await Promise.resolve(onProgress?.('opening', username));
+      await Promise.resolve(onProgress?.('submitting', username));
       // The header-only POST is answered 302 -> "/" by Codeforces' own router,
       // so it remains an opt-in diagnostic; the browser path is the real
       // transport for the free-tier submission service.
@@ -282,6 +293,7 @@ async function runForAccount(
     }
 
     let result = await submitOnce(submissionCode);
+    await Promise.resolve(onProgress?.('verdict', username));
 
     if (
       useCommentStrippedFirst &&
@@ -306,6 +318,7 @@ async function runForAccount(
       if (reclaimed) {
         submissionCode = originalCode;
         result = await submitOnce(originalCode);
+        await Promise.resolve(onProgress?.('verdict', username));
         logger.info(
           {
             label,
