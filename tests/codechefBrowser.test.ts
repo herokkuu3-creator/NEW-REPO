@@ -52,10 +52,58 @@ describe('CodeChef current browser flow', () => {
   });
 
   it('recognizes login redirects before any submission attempt', async () => {
-    await page.route('https://www.codechef.com/**', route => route.request().url().includes('/submit/')
+    await page.route('https://www.codechef.com/**', route => (route.request().url().includes('/submit/') || route.request().url().includes('/problems/'))
       ? route.fulfill({ status: 302, headers: { location: 'https://www.codechef.com/login' } })
       : route.fulfill({ contentType: 'text/html', body: 'Please login' }));
     expect(await submitOnCodeChefPage(page, 'https://www.codechef.com/problems/AAA', 'code')).toMatchObject({ ok: false, kind: 'signed-out', clicked: false });
+  });
+
+  it('verifies submission using upid and result_code from modern CodeChef /api/ide/submit response', async () => {
+    await fixture({
+      upid: '1369704347',
+      result_code: 'accepted',
+      result_description: '',
+      show_status_table: 'yes',
+    });
+    const result = await submitOnCodeChefPage(page, 'https://www.codechef.com/problems/LEXMATCH?tab=ide', 'int main(){}', 'cpp', 2000);
+    expect(result).toMatchObject({
+      ok: true,
+      performed: true,
+      submissionId: '1369704347',
+      verdict: 'Accepted',
+      clicked: true,
+    });
+  });
+
+  it('handles active polling for verdict when initial submit returns pending result', async () => {
+    let polled = false;
+    await page.route('https://www.codechef.com/**', async route => {
+      const url = route.request().url();
+      if (route.request().method() === 'POST') {
+        return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ upid: '1369704347', result_code: 'wait' }) });
+      }
+      if (url.includes('/api/ide/submit') && url.includes('solution_id=')) {
+        polled = true;
+        return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ upid: '1369704347', result_code: 'accepted' }) });
+      }
+      return route.fulfill({ contentType: 'text/html', body: `
+        <select><option value="cpp17">C++17</option></select>
+        <div class="ace_editor">Editor</div>
+        <button id="submit_btn">Submit</button>
+        <script>
+        window.source='';window.ace={edit:()=>({setValue:c=>window.source=c,getValue:()=>window.source})};
+        document.querySelector('#submit_btn').onclick=()=>fetch('/api/ide/submit',{method:'POST',body:JSON.stringify({code:window.source})});
+        </script>` });
+    });
+
+    const result = await submitOnCodeChefPage(page, 'https://www.codechef.com/problems/LEXMATCH', 'int main(){}', 'cpp', 5000);
+    expect(result).toMatchObject({
+      ok: true,
+      performed: true,
+      submissionId: '1369704347',
+      verdict: 'Accepted',
+    });
+    expect(polled).toBe(true);
   });
 
   it('logs in through the login form instead of the adjacent registration form', async () => {
@@ -85,5 +133,7 @@ describe('CodeChef current browser flow', () => {
     expect(normalizeCodeChefVerdict('Compilation Error')).toBe('Compilation Error');
     expect(normalizeCodeChefVerdict('TLE')).toBe('Time Limit Exceeded');
     expect(normalizeCodeChefVerdict('Runtime Error')).toBe('Runtime Error');
+    expect(normalizeCodeChefVerdict('accepted')).toBe('Accepted');
+    expect(normalizeCodeChefVerdict('wrong')).toBe('Wrong Answer');
   });
 });
