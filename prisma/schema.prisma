@@ -156,3 +156,62 @@ enum CodeforcesSourceKind {
   NON_CODEFORCES
   UNRESOLVED
 }
+
+enum CodeChefSourceKind {
+  CODECHEF
+  UNRESOLVED
+}
+
+model CodeChefAccount {
+  id                 String               @id @default(cuid())
+  label              String               @unique
+  storageState       String               @db.Text
+  username           String?
+  status             CodeChefAccountStatus @default(UNKNOWN)
+  lastCheckedAt      DateTime?
+  lastSubmissionDate String?
+  lastSubmissionId   String?
+  lastVerdict        String?
+  lastError          String?              @db.Text
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  progress           CodeChefProgress?
+
+  @@index([status])
+}
+
+model CodeChefProgress {
+  accountId         String          @id
+  account           CodeChefAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  nextKey           String?
+  lastCompletedKey  String?
+  lastCompletedAt   DateTime?
+  lastAttemptDate   String?
+  lastAttemptKey    String?
+  lastSubmissionId  String?
+  lastVerdict       String?
+  updatedAt         DateTime        @updatedAt
+}
+
+model CodeChefSourceAudit {
+  path          String             @id
+  fileName      String
+  language      String
+  kind          CodeChefSourceKind
+  problemCode   String?
+  problemUrl    String?
+  reason        String             @db.Text
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([kind])
+}
+
+enum CodeChefAccountStatus {
+  UNKNOWN
+  ACTIVE
+  EXPIRED
+  REJECTED
+  DISABLED
+}
+

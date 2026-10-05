@@ -1,0 +1,61 @@
+{
+  "projectName": "CodeChef",
+  "projectOwner": "hhhrrrttt222111",
+  "repoType": "github",
+  "repoHost": "https://github.com",
+  "files": [
+    "README.md"
+  ],
+  "imageSize": 100,
+  "commit": true,
+  "commitConvention": "none",
+  "contributors": [
+    {
+      "login": "hhhrrrttt222111",
+      "name": "hhhrrrttt222111",
+      "avatar_url": "https://avatars2.githubusercontent.com/u/43471295?v=4",
+      "profile": "http://hhhrrrttt222111.me/",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "Ashishjagrawal",
+      "name": "Ashish kumar jagrawal",
+      "avatar_url": "https://avatars0.githubusercontent.com/u/44999678?v=4",
+      "profile": "https://ashishjagrawal.github.io/",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "sayand0122",
+      "name": "Sayan Dutta",
+      "avatar_url": "https://avatars1.githubusercontent.com/u/53222600?v=4",
+      "profile": "https://github.com/sayand0122",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "Yash0605",
+      "name": "Yash",
+      "avatar_url": "https://avatars2.githubusercontent.com/u/12882931?v=4",
+      "profile": "https://github.com/Yash0605",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "DesmondWasHere",
+      "name": "Subrat Katiyar",
+      "avatar_url": "https://avatars3.githubusercontent.com/u/43543908?v=4",
+      "profile": "https://github.com/DesmondWasHere",
+      "contributions": [
+        "code"
+      ]
+    }
+  ],
+  "contributorsPerLine": 7,
+  "skipCi": true
+}
