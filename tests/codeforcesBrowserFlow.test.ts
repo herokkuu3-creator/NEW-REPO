@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright';
-import { blockCodeforcesResource, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, submissionFeedback, waitForCodeforcesPage } from '../src/codeforces/browserForm';
+import { blockCodeforcesResource, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, nativeVerificationComplete, submissionFeedback, waitForCodeforcesPage } from '../src/codeforces/browserForm';
 import { postSubmitForm } from '../src/codeforces/submission';
 import type { BrowserSession } from '../src/browser/playwright';
 import type { SourceIndexEntry } from '../src/codeforces/sourceRepo';
@@ -318,7 +318,7 @@ describe('Codeforces native browser submission', () => {
     expect(posts).toHaveLength(0);
   });
 
-  it('blocks when verification script exists but its widget has not initialized', async () => {
+  it('continues automatically when the shared verification script exists without a widget', async () => {
     await fixture();
     await page.evaluate(() => {
       const script = document.createElement('script');
@@ -326,8 +326,28 @@ describe('Codeforces native browser submission', () => {
       script.textContent = 'turnstile.render(container)';
       document.body.append(script);
     });
-    await expect(ensureFormTurnstile(page, 50)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
+    await expect(ensureFormTurnstile(page, 50)).resolves.toEqual({ turnstile: false, interactive: false });
+    expect(await nativeVerificationComplete(page)).toBe(true);
+    const handoff = createPhoneVerification('https://broker.example', 'job-id', {});
+    const relay = vi.fn();
+    vi.stubGlobal('fetch', relay);
+    await expect(handoff(page, 'turnstile')).resolves.toBe(true);
+    expect(relay).not.toHaveBeenCalled();
     expect(posts).toHaveLength(0);
+  });
+
+  it('does not classify a disabled submit control without a widget as a CAPTCHA', async () => {
+    await fixture({ disabled: true });
+    await page.evaluate(() => {
+      const script = document.createElement('script');
+      script.type = 'text/plain';
+      script.textContent = 'turnstile.render(container)';
+      document.body.append(script);
+    });
+    await expect(ensureFormTurnstile(page, 50)).rejects.toMatchObject({
+      kind: 'blocked', clicked: false, flags: { turnstile: false, interactive: false },
+    });
+    expect(await nativeVerificationComplete(page)).toBe(false);
   });
 
   it('never submits with a token while the native Submit control remains disabled', async () => {

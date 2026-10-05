@@ -122,13 +122,16 @@ async function verificationState(page: Page) {
     const submitReady = !!control && !control.disabled && control.getClientRects().length > 0 &&
       getComputedStyle(control).visibility !== 'hidden' && getComputedStyle(control).display !== 'none';
     return { tokenInForm, iframePresent, widgetPresent, scriptPresent, submitReady,
-      required: widgetPresent || scriptPresent || tokenInForm };
+      // Codeforces can include the shared Turnstile script on accounts for
+      // which it never renders a challenge. Script presence alone is not a
+      // verification requirement and must not trigger a phone handoff.
+      required: widgetPresent || tokenInForm };
   });
 }
 
 export async function nativeVerificationComplete(page: Page): Promise<boolean> {
   const state = await verificationState(page);
-  return state.tokenInForm && state.submitReady;
+  return state.submitReady && (state.tokenInForm || !state.required);
 }
 
 /** One native click, with evidence from the actual POST. Never retry an ambiguous POST. */
