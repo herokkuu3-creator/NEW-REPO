@@ -636,7 +636,7 @@ const defaultCodeforcesSubmitUiDeps: CodeforcesSubmitUiDeps = {
     });
   },
   answer: async (callbackId, text) => {
-    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text } : {}) });
+    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text, show_alert: true } : {}) });
   },
 };
 
@@ -944,7 +944,7 @@ const defaultCoinClaimUiDeps: CoinClaimUiDeps = {
     });
   },
   answer: async (callbackId, text) => {
-    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text } : {}) });
+    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text, show_alert: true } : {}) });
   },
 };
 
@@ -1134,7 +1134,7 @@ const defaultRemovalDeps: RemovalDeps = {
     });
   },
   answer: async (callbackId, text) => {
-    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text } : {}) });
+    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text, show_alert: true } : {}) });
   },
 };
 
