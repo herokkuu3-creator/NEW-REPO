@@ -29,6 +29,9 @@ jobs:
       # resources remain available. This keeps residential-proxy data low.
       CODEFORCES_BLOCK_ASSETS: 'true'
       CODEFORCES_BROWSER: chromium
+      CODEFORCES_BROWSER_STATE_DIR: .codeforces-browser-state
+      CODEFORCES_TURNSTILE_WAIT_MS: '45000'
+      CODEFORCES_CHALLENGE_WAIT_MS: '45000'
       # The Telegram-selected route is read from the Render job before this
       # runner joins Tailscale. Both routes remain available as explicit choices.
       TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
@@ -73,6 +76,13 @@ jobs:
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
       - run: npm run build
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
+      - name: Restore encrypted browser sessions
+        if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
+        uses: actions/cache/restore@v4
+        with:
+          path: .codeforces-browser-state
+          key: cf-browser-state-v1-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: cf-browser-state-v1-${{ github.ref_name }}-
       # Connect only after all large downloads finish. Phone/proxy traffic is
       # then limited to the small Codeforces browser session itself.
       - name: Connect to phone network
@@ -109,3 +119,9 @@ jobs:
         env:
           CODEFORCES_JOB_ID: ${{ inputs.job_id || steps.lookup.outputs.job_id }}
         run: xvfb-run -a node --expose-gc dist/src/codeforces/actionRunner.js
+      - name: Save encrypted browser sessions
+        if: always() && (inputs.job_id != '' || steps.lookup.outputs.job_id != '')
+        uses: actions/cache/save@v4
+        with:
+          path: .codeforces-browser-state
+          key: cf-browser-state-v1-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}

@@ -13,7 +13,13 @@ async function main(): Promise<void> {
   const request = await claim.json() as Parameters<typeof submit>[0];
   let result: Awaited<ReturnType<typeof submit>>;
   try {
-    result = await submit(request);
+    result = await submit(request, async (phase) => {
+      try {
+        await fetch(`${base}/jobs/${id}/progress`, {
+          method: 'POST', headers, body: JSON.stringify({ phase }), signal: AbortSignal.timeout(5_000),
+        });
+      } catch { /* Progress delivery must not interrupt the browser. */ }
+    });
   } catch (err) {
     const formError = err instanceof BrowserFormError ? err : null;
     result = {

@@ -14,6 +14,7 @@ local-auth/
 browser-profile/
 storage-state.json
 storageState.json
+.codeforces-browser-state/
 
 # Runtime diagnostics (may contain page HTML / screenshots)
 diagnostics/

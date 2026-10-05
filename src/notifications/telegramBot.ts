@@ -576,6 +576,13 @@ export async function handleCodeforcesSubmitNext(
           opening: `🖥️ <b>Account ${index}/${total}</b> · opening Codeforces submit page`,
           submitting: `🚀 <b>Account ${index}/${total}</b> · submitting signed form`,
           verdict: `⏳ <b>Account ${index}/${total}</b> · waiting for Codeforces verdict`,
+          'session-restored': `💾 <b>${account}</b> · saved browser session restored`,
+          'session-fresh': `🍪 <b>${account}</b> · starting from uploaded session cookies`,
+          verification: `🔐 <b>${account}</b> · checking verification · waiting for the page to complete normally`,
+          'verification-retry': `⏳ <b>${account}</b> · verification has not cleared · one retry before submitting`,
+          'verification-blocked': `⚠️ <b>${account}</b> · verification did not clear automatically · attention required`,
+          'verification-cleared': `✅ <b>${account}</b> · verification completed · preparing submission`,
+          'verification-not-required': `✅ <b>${account}</b> · no form verification required`,
         }[phase];
         progressLines.set(
           index,

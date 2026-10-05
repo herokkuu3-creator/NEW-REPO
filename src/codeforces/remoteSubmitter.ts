@@ -83,6 +83,7 @@ export async function submitViaRemoteSubmitter(
   entry: SourceIndexEntry,
   code: string,
   networkMode: CodeforcesNetworkMode = 'proxy',
+  onProgress?: (phase: string) => Promise<void>,
 ): Promise<PostedResult | null> {
   const url = remoteSubmitterUrl();
   const token = process.env.CODEFORCES_SUBMITTER_TOKEN?.trim() ?? '';
@@ -138,7 +139,7 @@ export async function submitViaRemoteSubmitter(
     });
   } catch (err) {
     // Deliberately NOT retried: the POST may have reached Codeforces.
-    const recovered = await waitForActionResult(url, token, payload.requestId);
+    const recovered = await waitForActionResult(url, token, payload.requestId, onProgress);
     if (recovered) return normalizeOutcome(recovered, submittedAt, 'GitHub browser');
     return {
       ...failed(
@@ -154,12 +155,12 @@ export async function submitViaRemoteSubmitter(
     | (Partial<PostedResult> & { error?: string; kind?: string })
     | null;
   if (!body && response.status >= 500) {
-    body = await waitForActionResult(url, token, payload.requestId);
+    body = await waitForActionResult(url, token, payload.requestId, onProgress);
     if (body) return normalizeOutcome(body, submittedAt, 'GitHub browser');
   }
   if (response.status === 202 && typeof (body as { jobId?: unknown } | null)?.jobId === 'string') {
     const id = (body as { jobId: string }).jobId;
-    body = await waitForActionResult(url, token, id);
+    body = await waitForActionResult(url, token, id, onProgress);
     if (!body || 'jobId' in body) {
       return { ...failed(`GitHub browser job ${id} did not return a result; its Codeforces outcome is uncertain`), submittedAt };
     }
@@ -204,8 +205,9 @@ function normalizeOutcome(body: Partial<PostedResult>, submittedAt: number, tran
   };
 }
 
-async function waitForActionResult(url: string, token: string, id: string): Promise<Partial<PostedResult> | null> {
+async function waitForActionResult(url: string, token: string, id: string, onProgress?: (phase: string) => Promise<void>): Promise<Partial<PostedResult> | null> {
   const deadline = Date.now() + ACTION_TIMEOUT_MS;
+  let lastProgress = '';
   while (Date.now() < deadline) {
     await sleep(3_000);
     try {
@@ -215,7 +217,11 @@ async function waitForActionResult(url: string, token: string, id: string): Prom
       });
       if (poll.status === 404) return null;
       if (!poll.ok) continue;
-      const state = await poll.json() as { pending?: boolean; result?: Partial<PostedResult> };
+      const state = await poll.json() as { pending?: boolean; result?: Partial<PostedResult>; progress?: string };
+      if (state.progress && state.progress !== lastProgress) {
+        lastProgress = state.progress;
+        await onProgress?.(state.progress).catch(() => undefined);
+      }
       if (state.pending === false && state.result) return state.result;
     } catch { /* Keep polling the same job. Never enqueue another submission. */ }
   }
