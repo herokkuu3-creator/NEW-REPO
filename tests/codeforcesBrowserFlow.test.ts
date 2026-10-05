@@ -6,6 +6,8 @@ import type { BrowserSession } from '../src/browser/playwright';
 import type { SourceIndexEntry } from '../src/codeforces/sourceRepo';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { applyVerificationAction, createPhoneVerification } from '../src/codeforces/phoneVerification';
+import { verificationHtml } from '../src/codeforces/verificationRelay';
 
 let browser: Browser;
 let page: Page;
@@ -97,6 +99,131 @@ afterAll(async () => {
 });
 
 describe('Codeforces native browser submission', () => {
+  it('never requests phone verification for a normal working submit page', async () => {
+    vi.stubEnv('CODEFORCES_CHALLENGE_WAIT_MS', '20');
+    const { openSubmitForm } = await import('../src/codeforces/submitterService');
+    await fixture();
+    const handoff = vi.fn(async () => true);
+    await openSubmitForm(page, source, handoff);
+    expect(handoff).not.toHaveBeenCalled();
+  });
+
+  it('opens the same challenged page for a human and resumes without a second navigation', async () => {
+    const { openSubmitForm } = await import('../src/codeforces/submitterService');
+    let navigations = 0;
+    await page.route('https://codeforces.com/**', route => {
+      if (route.request().isNavigationRequest()) navigations++;
+      return route.fulfill({ status: 403, headers: { 'cf-mitigated': 'challenge' }, contentType: 'text/html', body: '<title>Just a moment...</title>' });
+    });
+    const handoff = vi.fn(async (samePage: Page, mode: string) => {
+      expect(samePage).toBe(page);
+      expect(mode).toBe('submit');
+      await samePage.setContent(formHtml({ token: 'human-completed-fixture' }));
+      return true;
+    });
+    await openSubmitForm(page, source, handoff);
+    expect(handoff).toHaveBeenCalledOnce();
+    expect(navigations).toBe(1);
+    expect(posts).toHaveLength(0);
+  });
+
+  it('does not reopen alternate submit URLs when the phone handoff is cancelled', async () => {
+    const { openSubmitForm } = await import('../src/codeforces/submitterService');
+    let navigations = 0;
+    await page.route('https://codeforces.com/**', route => {
+      if (route.request().isNavigationRequest()) navigations++;
+      return route.fulfill({ status: 403, headers: { 'cf-mitigated': 'challenge' }, contentType: 'text/html', body: '<title>Just a moment...</title>' });
+    });
+    await expect(openSubmitForm(page, source, async () => false)).rejects.toThrow('phone handoff');
+    expect(navigations).toBe(1);
+    expect(posts).toHaveLength(0);
+  });
+
+  it('renders the phone view, relays scaled taps, and clears the image when the link ends', async () => {
+    const token = 'a'.repeat(64);
+    await page.setContent('<h1>Verification fixture</h1>');
+    const image = await page.screenshot({ type: 'jpeg' });
+    let ended = false;
+    const interactions: Record<string, unknown>[] = [];
+    await page.route('https://phone.example/**', async route => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname;
+      if (path === '/verify') return route.fulfill({ contentType: 'text/html', body: verificationHtml });
+      expect(request.headers()['x-verification-token']).toBe(token);
+      if (path === '/verification/frame') return route.fulfill({ status: ended ? 410 : 200, contentType: 'image/jpeg', headers: { 'x-expires-at': String(Date.now() + 240000) }, body: image });
+      interactions.push(request.postDataJSON() as Record<string, unknown>);
+      return route.fulfill({ contentType: 'application/json', body: '{}' });
+    });
+    await page.goto(`https://phone.example/verify#${token}`);
+    await expect.poll(() => page.locator('#screen').evaluate(el => (el as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+    expect(page.url()).toBe('https://phone.example/verify');
+    await page.locator('#screen').click({ position: { x: 20, y: 20 } });
+    await expect.poll(() => interactions.length).toBe(1);
+    expect(interactions[0]?.type).toBe('click');
+    expect(interactions[0]?.x).toBeGreaterThan(0);
+    ended = true;
+    await expect.poll(() => page.locator('#status').innerText(), { timeout: 3000 }).toContain('session has ended');
+    expect(await page.locator('#screen').getAttribute('src')).toBeNull();
+  });
+
+  it('only forwards human clicks inside verification widgets, never Submit', async () => {
+    await fixture();
+    await page.evaluate(() => {
+      const widget = document.createElement('div');
+      widget.className = 'cf-turnstile';
+      widget.style.cssText = 'position:fixed;top:400px;left:20px;width:150px;height:50px';
+      widget.onclick = () => { (window as unknown as { humanClicked: boolean }).humanClicked = true; };
+      document.body.append(widget);
+    });
+    const submitBox = await page.locator('#solution input[type="submit"]').boundingBox();
+    expect(await applyVerificationAction(page, { type: 'click', x: submitBox!.x + 5, y: submitBox!.y + 5 })).toBe(false);
+    expect(posts).toHaveLength(0);
+    expect(await applyVerificationAction(page, { type: 'click', x: 40, y: 420 })).toBe(true);
+    expect(await page.evaluate(() => (window as unknown as { humanClicked: boolean }).humanClicked)).toBe(true);
+    await page.locator('[name=turnstileToken]').evaluate(el => { (el as HTMLInputElement).value = 'completed'; });
+    expect(await applyVerificationAction(page, { type: 'click', x: 40, y: 420 })).toBe(false);
+  });
+
+  it('keeps the same browser and stops relaying when a human completes native verification', async () => {
+    await fixture({ callback: true, disabled: true });
+    await page.locator('.cf-turnstile').evaluate(el => {
+      (el as HTMLElement).style.cssText = 'width:200px;height:80px';
+      el.addEventListener('click', () => {
+        (document.querySelector('[name=turnstileToken]') as HTMLInputElement).value = 'human-completed-fixture';
+        (document.querySelector('#solution input[type=submit]') as HTMLInputElement).disabled = false;
+      });
+    });
+    const box = await page.locator('.cf-turnstile').boundingBox();
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      calls.push(body.close ? 'close' : 'frame');
+      return new Response(JSON.stringify(body.close ? {} : { actions: [{ type: 'click', x: box!.x + 5, y: box!.y + 5 }] }), { status: 200 });
+    }));
+    const handoff = createPhoneVerification('https://broker.example', 'job', { authorization: 'Bearer fixture' });
+    expect(await handoff(page, 'turnstile')).toBe(true);
+    expect(calls).toEqual(['frame', 'close']);
+    expect(posts).toHaveLength(0);
+    const result = await clickSubmitForm(page, 3000);
+    expect(result.clicked).toBe(true);
+    expect(posts).toHaveLength(1);
+  });
+
+  it('revokes the phone link on cancellation without posting any solution', async () => {
+    await fixture({ callback: true, disabled: true });
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      calls.push(body.close ? 'close' : 'frame');
+      return new Response(JSON.stringify({ actions: [{ type: 'cancel' }] }), { status: 200 });
+    }));
+    const handoff = createPhoneVerification('https://broker.example', 'job', {});
+    expect(await handoff(page, 'turnstile')).toBe(false);
+    expect(await handoff(page, 'turnstile')).toBe(false);
+    expect(calls).toEqual(['frame', 'close']);
+    expect(posts).toHaveLength(0);
+  });
+
   it('does not mistake a generic body container for a completed page', async () => {
     await page.setContent('<div id="body">Loading...</div>');
     expect(await waitForCodeforcesPage(page, 'submit', 200)).toBe(false);

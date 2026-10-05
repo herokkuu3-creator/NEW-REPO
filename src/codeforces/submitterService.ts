@@ -28,6 +28,8 @@ import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, submissionFeedback, waitForCodeforcesPage } from './browserForm';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
+import type { PhoneVerification } from './phoneVerification';
+import { VerificationRelay, verificationHtml } from './verificationRelay';
 
 const PORT = Number(process.env.PORT ?? 10000);
 const TOKEN = process.env.CODEFORCES_SUBMITTER_TOKEN?.trim() ?? '';
@@ -46,6 +48,7 @@ const GITHUB_DISPATCH_TOKEN = (process.env.GITHUB_DISPATCH_TOKEN ?? '').trim();
 const RUNNER_MODE = (process.env.CODEFORCES_RUNNER_MODE ?? 'github').trim().toLowerCase();
 const LOCAL_RUNNER_MODE = RUNNER_MODE === 'local';
 const LOCAL_RUNNER_TOKEN = (process.env.CODEFORCES_LOCAL_RUNNER_TOKEN ?? '').trim();
+const verificationRelay = new VerificationRelay();
 const broker = RUNNER_REPOSITORY || LOCAL_RUNNER_MODE
   ? new ActionBroker((id) => LOCAL_RUNNER_MODE ? Promise.resolve() : dispatchAction(RUNNER_REPOSITORY, GITHUB_DISPATCH_TOKEN, id))
   : null;
@@ -297,7 +300,7 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
   return names.length > 0 ? names.join(', ') : '(no named fields)';
 }
 
-async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> {
+export async function openSubmitForm(page: Page, entry: SubmitterEntry, phoneVerification?: PhoneVerification): Promise<void> {
   const paths = candidates(entry);
   const attempts: string[] = [];
   let blocked = 0;
@@ -319,8 +322,13 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
         const challengeResources = await page.locator('script[src*="/cdn-cgi/challenge-platform/"], iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0);
         const challengeDetected = mitigation === 'challenge' || challengeResources > 0 || CHALLENGE_RE.test(title) || CHALLENGE_RE.test(await readBody(page));
         log({ path, status, title, mitigation: mitigation ?? null, challengeDetected }, 'Codeforces submit page access diagnostics');
-        if (!challengeDetected || !(await waitForCodeforcesPage(page, 'submit', CHALLENGE_WAIT_MS))) {
+        const cleared = challengeDetected && (await waitForCodeforcesPage(page, 'submit', CHALLENGE_WAIT_MS)
+          || await phoneVerification?.(page, 'submit'));
+        if (!cleared) {
           const reason = challengeDetected ? 'detected verification did not complete' : 'access denied or unavailable; no verification widget detected';
+          if (challengeDetected && phoneVerification) {
+            throw new BrowserFormError('Codeforces verification was not completed during the phone handoff. No submission was sent; try again when you can open the private link.', 'blocked');
+          }
           attempts.push(`${path}: HTTP ${status} (${reason}${title ? `; page title: ${title}` : ''})`);
           blocked += 1;
           continue;
@@ -328,7 +336,9 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
       }
       const body = await readBody(page);
       if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(page.url())) {
-        if (!(await waitForCodeforcesPage(page, 'submit', CHALLENGE_WAIT_MS))) {
+        if (!(await waitForCodeforcesPage(page, 'submit', CHALLENGE_WAIT_MS)
+          || await phoneVerification?.(page, 'submit'))) {
+          if (phoneVerification) throw new BrowserFormError('Codeforces verification was not completed during the phone handoff. No submission was sent.', 'blocked');
           attempts.push(`${path}: challenge did not clear`);
           blocked += 1;
           continue;
@@ -344,6 +354,7 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
       }
       attempts.push(`${path}: no submit form (url ${page.url()}; fields: ${summarize(fields)})`);
     } catch (err) {
+      if (err instanceof BrowserFormError) throw err;
       attempts.push(`${path}: ${errorMessage(err)}`);
     }
   }
@@ -467,7 +478,7 @@ function compactBodyError(body: string): string {
   return useful?.slice(0, 500) ?? 'Codeforces rejected the submission form';
 }
 
-export async function submit(request: SubmitRequest, progress: (phase: string) => Promise<void> = async () => {}): Promise<SubmitResponse> {
+export async function submit(request: SubmitRequest, progress: (phase: string) => Promise<void> = async () => {}, phoneVerification?: PhoneVerification): Promise<SubmitResponse> {
   const label = request.label ?? request.handle ?? 'account';
   const available = freeMemoryMb();
   log({ label, availableMb: available, minimumFreeMb: BROWSER_MIN_FREE_MB }, 'isolated Codeforces browser preflight');
@@ -489,17 +500,29 @@ export async function submit(request: SubmitRequest, progress: (phase: string) =
   log({ label, browser: BROWSER_ENGINE, usedMb: cgroupUsedMb() }, 'browser launched for isolated Codeforces submission');
 
   const flags = { turnstile: false, interactive: false };
+  let phoneRequested = false;
+  const requestPhone = phoneVerification ? async (page: Page, mode: Parameters<PhoneVerification>[1]) => {
+    phoneRequested = true;
+    return phoneVerification(page, mode);
+  } : undefined;
   try {
     let ts: { turnstile: boolean; interactive: boolean } | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         await progress('opening');
-        await openSubmitForm(session.page, request.entry);
+        await openSubmitForm(session.page, request.entry, requestPhone);
         await progress('verification');
-        ts = await fillSubmitForm(session.page, request.entry, request.code);
+        try {
+          ts = await fillSubmitForm(session.page, request.entry, request.code);
+        } catch (err) {
+          if (!(err instanceof BrowserFormError) || err.kind !== 'blocked' || err.clicked
+            || !(err.flags.turnstile || err.flags.interactive)
+            || !await requestPhone?.(session.page, 'turnstile')) throw err;
+          ts = await ensureFormTurnstile(session.page, 1000);
+        }
         break;
       } catch (err) {
-        if (!(err instanceof BrowserFormError) || err.kind !== 'blocked' || err.clicked || attempt === 1) {
+        if (!(err instanceof BrowserFormError) || err.kind !== 'blocked' || err.clicked || attempt === 1 || phoneRequested) {
           if (err instanceof BrowserFormError && err.kind === 'blocked') await progress('verification-blocked');
           throw err;
         }
@@ -531,7 +554,8 @@ export async function submit(request: SubmitRequest, progress: (phase: string) =
     let finalUrl = session.page.url();
     if (click.status === 403 || click.status === 503 || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl) || /__cf_chl/i.test(finalUrl)) {
       await progress('verification');
-      const cleared = await waitForCodeforcesPage(session.page, 'result', CHALLENGE_WAIT_MS);
+      const cleared = await waitForCodeforcesPage(session.page, 'result', CHALLENGE_WAIT_MS)
+        || await requestPhone?.(session.page, 'result');
       body = await readBody(session.page);
       finalUrl = session.page.url();
       if (!cleared || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
@@ -637,6 +661,36 @@ function runnerAuthorized(req: http.IncomingMessage): boolean {
 export const server = http.createServer((req, res) => {
   const url = req.url ?? '/';
 
+  if (req.method === 'GET' && url === '/verify') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff', 'x-robots-tag': 'noindex, nofollow',
+      'content-security-policy': "default-src 'self'; img-src 'self' blob:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+    res.end(verificationHtml);
+    return;
+  }
+  if (url === '/verification/frame' || url === '/verification/action') {
+    const token = req.headers['x-verification-token'];
+    const session = typeof token === 'string' && /^[a-f0-9]{64}$/.test(token) ? verificationRelay.frame(token) : null;
+    if (!session || broker?.status(session.id)?.pending !== true) { json(res, 410, { error: 'verification session ended' }); return; }
+    if (url === '/verification/frame' && req.method === 'GET' && session.image) {
+      res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff', 'x-expires-at': String(session.expiresAt), 'referrer-policy': 'no-referrer' });
+      res.end(session.image);
+      return;
+    }
+    if (url === '/verification/action' && req.method === 'POST') {
+      let raw = '';
+      req.on('data', (chunk: Buffer) => { raw += chunk.toString(); if (raw.length > 256) req.destroy(); });
+      req.on('end', () => {
+        try { json(res, verificationRelay.queue(session.token, JSON.parse(raw)) ? 200 : 400, { accepted: true }); }
+        catch { json(res, 400, { error: 'invalid interaction' }); }
+      });
+      return;
+    }
+    json(res, 405, { error: 'method not allowed' });
+    return;
+  }
+
   // Public liveness endpoint for Render/UptimeRobot. Keep this path completely
   // independent of the browser, auth token, or Codeforces itself. Support both
   // GET and HEAD because HTTP monitors may use either request style.
@@ -662,7 +716,7 @@ export const server = http.createServer((req, res) => {
     return;
   }
 
-  const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result|network|progress))?$/.exec(url);
+  const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result|network|progress|verification))?$/.exec(url);
   if (broker && req.method === 'GET' && url === '/jobs/next') {
     if (!runnerAuthorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
     json(res, 200, { jobId: broker.nextId, networkMode: broker.nextId ? broker.nextNetworkMode : null });
@@ -674,7 +728,8 @@ export const server = http.createServer((req, res) => {
     const action = jobRoute[2];
     if (req.method === 'GET' && !action) {
       const status = broker.status(id);
-      json(res, status ? 200 : 404, status ?? { error: 'job not found or expired' });
+      const verification = status?.pending ? verificationRelay.metadata(id) : undefined;
+      json(res, status ? 200 : 404, status ? { ...status, ...(verification ? { verification } : {}) } : { error: 'job not found or expired' });
       return;
     }
     if (req.method === 'GET' && action === 'network') {
@@ -685,6 +740,24 @@ export const server = http.createServer((req, res) => {
     if (req.method === 'POST' && action === 'claim') {
       const payload = broker.claim(id);
       json(res, payload ? 200 : 404, payload ?? { error: 'job not found or already claimed' });
+      return;
+    }
+    if (req.method === 'POST' && action === 'verification') {
+      if (broker.status(id)?.pending !== true || !broker.updateProgress(id, 'verification-required')) { json(res, 409, { error: 'inactive job' }); return; }
+      let raw = '';
+      req.on('data', (chunk: Buffer) => { raw += chunk.toString(); if (raw.length > 601_000) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const value = JSON.parse(raw) as { close?: boolean; image: string; width: number; height: number };
+          if (value.close === true) {
+            verificationRelay.close(id);
+            broker.updateProgress(id, 'verification');
+            json(res, 200, { closed: true });
+          } else {
+            json(res, 200, verificationRelay.publish(id, value.image, value.width, value.height));
+          }
+        } catch { json(res, 400, { error: 'invalid verification frame' }); }
+      });
       return;
     }
     if (req.method === 'POST' && action === 'progress') {
@@ -712,7 +785,9 @@ export const server = http.createServer((req, res) => {
         try {
           const value = JSON.parse(raw) as SubmitResponse;
           if (typeof value?.ok !== 'boolean' || typeof value?.clicked !== 'boolean') throw new Error('invalid result');
-          json(res, broker.finish(id, value) ? 200 : 409, { accepted: broker.status(id)?.pending === false });
+          const accepted = broker.finish(id, value);
+          if (accepted) verificationRelay.close(id);
+          json(res, accepted ? 200 : 409, { accepted: broker.status(id)?.pending === false });
         } catch { json(res, 400, { error: 'invalid result' }); }
       });
       return;

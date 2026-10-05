@@ -126,6 +126,11 @@ async function verificationState(page: Page) {
   });
 }
 
+export async function nativeVerificationComplete(page: Page): Promise<boolean> {
+  const state = await verificationState(page);
+  return state.tokenInForm && state.submitReady;
+}
+
 /** One native click, with evidence from the actual POST. Never retry an ambiguous POST. */
 export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{ clicked: boolean; status: number | null }> {
   const form = page.locator('form:has(textarea[name="source"])').first();

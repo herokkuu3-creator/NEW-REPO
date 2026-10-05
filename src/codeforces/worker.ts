@@ -65,7 +65,7 @@ export function isCodeforcesRunInProgress(): boolean {
 export interface CodeforcesRunOptions {
   onAccountOutcome?: (outcome: CodeforcesAccountOutcome, index: number, total: number) => Promise<void> | void;
   onAccountProgress?: (progress: {
-    phase: 'checking' | 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict' | 'session-restored' | 'session-fresh' | 'verification' | 'verification-retry' | 'verification-blocked' | 'verification-cleared' | 'verification-not-required';
+    phase: 'checking' | 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict' | 'session-restored' | 'session-fresh' | 'verification' | 'verification-retry' | 'verification-blocked' | 'verification-cleared' | 'verification-not-required' | 'verification-required';
     label: string;
     username?: string | null;
     index: number;
@@ -272,7 +272,7 @@ async function runForAccount(
           submissionCode,
           networkMode,
           async (phase) => {
-            const phases = ['opening', 'submitting', 'session-restored', 'session-fresh', 'verification', 'verification-retry', 'verification-blocked', 'verification-cleared', 'verification-not-required'] as const;
+            const phases = ['opening', 'submitting', 'session-restored', 'session-fresh', 'verification', 'verification-retry', 'verification-blocked', 'verification-cleared', 'verification-not-required', 'verification-required'] as const;
             const known = phases.find((value) => value === phase);
             if (known) await onProgress?.(known, username);
           },
