@@ -31,7 +31,7 @@ function formHtml(options: { token?: string; disabled?: boolean; prevent?: boole
       ${options.callback ? '<div class="cf-turnstile" data-sitekey="fixture-key" data-callback="onVerified"></div>' : ''}
     </form></div>
     <script>
-      window.editor = { save: () => { window.saved = true; } };
+      window.editor = { value: '', setValue: (value) => { window.editor.value = value; }, save: () => { window.saved = true; } };
       window.onVerified = () => document.querySelector('#solution input[type=submit]').disabled = false;
       document.querySelector('#solution').addEventListener('submit', event => {
         ${options.prevent ? 'event.preventDefault();' : ''}
@@ -181,8 +181,18 @@ describe('Codeforces native browser submission', () => {
     expect(await page.locator('textarea').inputValue()).toBe(code);
     expect(await page.evaluate(() => {
       (window as any).editor.save();
-      return (window as any).saved;
-    })).toBe(true);
+      return { saved: (window as any).saved, editorValue: (window as any).editor.value,
+        plainTextarea: (document.getElementById('toggleEditorCheckbox') as HTMLInputElement).checked };
+    })).toEqual({ saved: true, editorValue: code, plainTextarea: true });
+  });
+
+  it('waits for Codeforces to enable Submit after the source events', async () => {
+    await fixture({ token: 'verified', disabled: true });
+    await page.evaluate(() => setTimeout(() => {
+      (document.querySelector('#solution input[type=submit]') as HTMLInputElement).disabled = false;
+    }, 120));
+    await expect(clickSubmitForm(page, 1_000)).resolves.toMatchObject({ clicked: true, status: 200 });
+    expect(posts).toHaveLength(1);
   });
 
   it('reports a prevented submit instead of treating a click as a POST', async () => {

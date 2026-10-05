@@ -28,7 +28,16 @@ export function blockCodeforcesResource(url: string, type: string): boolean {
 export async function fillSource(page: Page, code: string): Promise<void> {
   await page.evaluate((content) => {
     const toggle = document.getElementById('toggleEditorCheckbox') as HTMLInputElement | null;
-    if (toggle?.checked) toggle.click();
+    // Keep the plain textarea active. Some Codeforces pages preserve an Ace
+    // editor preference; switching it on after filling the textarea makes the
+    // editor look empty and leaves Submit disabled.
+    if (toggle && !toggle.checked) toggle.click();
+    const editor = (window as unknown as {
+      editor?: { setValue?: (value: string, cursor?: number) => void };
+    }).editor;
+    // Sync Ace as well so the site's native submit handler cannot overwrite
+    // the textarea with stale editor content.
+    if (typeof editor?.setValue === 'function') editor.setValue(content, -1);
     const source = document.querySelector('textarea[name="source"]') as HTMLTextAreaElement | null;
     if (!source) throw new Error('Codeforces submit form has no source textarea');
     source.value = content;
@@ -179,8 +188,24 @@ export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{
   const form = page.locator('form:has(textarea[name="source"])').first();
   const control = form.locator('input[type="submit"], button[type="submit"], button:not([type])').first();
   if (await control.count() === 0) return { clicked: false, status: null };
-  if (!await control.isEnabled()) {
-    throw new BrowserFormError('Codeforces submit button is disabled; verification or form initialization is incomplete. No submission was sent.', 'blocked');
+  // Codeforces can enable Submit a moment after the source input/change events.
+  // Wait for that native update, but never remove the disabled attribute or
+  // force a form that Codeforces still considers invalid.
+  const readyDeadline = Date.now() + Math.min(5_000, timeoutMs);
+  while (!await control.isEnabled().catch(() => false) && Date.now() < readyDeadline) {
+    await new Promise(resolve => setTimeout(resolve, Math.min(100, readyDeadline - Date.now())));
+  }
+  if (!await control.isEnabled().catch(() => false)) {
+    const details = await form.evaluate((element) => {
+      const source = element.querySelector<HTMLTextAreaElement>('textarea[name="source"]');
+      const toggle = document.getElementById('toggleEditorCheckbox') as HTMLInputElement | null;
+      return { sourcePresent: !!source?.value.trim(), editorDisabled: toggle?.checked ?? null,
+        widgetPresent: !!element.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]') };
+    }).catch(() => ({ sourcePresent: false, editorDisabled: null, widgetPresent: false }));
+    throw new BrowserFormError(
+      `Codeforces submit button stayed disabled after source initialization (${JSON.stringify(details)}). No submission was sent.`,
+      'blocked',
+    );
   }
 
   let posted: Request | undefined;

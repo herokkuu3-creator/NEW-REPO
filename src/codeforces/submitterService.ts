@@ -435,7 +435,7 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
   if (!language) throw new Error(`no ${wantsPython ? 'Python 3' : 'C++'} language option on the Codeforces form`);
   await setSelectValue(page, 'programTypeId', language.value);
 
-  log({}, 'unchecking editor and filling source');
+  log({}, 'syncing editor and filling source');
   const sourceBox = page.locator('textarea[name="source"]').first();
   if ((await sourceBox.count().catch(() => 0)) === 0) throw new Error('Codeforces submit form has no source textarea');
 
