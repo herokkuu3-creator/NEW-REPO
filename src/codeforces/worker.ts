@@ -34,6 +34,11 @@ import {
 const CODEFORCES_LAST_REPORT_KEY = 'codeforcesLastReport';
 let runInProgress = false;
 
+/** Codeforces can reject a duplicate without creating a new submission ID. */
+export function isAlreadySubmittedCodeError(error: string | null | undefined): boolean {
+  return /exactly the same code|same code before|already submitted/i.test(error ?? '');
+}
+
 /**
  * Minimum free container memory required before Firefox may start.
  *
@@ -369,16 +374,17 @@ async function runForAccount(
 
     const verdictCode = result.verdict ?? result.kind.toUpperCase().replace(/-/g, '_');
     await recordAttempt(account.id, { submissionId: result.submissionId ?? null, verdict: verdictCode });
+    const duplicateSubmission = isAlreadySubmittedCodeError(result.error);
     const finalVerdict = Boolean(
       result.submissionId && result.verdict && !['TESTING', 'QUEUE', 'QUEUED'].includes(result.verdict.toUpperCase()),
     );
-    if (finalVerdict) {
+    if (finalVerdict || duplicateSubmission) {
       const index = source.queue.findIndex((e) => e.key === entry.key);
       await completeCurrentProblem(account.id, {
         completedKey: entry.key,
         nextKey: source.queue[index + 1]?.key ?? null,
-        submissionId: result.submissionId!,
-        verdict: verdictCode,
+        submissionId: result.submissionId ?? null,
+        verdict: duplicateSubmission ? 'DUPLICATE_CODE' : verdictCode,
       });
     }
     await patchCodeforcesAccount(account.id, {
@@ -399,7 +405,9 @@ async function runForAccount(
       label,
       username,
       kind: result.kind === 'signed-out' ? 'rejected' : 'failed',
-      note,
+      note: duplicateSubmission
+        ? `${note ? `${note} ` : ''}Codeforces already had this exact source; marked it performed and advanced to the next solution.`
+        : note,
       problem: problemLabel(entry),
       problemUrl: entry.problemUrl ?? null,
       submissionId: result.submissionId ?? null,

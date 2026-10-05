@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { shouldReleaseDailyAttempt } from '../src/codeforces/dailyGate';
+import { isAlreadySubmittedCodeError } from '../src/codeforces/worker';
 
 /** The reported bug: a failed attempt consumed the whole day. */
 describe('shouldReleaseDailyAttempt', () => {
@@ -25,5 +26,12 @@ describe('shouldReleaseDailyAttempt', () => {
   it('leaves another day alone', () => {
     expect(shouldReleaseDailyAttempt({ manual: false, lastAttemptDate: '2026-09-28', lastVerdict: null, today })).toBe(false);
     expect(shouldReleaseDailyAttempt({ manual: false, lastAttemptDate: null, lastVerdict: null, today })).toBe(false);
+  });
+});
+
+describe('duplicate Codeforces submissions', () => {
+  it('recognizes the duplicate-code response even when no submission ID exists', () => {
+    expect(isAlreadySubmittedCodeError('You have submitted exactly the same code before')).toBe(true);
+    expect(isAlreadySubmittedCodeError('Codeforces verdict: WRONG_ANSWER')).toBe(false);
   });
 });
