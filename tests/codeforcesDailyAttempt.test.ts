@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { shouldReleaseDailyAttempt } from '../src/codeforces/dailyGate';
-import { isAlreadySubmittedCodeError } from '../src/codeforces/worker';
+import { isAfterCodeforcesSchedule, isAlreadySubmittedCodeError } from '../src/codeforces/worker';
 
 /** The reported bug: a failed attempt consumed the whole day. */
 describe('shouldReleaseDailyAttempt', () => {
@@ -33,5 +33,13 @@ describe('duplicate Codeforces submissions', () => {
   it('recognizes the duplicate-code response even when no submission ID exists', () => {
     expect(isAlreadySubmittedCodeError('You have submitted exactly the same code before')).toBe(true);
     expect(isAlreadySubmittedCodeError('Codeforces verdict: WRONG_ANSWER')).toBe(false);
+  });
+});
+
+describe('automatic Codeforces retry window', () => {
+  it('starts retries only after the configured daily time', () => {
+    expect(isAfterCodeforcesSchedule(new Date('2026-10-05T03:44:00.000Z'), 9, 15, 'Asia/Kolkata')).toBe(false);
+    expect(isAfterCodeforcesSchedule(new Date('2026-10-05T03:45:00.000Z'), 9, 15, 'Asia/Kolkata')).toBe(false);
+    expect(isAfterCodeforcesSchedule(new Date('2026-10-05T03:50:00.000Z'), 9, 15, 'Asia/Kolkata')).toBe(true);
   });
 });

@@ -12,6 +12,8 @@ export interface CodeforcesAccountOutcome {
   verdict?: string | null;
   error?: string | null;
   note?: string;
+  /** A Codeforces submission was accepted by the form and reached a final verdict, or was already present. */
+  performed?: boolean;
 }
 
 export interface CodeforcesRunReport {

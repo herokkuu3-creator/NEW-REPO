@@ -364,6 +364,7 @@ async function runForAccount(
         label,
         username,
         kind: 'solved',
+        performed: true,
         note,
         problem: problemLabel(entry),
         problemUrl: entry.problemUrl ?? null,
@@ -405,6 +406,7 @@ async function runForAccount(
       label,
       username,
       kind: result.kind === 'signed-out' ? 'rejected' : 'failed',
+      performed: finalVerdict || duplicateSubmission,
       note: duplicateSubmission
         ? `${note ? `${note} ` : ''}Codeforces already had this exact source; marked it performed and advanced to the next solution.`
         : note,
@@ -671,6 +673,90 @@ function problemLabel(entry: SourceIndexEntry): string {
   return `${entry.contestId ?? '?'}${entry.problemIndex ?? ''}${entry.problemName ? ` — ${entry.problemName}` : ''}`;
 }
 
+interface CodeforcesDailyState {
+  date: string;
+  retryCount: number;
+  completedAccountIds: string[];
+}
+
+const CODEFORCES_DAILY_RETRY_LIMIT = 10;
+
+async function readCodeforcesDailyState(date: string): Promise<CodeforcesDailyState> {
+  try {
+    const raw = await getSystemState(SystemKeys.codeforcesDailyState);
+    const parsed = raw ? JSON.parse(raw) as Partial<CodeforcesDailyState> : null;
+    if (parsed?.date === date) {
+      return {
+        date,
+        retryCount: Number.isInteger(parsed.retryCount) && Number(parsed.retryCount) >= 0 ? Number(parsed.retryCount) : 0,
+        completedAccountIds: Array.isArray(parsed.completedAccountIds)
+          ? parsed.completedAccountIds.filter((id): id is string => typeof id === 'string')
+          : [],
+      };
+    }
+  } catch {
+    // Reset malformed state; account progress remains durable in its own table.
+  }
+  return { date, retryCount: 0, completedAccountIds: [] };
+}
+
+async function writeCodeforcesDailyState(state: CodeforcesDailyState): Promise<void> {
+  await setSystemState(SystemKeys.codeforcesDailyState, JSON.stringify(state));
+}
+
+export function isAfterCodeforcesSchedule(
+  now: Date,
+  hour: number,
+  minute: number,
+  timezone: string,
+): boolean {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(now);
+  const currentHour = Number(parts.find((part) => part.type === 'hour')?.value ?? -1);
+  const currentMinute = Number(parts.find((part) => part.type === 'minute')?.value ?? -1);
+  return currentHour * 60 + currentMinute > hour * 60 + minute;
+}
+
+async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minute: number, timezone: string): Promise<void> {
+  if (runInProgress) return;
+  if (isRetry && !isAfterCodeforcesSchedule(new Date(), hour, minute, timezone)) return;
+
+  const date = todayInTimezone();
+  const state = await readCodeforcesDailyState(date);
+  if (isRetry && state.retryCount >= CODEFORCES_DAILY_RETRY_LIMIT) return;
+
+  const accounts = await listCodeforcesAccounts(false);
+  const completed = new Set(state.completedAccountIds);
+  const pending = accounts.filter((account) => !completed.has(account.id));
+  if (pending.length === 0) return;
+
+  if (isRetry) state.retryCount += 1;
+  await writeCodeforcesDailyState(state);
+  logger.info(
+    { date, retry: isRetry, retryAttempt: state.retryCount, retryLimit: CODEFORCES_DAILY_RETRY_LIMIT, accounts: pending.length },
+    'automatic Codeforces daily run starting',
+  );
+
+  await runCodeforcesNow('cron', {
+    forceDailyAttempt: true,
+    accountIds: pending.map((account) => account.id),
+    onAccountOutcome: async (outcome, index) => {
+      const account = pending[index - 1];
+      if (!account) return;
+      const terminalWithoutSource = outcome.kind === 'skipped' && /queue is exhausted/i.test(outcome.error ?? '');
+      if (outcome.performed || terminalWithoutSource) {
+        completed.add(account.id);
+        state.completedAccountIds = [...completed];
+        await writeCodeforcesDailyState(state);
+      }
+    },
+  });
+}
+
 export function startCodeforcesScheduler(): () => void {
   // Staggered away from the LeetCode run by default (09:15 vs 09:00) so the two
   // never contend for the same 512MB container.
@@ -688,12 +774,22 @@ export function startCodeforcesScheduler(): () => void {
   const task = cron.schedule(
     expression,
     () => {
-      void triggerCodeforcesRun('cron');
+      void runAutomaticCodeforcesDaily(false, hour, minute, timezone);
     },
     { timezone },
   );
-  logger.info({ expression, timezone }, 'Codeforces scheduler armed');
+  const retryTask = cron.schedule(
+    '*/5 * * * *',
+    () => {
+      void runAutomaticCodeforcesDaily(true, hour, minute, timezone);
+    },
+    { timezone },
+  );
+  logger.info({ expression, retryExpression: '*/5 * * * *', retryLimit: CODEFORCES_DAILY_RETRY_LIMIT, timezone }, 'Codeforces scheduler armed');
   // Deliberately no RUN_ON_BOOT hook: existing LeetCode boot behavior stays unchanged,
   // and Codeforces submissions happen on the configured daily cron or manual command.
-  return () => task.stop();
+  return () => {
+    task.stop();
+    retryTask.stop();
+  };
 }
