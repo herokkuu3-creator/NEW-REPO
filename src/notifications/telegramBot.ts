@@ -534,23 +534,49 @@ export async function handleCodeforcesSubmitNext(
     await reply('🚧 A Codeforces run is already in progress — wait for its report, then send /submitnextsolution again.');
     return null;
   }
-  await reply('🏆 Submitting the next Codeforces source solution for all Codeforces accounts.');
+  const statusMessage = await tgApi<{ message_id: number }>('sendMessage', {
+    chat_id: config.telegram.chatId,
+    text: '🏆 Submitting the next Codeforces source solution for all Codeforces accounts.\n\n🔎 Checking accounts…',
+    disable_web_page_preview: true,
+  });
+  const progressLines = new Map<number, string>();
+  const editProgress = async (): Promise<void> => {
+    const lines = [...progressLines.entries()].sort(([a], [b]) => a - b).map(([, line]) => line);
+    await tgApi('editMessageText', {
+      chat_id: config.telegram.chatId,
+      message_id: statusMessage.message_id,
+      text: ['🏆 Submitting the next Codeforces source solution for all Codeforces accounts.', '', ...lines].join('\n'),
+      disable_web_page_preview: true,
+    }).catch((err) => logger.warn({ err: errText(err) }, 'could not update Codeforces progress message'));
+  };
   const done = (async () => {
     const report = await runner(CODEFORCES_MANUAL_REASON, {
       forceDailyAttempt: true,
+      onAccountProgress: async ({ phase, label, username, index, total }) => {
+        progressLines.set(
+          index,
+          phase === 'checking'
+            ? `👤 Account ${index}/${total} — 🔎 Checking ${label}…`
+            : `👤 Account ${index}/${total} — ✅ Account verified ${username ?? label}`,
+        );
+        await editProgress();
+      },
       onAccountOutcome: (outcome, index, total) =>
-        reply(formatCodeforcesAccountMessage(outcome, index, total)),
+        (progressLines.set(index, formatCodeforcesAccountMessage(outcome, index, total)), editProgress()),
     });
     if (!report) {
-      await reply('⏳ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
+      progressLines.set(0, '⏳ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
+      await editProgress();
     } else if (report.totals.accounts === 0) {
-      await reply('📭 No Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
+      progressLines.set(0, '📭 No Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
+      await editProgress();
     } else {
       logger.info({ summary: summarizeCodeforcesReport(report) }, 'telegram /submitnextsolution finished');
     }
   })().catch(async (err) => {
     logger.warn({ err: errText(err) }, '/submitnextsolution failed');
-    await reply(`⚠️ /submitnextsolution failed: ${errText(err)}`).catch(() => undefined);
+    progressLines.set(0, `⚠️ /submitnextsolution failed: ${errText(err)}`);
+    await editProgress().catch(() => undefined);
   });
   return { done };
 }

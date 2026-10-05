@@ -59,6 +59,7 @@ export function isCodeforcesRunInProgress(): boolean {
 
 export interface CodeforcesRunOptions {
   onAccountOutcome?: (outcome: CodeforcesAccountOutcome, index: number, total: number) => Promise<void> | void;
+  onAccountProgress?: (progress: { phase: 'checking' | 'verified'; label: string; username?: string | null; index: number; total: number }) => Promise<void> | void;
   /** Manual triggers may reuse a day's single attempt after it failed. */
   forceDailyAttempt?: boolean;
   /** When present, run only these active Codeforces account IDs. */
@@ -120,7 +121,10 @@ export async function executeCodeforcesRun(
     }
 
     for (const account of accounts) {
-      const outcome = await runForAccount(account, today, source, forceDailyAttempt, networkMode);
+      await Promise.resolve(options.onAccountProgress?.({ phase: 'checking', label: account.label, username: account.username, index: outcomes.length + 1, total: accounts.length }));
+      const outcome = await runForAccount(account, today, source, forceDailyAttempt, networkMode, (username) =>
+        options.onAccountProgress?.({ phase: 'verified', label: account.label, username, index: outcomes.length + 1, total: accounts.length }),
+      );
       outcomes.push(outcome);
       if (options.onAccountOutcome) {
         await Promise.resolve(options.onAccountOutcome(outcome, outcomes.length, accounts.length)).catch((err) =>
@@ -144,6 +148,7 @@ async function runForAccount(
   source: Awaited<ReturnType<typeof loadRuntimeSourceIndex>>,
   forceDailyAttempt = false,
   networkMode: CodeforcesNetworkMode = 'proxy',
+  onVerified?: (username: string | null) => Promise<void> | void,
 ): Promise<CodeforcesAccountOutcome> {
   const label = account.label;
   const stored = parseStoredCodeforcesState(account.storageState);
@@ -190,6 +195,7 @@ async function runForAccount(
   const entry = current;
   const handle = account.username ?? label;
   let username = handle;
+  await Promise.resolve(onVerified?.(username));
   try {
     const originalCode = await fetchSourceCode(entry);
     const strippedCode =
@@ -350,6 +356,18 @@ async function runForAccount(
 
     const verdictCode = result.verdict ?? result.kind.toUpperCase().replace(/-/g, '_');
     await recordAttempt(account.id, { submissionId: result.submissionId ?? null, verdict: verdictCode });
+    const finalVerdict = Boolean(
+      result.submissionId && result.verdict && !['TESTING', 'QUEUE', 'QUEUED'].includes(result.verdict.toUpperCase()),
+    );
+    if (finalVerdict) {
+      const index = source.queue.findIndex((e) => e.key === entry.key);
+      await completeCurrentProblem(account.id, {
+        completedKey: entry.key,
+        nextKey: source.queue[index + 1]?.key ?? null,
+        submissionId: result.submissionId!,
+        verdict: verdictCode,
+      });
+    }
     await patchCodeforcesAccount(account.id, {
       status:
         result.kind === 'signed-out'
