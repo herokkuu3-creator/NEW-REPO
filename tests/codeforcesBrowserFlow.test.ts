@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright';
-import { blockCodeforcesResource, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory } from '../src/codeforces/browserForm';
+import { blockCodeforcesResource, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, submissionFeedback } from '../src/codeforces/browserForm';
 import { postSubmitForm } from '../src/codeforces/submission';
 import type { BrowserSession } from '../src/browser/playwright';
 import type { SourceIndexEntry } from '../src/codeforces/sourceRepo';
@@ -16,7 +16,7 @@ let server: Server;
 let fixtureOrigin: string;
 let fixtureResult = 'history';
 
-function formHtml(options: { token?: string; disabled?: boolean; prevent?: boolean; callback?: boolean } = {}): string {
+function formHtml(options: { token?: string; disabled?: boolean; prevent?: boolean; callback?: boolean; editorEnabled?: boolean } = {}): string {
   return `<!doctype html><link rel="stylesheet" href="/submit.css"><div id="body">
     <form action="/search" method="post"><input type="submit" value="Search"></form>
     <form id="solution" action="${fixtureOrigin}/contest/1/submit" method="post">
@@ -25,13 +25,22 @@ function formHtml(options: { token?: string; disabled?: boolean; prevent?: boole
       <select name="programTypeId"><option value="89">GNU G++23</option></select>
       <input type="hidden" name="turnstileToken" value="${options.token ?? ''}">
       <input type="hidden" name="_tta" value="">
-      <input id="toggleEditorCheckbox" type="checkbox" checked>
+      <input id="toggleEditorCheckbox" type="checkbox" ${options.editorEnabled ? '' : 'checked'}>
       <textarea name="source"></textarea>
       <input type="submit" name="submit" value="Submit" ${options.disabled ? 'disabled' : ''}>
       ${options.callback ? '<div class="cf-turnstile" data-sitekey="fixture-key" data-callback="onVerified"></div>' : ''}
     </form></div>
     <script>
-      window.editor = { save: () => { window.saved = true; } };
+      window.editor = {
+        value: '',
+        setValue: function(value) { this.value = value; },
+        save: function() {
+          window.saved = true;
+          if (!document.getElementById('toggleEditorCheckbox').checked) {
+            document.querySelector('[name=source]').value = this.value;
+          }
+        }
+      };
       window.onVerified = () => document.querySelector('#solution input[type=submit]').disabled = false;
       document.querySelector('#solution').addEventListener('submit', event => {
         ${options.prevent ? 'event.preventDefault();' : ''}
@@ -183,6 +192,21 @@ describe('Codeforces native browser submission', () => {
       (window as any).editor.save();
       return (window as any).saved;
     })).toBe(true);
+  });
+
+  it('switches off an enabled editor and keeps source intact through native submit', async () => {
+    await fixture({ token: 'verified', editorEnabled: true });
+    await fillSource(page, code);
+    expect(await page.locator('#toggleEditorCheckbox').isChecked()).toBe(true);
+    expect(await page.evaluate(() => (window as any).editor.value)).toBe(code);
+    await clickSubmitForm(page);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.get('source')).toBe(code);
+  });
+
+  it('reads visible validation labels without reading source or hidden tokens', async () => {
+    await page.setContent('<span class="error">Source is empty</span><span class="error" style="display:none">Hidden error</span><textarea>private source</textarea><input type="hidden" name="csrf_token" value="private-token">');
+    expect(await submissionFeedback(page)).toBe('Source is empty');
   });
 
   it('reports a prevented submit instead of treating a click as a POST', async () => {

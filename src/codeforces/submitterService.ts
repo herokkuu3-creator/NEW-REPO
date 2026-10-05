@@ -26,7 +26,7 @@ import http from 'node:http';
 import { BrowserStateCache } from './browserStateCache';
 import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
-import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource } from './browserForm';
+import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, submissionFeedback } from './browserForm';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
 const PORT = Number(process.env.PORT ?? 10000);
@@ -448,7 +448,7 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
   if (!language) throw new Error(`no ${wantsPython ? 'Python 3' : 'C++'} language option on the Codeforces form`);
   await setSelectValue(page, 'programTypeId', language.value);
 
-  log({}, 'unchecking editor and filling source');
+  log({}, 'switching off editor and filling source');
   const sourceBox = page.locator('textarea[name="source"]').first();
   if ((await sourceBox.count().catch(() => 0)) === 0) throw new Error('Codeforces submit form has no source textarea');
 
@@ -587,7 +587,13 @@ export async function submit(request: SubmitRequest, progress: (phase: string) =
       };
     }
     if (!isSubmissionHistory(finalUrl)) {
-      return { ok: false, kind: 'submission-error', error: 'Codeforces did not redirect to submission history after the POST; acceptance is uncertain and the POST was not retried.', status: click.status, finalUrl, clicked: true, ...flags };
+      const feedback = await submissionFeedback(session.page);
+      const returnedForm = await session.page.locator('form:has(textarea[name="source"])').count() > 0;
+      const path = new URL(finalUrl).pathname;
+      log({ status: click.status, path, returnedForm, feedback }, 'Codeforces POST returned without submission history');
+      return { ok: false, kind: 'submission-error', error: feedback
+        ? `Codeforces returned the submit form: ${feedback}`
+        : `Codeforces did not redirect to submission history after the POST (HTTP ${click.status ?? '?'}, path ${path}, submit form ${returnedForm ? 'present' : 'absent'}); acceptance is uncertain and the POST was not retried.`, status: click.status, finalUrl, clicked: true, ...flags };
     }
     return { ok: true, status: click.status, finalUrl, clicked: true, ...flags };
   } catch (err) {

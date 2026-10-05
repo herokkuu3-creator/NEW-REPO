@@ -28,13 +28,31 @@ export function blockCodeforcesResource(url: string, type: string): boolean {
 export async function fillSource(page: Page, code: string): Promise<void> {
   await page.evaluate((content) => {
     const toggle = document.getElementById('toggleEditorCheckbox') as HTMLInputElement | null;
-    if (toggle?.checked) toggle.click();
+    // "Switch off editor" is checked when the plain textarea is active.
+    // Unchecking it re-enables Ace, whose submit handler can replace the source.
+    if (toggle && !toggle.checked) toggle.click();
+    const editor = (window as unknown as { editor?: { setValue?: (value: string, cursor?: number) => void } }).editor;
+    // Keep the real editor in sync too, since some page versions save it on submit.
+    if (typeof editor?.setValue === 'function') editor.setValue(content, -1);
     const source = document.querySelector('textarea[name="source"]') as HTMLTextAreaElement | null;
     if (!source) throw new Error('Codeforces submit form has no source textarea');
     source.value = content;
     source.dispatchEvent(new Event('input', { bubbles: true }));
     source.dispatchEvent(new Event('change', { bubbles: true }));
   }, code);
+}
+
+/** Read only visible validation labels, never textarea content or hidden tokens. */
+export async function submissionFeedback(page: Page): Promise<string | null> {
+  const errors = await page.locator('.error, .error-message, .alert-danger, .notice, [class*="error-for__"]')
+    .evaluateAll((nodes) => nodes.filter((node) => {
+      const element = node as HTMLElement;
+      return element.offsetWidth > 0 || element.offsetHeight > 0 || element.getClientRects().length > 0;
+    }).map((node) => (node.textContent ?? '').replace(/\s+/g, ' ').trim()).filter(Boolean))
+    .catch(() => [] as string[]);
+  const text = [...new Set(errors)].join(' · ').slice(0, 600);
+  // Redact token-like query values should a validation label include a URL.
+  return text ? text.replace(/(csrf_token|turnstileToken|cf-turnstile-response)=\S+/gi, '$1=[redacted]') : null;
 }
 
 export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promise<VerificationFlags> {
