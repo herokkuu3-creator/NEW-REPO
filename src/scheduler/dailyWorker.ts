@@ -349,10 +349,10 @@ async function runForAccount(
     });
     logger.info({ label, username }, 'account authenticated');
 
-    // Reward collection uses its own tab and is deliberately best-effort:
-    // missing offers, page changes, and navigation failures never interrupt
-    // the daily submission pipeline.
-    const contestReward = await claimContestReward(activeSession.context, label);
+    // Reward collection uses the contest frontend's authenticated GraphQL
+    // operations and is deliberately best-effort, so it never navigates to
+    // the Cloudflare-protected contest HTML or interrupts daily submission.
+    const contestReward = await claimContestReward(api, label);
 
     // --- 2) Locate the current LeetCode daily challenge --------------------
     let daily;

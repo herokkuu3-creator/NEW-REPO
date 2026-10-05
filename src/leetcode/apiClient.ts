@@ -184,8 +184,15 @@ export class LeetCodeApi {
     variables: Record<string, unknown>,
     schema: z.ZodType<T>,
   ): Promise<T> {
+    const token = await this.csrfToken();
     const res = await this.request.post(`${ORIGIN}/graphql`, {
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Origin: ORIGIN,
+        Referer: `${ORIGIN}/`,
+        ...(token ? { 'x-csrftoken': token } : {}),
+      },
       data: { query, variables },
       timeout: REQUEST_TIMEOUT_MS,
     });

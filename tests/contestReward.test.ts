@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest';
-import { chromium } from 'playwright';
+import { describe, expect, it, vi } from 'vitest';
+import type { BrowserContext } from 'playwright';
 import type { AccountRecord } from '../src/database/accounts';
-import { claimContestReward, isContestRewardCandidate } from '../src/leetcode/contestReward';
+import { claimContestReward, type ContestRewardApi } from '../src/leetcode/contestReward';
+import { LeetCodeApi } from '../src/leetcode/apiClient';
 import { buildCoinClaimPicker } from '../src/notifications/telegramBot';
 import { formatOutcomeLine } from '../src/scheduler/report';
 
@@ -9,16 +10,60 @@ function account(id: string, label: string): AccountRecord {
   return { id, label, username: label, status: 'ACTIVE' } as unknown as AccountRecord;
 }
 
-describe('LeetCode contest reward safety', () => {
-  it('accepts reward controls in the contest-page promotion area', () => {
-    expect(isContestRewardCandidate({ text: 'Unbox surprise', x: 20, y: 110, width: 180, height: 42 })).toBe(true);
-    expect(isContestRewardCandidate({ text: 'Claim your LeetCoins', x: 30, y: 140, width: 200, height: 40 })).toBe(true);
-    expect(isContestRewardCandidate({ text: 'Mystery drop', x: 25, y: 120, width: 160, height: 40 })).toBe(true);
+function rewardApi(responses: unknown[]): ContestRewardApi & { graphql: ReturnType<typeof vi.fn> } {
+  return { graphql: vi.fn(async () => responses.shift()) } as unknown as ContestRewardApi & {
+    graphql: ReturnType<typeof vi.fn>;
+  };
+}
+
+describe('LeetCode contest reward GraphQL flow', () => {
+  it('does not mutate when the weekly reward is already collected', async () => {
+    const api = rewardApi([{ isEasterEggCollected: true }]);
+    await expect(claimContestReward(api, 'first')).resolves.toEqual({ offered: false, claimed: false });
+    expect(api.graphql).toHaveBeenCalledTimes(1);
+    expect(api.graphql.mock.calls[0]![0]).toContain('query easterEgg');
   });
 
-  it('does not treat contest actions or distant navigation as rewards', () => {
-    expect(isContestRewardCandidate({ text: 'Register Weekly Contest', x: 20, y: 110, width: 180, height: 42 })).toBe(false);
-    expect(isContestRewardCandidate({ text: 'LeetCoin Store', x: 900, y: 40, width: 120, height: 40 })).toBe(false);
+  it('collects an available reward with the frontend mutation', async () => {
+    const api = rewardApi([
+      { isEasterEggCollected: false },
+      { collectContestEasterEgg: { ok: true } },
+    ]);
+    await expect(claimContestReward(api, 'broZEdex')).resolves.toEqual({ offered: true, claimed: true });
+    expect(api.graphql).toHaveBeenCalledTimes(2);
+    expect(api.graphql.mock.calls[1]![0]).toContain('mutation collectContestEasterEgg');
+  });
+
+  it('sends the authenticated mutation with the session CSRF token', async () => {
+    const posts: Array<{ data: { query: string }; headers: Record<string, string> }> = [];
+    const context = {
+      cookies: vi.fn(async () => [{ name: 'csrftoken', value: 'csrf-123' }]),
+      request: {
+        post: vi.fn(async (_url: string, init: { data: { query: string }; headers: Record<string, string> }) => {
+          posts.push(init);
+          const body = init.data.query.includes('mutation collectContestEasterEgg')
+            ? { data: { collectContestEasterEgg: { ok: true } } }
+            : { data: { isEasterEggCollected: false } };
+          return { status: () => 200, text: async () => JSON.stringify(body) };
+        }),
+      },
+    } as unknown as BrowserContext;
+    await expect(claimContestReward(new LeetCodeApi(context), 'live-shape')).resolves.toEqual({
+      offered: true,
+      claimed: true,
+    });
+    expect(posts).toHaveLength(2);
+    expect(posts[1]!.headers['x-csrftoken']).toBe('csrf-123');
+    expect(posts[1]!.headers.Origin).toBe('https://leetcode.com');
+  });
+
+  it('keeps API errors non-fatal and reports them accurately', async () => {
+    const api = { graphql: vi.fn(async () => { throw new Error('GraphQL HTTP 403'); }) } as unknown as ContestRewardApi;
+    await expect(claimContestReward(api, 'blocked')).resolves.toEqual({
+      offered: false,
+      claimed: false,
+      error: 'contest reward API failed: GraphQL HTTP 403',
+    });
   });
 
   it('adds the collection note only after a confirmed claim', () => {
@@ -28,27 +73,6 @@ describe('LeetCode contest reward safety', () => {
       '✅ dom9090 (dom9090) — Accepted · 0 ms · 7.9 MB || Coins offered collected',
     );
   });
-
-  it('clicks an authenticated contest-page offer in an isolated browser tab', async () => {
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext();
-    await context.route('https://leetcode.com/contest/', async (route) => {
-      await route.fulfill({
-        contentType: 'text/html',
-        body: `<!doctype html><body>
-          <button id="offer" style="position:fixed;left:20px;top:110px;width:180px;height:42px"
-            onclick="this.remove();document.getElementById('done').style.display='block'">Mystery drop</button>
-          <div id="done" role="alert" style="display:none">Reward collected</div>
-        </body>`,
-      });
-    });
-    try {
-      await expect(claimContestReward(context, 'test')).resolves.toEqual({ offered: true, claimed: true });
-    } finally {
-      await context.close();
-      await browser.close();
-    }
-  }, 10_000);
 });
 
 describe('/claimcoins picker', () => {
