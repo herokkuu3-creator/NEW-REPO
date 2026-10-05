@@ -1506,10 +1506,10 @@ let pendingRenewalLabel: string | undefined;
 async function accountsText(): Promise<string> {
   const [accounts, codeforces] = await Promise.all([listAccounts(), listCodeforcesAccounts(true)]);
   const lines = [
-    '<b>👥 ACCOUNT CENTER</b>',
-    '<i>Live account health and submission progress</i>',
+    '<b>✦ ACCOUNT HUB</b>  <i>live snapshot</i>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
     '',
-    `<b>🟩 LEETCODE · ${accounts.length}</b>`,
+    `<b>🟩 LEETCODE</b>  <code>${accounts.length} connected</code>`,
   ];
   if (accounts.length === 0) {
     lines.push('📭 No LeetCode accounts configured. Send /renew with a cookie export.');
@@ -1517,24 +1517,20 @@ async function accountsText(): Promise<string> {
   for (const a of accounts) {
     const who = a.username ? ` (${escapeHtml(a.username)})` : '';
     const accepted = await latestAcceptedRunForAccount(a.id);
-    const acceptedText = accepted
-      ? `, last accepted ${humanLocal(accepted.updatedAt)}`
-      : ', no accepted submission recorded';
-    const checkedText = a.lastCheckedAt ? `, checked ${humanLocal(a.lastCheckedAt)}` : '';
-    lines.push(`▪️ <b>${escapeHtml(a.label)}</b>${who}: <i>${escapeHtml(a.status)}</i>${escapeHtml(acceptedText)}${escapeHtml(checkedText)}`);
-    if (a.lastError) lines.push(`  ⚠️ <i>error: ${escapeHtml(a.lastError.slice(0, 150))}</i>`);
+    const acceptedText = accepted ? `AC ${humanLocal(accepted.updatedAt)}` : 'no accepted run';
+    const checkedText = a.lastCheckedAt ? ` · checked ${humanLocal(a.lastCheckedAt)}` : '';
+    lines.push(`${accountStatusIcon(a.status)} <b>${escapeHtml(a.label)}</b>${who}  <i>${escapeHtml(acceptedText)}${escapeHtml(checkedText)}</i>`);
+    if (a.lastError) lines.push(`   └ ⚠️ <i>${escapeHtml(a.lastError.slice(0, 120))}</i>`);
   }
-  lines.push('', `<b>🏆 CODEFORCES · ${codeforces.length}</b>`);
+  lines.push('', '<code>━━━━━━━━━━━━━━━━━━━━</code>', '', `<b>🏆 CODEFORCES</b>  <code>${codeforces.length} connected</code>`);
   if (codeforces.length === 0) lines.push('📭 No Codeforces accounts configured.');
   for (const account of codeforces) {
     const progress = await getCodeforcesProgress(account.id);
     const who = account.username ? ` (${escapeHtml(account.username)})` : '';
-    lines.push(`▪️ <b>${escapeHtml(account.label)}</b>${who}: <i>${escapeHtml(account.status)}</i>`);
-    lines.push(`  📍 Next: <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>`);
-    if (progress.lastCompletedKey) lines.push(`  ✅ Last completed: <code>${escapeHtml(progress.lastCompletedKey)}</code>`);
-    if (progress.lastAttemptDate) lines.push(`  🗓️ Last attempt: ${escapeHtml(progress.lastAttemptDate)}${progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : ''}`);
-    if (progress.lastSubmissionId) lines.push(`  🆔 Submission: <code>${escapeHtml(progress.lastSubmissionId)}</code>`);
-    if (account.lastError) lines.push(`  ⚠️ <i>${escapeHtml(account.lastError.slice(0, 180))}</i>`);
+    const verdict = progress.lastVerdict ? ` · <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
+    lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
+    lines.push(`   └ next <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>${progress.lastSubmissionId ? ` · #<code>${escapeHtml(progress.lastSubmissionId)}</code>` : ''}`);
+    if (account.lastError) lines.push(`   └ ⚠️ <i>${escapeHtml(account.lastError.slice(0, 140))}</i>`);
   }
   return lines.join('\n');
 }
@@ -1542,15 +1538,12 @@ async function accountsText(): Promise<string> {
 async function codeforcesAccountsText(): Promise<string> {
   const accounts = await listCodeforcesAccounts(true);
   if (accounts.length === 0) return '📭 No Codeforces accounts configured. Send /renew with a Codeforces session JSON.';
-  const lines = [`<b>🏆 CODEFORCES ACCOUNTS · ${accounts.length}</b>`, '<i>Submission queue and latest verdict</i>', ''];
+  const lines = [`<b>🏆 CODEFORCES</b>  <code>${accounts.length} connected</code>`, '<i>queue · verdict · transport health</i>', '<code>━━━━━━━━━━━━━━━━━━━━</code>', ''];
   for (const account of accounts) {
     const progress = await (await import('../codeforces/storage')).getCodeforcesProgress(account.id);
-    lines.push(`▪️ <b>${escapeHtml(account.label)}</b>${account.username ? ` (${escapeHtml(account.username)})` : ''}: <i>${escapeHtml(account.status)}</i>`);
-    lines.push(`  📍 Next: <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>`);
-    if (progress.lastCompletedKey) lines.push(`  ✅ Last accepted: <code>${escapeHtml(progress.lastCompletedKey)}</code>`);
-    if (progress.lastAttemptDate) lines.push(`  🗓️ Last attempt: ${escapeHtml(progress.lastAttemptDate)}${progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : ''}`);
-    if (progress.lastSubmissionId) lines.push(`  🆔 Submission: <code>${escapeHtml(progress.lastSubmissionId)}</code>`);
-    if (account.lastError) lines.push(`  ⚠️ <i>${escapeHtml(account.lastError.slice(0, 180))}</i>`);
+    lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${account.username ? ` (${escapeHtml(account.username)})` : ''}${progress.lastVerdict ? ` · <i>${escapeHtml(progress.lastVerdict)}</i>` : ''}`);
+    lines.push(`   └ next <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>${progress.lastSubmissionId ? ` · #<code>${escapeHtml(progress.lastSubmissionId)}</code>` : ''}`);
+    if (account.lastError) lines.push(`   └ ⚠️ <i>${escapeHtml(account.lastError.slice(0, 140))}</i>`);
   }
   return lines.join('\n');
 }
@@ -1567,22 +1560,22 @@ async function statusText(): Promise<string> {
   const expired = accounts.filter((a) => a.status === AccountStatus.EXPIRED).length;
   const rejected = accounts.filter((a) => a.status === AccountStatus.REJECTED).length;
   const lines = [
-    '<b>📊 AGENT STATUS</b>',
-    '<i>Platform health and latest activity</i>',
+    '<b>◈ AGENT PULSE</b>  <i>platform health</i>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
     '',
-    '<b>🟩 LEETCODE</b>',
-    `👥 Accounts: <b>${accounts.length}</b>${accounts.length ? ` <i>(${active} active, ${expired} expired, ${rejected} rejected)</i>` : ''}`,
-    `🔐 Auth: <i>${escapeHtml(String(sys['authStatus'] ?? 'unknown'))}</i>${sys['authUsername'] ? ` (${escapeHtml(String(sys['authUsername']))})` : ''}`,
+    `<b>🟩 LEETCODE</b>  <code>${accounts.length} total</code>`,
+    `👥 <b>${active}</b> active · <i>${expired} expired · ${rejected} rejected</i>`,
+    `🔐 <i>${escapeHtml(String(sys['authStatus'] ?? 'unknown'))}</i>${sys['authUsername'] ? ` · ${escapeHtml(String(sys['authUsername']))}` : ''}`,
   ];
   if (lastAccepted) {
     lines.push(
-      `✅ Last accepted: <b>${escapeHtml(lastAccepted.title)}</b>${lastAccepted.submissionStatus ? ` (<i>${escapeHtml(lastAccepted.submissionStatus)}</i>)` : ''} — ${escapeHtml(humanLocal(lastAccepted.updatedAt))}`,
+      `✅ <b>${escapeHtml(lastAccepted.title)}</b>${lastAccepted.submissionStatus ? ` · <i>${escapeHtml(lastAccepted.submissionStatus)}</i>` : ''} · ${escapeHtml(humanLocal(lastAccepted.updatedAt))}`,
     );
   } else {
     lines.push('✅ Last accepted: <i>none recorded</i>');
   }
   if (last && last.state !== 'SUCCESS' && last.error) lines.push(`❗ Latest run error: <i>${escapeHtml(last.error.slice(0, 300))}</i>`);
-  lines.push('', '<b>🏆 CODEFORCES</b>', `👥 Accounts: <b>${codeforces.length}</b>`);
+  lines.push('', '<code>━━━━━━━━━━━━━━━━━━━━</code>', '', `<b>🏆 CODEFORCES</b>  <code>${codeforces.length} total</code>`);
   if (codeforces.length === 0) {
     lines.push('📭 No Codeforces accounts configured.');
   } else {
@@ -1590,7 +1583,8 @@ async function statusText(): Promise<string> {
       const progress = await getCodeforcesProgress(account.id);
       const who = account.username ? ` (${escapeHtml(account.username)})` : '';
       const verdict = progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
-      lines.push(`▪️ <b>${escapeHtml(account.label)}</b>${who}: <i>${escapeHtml(account.status)}</i> · next <code>${escapeHtml(progress.nextKey ?? 'queued')}</code>${verdict}`);
+      lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
+      lines.push(`   └ next <code>${escapeHtml(progress.nextKey ?? 'queued')}</code>`);
     }
   }
   return lines.join('\n');
@@ -1598,6 +1592,16 @@ async function statusText(): Promise<string> {
 
 function escapeHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function accountStatusIcon(status: string): string {
+  switch (status.toUpperCase()) {
+    case 'ACTIVE': return '🟢';
+    case 'EXPIRED': return '🟠';
+    case 'REJECTED': return '🔴';
+    case 'DISABLED': return '⚫';
+    default: return '⚪';
+  }
 }
 
 function looksLikeCookiePayload(text: string): boolean {
