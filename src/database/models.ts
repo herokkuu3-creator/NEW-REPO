@@ -75,6 +75,7 @@ export const SystemKeys = {
   lastError: 'lastError',
   lastRunSummary: 'lastRunSummary',
   lastReport: 'lastMultiRunReport', // JSON RunReport of the latest multi-account batch
+  dailyRetryState: 'leetcodeDailyRetryState', // JSON { date, count }
   storageState: 'storageStateJson', // Playwright storageState snapshot (DB-persisted, legacy single-session)
   codeforcesNetworkMode: 'codeforcesNetworkMode', // 'proxy' | 'tailscale'
 } as const;

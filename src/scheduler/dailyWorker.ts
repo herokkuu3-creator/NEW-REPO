@@ -8,6 +8,7 @@ import {
   createRun,
   findRunByDate,
   finalizeRun,
+  getSystemState,
   setSystemState,
   SystemKeys,
   updateRun,
@@ -138,11 +139,7 @@ export function shouldSkipExistingDailyRun(
     existing.state === RunState.SUCCESS &&
     /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(existing.submissionStatus ?? '');
 
-  return Boolean(
-    !forceRun &&
-      !previousRunWasNotSubmitted &&
-      (existing.state === RunState.SUCCESS || existing.state === RunState.PENDING),
-  );
+  return Boolean(!forceRun && !previousRunWasNotSubmitted && existing.state === RunState.SUCCESS);
 }
 
 /**
@@ -800,12 +797,55 @@ export function startScheduler(): () => void {
     },
     { timezone },
   );
-  logger.info({ expression, timezone }, 'daily scheduler armed');
+  const retryTask = cron.schedule(
+    '*/5 * * * *',
+    () => {
+      void triggerDailyRetry();
+    },
+    { timezone },
+  );
+  logger.info({ expression, retryExpression: '*/5 * * * *', timezone }, 'daily scheduler armed');
 
   if (config.schedule.runOnBoot) {
     logger.info('RUN_ON_BOOT=true — triggering an immediate run');
     void triggerRun('boot');
   }
 
-  return () => task.stop();
+  return () => {
+    task.stop();
+    retryTask.stop();
+  };
+}
+
+const DAILY_RETRY_LIMIT = 10;
+
+async function triggerDailyRetry(): Promise<void> {
+  if (runInProgress) return;
+  const today = todayInTimezone();
+  const accounts = await listEnabledAccounts().catch(() => []);
+  if (accounts.length === 0) return;
+
+  const incomplete = await Promise.all(accounts.map(async (account) => {
+    const row = await findRunByDate(account.id, today);
+    return !row || row.state !== RunState.SUCCESS || /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(row.submissionStatus ?? '');
+  }));
+  if (!incomplete.some(Boolean)) return;
+
+  let retry = { date: today, count: 0 };
+  try {
+    const raw = await getSystemState(SystemKeys.dailyRetryState);
+    const parsed = raw ? JSON.parse(raw) as { date?: unknown; count?: unknown } : null;
+    if (parsed?.date === today && Number.isInteger(parsed.count) && Number(parsed.count) >= 0) {
+      retry.count = Number(parsed.count);
+    }
+  } catch {
+    // A malformed retry marker is safe to reset for today's recovery window.
+  }
+  if (retry.count >= DAILY_RETRY_LIMIT) return;
+
+  const trigger = await triggerRun('cron-retry');
+  if (!trigger.started) return;
+  retry.count += 1;
+  await setSystemState(SystemKeys.dailyRetryState, JSON.stringify(retry));
+  logger.info({ today, attempt: retry.count, limit: DAILY_RETRY_LIMIT }, 'LeetCode daily retry scheduled');
 }

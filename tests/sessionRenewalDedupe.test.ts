@@ -50,6 +50,13 @@ describe('session-renewal daily dedupe', () => {
   it('keeps the existing retry behavior for non-renewal runs', () => {
     expect(
       shouldSkipExistingDailyRun(
+        { state: RunState.PENDING, submissionStatus: null },
+        false,
+      ),
+    ).toBe(false);
+
+    expect(
+      shouldSkipExistingDailyRun(
         { state: RunState.SUBMISSION_ERROR, submissionStatus: null },
         false,
       ),
