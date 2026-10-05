@@ -2,17 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import { ActionBroker, dispatchAction } from '../src/codeforces/actionBroker';
 
 describe('Codeforces Actions handoff', () => {
-  it('reports progress only for the claimed active job', async () => {
-    const broker = new ActionBroker(async () => undefined);
-    const id = await broker.enqueue({ code: 'source' });
-    expect(broker.updateProgress(id, 'verification')).toBe(false);
-    broker.claim(id);
-    expect(broker.updateProgress('different-job', 'verification')).toBe(false);
-    expect(broker.updateProgress(id, 'verification')).toBe(true);
-    expect(broker.status(id)).toEqual({ pending: true, progress: 'verification' });
-    broker.finish(id, { ok: true });
-    expect(broker.updateProgress(id, 'submitting')).toBe(false);
-  });
   it('dispatches an opaque id, claims credentials once, and returns the result', async () => {
     const dispatch = vi.fn(async (_id: string) => undefined);
     const broker = new ActionBroker(dispatch);

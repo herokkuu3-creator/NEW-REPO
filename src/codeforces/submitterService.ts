@@ -23,10 +23,9 @@
  * could create a duplicate Codeforces submission.
  */
 import http from 'node:http';
-import { BrowserStateCache } from './browserStateCache';
 import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
-import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, submissionFeedback, waitForCodeforcesPage } from './browserForm';
+import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource } from './browserForm';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
 const PORT = Number(process.env.PORT ?? 10000);
@@ -180,7 +179,7 @@ function proxyLabel(proxy: ReturnType<typeof browserProxy>): string {
   try { return new URL(proxy.server).origin; } catch { return 'configured'; }
 }
 
-async function launchFirefox(state: SubmitRequest['state'], label: string, networkMode: SubmitRequest['networkMode'] = 'proxy', progress: (phase: string) => Promise<void> = async () => {}): Promise<Session> {
+async function launchFirefox(state: SubmitRequest['state'], label: string, networkMode: SubmitRequest['networkMode'] = 'proxy'): Promise<Session> {
   let browser: Browser | null = null;
   const proxy = networkMode === 'tailscale' ? undefined : browserProxy(PROXY_SERVER);
   if (networkMode !== 'tailscale' && PROXY_SERVER && !proxy) {
@@ -207,15 +206,8 @@ async function launchFirefox(state: SubmitRequest['state'], label: string, netwo
         'dom.ipc.keepProcessesAlive.web': 0,
       } } : {}),
     }));
-    const directory = process.env.CODEFORCES_BROWSER_STATE_DIR;
-    const cache = directory && TOKEN ? new BrowserStateCache<SubmitRequest['state']>(directory, TOKEN, {
-      label, state, networkMode, route: networkMode === 'tailscale' ? process.env.TAILSCALE_EXIT_NODE : PROXY_SERVER,
-      engine: BROWSER_ENGINE, version: active.version(),
-    }) : null;
-    const restored = await cache?.load();
-    await progress(restored ? 'session-restored' : 'session-fresh');
     const context = await active.newContext({
-      storageState: (restored ?? { cookies: state.cookies, origins: state.origins ?? [] }) as Parameters<
+      storageState: { cookies: state.cookies, origins: state.origins ?? [] } as Parameters<
         BrowserContext['storageState']
       > extends never
         ? never
@@ -240,12 +232,6 @@ async function launchFirefox(state: SubmitRequest['state'], label: string, netwo
       context,
       page,
       close: async () => {
-        if (cache) {
-          try {
-            const updated = await context.storageState({ indexedDB: true });
-            await cache.save(updated);
-          } catch { log({ label }, 'browser session cache could not be saved; submission result is unchanged'); }
-        }
         await context.close().catch(() => undefined);
         await active.close().catch(() => undefined);
       },
@@ -297,6 +283,18 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
   return names.length > 0 ? names.join(', ') : '(no named fields)';
 }
 
+async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(1_000);
+    const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
+    if (isCodeforces) return true;
+    
+
+  }
+  return false;
+}
+
 async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> {
   const paths = candidates(entry);
   const attempts: string[] = [];
@@ -313,29 +311,18 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
       if (/\/enter(?:[/?#]|$)/i.test(finalUrl)) {
         throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
       }
-      if (status === 403 || status === 503) {
-        const title = (await page.title().catch(() => '')).replace(/\s+/g, ' ').slice(0, 120);
-        const mitigation = await response?.headerValue('cf-mitigated').catch(() => null);
-        const challengeResources = await page.locator('script[src*="/cdn-cgi/challenge-platform/"], iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0);
-        const challengeDetected = mitigation === 'challenge' || challengeResources > 0 || CHALLENGE_RE.test(title) || CHALLENGE_RE.test(await readBody(page));
-        log({ path, status, title, mitigation: mitigation ?? null, challengeDetected }, 'Codeforces submit page access diagnostics');
-        if (!challengeDetected || !(await waitForCodeforcesPage(page, 'submit', CHALLENGE_WAIT_MS))) {
-          const reason = challengeDetected ? 'detected verification did not complete' : 'access denied or unavailable; no verification widget detected';
-          attempts.push(`${path}: HTTP ${status} (${reason}${title ? `; page title: ${title}` : ''})`);
-          blocked += 1;
-          continue;
-        }
+      if ((status === 403 || status === 503) && !(await waitOutChallenge(page))) {
+        attempts.push(`${path}: HTTP ${status} (Cloudflare challenge)`);
+        blocked += 1;
+        continue;
       }
       const body = await readBody(page);
-      if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(page.url())) {
-        if (!(await waitForCodeforcesPage(page, 'submit', CHALLENGE_WAIT_MS))) {
+      if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
+        if (!(await waitOutChallenge(page))) {
           attempts.push(`${path}: challenge did not clear`);
           blocked += 1;
           continue;
         }
-      }
-      if (/\/enter(?:[/?#]|$)/i.test(page.url())) {
-        throw new Error('Codeforces session is signed out (verification redirected to the login page)');
       }
       const fields = await readFields(page);
       if (hasSubmitForm(fields)) {
@@ -349,8 +336,7 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
   }
 
   const message = `Codeforces submit form could not be opened for ${entry.contestId}/${entry.problemIndex} — ${attempts.join(' | ')}`;
-  if (blocked > 0) throw new BrowserFormError(message, 'blocked');
-  throw new Error(message);
+  throw new Error(blocked === paths.length ? `blocked: ${message}` : message);
 }
 
 /**
@@ -447,7 +433,7 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
   if (!language) throw new Error(`no ${wantsPython ? 'Python 3' : 'C++'} language option on the Codeforces form`);
   await setSelectValue(page, 'programTypeId', language.value);
 
-  log({}, 'switching off editor and filling source');
+  log({}, 'unchecking editor and filling source');
   const sourceBox = page.locator('textarea[name="source"]').first();
   if ((await sourceBox.count().catch(() => 0)) === 0) throw new Error('Codeforces submit form has no source textarea');
 
@@ -467,7 +453,7 @@ function compactBodyError(body: string): string {
   return useful?.slice(0, 500) ?? 'Codeforces rejected the submission form';
 }
 
-export async function submit(request: SubmitRequest, progress: (phase: string) => Promise<void> = async () => {}): Promise<SubmitResponse> {
+export async function submit(request: SubmitRequest): Promise<SubmitResponse> {
   const label = request.label ?? request.handle ?? 'account';
   const available = freeMemoryMb();
   log({ label, availableMb: available, minimumFreeMb: BROWSER_MIN_FREE_MB }, 'isolated Codeforces browser preflight');
@@ -485,34 +471,16 @@ export async function submit(request: SubmitRequest, progress: (phase: string) =
   }
 
   releaseHeap();
-  const session = await launchFirefox(request.state, label, request.networkMode, progress);
+  const session = await launchFirefox(request.state, label, request.networkMode);
   log({ label, browser: BROWSER_ENGINE, usedMb: cgroupUsedMb() }, 'browser launched for isolated Codeforces submission');
 
   const flags = { turnstile: false, interactive: false };
   try {
-    let ts: { turnstile: boolean; interactive: boolean } | undefined;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        await progress('opening');
-        await openSubmitForm(session.page, request.entry);
-        await progress('verification');
-        ts = await fillSubmitForm(session.page, request.entry, request.code);
-        break;
-      } catch (err) {
-        if (!(err instanceof BrowserFormError) || err.kind !== 'blocked' || err.clicked || attempt === 1) {
-          if (err instanceof BrowserFormError && err.kind === 'blocked') await progress('verification-blocked');
-          throw err;
-        }
-        await progress('verification-retry');
-        await sleep(10_000);
-      }
-    }
-    if (!ts) throw new Error('submit form preparation did not finish');
+    await openSubmitForm(session.page, request.entry);
+    const ts = await fillSubmitForm(session.page, request.entry, request.code);
     flags.turnstile = ts.turnstile;
     flags.interactive = ts.interactive;
 
-    await progress(ts.turnstile ? 'verification-cleared' : 'verification-not-required');
-    await progress('submitting');
     const click = await clickSubmitForm(session.page);
     if (!click.clicked) {
       return {
@@ -530,12 +498,10 @@ export async function submit(request: SubmitRequest, progress: (phase: string) =
     let body = await readBody(session.page);
     let finalUrl = session.page.url();
     if (click.status === 403 || click.status === 503 || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl) || /__cf_chl/i.test(finalUrl)) {
-      await progress('verification');
-      const cleared = await waitForCodeforcesPage(session.page, 'result', CHALLENGE_WAIT_MS);
+      const cleared = await waitOutChallenge(session.page);
       body = await readBody(session.page);
       finalUrl = session.page.url();
       if (!cleared || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
-        await progress('verification-blocked');
         return {
           ok: false,
           kind: 'blocked',
@@ -586,15 +552,7 @@ export async function submit(request: SubmitRequest, progress: (phase: string) =
       };
     }
     if (!isSubmissionHistory(finalUrl)) {
-      const feedback = await submissionFeedback(session.page);
-      const returnedForm = await session.page.locator('form:has(textarea[name="source"])').count() > 0;
-      const path = new URL(finalUrl).pathname;
-      log({ status: click.status, path, returnedForm, feedback }, 'Codeforces POST returned without submission history');
-      const verificationRequired = !!feedback && /anti.?bot|verification|turnstile|captcha/i.test(feedback);
-      if (verificationRequired) await progress('verification-blocked');
-      return { ok: false, kind: verificationRequired ? 'blocked' : 'submission-error', error: feedback
-        ? `Codeforces returned the submit form: ${feedback}`
-        : `Codeforces did not redirect to submission history after the POST (HTTP ${click.status ?? '?'}, path ${path}, submit form ${returnedForm ? 'present' : 'absent'}); acceptance is uncertain and the POST was not retried.`, status: click.status, finalUrl, clicked: true, ...flags, ...(verificationRequired ? { turnstile: true } : {}) };
+      return { ok: false, kind: 'submission-error', error: 'Codeforces did not redirect to submission history after the POST; acceptance is uncertain and the POST was not retried.', status: click.status, finalUrl, clicked: true, ...flags };
     }
     return { ok: true, status: click.status, finalUrl, clicked: true, ...flags };
   } catch (err) {
@@ -662,7 +620,7 @@ export const server = http.createServer((req, res) => {
     return;
   }
 
-  const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result|network|progress))?$/.exec(url);
+  const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result|network))?$/.exec(url);
   if (broker && req.method === 'GET' && url === '/jobs/next') {
     if (!runnerAuthorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
     json(res, 200, { jobId: broker.nextId, networkMode: broker.nextId ? broker.nextNetworkMode : null });
@@ -685,21 +643,6 @@ export const server = http.createServer((req, res) => {
     if (req.method === 'POST' && action === 'claim') {
       const payload = broker.claim(id);
       json(res, payload ? 200 : 404, payload ?? { error: 'job not found or already claimed' });
-      return;
-    }
-    if (req.method === 'POST' && action === 'progress') {
-      let raw = '';
-      req.on('data', (chunk: Buffer) => {
-        raw += chunk.toString('utf8');
-        if (raw.length > 512) req.destroy();
-      });
-      req.on('end', () => {
-        try {
-          const value = JSON.parse(raw) as { phase?: unknown };
-          if (typeof value.phase !== 'string' || !/^[a-z-]{1,40}$/.test(value.phase)) throw new Error('invalid progress');
-          json(res, broker.updateProgress(id, value.phase) ? 200 : 409, { accepted: true });
-        } catch { json(res, 400, { error: 'invalid progress' }); }
-      });
       return;
     }
     if (req.method === 'POST' && action === 'result') {

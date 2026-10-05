@@ -10,7 +10,6 @@ interface Job {
   ready: boolean;
   claimed: boolean;
   result: unknown | null;
-  progress?: string;
 }
 
 type NetworkMode = 'proxy' | 'tailscale';
@@ -82,17 +81,10 @@ export class ActionBroker {
     return true;
   }
 
-  updateProgress(id: string, phase: string): boolean {
-    this.expire();
-    if (!this.job || this.job.id !== id || !this.job.claimed || this.job.result !== null) return false;
-    this.job.progress = phase;
-    return true;
-  }
-
-  status(id: string): { pending: true; progress?: string } | { pending: false; result: unknown } | null {
+  status(id: string): { pending: true } | { pending: false; result: unknown } | null {
     this.expire();
     if (!this.job || this.job.id !== id) return null;
-    return this.job.result === null ? { pending: true, ...(this.job.progress ? { progress: this.job.progress } : {}) } : { pending: false, result: this.job.result };
+    return this.job.result === null ? { pending: true } : { pending: false, result: this.job.result };
   }
 
   private expire(): void {

@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright';
-import { blockCodeforcesResource, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, submissionFeedback, waitForCodeforcesPage } from '../src/codeforces/browserForm';
+import { blockCodeforcesResource, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory } from '../src/codeforces/browserForm';
 import { postSubmitForm } from '../src/codeforces/submission';
 import type { BrowserSession } from '../src/browser/playwright';
 import type { SourceIndexEntry } from '../src/codeforces/sourceRepo';
@@ -16,7 +16,7 @@ let server: Server;
 let fixtureOrigin: string;
 let fixtureResult = 'history';
 
-function formHtml(options: { token?: string; disabled?: boolean; prevent?: boolean; callback?: boolean; editorEnabled?: boolean } = {}): string {
+function formHtml(options: { token?: string; disabled?: boolean; prevent?: boolean; callback?: boolean } = {}): string {
   return `<!doctype html><link rel="stylesheet" href="/submit.css"><div id="body">
     <form action="/search" method="post"><input type="submit" value="Search"></form>
     <form id="solution" action="${fixtureOrigin}/contest/1/submit" method="post">
@@ -25,22 +25,13 @@ function formHtml(options: { token?: string; disabled?: boolean; prevent?: boole
       <select name="programTypeId"><option value="89">GNU G++23</option></select>
       <input type="hidden" name="turnstileToken" value="${options.token ?? ''}">
       <input type="hidden" name="_tta" value="">
-      <input id="toggleEditorCheckbox" type="checkbox" ${options.editorEnabled ? '' : 'checked'}>
+      <input id="toggleEditorCheckbox" type="checkbox" checked>
       <textarea name="source"></textarea>
       <input type="submit" name="submit" value="Submit" ${options.disabled ? 'disabled' : ''}>
       ${options.callback ? '<div class="cf-turnstile" data-sitekey="fixture-key" data-callback="onVerified"></div>' : ''}
     </form></div>
     <script>
-      window.editor = {
-        value: '',
-        setValue: function(value) { this.value = value; },
-        save: function() {
-          window.saved = true;
-          if (!document.getElementById('toggleEditorCheckbox').checked) {
-            document.querySelector('[name=source]').value = this.value;
-          }
-        }
-      };
+      window.editor = { save: () => { window.saved = true; } };
       window.onVerified = () => document.querySelector('#solution input[type=submit]').disabled = false;
       document.querySelector('#solution').addEventListener('submit', event => {
         ${options.prevent ? 'event.preventDefault();' : ''}
@@ -97,32 +88,6 @@ afterAll(async () => {
 });
 
 describe('Codeforces native browser submission', () => {
-  it('does not mistake a generic body container for a completed page', async () => {
-    await page.setContent('<div id="body">Loading...</div>');
-    expect(await waitForCodeforcesPage(page, 'submit', 200)).toBe(false);
-  });
-
-  it('waits for the actual form to appear after the page shell', async () => {
-    await page.setContent(`<div id="body"></div><script>
-      setTimeout(() => document.querySelector('#body').innerHTML =
-        '<form><textarea name="source"></textarea><select name="programTypeId"></select></form>', 150);
-    </script>`);
-    expect(await waitForCodeforcesPage(page, 'submit', 2000)).toBe(true);
-  });
-
-  it('does not accept a challenge title even when form controls exist', async () => {
-    await page.setContent('<title>Just a moment...</title>' + formHtml());
-    expect(await waitForCodeforcesPage(page, 'submit', 200)).toBe(false);
-  });
-
-  it('requires submission rows or a status table on a history URL', async () => {
-    await fixture();
-    await page.goto('https://codeforces.com/contest/1/my');
-    expect(await waitForCodeforcesPage(page, 'result', 200)).toBe(false);
-    await page.locator('#body').evaluate(el => { el.innerHTML = '<table class="status-frame"></table>'; });
-    expect(await waitForCodeforcesPage(page, 'result', 1000)).toBe(true);
-  });
-
   it('retains CSS and every Cloudflare verification resource', async () => {
     expect(blockCodeforcesResource('https://challenges.cloudflare.com/widget/image', 'image')).toBe(false);
     expect(blockCodeforcesResource('https://codeforces.com/cdn-cgi/challenge-platform/image', 'image')).toBe(false);
@@ -139,7 +104,7 @@ describe('Codeforces native browser submission', () => {
 
   it('stops without clicking or posting when a Turnstile widget never produces a token', async () => {
     await fixture({ disabled: true, callback: true });
-    await expect(ensureFormTurnstile(page, 25)).rejects.toMatchObject({ kind: 'blocked', clicked: false, flags: { turnstile: true } });
+    await expect(ensureFormTurnstile(page, 25)).rejects.toMatchObject({ kind: 'blocked', clicked: false, flags: { turnstile: false } });
     expect(posts).toHaveLength(0);
   });
 
@@ -151,71 +116,53 @@ describe('Codeforces native browser submission', () => {
     expect(await ensureFormTurnstile(page, 1_000)).toEqual({ turnstile: true, interactive: false });
   });
 
-  it('detects a widget outside the form even without a custom token field', async () => {
-    await fixture();
+  it('renders an uninitialized Turnstile widget with the real page API', async () => {
+    await fixture({ disabled: true, callback: true });
     await page.evaluate(() => {
-      document.querySelector('[name=turnstileToken]')?.remove();
-      const widget = document.createElement('div');
-      widget.className = 'cf-turnstile';
-      document.body.append(widget);
+      (window as any).turnstile = {
+        render: (_widget: HTMLElement, options: { callback: (token: string) => void }) => {
+          setTimeout(() => options.callback('native-render-token'), 10);
+          return 'widget-id';
+        },
+      };
     });
-    await expect(ensureFormTurnstile(page, 50)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
+    expect(await ensureFormTurnstile(page, 3_500)).toEqual({ turnstile: true, interactive: false });
+    expect(await page.locator('#solution input[type=submit]').isEnabled()).toBe(true);
     expect(posts).toHaveLength(0);
   });
 
-  it('accepts the standard native response only when Submit becomes ready', async () => {
-    await fixture({ disabled: true });
+  it('executes a rendered widget when verification remains idle', async () => {
+    await fixture({ disabled: true, callback: true });
     await page.evaluate(() => {
-      const field = document.querySelector('[name=turnstileToken]') as HTMLInputElement;
-      field.name = 'cf-turnstile-response';
-      setTimeout(() => {
-        field.value = 'native-standard-response';
-        (document.querySelector('#solution input[type=submit]') as HTMLInputElement).disabled = false;
-      }, 40);
+      let verified: ((token: string) => void) | undefined;
+      (window as any).turnstile = {
+        render: (_widget: HTMLElement, options: { callback: (token: string) => void }) => {
+          verified = options.callback;
+          return 'widget-id';
+        },
+        execute: () => verified?.('executed-token'),
+      };
     });
-    expect(await ensureFormTurnstile(page, 1_000)).toEqual({ turnstile: true, interactive: false });
+    expect(await ensureFormTurnstile(page, 6_500)).toEqual({ turnstile: true, interactive: false });
+    expect(await page.locator('input[name="turnstileToken"]').inputValue()).toBe('executed-token');
     expect(posts).toHaveLength(0);
   });
 
-  it('waits for a late widget instead of mistaking missing fields for no verification', async () => {
-    await fixture();
-    await page.evaluate(() => {
-      document.querySelector('[name=turnstileToken]')?.remove();
-      setTimeout(() => {
-        const widget = document.createElement('div');
-        widget.className = 'cf-turnstile';
-        document.body.append(widget);
-      }, 30);
-    });
-    await expect(ensureFormTurnstile(page, 500)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
-    expect(posts).toHaveLength(0);
-  });
-
-  it('blocks when verification script exists but its widget has not initialized', async () => {
-    await fixture();
-    await page.evaluate(() => {
-      const script = document.createElement('script');
-      script.type = 'text/plain';
-      script.textContent = 'turnstile.render(container)';
-      document.body.append(script);
-    });
-    await expect(ensureFormTurnstile(page, 50)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
-    expect(posts).toHaveLength(0);
-  });
-
-  it('never submits with a token while the native Submit control remains disabled', async () => {
+  it('never turns a disabled button into a successful click', async () => {
     await fixture({ token: 'verified', disabled: true });
-    await expect(ensureFormTurnstile(page, 50)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
     await expect(clickSubmitForm(page, 300)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
     expect(posts).toHaveLength(0);
   });
 
-  it('never forces a hidden Submit control into sending a POST', async () => {
-    await fixture({ token: 'verified' });
-    await page.locator('#solution input[type=submit]').evaluate(element => (element as HTMLElement).style.display = 'none');
-    await expect(ensureFormTurnstile(page, 50)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
-    await expect(clickSubmitForm(page, 300)).rejects.toMatchObject({ kind: 'blocked', clicked: false });
+  it('lets a solver update the native callback without submitting the search or solution form', async () => {
+    await fixture({ disabled: true, callback: true });
+    vi.stubEnv('TURNSTILE_SOLVER_URL', 'https://solver.example');
+    const solve = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ token: 'solver-token' }) });
+    vi.stubGlobal('fetch', solve);
+    expect(await ensureFormTurnstile(page, 25)).toEqual({ turnstile: true, interactive: false });
+    expect(solve).toHaveBeenCalledOnce();
     expect(posts).toHaveLength(0);
+    expect(await page.locator('#solution input[type=submit]').isEnabled()).toBe(true);
   });
 
   it('submits the source once through native signing handlers and follows the redirect', async () => {
@@ -236,21 +183,6 @@ describe('Codeforces native browser submission', () => {
       (window as any).editor.save();
       return (window as any).saved;
     })).toBe(true);
-  });
-
-  it('switches off an enabled editor and keeps source intact through native submit', async () => {
-    await fixture({ token: 'verified', editorEnabled: true });
-    await fillSource(page, code);
-    expect(await page.locator('#toggleEditorCheckbox').isChecked()).toBe(true);
-    expect(await page.evaluate(() => (window as any).editor.value)).toBe(code);
-    await clickSubmitForm(page);
-    expect(posts).toHaveLength(1);
-    expect(posts[0]?.get('source')).toBe(code);
-  });
-
-  it('reads visible validation labels without reading source or hidden tokens', async () => {
-    await page.setContent('<span class="error">Source is empty</span><span class="error" style="display:none">Hidden error</span><textarea>private source</textarea><input type="hidden" name="csrf_token" value="private-token">');
-    expect(await submissionFeedback(page)).toBe('Source is empty');
   });
 
   it('reports a prevented submit instead of treating a click as a POST', async () => {

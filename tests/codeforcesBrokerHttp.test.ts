@@ -45,11 +45,6 @@ describe('authenticated scheduled runner broker', () => {
     expect((await (await fetch(`${origin}/jobs/next`, { headers })).json() as { jobId: null }).jobId).toBeNull();
     expect((await fetch(`${origin}/jobs/${jobId}/claim`, { method: 'POST', headers })).status).toBe(404);
 
-    expect((await fetch(`${origin}/jobs/${jobId}/progress`, { method: 'POST', body: JSON.stringify({ phase: 'verification' }) })).status).toBe(401);
-    expect((await fetch(`${origin}/jobs/${jobId}/progress`, { method: 'POST', headers, body: JSON.stringify({ phase: 'verification' }) })).status).toBe(200);
-    expect(await (await fetch(`${origin}/jobs/${jobId}`, { headers })).json()).toEqual({ pending: true, progress: 'verification' });
-    expect((await fetch(`${origin}/jobs/${jobId}/progress`, { method: 'POST', headers, body: JSON.stringify({ phase: '<invalid>' }) })).status).toBe(400);
-
     const result = { ok: true, status: 302, finalUrl: 'https://codeforces.com/contest/1/my', clicked: true, turnstile: true, interactive: false };
     expect((await fetch(`${origin}/jobs/${jobId}/result`, { method: 'POST', headers, body: JSON.stringify(result) })).status).toBe(200);
     expect(await (await fetch(`${origin}/jobs/${jobId}`, { headers })).json()).toEqual({ pending: false, result });

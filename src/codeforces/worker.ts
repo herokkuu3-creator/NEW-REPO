@@ -65,7 +65,7 @@ export function isCodeforcesRunInProgress(): boolean {
 export interface CodeforcesRunOptions {
   onAccountOutcome?: (outcome: CodeforcesAccountOutcome, index: number, total: number) => Promise<void> | void;
   onAccountProgress?: (progress: {
-    phase: 'checking' | 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict' | 'session-restored' | 'session-fresh' | 'verification' | 'verification-retry' | 'verification-blocked' | 'verification-cleared' | 'verification-not-required';
+    phase: 'checking' | 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict';
     label: string;
     username?: string | null;
     index: number;
@@ -160,7 +160,7 @@ async function runForAccount(
   source: Awaited<ReturnType<typeof loadRuntimeSourceIndex>>,
   forceDailyAttempt = false,
   networkMode: CodeforcesNetworkMode = 'proxy',
-  onProgress?: (phase: Parameters<NonNullable<CodeforcesRunOptions['onAccountProgress']>>[0]['phase'], username: string | null) => Promise<void> | void,
+  onProgress?: (phase: 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict', username: string | null) => Promise<void> | void,
 ): Promise<CodeforcesAccountOutcome> {
   const label = account.label;
   const stored = parseStoredCodeforcesState(account.storageState);
@@ -244,6 +244,7 @@ async function runForAccount(
     const submitOnce = async (submissionCode: string): Promise<HttpSubmitResult & { handle?: string }> => {
       await Promise.resolve(onProgress?.('network', username));
       await Promise.resolve(onProgress?.('opening', username));
+      await Promise.resolve(onProgress?.('submitting', username));
       // The header-only POST is answered 302 -> "/" by Codeforces' own router,
       // so it remains an opt-in diagnostic; the browser path is the real
       // transport for the free-tier submission service.
@@ -271,11 +272,6 @@ async function runForAccount(
           entry,
           submissionCode,
           networkMode,
-          async (phase) => {
-            const phases = ['opening', 'submitting', 'session-restored', 'session-fresh', 'verification', 'verification-retry', 'verification-blocked', 'verification-cleared', 'verification-not-required'] as const;
-            const known = phases.find((value) => value === phase);
-            if (known) await onProgress?.(known, username);
-          },
         );
         if (viaBrowser) {
           attempt = viaBrowser;
@@ -464,7 +460,6 @@ async function submitViaBrowser(
   entry: SourceIndexEntry,
   code: string,
   networkMode: CodeforcesNetworkMode = 'proxy',
-  onProgress?: (phase: string) => Promise<void>,
 ): Promise<(HttpSubmitResult & { handle?: string }) | null> {
   const user = handle ?? label;
 
@@ -482,7 +477,7 @@ async function submitViaBrowser(
   }
 
   const posted = isRemoteSubmitterConfigured()
-    ? await submitViaRemoteSubmitter(state, label, user, entry, code, networkMode, onProgress)
+    ? await submitViaRemoteSubmitter(state, label, user, entry, code, networkMode)
     : await postViaLocalBrowser(state, label, entry, code);
 
   if (!posted) {
