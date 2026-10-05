@@ -1,5 +1,6 @@
 import type { Page, Response } from 'playwright';
 import { withCodeChefPage, type CodeChefState } from './browser';
+import { logger } from '../logger';
 
 export interface CodeChefSubmitResult {
   ok: boolean;
@@ -87,34 +88,52 @@ export async function submitOnCodeChefPage(page: Page, problemUrl: string, code:
     const url = new URL(problemUrl);
     const match = /^\/(?:[^/]+\/)?problems\/([a-z0-9_]+)\/?$/i.exec(url.pathname);
     if (!/(^|\.)codechef\.com$/.test(url.hostname) || !match) throw new Error('Invalid CodeChef problem URL');
-    const response = await page.goto(`https://www.codechef.com/submit/${match[1]}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const submitUrl = `https://www.codechef.com/submit/${match[1]}`;
+    logger.info({ submitUrl }, 'Navigating to CodeChef submit page...');
+    const response = await page.goto(submitUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     if (response && response.status() >= 400) return { ok: false, clicked: false, kind: response.status() === 401 ? 'signed-out' : response.status() === 403 ? 'blocked' : 'error', error: `CodeChef submit page returned HTTP ${response.status()}` };
     if (/\/login(?:[/?#]|$)/.test(page.url())) return { ok: false, clicked: false, kind: 'signed-out', error: 'CodeChef session redirected to login' };
+    logger.info({ language }, 'Selecting programming language...');
     await selectCodeChefLanguage(page, language);
+    logger.info('Populating CodeChef code editor...');
     await fillCodeChefSource(page, code);
     page.on('response', onResponse);
     const control = page.locator('#submit_btn, #submitBtn').first();
     const button = await control.count() ? control : page.getByRole('button', { name: 'Submit', exact: true });
     if (!await button.isEnabled()) throw new Error('CodeChef Submit is disabled');
+    logger.info('Clicking CodeChef Submit button...');
     clicked = true;
     await button.click();
+    logger.info('Submit button clicked; waiting for judge verdict or submission ID...');
     const deadline = Date.now() + timeoutMs;
+    let pollCount = 0;
     while (Date.now() < deadline) {
-      if (submissionId && verdict) return { ok: verdict === 'Accepted', performed: true, clicked, submissionId, verdict };
+      if (submissionId && verdict) {
+        logger.info({ submissionId, verdict }, 'CodeChef submission verdict received via API');
+        return { ok: verdict === 'Accepted', performed: true, clicked, submissionId, verdict };
+      }
       // Read only the judge's result panel, never the problem text/editor HTML.
       const result = page.locator('.verdict-text, [data-verdict], #solution-status, .submission-result').first();
       if (await result.count()) {
         const text = await result.innerText().catch(() => '');
         const terminal = normalizeCodeChefVerdict(text);
-        if (submissionId && terminal) return { ok: terminal === 'Accepted', performed: true, clicked, submissionId, verdict: terminal };
+        if (submissionId && terminal) {
+          logger.info({ submissionId, verdict: terminal }, 'CodeChef submission verdict received via UI');
+          return { ok: terminal === 'Accepted', performed: true, clicked, submissionId, verdict: terminal };
+        }
       }
       if (await page.getByText(/please log ?in to submit|login to submit/i).count()) {
         return { ok: false, clicked, kind: 'signed-out', error: 'CodeChef requires login before submitting' };
+      }
+      pollCount++;
+      if (pollCount % 20 === 0) {
+        logger.info({ elapsedSec: Math.round((Date.now() - (deadline - timeoutMs)) / 1000), submissionId }, 'Waiting for CodeChef judge verdict...');
       }
       await page.waitForTimeout(250);
     }
     return { ok: false, clicked, submissionId, verdict: 'UNKNOWN', error: 'CodeChef did not return a confirmed submission ID and terminal verdict. The submit click was not retried.' };
   } catch (err) {
+    logger.error({ err: err instanceof Error ? err.message : String(err) }, 'CodeChef submitOnCodeChefPage failed');
     return { ok: false, clicked, submissionId, kind: 'error', error: err instanceof Error ? err.message : String(err) };
   } finally { page.off('response', onResponse); }
 }

@@ -60,22 +60,33 @@ export async function runCodeChefNow(reason: 'manual' | 'cron' = 'manual'): Prom
         const entry = queue[index];
         if (!entry) { row.skipped = true; row.error = 'Source queue exhausted'; continue; }
         row.problem = entry.problemCode;
+        logger.info({ account: account.label, problem: entry.problemCode, index, total: queue.length }, 'Starting CodeChef attempt for account');
         claimed = await claimDailyAttempt(account.id, report.date, entry.problemCode!);
-        if (!claimed) { row.skipped = true; row.error = 'Today’s CodeChef attempt is already completed or awaiting confirmation'; continue; }
+        if (!claimed) {
+          logger.info({ account: account.label, problem: entry.problemCode }, 'Today’s CodeChef attempt is already claimed or awaiting confirmation');
+          row.skipped = true;
+          row.error = 'Today’s CodeChef attempt is already completed or awaiting confirmation';
+          continue;
+        }
         const credentials = JSON.parse(account.storageState) as Partial<CodeChefState> & { username?: string; password?: string };
         const state: CodeChefState | undefined = credentials.cookies?.length ? { cookies: credentials.cookies, origins: credentials.origins ?? [] } : undefined;
+        logger.info({ account: account.label, hasSavedSession: !!state }, 'Launching CodeChef browser session...');
         const code = await fetchSourceCode(entry);
         const result = await withCodeChefPage(state, async page => {
           const login = async () => {
+            logger.info({ account: account.label }, 'Authenticating account on CodeChef...');
             const updated = await loginOnCodeChefPage(page, credentials.username ?? account.username ?? account.label, credentials.password ?? '');
             await patchCodeChefAccount(account.id, { storageState: JSON.stringify({ username: credentials.username, password: credentials.password, ...updated }), checked: true });
+            logger.info({ account: account.label }, 'CodeChef account session saved to DB');
           };
           if (!state) await login();
           mayHaveSubmitted = true;
+          logger.info({ account: account.label, problem: entry.problemCode }, 'Navigating to CodeChef problem submit page...');
           let posted = await submitOnCodeChefPage(page, entry.problemUrl!, code, entry.language);
           mayHaveSubmitted = posted.clicked === true;
           // A signed-out redirect before any click is safe to reauthenticate.
           if (posted.kind === 'signed-out' && !posted.clicked) {
+            logger.warn({ account: account.label }, 'CodeChef session expired before submit click; re-authenticating...');
             await login();
             mayHaveSubmitted = true;
             posted = await submitOnCodeChefPage(page, entry.problemUrl!, code, entry.language);
@@ -87,6 +98,7 @@ export async function runCodeChefNow(reason: 'manual' | 'cron' = 'manual'): Prom
         row.verdict = result.verdict;
         row.error = result.error;
         row.performed = result.performed === true && !!result.submissionId;
+        logger.info({ account: account.label, problem: entry.problemCode, submissionId: result.submissionId, verdict: result.verdict, performed: row.performed }, 'CodeChef submission finished');
         if (row.performed) {
           await completeCurrentProblem(account.id, { completedKey: entry.problemCode!, nextKey: queue[index + 1]?.problemCode ?? null,
             submissionId: result.submissionId!, verdict: result.verdict ?? null });
