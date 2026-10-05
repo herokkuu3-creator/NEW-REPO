@@ -1,4 +1,4 @@
-﻿import { AccountStatus } from '@prisma/client';
+import { AccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
 import { sendTelegramMessage } from './telegram';
@@ -574,6 +574,7 @@ export async function handleCodeforcesSubmitNext(
         const account = html(username ?? label);
         const route = networkMode === 'tailscale' ? 'ðŸ“± PHONE TAILSCALE' : 'ðŸ  RESIDENTIAL PROXY';
         const phaseText = {
+          'verification-required': `📱 <b>${account}</b> · waiting for you to verify · open the private browser link sent below`,
           checking: `ðŸ”Ž <b>Account ${index}/${total}</b> Â· checking <code>${account}</code>â€¦`,
           verified: `âœ… <b>Account ${index}/${total}</b> Â· verified <code>${account}</code>`,
           source: `ðŸ“¦ <b>Account ${index}/${total}</b> Â· source loaded for <code>${account}</code>`,

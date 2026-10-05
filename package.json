@@ -1,4 +1,4 @@
-﻿{
+{
     "name":  "leetcode-daily-agent",
     "version":  "1.0.0",
     "description":  "Autonomous LeetCode Daily Challenge assistant running as a Render Background Worker with an authenticated persistent Chromium session.",
