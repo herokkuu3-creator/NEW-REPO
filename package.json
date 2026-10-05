@@ -1,4 +1,4 @@
-{
+﻿{
     "name":  "leetcode-daily-agent",
     "version":  "1.0.0",
     "description":  "Autonomous LeetCode Daily Challenge assistant running as a Render Background Worker with an authenticated persistent Chromium session.",
@@ -12,7 +12,8 @@
                     "build":  "tsc -p tsconfig.json",
                     "start":  "node dist/src/main.js",
                     "submitter":  "node --expose-gc dist/src/codeforces/submitterService.js",
-                    "codeforces:local":  "tsx src/codeforces/localRunner.ts",
+                    "codeforces:local": "tsx src/codeforces/localRunner.ts",
+                    "codechef:run": "tsx scripts/run-codechef-now.ts",
                     "dev":  "tsx watch src/main.ts",
                     "auth:setup":  "tsx scripts/auth-setup.ts",
                     "run:now":  "tsx scripts/run-now.ts",

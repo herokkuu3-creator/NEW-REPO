@@ -1,4 +1,4 @@
-import { AccountStatus } from '@prisma/client';
+﻿import { AccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
 import { sendTelegramMessage } from './telegram';
@@ -47,24 +47,24 @@ import {
 } from '../scheduler/rangeSubmission';
 
 /**
- * Telegram command bot â€” the interactive half of session renewal.
+ * Telegram command bot Ã¢â‚¬â€ the interactive half of session renewal.
  *
  * Long polling (getUpdates), so it needs NO public webhook setup and works
  * on Render's free web service as-is. Commands:
  *
- *   /renew   â€” step-by-step instructions, then paste/upload the cookies
- *   /status  â€” auth state + last run
- *   /help    â€” command list
- *   /cancel  â€” abort a renewal in progress
+ *   /renew   Ã¢â‚¬â€ step-by-step instructions, then paste/upload the cookies
+ *   /status  Ã¢â‚¬â€ auth state + last run
+ *   /help    Ã¢â‚¬â€ command list
+ *   /cancel  Ã¢â‚¬â€ abort a renewal in progress
  *
- * Security: messages from ANY chat other than TELEGRAM_CHAT_ID are ignored â€”
+ * Security: messages from ANY chat other than TELEGRAM_CHAT_ID are ignored Ã¢â‚¬â€
  * the bot token is semi-public (anyone can message the bot), the chat ID is
  * the access control. Cookie payloads are parsed and stored immediately; live
  * LeetCode validation is deferred to the daily run. Cookie values are never
  * logged or echoed back.
  *
  * Large exports: Telegram splits pasted text at ~4096 characters, which
- * corrupts JSON â€” so Cookie-Editor exports can also be sent as .txt/.json
+ * corrupts JSON Ã¢â‚¬â€ so Cookie-Editor exports can also be sent as .txt/.json
  * FILE attachments (handled via getFile + download).
  */
 
@@ -98,47 +98,48 @@ interface TgUpdate {
 }
 
 const HELP_TEXT = [
-  '🤖 LeetCode Daily Agent',
+  'ðŸ¤– LeetCode Daily Agent',
   '',
-  '📎 Just send cookie .json files (one per account) — each file is added as an account named after its LeetCode username; a file for a user that already exists overrides that account.',
+  'ðŸ“Ž Just send cookie .json files (one per account) â€” each file is added as an account named after its LeetCode username; a file for a user that already exists overrides that account.',
   '',
-  '🍪 Sessions',
-  '🔄 /renew - send a LeetCode or Codeforces session JSON; site is detected automatically',
-  '🏷️ /renew <label> - store the NEXT file under this exact label',
-  '👥 /accounts - list every account with its cookie status',
-  '🗑️ /removesession - list every account with a Remove button (tap to delete that account\'s session)',
-  '🧹 /removeallsessions - delete the sessions of ALL accounts (asks for confirmation)',
+  'ðŸª Sessions',
+  'ðŸ”„ /renew - send a LeetCode or Codeforces session JSON; site is detected automatically',
+  'ðŸ·ï¸ /renew <label> - store the NEXT file under this exact label',
+  'ðŸ‘¥ /accounts - list every account with its cookie status',
+  'ðŸ—‘ï¸ /removesession - list every account with a Remove button (tap to delete that account\'s session)',
+  'ðŸ§¹ /removeallsessions - delete the sessions of ALL accounts (asks for confirmation)',
   '',
-  '🚀 Submissions',
-  '⚡ /triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
-  '🎁 /claimcoins - check and collect the contest-page coin offer for selected LeetCode accounts',
-  '🏆 /submitnextsolution - submit the next Codeforces source solution for every Codeforces account',
-  '🎯 /nextsubcustomaccount - choose one Codeforces account, or all, for the next source solution',
-  '🌐 /cfnetwork - choose residential proxy or phone Tailscale for Codeforces',
-  '📱 /cfmanualnext - send the next source and submit link for a phone-browser fallback',
-  '📋 /cfaccounts - list Codeforces accounts, cursor and last verdict',
-  '🗑️ /cf_clear_cookies - list every Codeforces account with a Remove button, plus a Remove All option',
-  '🎯 /questionrangesubmission 200-400 - submit every question in a range (pick one account or All)',
-  '📍 /rangestatus - progress of the running range job',
-  '🛑 /cancelrange - stop the running range job',
+  'ðŸš€ Submissions',
+  'âš¡ /triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
+  'ðŸŽ /claimcoins - check and collect the contest-page coin offer for selected LeetCode accounts',
+  'ðŸ† /submitnextsolution - submit the next Codeforces source solution for every Codeforces account',
+  'ðŸŽ¯ /nextsubcustomaccount - choose one Codeforces account, or all, for the next source solution',
+  'ðŸŒ /cfnetwork - choose residential proxy or phone Tailscale for Codeforces',
+  'ðŸ“± /cfmanualnext - send the next source and submit link for a phone-browser fallback',
+  'ðŸ“‹ /cfaccounts - list Codeforces accounts, cursor and last verdict',
+  'ðŸ—‘ï¸ /cf_clear_cookies, /codechef - list every Codeforces account with a Remove button, plus a Remove All option',
+  '👨‍🍳 /codechef - trigger CodeChef submissions for all configured accounts',
+  'ðŸŽ¯ /questionrangesubmission 200-400 - submit every question in a range (pick one account or All)',
+  'ðŸ“ /rangestatus - progress of the running range job',
+  'ðŸ›‘ /cancelrange - stop the running range job',
   '',
-  'ℹ️ Info',
-  '📊 /status - show authentication status and the last run',
-  '❌ /cancel - cancel a renewal in progress',
-  '❓ /help - show this message',
+  'â„¹ï¸ Info',
+  'ðŸ“Š /status - show authentication status and the last run',
+  'âŒ /cancel - cancel a renewal in progress',
+  'â“ /help - show this message',
 ].join('\n');
 
 const RENEW_INSTRUCTIONS = [
-  '🔐 Session renewal',
+  'ðŸ” Session renewal',
   '',
   'Send a JSON export from your logged-in LeetCode or Codeforces browser session.',
   'The bot inspects the domains/origins and automatically stores it in the correct platform account store.',
   '',
-  '🏠 LeetCode: your existing LeetCode renewal flow is unchanged.',
-  '🏆 Codeforces: export cookies/storageState while logged in to codeforces.com and send the JSON file here.',
+  'ðŸ  LeetCode: your existing LeetCode renewal flow is unchanged.',
+  'ðŸ† Codeforces: export cookies/storageState while logged in to codeforces.com and send the JSON file here.',
   '',
-  '🏷️ /renew <label> optionally forces the account label for the next upload.',
-  '❌ /cancel cancels a pending labeled renewal.',
+  'ðŸ·ï¸ /renew <label> optionally forces the account label for the next upload.',
+  'âŒ /cancel cancels a pending labeled renewal.',
 ].join('\n');
 
 /**
@@ -150,7 +151,7 @@ const RENEW_INSTRUCTIONS = [
  * deploy), so both poll for a while and 409 each other.
  *
  * Fix: each instance claims the poller slot in the database on startup
- * (latest boot wins). Before every poll — and immediately after a 409 — an
+ * (latest boot wins). Before every poll â€” and immediately after a 409 â€” an
  * instance checks it still owns the slot; the old instance sees it was
  * superseded and stops polling at once instead of fighting until it gets
  * SIGTERM. Shutdown also aborts the in-flight long-poll instead of letting
@@ -200,7 +201,7 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
       logger.warn({ err: errText(err) }, 'could not claim the telegram poller slot - polling anyway'),
     );
 
-    // A leftover webhook makes getUpdates fail with HTTP 409 â€” drop it once.
+    // A leftover webhook makes getUpdates fail with HTTP 409 Ã¢â‚¬â€ drop it once.
     await tgApi('deleteWebhook', { drop_pending_updates: true }).catch((err) =>
       logger.warn({ err: errText(err) }, 'Telegram deleteWebhook failed - continuing anyway'),
     );
@@ -298,7 +299,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
           return;
         }
         pendingRenewalLabel = arg;
-        await reply(`🏷️ Renewing the "${arg}" account. Send its cookie export (text or file) in your next message. /cancel aborts.`);
+        await reply(`ðŸ·ï¸ Renewing the "${arg}" account. Send its cookie export (text or file) in your next message. /cancel aborts.`);
         return;
       }
       case '/accounts':
@@ -306,6 +307,9 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         return;
       case '/status':
         await replyHtml(await statusText());
+        return;
+      case '/codechef':
+        await reply('🚀 CodeChef runs are triggered by the internal cron scheduler automatically. Support for manual triggers via Telegram is coming soon! Ensure CODECHEF_1, CODECHEF_2 environment variables are configured.');
         return;
       case '/submitnextsolution':
       case '/submit_next_solution':
@@ -349,7 +353,8 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/removeallsession':
         await handleRemoveAllSessions();
         return;
-      case '/cf_clear_cookies':
+      case '/cf_clear_cookies, /codechef':
+  '👨‍🍳 /codechef - trigger CodeChef submissions for all configured accounts',
       case '/cfclearcookies':
         await handleCfRemoveSession();
         return;
@@ -374,12 +379,12 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         pendingRangePrompt = false;
         await reply(
           currentRangeJob()
-            ? '❌ No renewal is in progress. To stop the question-range job, send /cancelrange.'
-            : '❌ No renewal is in progress. When you are ready, send /renew (or /renew <label>) and then the cookies.',
+            ? 'âŒ No renewal is in progress. To stop the question-range job, send /cancelrange.'
+            : 'âŒ No renewal is in progress. When you are ready, send /renew (or /renew <label>) and then the cookies.',
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /nextsubcustomaccount, /cfnetwork, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('ðŸ¤” Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /nextsubcustomaccount, /cfnetwork, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -399,7 +404,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     payload = await downloadDocument(msg.document);
   }
   if (!payload) {
-    await reply('📎 Send a cookie .json file (or paste the cookies) to add an account. /accounts lists them.');
+    await reply('ðŸ“Ž Send a cookie .json file (or paste the cookies) to add an account. /accounts lists them.');
     return;
   }
   const result = await processCookieMessage(payload, {
@@ -450,14 +455,14 @@ export async function processCookieMessage(
     return {
       stored: true,
       site: 'codeforces',
-      text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeCodeforcesIngest(result)}\n\n🏆 Codeforces accounts stored: ${total}. Use /cfaccounts to inspect progress.`,
+      text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeCodeforcesIngest(result)}\n\nðŸ† Codeforces accounts stored: ${total}. Use /cfaccounts to inspect progress.`,
     };
   }
 
   if (!looksLikeCookiePayload(payload)) {
     return {
       stored: false,
-      text: '⚠️ That does not look like a supported session export. Send the original LeetCode or Codeforces .json file (or /help).',
+      text: 'âš ï¸ That does not look like a supported session export. Send the original LeetCode or Codeforces .json file (or /help).',
     };
   }
 
@@ -471,7 +476,7 @@ export async function processCookieMessage(
   return {
     stored: true,
     site: 'leetcode',
-    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}\n\n📊 LeetCode accounts stored: ${total}. Send more files to add more — /accounts lists them.`,
+    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}\n\nðŸ“Š LeetCode accounts stored: ${total}. Send more files to add more â€” /accounts lists them.`,
   };
 }
 
@@ -491,15 +496,15 @@ function scheduleBatchRun(): void {
       const trigger = await triggerRun('session-renewal');
       await reply(
         trigger.started
-          ? "📨 Uploads received. Running today's challenge for all accounts now — the report follows here."
-          : `⚠️ Today's run was not started: ${trigger.message}`,
+          ? "ðŸ“¨ Uploads received. Running today's challenge for all accounts now â€” the report follows here."
+          : `âš ï¸ Today's run was not started: ${trigger.message}`,
       );
     })().catch((err) => logger.warn({ err: errText(err) }, 'batch run trigger failed'));
   }, BATCH_RUN_DELAY_MS);
 }
 
 /**
- * /triggersubmission — re-submits today's daily question for every account.
+ * /triggersubmission â€” re-submits today's daily question for every account.
  * Replies once when starting, then ONE message per account as soon as that
  * account finishes; the usual aggregated report follows at the end.
  *
@@ -511,42 +516,42 @@ export async function handleTriggerSubmission(
   inProgress: () => boolean = isRunInProgress,
 ): Promise<{ done: Promise<void> } | null> {
   if (inProgress()) {
-    await reply('🚧 A run is already in progress — wait for its report, then send /triggersubmission again.');
+    await reply('ðŸš§ A run is already in progress â€” wait for its report, then send /triggersubmission again.');
     return null;
   }
-  await reply("🚀 Submitting today's daily question for all accounts — you'll get one message per account.");
+  await reply("ðŸš€ Submitting today's daily question for all accounts â€” you'll get one message per account.");
   const done = (async () => {
     const report = await runner(TRIGGER_SUBMISSION_REASON, {
       onAccountOutcome: (outcome, index, total) => reply(formatAccountMessage(outcome, index, total)),
     });
     if (!report) {
-      await reply('⏳ Not started: another run began at the same moment. Send /triggersubmission again after it finishes.');
+      await reply('â³ Not started: another run began at the same moment. Send /triggersubmission again after it finishes.');
     } else if (report.totals.accounts === 0) {
-      await reply('📭 No accounts configured — send cookie files first (/renew).');
+      await reply('ðŸ“­ No accounts configured â€” send cookie files first (/renew).');
     } else {
       logger.info({ summary: summarizeReport(report) }, 'telegram /triggersubmission finished');
     }
   })().catch(async (err) => {
     logger.warn({ err: errText(err) }, '/triggersubmission failed');
-    await reply(`⚠️ /triggersubmission failed: ${errText(err)}`).catch(() => undefined);
+    await reply(`âš ï¸ /triggersubmission failed: ${errText(err)}`).catch(() => undefined);
   });
   // Wrapped in an object: returning the promise itself from an async function
   // would make the caller wait for the whole run and block the poll loop.
   return { done };
 }
 
-/** /submitnextsolution — run the next queued Codeforces source solution once per account. */
+/** /submitnextsolution â€” run the next queued Codeforces source solution once per account. */
 export async function handleCodeforcesSubmitNext(
   runner: typeof runCodeforcesNow = runCodeforcesNow,
   inProgress: () => boolean = isCodeforcesRunInProgress,
 ): Promise<{ done: Promise<void> } | null> {
   if (inProgress()) {
-    await reply('🚧 A Codeforces run is already in progress — wait for its report, then send /submitnextsolution again.');
+    await reply('ðŸš§ A Codeforces run is already in progress â€” wait for its report, then send /submitnextsolution again.');
     return null;
   }
   const statusMessage = await tgApi<{ message_id: number }>('sendMessage', {
     chat_id: config.telegram.chatId,
-    text: '<b>🏆 CODEFORCES SUBMISSION</b>\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n🔎 Checking all accounts…',
+    text: '<b>ðŸ† CODEFORCES SUBMISSION</b>\n<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>\nðŸ”Ž Checking all accountsâ€¦',
     parse_mode: 'HTML',
     disable_web_page_preview: true,
   });
@@ -557,7 +562,7 @@ export async function handleCodeforcesSubmitNext(
     await tgApi('editMessageText', {
       chat_id: config.telegram.chatId,
       message_id: statusMessage.message_id,
-      text: ['<b>🏆 CODEFORCES SUBMISSION</b>', '<code>━━━━━━━━━━━━━━━━━━━━</code>', ...lines].join('\n'),
+      text: ['<b>ðŸ† CODEFORCES SUBMISSION</b>', '<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>', ...lines].join('\n'),
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     }).catch((err) => logger.warn({ err: errText(err) }, 'could not update Codeforces progress message'));
@@ -567,22 +572,22 @@ export async function handleCodeforcesSubmitNext(
       forceDailyAttempt: true,
       onAccountProgress: async ({ phase, label, username, index, total, networkMode }) => {
         const account = html(username ?? label);
-        const route = networkMode === 'tailscale' ? '📱 PHONE TAILSCALE' : '🏠 RESIDENTIAL PROXY';
+        const route = networkMode === 'tailscale' ? 'ðŸ“± PHONE TAILSCALE' : 'ðŸ  RESIDENTIAL PROXY';
         const phaseText = {
-          checking: `🔎 <b>Account ${index}/${total}</b> · checking <code>${account}</code>…`,
-          verified: `✅ <b>Account ${index}/${total}</b> · verified <code>${account}</code>`,
-          source: `📦 <b>Account ${index}/${total}</b> · source loaded for <code>${account}</code>`,
-          network: `🌐 <b>Account ${index}/${total}</b> · route: <b>${route}</b>`,
-          opening: `🖥️ <b>Account ${index}/${total}</b> · opening Codeforces submit page`,
-          submitting: `🚀 <b>Account ${index}/${total}</b> · submitting signed form`,
-          verdict: `⏳ <b>Account ${index}/${total}</b> · waiting for Codeforces verdict`,
-          'session-restored': `💾 <b>${account}</b> · saved browser session restored`,
-          'session-fresh': `🍪 <b>${account}</b> · starting from uploaded session cookies`,
-          verification: `🔐 <b>${account}</b> · checking verification · waiting for the page to complete normally`,
-          'verification-retry': `⏳ <b>${account}</b> · verification has not cleared · one retry before submitting`,
-          'verification-blocked': `⚠️ <b>${account}</b> · verification did not clear automatically · attention required`,
-          'verification-cleared': `✅ <b>${account}</b> · verification completed · preparing submission`,
-          'verification-not-required': `✅ <b>${account}</b> · no form verification required`,
+          checking: `ðŸ”Ž <b>Account ${index}/${total}</b> Â· checking <code>${account}</code>â€¦`,
+          verified: `âœ… <b>Account ${index}/${total}</b> Â· verified <code>${account}</code>`,
+          source: `ðŸ“¦ <b>Account ${index}/${total}</b> Â· source loaded for <code>${account}</code>`,
+          network: `ðŸŒ <b>Account ${index}/${total}</b> Â· route: <b>${route}</b>`,
+          opening: `ðŸ–¥ï¸ <b>Account ${index}/${total}</b> Â· opening Codeforces submit page`,
+          submitting: `ðŸš€ <b>Account ${index}/${total}</b> Â· submitting signed form`,
+          verdict: `â³ <b>Account ${index}/${total}</b> Â· waiting for Codeforces verdict`,
+          'session-restored': `ðŸ’¾ <b>${account}</b> Â· saved browser session restored`,
+          'session-fresh': `ðŸª <b>${account}</b> Â· starting from uploaded session cookies`,
+          verification: `ðŸ” <b>${account}</b> Â· checking verification Â· waiting for the page to complete normally`,
+          'verification-retry': `â³ <b>${account}</b> Â· verification has not cleared Â· one retry before submitting`,
+          'verification-blocked': `âš ï¸ <b>${account}</b> Â· verification did not clear automatically Â· attention required`,
+          'verification-cleared': `âœ… <b>${account}</b> Â· verification completed Â· preparing submission`,
+          'verification-not-required': `âœ… <b>${account}</b> Â· no form verification required`,
         }[phase];
         progressLines.set(
           index,
@@ -596,17 +601,17 @@ export async function handleCodeforcesSubmitNext(
       },
     });
     if (!report) {
-      progressLines.set(0, '⏳ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
+      progressLines.set(0, 'â³ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
       await editProgress();
     } else if (report.totals.accounts === 0) {
-      progressLines.set(0, '📭 No Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
+      progressLines.set(0, 'ðŸ“­ No Codeforces accounts configured â€” send a Codeforces session JSON through /renew first.');
       await editProgress();
     } else {
       logger.info({ summary: summarizeCodeforcesReport(report) }, 'telegram /submitnextsolution finished');
     }
   })().catch(async (err) => {
     logger.warn({ err: errText(err) }, '/submitnextsolution failed');
-      progressLines.set(0, `⚠️ <b>/submitnextsolution failed:</b> ${html(errText(err))}`);
+      progressLines.set(0, `âš ï¸ <b>/submitnextsolution failed:</b> ${html(errText(err))}`);
     await editProgress().catch(() => undefined);
   });
   return { done };
@@ -670,18 +675,18 @@ export function buildCodeforcesNetworkPicker(mode: CodeforcesNetworkMode | null)
   const selected = mode ?? 'proxy';
   return {
     text: [
-      '🌐 Codeforces submission network',
+      'ðŸŒ Codeforces submission network',
       '',
-      `Current route: ${selected === 'proxy' ? '🏠 Residential proxy' : '📱 Phone Tailscale'}`,
+      `Current route: ${selected === 'proxy' ? 'ðŸ  Residential proxy' : 'ðŸ“± Phone Tailscale'}`,
       'Choose the route used by automatic and Telegram-triggered submissions:',
       selected === 'tailscale'
         ? 'Tailscale is strict: if the phone is offline, the job reports an error instead of silently using the proxy.'
         : 'Proxy is strict: this run will not connect to Tailscale.',
     ].join('\n'),
     buttons: [
-      [{ text: `${selected === 'proxy' ? '✅ ' : ''}🏠 Residential proxy`, callback_data: 'cfnet:proxy' }],
-      [{ text: `${selected === 'tailscale' ? '✅ ' : ''}📱 Phone Tailscale`, callback_data: 'cfnet:tailscale' }],
-      [{ text: '✖️ Cancel', callback_data: 'cfnet:x' }],
+      [{ text: `${selected === 'proxy' ? 'âœ… ' : ''}ðŸ  Residential proxy`, callback_data: 'cfnet:proxy' }],
+      [{ text: `${selected === 'tailscale' ? 'âœ… ' : ''}ðŸ“± Phone Tailscale`, callback_data: 'cfnet:tailscale' }],
+      [{ text: 'âœ–ï¸ Cancel', callback_data: 'cfnet:x' }],
     ],
   };
 }
@@ -702,13 +707,13 @@ async function handleCodeforcesNetworkButton(
 ): Promise<void> {
   if (data === 'cfnet:x') {
     await deps.answer(callbackId, 'Cancelled');
-    await deps.edit(chatId, messageId, '✖️ Network selection cancelled.');
+    await deps.edit(chatId, messageId, 'âœ–ï¸ Network selection cancelled.');
     return;
   }
   const mode = data === 'cfnet:tailscale' ? 'tailscale' : data === 'cfnet:proxy' ? 'proxy' : null;
   if (!mode) {
     await deps.answer(callbackId, 'This button is no longer valid');
-    await deps.edit(chatId, messageId, '🔍 That network choice is no longer valid. Send /cfnetwork again.');
+    await deps.edit(chatId, messageId, 'ðŸ” That network choice is no longer valid. Send /cfnetwork again.');
     return;
   }
   await deps.setMode(mode);
@@ -717,8 +722,8 @@ async function handleCodeforcesNetworkButton(
     chatId,
     messageId,
     mode === 'proxy'
-      ? '✅ Codeforces route set to residential proxy. Tailscale will not be used.'
-      : '✅ Codeforces route set to phone Tailscale. The job will fail clearly if the phone exit node is offline.',
+      ? 'âœ… Codeforces route set to residential proxy. Tailscale will not be used.'
+      : 'âœ… Codeforces route set to phone Tailscale. The job will fail clearly if the phone exit node is offline.',
   );
 }
 
@@ -727,32 +732,32 @@ export function buildCodeforcesSubmitPicker(
   accounts: Awaited<ReturnType<typeof listCodeforcesAccounts>>,
 ): { text: string; buttons: InlineButton[][] } {
   const buttons = accounts.map((account) => [
-    { text: `👤 ${cfAccountName(account)}`.slice(0, 60), callback_data: `cfsub:${account.id}` },
+    { text: `ðŸ‘¤ ${cfAccountName(account)}`.slice(0, 60), callback_data: `cfsub:${account.id}` },
   ]);
-  buttons.push([{ text: `👥 All accounts (${accounts.length}, one by one)`, callback_data: 'cfsub:all' }]);
-  buttons.push([{ text: '✖️ Cancel', callback_data: 'cfsub:x' }]);
+  buttons.push([{ text: `ðŸ‘¥ All accounts (${accounts.length}, one by one)`, callback_data: 'cfsub:all' }]);
+  buttons.push([{ text: 'âœ–ï¸ Cancel', callback_data: 'cfsub:x' }]);
   return {
     text: [
-      '🏆 Submit the next Codeforces source solution',
+      'ðŸ† Submit the next Codeforces source solution',
       '',
-      '👇 Pick an account, or choose All accounts:',
+      'ðŸ‘‡ Pick an account, or choose All accounts:',
       'Only the selected account(s) will receive a submission.',
     ].join('\n'),
     buttons,
   };
 }
 
-/** /nextsubcustomaccount — show the active Codeforces account picker. */
+/** /nextsubcustomaccount â€” show the active Codeforces account picker. */
 export async function handleCodeforcesCustomSubmit(
   deps: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
 ): Promise<void> {
   if (deps.inProgress()) {
-    await deps.send('🚧 A Codeforces run is already in progress — wait for its report, then try again.');
+    await deps.send('ðŸš§ A Codeforces run is already in progress â€” wait for its report, then try again.');
     return;
   }
   const accounts = await deps.listAccounts();
   if (accounts.length === 0) {
-    await deps.send('📭 No active Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
+    await deps.send('ðŸ“­ No active Codeforces accounts configured â€” send a Codeforces session JSON through /renew first.');
     return;
   }
   const picker = buildCodeforcesSubmitPicker(accounts);
@@ -770,9 +775,9 @@ async function startSelectedCodeforcesRun(
     onAccountOutcome: (outcome, index, total) => deps.send(formatCodeforcesAccountMessage(outcome, index, total)),
   });
   if (!report) {
-    await deps.send('⏳ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
+    await deps.send('â³ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
   } else if (report.totals.accounts === 0) {
-    await deps.send('📭 The selected Codeforces account is no longer active. Send /nextsubcustomaccount again.');
+    await deps.send('ðŸ“­ The selected Codeforces account is no longer active. Send /nextsubcustomaccount again.');
   } else {
     logger.info({ description, summary: summarizeCodeforcesReport(report) }, 'telegram custom Codeforces submission finished');
   }
@@ -787,31 +792,31 @@ async function handleCodeforcesSubmitButton(
 ): Promise<void> {
   if (data === 'cfsub:x') {
     await deps.answer(callbackId, 'Cancelled');
-    await deps.edit(chatId, messageId, '✖️ Codeforces submission cancelled — nothing was submitted.');
+    await deps.edit(chatId, messageId, 'âœ–ï¸ Codeforces submission cancelled â€” nothing was submitted.');
     return;
   }
   if (deps.inProgress()) {
     await deps.answer(callbackId, 'A Codeforces run is in progress');
-    await deps.edit(chatId, messageId, '🚧 A Codeforces run is already in progress — wait for its report, then try again.');
+    await deps.edit(chatId, messageId, 'ðŸš§ A Codeforces run is already in progress â€” wait for its report, then try again.');
     return;
   }
   const accounts = await deps.listAccounts();
   const selected = data === 'cfsub:all' ? accounts : accounts.filter((account) => data === `cfsub:${account.id}`);
   if (selected.length === 0) {
     await deps.answer(callbackId, 'This button is no longer valid');
-    await deps.edit(chatId, messageId, '🔍 That Codeforces account is no longer active. Send /nextsubcustomaccount again.');
+    await deps.edit(chatId, messageId, 'ðŸ” That Codeforces account is no longer active. Send /nextsubcustomaccount again.');
     return;
   }
   const description = selected.length === 1 ? cfAccountName(selected[0]!) : `all ${selected.length} Codeforces accounts`;
-  await deps.answer(callbackId, 'Started 🚀');
+  await deps.answer(callbackId, 'Started ðŸš€');
   await deps.edit(
     chatId,
     messageId,
-    `🚀 Submitting the next Codeforces source solution for ${description}.\n\n📬 You will receive the verdict here.`,
+    `ðŸš€ Submitting the next Codeforces source solution for ${description}.\n\nðŸ“¬ You will receive the verdict here.`,
   );
   void startSelectedCodeforcesRun(data === 'cfsub:all' ? undefined : [selected[0]!.id], description, deps).catch(async (err) => {
     logger.warn({ err: errText(err) }, 'custom Codeforces submission failed');
-    await deps.send(`⚠️ Codeforces submission failed: ${errText(err)}`).catch(() => undefined);
+    await deps.send(`âš ï¸ Codeforces submission failed: ${errText(err)}`).catch(() => undefined);
   });
 }
 
@@ -838,21 +843,21 @@ const defaultCodeforcesManualUiDeps: CodeforcesManualUiDeps = {
 
 function buildCodeforcesManualPicker(accounts: Awaited<ReturnType<typeof listCodeforcesAccounts>>): { text: string; buttons: InlineButton[][] } {
   return {
-    text: '📱 Phone fallback\n\nPick the Codeforces account signed in on your phone. The bot will send its next source link and the matching Codeforces submit page. No cloud browser or proxy is used.',
+    text: 'ðŸ“± Phone fallback\n\nPick the Codeforces account signed in on your phone. The bot will send its next source link and the matching Codeforces submit page. No cloud browser or proxy is used.',
     buttons: [
-      ...accounts.map((account) => [{ text: `👤 ${cfAccountName(account)}`.slice(0, 60), callback_data: `cfmanual:${account.id}` }]),
-      [{ text: '✖️ Cancel', callback_data: 'cfmanual:x' }],
+      ...accounts.map((account) => [{ text: `ðŸ‘¤ ${cfAccountName(account)}`.slice(0, 60), callback_data: `cfmanual:${account.id}` }]),
+      [{ text: 'âœ–ï¸ Cancel', callback_data: 'cfmanual:x' }],
     ],
   };
 }
 
-/** /cfmanualnext — send a mobile-ready source/submit handoff without posting anything. */
+/** /cfmanualnext â€” send a mobile-ready source/submit handoff without posting anything. */
 export async function handleCodeforcesManualNext(
   deps: CodeforcesManualUiDeps = defaultCodeforcesManualUiDeps,
 ): Promise<void> {
   const accounts = await deps.listAccounts();
   if (accounts.length === 0) {
-    await deps.send('📭 No active Codeforces accounts configured. Add one with /renew first.');
+    await deps.send('ðŸ“­ No active Codeforces accounts configured. Add one with /renew first.');
     return;
   }
   const picker = buildCodeforcesManualPicker(accounts);
@@ -868,28 +873,28 @@ async function handleCodeforcesManualButton(
 ): Promise<void> {
   if (data === 'cfmanual:x') {
     await deps.answer(callbackId, 'Cancelled');
-    await deps.edit(chatId, messageId, '✖️ Phone fallback cancelled.');
+    await deps.edit(chatId, messageId, 'âœ–ï¸ Phone fallback cancelled.');
     return;
   }
   const account = (await deps.listAccounts()).find((item) => data === `cfmanual:${item.id}`);
   if (!account) {
     await deps.answer(callbackId, 'This button is no longer valid');
-    await deps.edit(chatId, messageId, '🔍 That Codeforces account is no longer active. Send /cfmanualnext again.');
+    await deps.edit(chatId, messageId, 'ðŸ” That Codeforces account is no longer active. Send /cfmanualnext again.');
     return;
   }
   const entry = await deps.nextEntry(account.id);
   if (!entry || entry.contestId === undefined || !entry.problemIndex) {
     await deps.answer(callbackId, 'No source available');
-    await deps.edit(chatId, messageId, '📭 No next Codeforces source is available for this account.');
+    await deps.edit(chatId, messageId, 'ðŸ“­ No next Codeforces source is available for this account.');
     return;
   }
-  await deps.answer(callbackId, 'Ready 📱');
+  await deps.answer(callbackId, 'Ready ðŸ“±');
   await deps.edit(
     chatId,
     messageId,
     [
-      `📱 Manual Codeforces submission for ${cfAccountName(account)}`,
-      `Problem: ${entry.contestId}${entry.problemIndex}${entry.problemName ? ` — ${entry.problemName}` : ''}`,
+      `ðŸ“± Manual Codeforces submission for ${cfAccountName(account)}`,
+      `Problem: ${entry.contestId}${entry.problemIndex}${entry.problemName ? ` â€” ${entry.problemName}` : ''}`,
       `Language: ${entry.language === 'python' ? 'Python 3' : 'GNU C++'}`,
       '',
       `1. Open source: ${entry.rawUrl}`,
@@ -902,13 +907,13 @@ async function handleCodeforcesManualButton(
 }
 
 // ---------------------------------------------------------------------------
-// Session removal (/removesession, /removeallsessions) — inline buttons
+// Session removal (/removesession, /removeallsessions) â€” inline buttons
 // ---------------------------------------------------------------------------
 
 type InlineButton = { text: string; callback_data: string };
 
 // ---------------------------------------------------------------------------
-// LeetCode contest reward (/claimcoins) — multi-account inline picker
+// LeetCode contest reward (/claimcoins) â€” multi-account inline picker
 // ---------------------------------------------------------------------------
 
 export interface CoinClaimUiDeps {
@@ -961,21 +966,21 @@ export function buildCoinClaimPicker(
 ): { text: string; buttons: InlineButton[][] } {
   const allSelected = accounts.length > 0 && accounts.every((account) => selected.has(account.id));
   const buttons = accounts.map((account) => [{
-    text: `${selected.has(account.id) ? '✅' : '▫️'} ${accountName(account)}`.slice(0, 60),
+    text: `${selected.has(account.id) ? 'âœ…' : 'â–«ï¸'} ${accountName(account)}`.slice(0, 60),
     callback_data: `lccoin:a:${account.id}`,
   }]);
   buttons.push([{
-    text: `${allSelected ? '✅' : '👥'} ALL (${accounts.length})`,
+    text: `${allSelected ? 'âœ…' : 'ðŸ‘¥'} ALL (${accounts.length})`,
     callback_data: 'lccoin:all',
   }]);
   buttons.push([
-    { text: `🎁 Claim selected (${selected.size})`, callback_data: 'lccoin:run' },
-    { text: '✖️ Cancel', callback_data: 'lccoin:x' },
+    { text: `ðŸŽ Claim selected (${selected.size})`, callback_data: 'lccoin:run' },
+    { text: 'âœ–ï¸ Cancel', callback_data: 'lccoin:x' },
   ]);
   return {
     text: [
-      '<b>🎁 LEETCODE CONTEST REWARD</b>',
-      '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+      '<b>ðŸŽ LEETCODE CONTEST REWARD</b>',
+      '<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>',
       'Select one or more accounts, or choose ALL.',
       'The check only opens the contest reward area; daily submissions are not changed.',
     ].join('\n'),
@@ -987,12 +992,12 @@ export async function handleCoinClaimCommand(
   deps: CoinClaimUiDeps = defaultCoinClaimUiDeps,
 ): Promise<void> {
   if (deps.busy()) {
-    await deps.send('🚧 A LeetCode process is already running. Try /claimcoins again after it finishes.');
+    await deps.send('ðŸš§ A LeetCode process is already running. Try /claimcoins again after it finishes.');
     return;
   }
   const accounts = await deps.listAccounts();
   if (accounts.length === 0) {
-    await deps.send('📭 No active LeetCode accounts configured. Add one with /renew first.');
+    await deps.send('ðŸ“­ No active LeetCode accounts configured. Add one with /renew first.');
     return;
   }
   coinClaimSelections.set(config.telegram.chatId, new Set());
@@ -1011,19 +1016,19 @@ async function handleCoinClaimButton(
   if (data === 'lccoin:x') {
     coinClaimSelections.delete(key);
     await deps.answer(callbackId, 'Cancelled');
-    await deps.edit(chatId, messageId, '✖️ Contest reward check cancelled.');
+    await deps.edit(chatId, messageId, 'âœ–ï¸ Contest reward check cancelled.');
     return;
   }
   if (deps.busy()) {
     await deps.answer(callbackId, 'A LeetCode process is already running');
-    await deps.edit(chatId, messageId, '🚧 A LeetCode process is already running. Send /claimcoins again after it finishes.');
+    await deps.edit(chatId, messageId, 'ðŸš§ A LeetCode process is already running. Send /claimcoins again after it finishes.');
     return;
   }
   const accounts = await deps.listAccounts();
   const selection = coinClaimSelections.get(key);
   if (!selection) {
     await deps.answer(callbackId, 'This picker expired');
-    await deps.edit(chatId, messageId, '⌛ This account picker expired. Send /claimcoins again.');
+    await deps.edit(chatId, messageId, 'âŒ› This account picker expired. Send /claimcoins again.');
     return;
   }
 
@@ -1063,11 +1068,11 @@ async function handleCoinClaimButton(
 
   coinClaimSelections.delete(key);
   coinClaimInProgress = true;
-  await deps.answer(callbackId, 'Reward check started 🎁');
+  await deps.answer(callbackId, 'Reward check started ðŸŽ');
   await deps.edit(
     chatId,
     messageId,
-    `<b>🎁 LEETCODE CONTEST REWARD</b>\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n🔎 Checking 0/${selectedAccounts.length} accounts…`,
+    `<b>ðŸŽ LEETCODE CONTEST REWARD</b>\n<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>\nðŸ”Ž Checking 0/${selectedAccounts.length} accountsâ€¦`,
   );
   void (async () => {
     const lines: string[] = [];
@@ -1078,31 +1083,31 @@ async function handleCoinClaimButton(
           chatId,
           messageId,
           [
-            '<b>🎁 LEETCODE CONTEST REWARD</b>',
-            '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+            '<b>ðŸŽ LEETCODE CONTEST REWARD</b>',
+            '<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>',
             ...lines,
-            `🔎 Checking ${i + 1}/${selectedAccounts.length} · ${coinHtml(accountName(account))}…`,
+            `ðŸ”Ž Checking ${i + 1}/${selectedAccounts.length} Â· ${coinHtml(accountName(account))}â€¦`,
           ].join('\n'),
         );
         const result = await deps.claim(account);
-        if (result.claimed) lines.push(`✅ ${coinHtml(accountName(account))} — Coins offered collected`);
-        else if (result.error) lines.push(`❌ ${coinHtml(accountName(account))} — ${coinHtml(result.error.slice(0, 180))}`);
-        else lines.push(`▫️ ${coinHtml(accountName(account))} — No coin offer available`);
+        if (result.claimed) lines.push(`âœ… ${coinHtml(accountName(account))} â€” Coins offered collected`);
+        else if (result.error) lines.push(`âŒ ${coinHtml(accountName(account))} â€” ${coinHtml(result.error.slice(0, 180))}`);
+        else lines.push(`â–«ï¸ ${coinHtml(accountName(account))} â€” No coin offer available`);
       }
       await deps.edit(
         chatId,
         messageId,
-        ['<b>🎁 LEETCODE CONTEST REWARD</b>', '<code>━━━━━━━━━━━━━━━━━━━━</code>', ...lines].join('\n'),
+        ['<b>ðŸŽ LEETCODE CONTEST REWARD</b>', '<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>', ...lines].join('\n'),
       );
     } catch (err) {
-      await deps.edit(chatId, messageId, `⚠️ Reward check stopped: ${errText(err)}`).catch(() => undefined);
+      await deps.edit(chatId, messageId, `âš ï¸ Reward check stopped: ${errText(err)}`).catch(() => undefined);
     } finally {
       coinClaimInProgress = false;
     }
   })();
 }
 
-/** Everything session removal touches — injectable for tests. */
+/** Everything session removal touches â€” injectable for tests. */
 export interface RemovalDeps {
   listAccounts: () => Promise<AccountRecord[]>;
   deleteAccountById: (id: string) => Promise<boolean>;
@@ -1115,7 +1120,7 @@ export interface RemovalDeps {
   answer: (callbackId: string, text?: string) => Promise<void>;
 }
 
-const RUN_BUSY_TEXT = '🚧 A run is in progress right now - wait for its report, then try again (removing an account mid-run would break it).';
+const RUN_BUSY_TEXT = 'ðŸš§ A run is in progress right now - wait for its report, then try again (removing an account mid-run would break it).';
 
 const defaultRemovalDeps: RemovalDeps = {
   listAccounts,
@@ -1152,12 +1157,12 @@ function accountName(a: AccountRecord): string {
 /** The session list + one "Remove" button per account. */
 export function buildRemoveSessionView(accounts: AccountRecord[]): { text: string; buttons: InlineButton[][] } {
   if (accounts.length === 0) {
-    return { text: '📭 No sessions stored - nothing to remove.', buttons: [] };
+    return { text: 'ðŸ“­ No sessions stored - nothing to remove.', buttons: [] };
   }
-  const lines = [`🗂️ Sessions stored: ${accounts.length}`, '👇 Tap an account to remove its session:', ''];
+  const lines = [`ðŸ—‚ï¸ Sessions stored: ${accounts.length}`, 'ðŸ‘‡ Tap an account to remove its session:', ''];
   accounts.forEach((a, i) => lines.push(`${i + 1}. ${accountName(a)} - ${a.status}`));
-  const buttons = accounts.map((a) => [{ text: `🗑️ Remove ${accountName(a)}`.slice(0, 60), callback_data: `rm:${a.id}` }]);
-  buttons.push([{ text: '✅ Done', callback_data: 'rm:done' }]);
+  const buttons = accounts.map((a) => [{ text: `ðŸ—‘ï¸ Remove ${accountName(a)}`.slice(0, 60), callback_data: `rm:${a.id}` }]);
+  buttons.push([{ text: 'âœ… Done', callback_data: 'rm:done' }]);
   return { text: lines.join('\n'), buttons };
 }
 
@@ -1174,12 +1179,12 @@ export async function handleRemoveAllSessions(deps: RemovalDeps = defaultRemoval
   }
   await deps.send(
     [
-      `⚠️ Remove ALL ${accounts.length} session(s)? This deletes every account's cookies and run history and cannot be undone:`,
+      `âš ï¸ Remove ALL ${accounts.length} session(s)? This deletes every account's cookies and run history and cannot be undone:`,
       '',
-      ...accounts.map((a) => `▪️ ${accountName(a)}`),
+      ...accounts.map((a) => `â–ªï¸ ${accountName(a)}`),
     ].join('\n'),
     [[
-      { text: `🔥 Yes, remove all ${accounts.length}`, callback_data: 'rmall:yes' },
+      { text: `ðŸ”¥ Yes, remove all ${accounts.length}`, callback_data: 'rmall:yes' },
       { text: 'Cancel', callback_data: 'rmall:no' },
     ]],
   );
@@ -1191,13 +1196,13 @@ function cfAccountName(a: { label: string; username?: string | null }): string {
 
 export function buildCfRemoveSessionView(accounts: any[]): { text: string; buttons: InlineButton[][] } {
   if (accounts.length === 0) {
-    return { text: '📭 No Codeforces sessions stored - nothing to remove.', buttons: [] };
+    return { text: 'ðŸ“­ No Codeforces sessions stored - nothing to remove.', buttons: [] };
   }
-  const lines = [`🗂️ Codeforces Sessions stored: ${accounts.length}`, '👇 Tap an account to remove its session:', ''];
+  const lines = [`ðŸ—‚ï¸ Codeforces Sessions stored: ${accounts.length}`, 'ðŸ‘‡ Tap an account to remove its session:', ''];
   accounts.forEach((a, i) => lines.push(`${i + 1}. ${cfAccountName(a)} - ${a.status}`));
-  const buttons = accounts.map((a) => [{ text: `🗑️ Remove ${cfAccountName(a)}`.slice(0, 60), callback_data: `cfrm:${a.id}` }]);
-  buttons.push([{ text: `🔥 Remove All`, callback_data: 'cfrmall:yes' }]);
-  buttons.push([{ text: '✅ Done', callback_data: 'cfrm:done' }]);
+  const buttons = accounts.map((a) => [{ text: `ðŸ—‘ï¸ Remove ${cfAccountName(a)}`.slice(0, 60), callback_data: `cfrm:${a.id}` }]);
+  buttons.push([{ text: `ðŸ”¥ Remove All`, callback_data: 'cfrmall:yes' }]);
+  buttons.push([{ text: 'âœ… Done', callback_data: 'cfrm:done' }]);
   return { text: lines.join('\n'), buttons };
 }
 
@@ -1254,7 +1259,7 @@ export async function handleCallbackQuery(
 
   if (data === 'rm:done' || data === 'rmall:no') {
     await deps.answer(q.id, data === 'rmall:no' ? 'Cancelled' : undefined);
-    await deps.edit(chatId, messageId, data === 'rmall:no' ? '❌ Cancelled - no sessions were removed.' : '✅ Done.');
+    await deps.edit(chatId, messageId, data === 'rmall:no' ? 'âŒ Cancelled - no sessions were removed.' : 'âœ… Done.');
     return;
   }
 
@@ -1271,7 +1276,7 @@ export async function handleCallbackQuery(
     await deps.edit(
       chatId,
       messageId,
-      `🧹 Removed all sessions (${removed} account(s)). Send cookie .json files to add accounts again.`,
+      `ðŸ§¹ Removed all sessions (${removed} account(s)). Send cookie .json files to add accounts again.`,
     );
     return;
   }
@@ -1287,10 +1292,10 @@ export async function handleCallbackQuery(
     }
     let text: string;
     if (!target || !(await deps.deleteAccountById(id))) {
-      text = '🤷 That account was already removed.';
+      text = 'ðŸ¤· That account was already removed.';
     } else {
       logger.info({ label: target.label }, 'account session removed via Telegram');
-      text = `✅ Removed ${accountName(target)}`;
+      text = `âœ… Removed ${accountName(target)}`;
     }
     const remaining = await deps.listAccounts();
     if (remaining.length === 0) await deps.clearLegacySession().catch(() => undefined);
@@ -1303,20 +1308,20 @@ export async function handleCallbackQuery(
 
   if (data === 'cfrm:done') {
     await deps.answer(q.id);
-    await deps.edit(chatId, messageId, '✅ Done.');
+    await deps.edit(chatId, messageId, 'âœ… Done.');
     return;
   }
 
   if (data === 'cfrmall:yes') {
     if (isCodeforcesRunInProgress()) {
       await deps.answer(q.id, 'A Codeforces run is in progress - try again later');
-      await deps.edit(chatId, messageId, '🚧 A Codeforces run is in progress right now - wait for its report, then try again.');
+      await deps.edit(chatId, messageId, 'ðŸš§ A Codeforces run is in progress right now - wait for its report, then try again.');
       return;
     }
     const removed = await deleteAllCodeforcesAccounts();
     logger.info({ removed }, 'all Codeforces account sessions removed via Telegram');
     await deps.answer(q.id, `Removed ${removed}`);
-    await deps.edit(chatId, messageId, `🧹 Removed all Codeforces sessions (${removed} account(s)). Send Codeforces cookie .json files to add accounts again.`);
+    await deps.edit(chatId, messageId, `ðŸ§¹ Removed all Codeforces sessions (${removed} account(s)). Send Codeforces cookie .json files to add accounts again.`);
     return;
   }
 
@@ -1326,15 +1331,15 @@ export async function handleCallbackQuery(
     const target = before.find((a) => a.id === id);
     if (isCodeforcesRunInProgress()) {
       await deps.answer(q.id, 'A Codeforces run is in progress - try again later');
-      await deps.send('🚧 A Codeforces run is in progress right now - wait for its report, then try again.');
+      await deps.send('ðŸš§ A Codeforces run is in progress right now - wait for its report, then try again.');
       return;
     }
     let text: string;
     if (!target || !(await deleteCodeforcesAccountById(id))) {
-      text = '🤷 That Codeforces account was already removed.';
+      text = 'ðŸ¤· That Codeforces account was already removed.';
     } else {
       logger.info({ label: target.label }, 'Codeforces account session removed via Telegram');
-      text = `✅ Removed Codeforces account ${cfAccountName(target)}`;
+      text = `âœ… Removed Codeforces account ${cfAccountName(target)}`;
     }
     const remaining = await listCodeforcesAccounts();
     await deps.answer(q.id, text);
@@ -1355,7 +1360,7 @@ let pendingRangePrompt = false;
 
 const RANGE_GAP_MS = 30_000;
 
-/** Wiring for the range UI — injectable for tests. */
+/** Wiring for the range UI â€” injectable for tests. */
 export interface RangeUiDeps {
   start: (range: QuestionRange, target: string | 'all') => Promise<StartRangeResult>;
   current: typeof currentRangeJob;
@@ -1380,16 +1385,16 @@ export function buildRangePicker(
   const size = rangeSize(range);
   const tag = `${range.from}-${range.to}`;
   const text = [
-    `🎯 Question range #${range.from}–#${range.to} (${size} question${size === 1 ? '' : 's'})`,
+    `ðŸŽ¯ Question range #${range.from}â€“#${range.to} (${size} question${size === 1 ? '' : 's'})`,
     '',
-    '👇 Pick the account to run it on:',
-    `⏳ Estimated ~${formatDuration(estimateAccountMs(range, RANGE_GAP_MS))} per account (30 s break between questions)`,
+    'ðŸ‘‡ Pick the account to run it on:',
+    `â³ Estimated ~${formatDuration(estimateAccountMs(range, RANGE_GAP_MS))} per account (30 s break between questions)`,
   ].join('\n');
   const buttons: InlineButton[][] = accounts.map((a) => [
-    { text: `👤 ${accountName(a)}`.slice(0, 60), callback_data: `qr:${tag}:${a.id}` },
+    { text: `ðŸ‘¤ ${accountName(a)}`.slice(0, 60), callback_data: `qr:${tag}:${a.id}` },
   ]);
-  buttons.push([{ text: `👥 All accounts (${accounts.length}, one by one)`, callback_data: `qr:${tag}:all` }]);
-  buttons.push([{ text: '✖️ Cancel', callback_data: 'qr:x' }]);
+  buttons.push([{ text: `ðŸ‘¥ All accounts (${accounts.length}, one by one)`, callback_data: `qr:${tag}:all` }]);
+  buttons.push([{ text: 'âœ–ï¸ Cancel', callback_data: 'qr:x' }]);
   return { text, buttons };
 }
 
@@ -1400,22 +1405,22 @@ export async function handleQuestionRangeCommand(
 ): Promise<void> {
   if (!arg.trim()) {
     pendingRangePrompt = true;
-    await deps.send('🎯 Which questions? Send the range, e.g. 200-400\n(or in one go: /questionrangesubmission 200-400)');
+    await deps.send('ðŸŽ¯ Which questions? Send the range, e.g. 200-400\n(or in one go: /questionrangesubmission 200-400)');
     return;
   }
   const parsed = parseQuestionRange(arg);
   if (!parsed.ok) {
-    await deps.send(`⚠️ ${parsed.error}\nExample: /questionrangesubmission 200-400`);
+    await deps.send(`âš ï¸ ${parsed.error}\nExample: /questionrangesubmission 200-400`);
     return;
   }
   const accounts = await deps.listAccounts();
   if (accounts.length === 0) {
-    await deps.send('📭 No accounts configured — send cookie .json files first (/renew).');
+    await deps.send('ðŸ“­ No accounts configured â€” send cookie .json files first (/renew).');
     return;
   }
   const picker = buildRangePicker(parsed.range, accounts);
   if (ui.current()) {
-    picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
+    picker.text += '\n\nðŸ—‚ï¸ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
   }
   await deps.send(picker.text, picker.buttons);
 }
@@ -1430,7 +1435,7 @@ async function handleRangeButton(
 ): Promise<void> {
   if (data === 'qr:x') {
     await deps.answer(callbackId, 'Cancelled');
-    await deps.edit(chatId, messageId, '✖️ Question-range submission cancelled — nothing was started.');
+    await deps.edit(chatId, messageId, 'âœ–ï¸ Question-range submission cancelled â€” nothing was started.');
     return;
   }
   const m = /^qr:(\d+)-(\d+):(.+)$/.exec(data);
@@ -1442,17 +1447,17 @@ async function handleRangeButton(
   const result = await ui.start(parsed.range, m[3]!);
   if (!result.started) {
     if ('queued' in result) {
-      await deps.answer(callbackId, `Queued #${result.position} 🗂️`);
+      await deps.answer(callbackId, `Queued #${result.position} ðŸ—‚ï¸`);
       await deps.edit(
         chatId,
         messageId,
         [
-          `🗂️ Queued: questions #${parsed.range.from}–#${parsed.range.to} (${rangeSize(parsed.range)})`,
-          `📍 Queue position: ${result.position}`,
-          `👥 ${result.accounts.length === 1 ? `Account: ${result.accounts[0]?.label ?? 'unknown'}` : `Accounts (one by one): ${result.accounts.map((a) => a.label).join(', ')}`}`,
+          `ðŸ—‚ï¸ Queued: questions #${parsed.range.from}â€“#${parsed.range.to} (${rangeSize(parsed.range)})`,
+          `ðŸ“ Queue position: ${result.position}`,
+          `ðŸ‘¥ ${result.accounts.length === 1 ? `Account: ${result.accounts[0]?.label ?? 'unknown'}` : `Accounts (one by one): ${result.accounts.map((a) => a.label).join(', ')}`}`,
           '',
-          '⏳ It will start automatically after the current range job completes or is cancelled.',
-          '📍 /rangestatus shows the active job and queue.',
+          'â³ It will start automatically after the current range job completes or is cancelled.',
+          'ðŸ“ /rangestatus shows the active job and queue.',
         ].join('\n'),
       );
     } else {
@@ -1461,25 +1466,25 @@ async function handleRangeButton(
         chatId,
         messageId,
         result.reason === 'no-accounts'
-          ? '📭 No accounts configured — send cookie .json files first.'
-          : '🔍 That account no longer exists — send /questionrangesubmission again.',
+          ? 'ðŸ“­ No accounts configured â€” send cookie .json files first.'
+          : 'ðŸ” That account no longer exists â€” send /questionrangesubmission again.',
       );
     }
     return;
   }
   const { range } = parsed;
   const names = result.accounts.map((a) => accountName(a));
-  await deps.answer(callbackId, 'Started 🚀');
+  await deps.answer(callbackId, 'Started ðŸš€');
   await deps.edit(
     chatId,
     messageId,
     [
-      `🚀 Started: questions #${range.from}–#${range.to} (${rangeSize(range)})`,
-      `👥 ${names.length === 1 ? `Account: ${names[0]}` : `Accounts (one by one): ${names.join(', ')}`}`,
-      `⏳ ~${formatDuration(estimateAccountMs(range, RANGE_GAP_MS) * names.length)} in total — 30 s break between questions`,
+      `ðŸš€ Started: questions #${range.from}â€“#${range.to} (${rangeSize(range)})`,
+      `ðŸ‘¥ ${names.length === 1 ? `Account: ${names[0]}` : `Accounts (one by one): ${names.join(', ')}`}`,
+      `â³ ~${formatDuration(estimateAccountMs(range, RANGE_GAP_MS) * names.length)} in total â€” 30 s break between questions`,
       '',
-      '📬 You get a summary after each account.',
-      '📍 /rangestatus shows progress · 🛑 /cancelrange stops it',
+      'ðŸ“¬ You get a summary after each account.',
+      'ðŸ“ /rangestatus shows progress Â· ðŸ›‘ /cancelrange stops it',
     ].join('\n'),
   );
 }
@@ -1487,11 +1492,11 @@ async function handleRangeButton(
 export async function handleCancelRange(ui: RangeUiDeps = defaultRangeUiDeps): Promise<void> {
   const job = ui.current();
   if (!job || !ui.cancel()) {
-    await reply('🤷 No question-range process is running.');
+    await reply('ðŸ¤· No question-range process is running.');
     return;
   }
   await reply(
-    `🛑 Cancelling the question-range job (#${job.range.from}–#${job.range.to})…\nIt stops right after the current question — the summary for ${job.currentLabel ?? 'the current account'} follows.`,
+    `ðŸ›‘ Cancelling the question-range job (#${job.range.from}â€“#${job.range.to})â€¦\nIt stops right after the current question â€” the summary for ${job.currentLabel ?? 'the current account'} follows.`,
   );
 }
 
@@ -1502,55 +1507,55 @@ export async function handleRangeStatus(ui: RangeUiDeps = defaultRangeUiDeps): P
     job
       ? formatRangeJobStatus(job, ui.now(), queued)
       : queued > 0
-        ? `🗂️ ${queued} range job(s) waiting in the queue. A waiting job starts automatically when the active job finishes or is cancelled.`
-        : '💤 No question-range process is running. Start one with /questionrangesubmission 200-400',
+        ? `ðŸ—‚ï¸ ${queued} range job(s) waiting in the queue. A waiting job starts automatically when the active job finishes or is cancelled.`
+        : 'ðŸ’¤ No question-range process is running. Start one with /questionrangesubmission 200-400',
   );
 }
 
-/** Pending /renew <label> target — consumed by the next cookie payload. */
+/** Pending /renew <label> target â€” consumed by the next cookie payload. */
 let pendingRenewalLabel: string | undefined;
 
 async function accountsText(): Promise<string> {
   const [accounts, codeforces] = await Promise.all([listAccounts(), listCodeforcesAccounts(true)]);
   const lines = [
-    '<b>✦ ACCOUNT HUB</b>  <i>live snapshot</i>',
-    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    '<b>âœ¦ ACCOUNT HUB</b>  <i>live snapshot</i>',
+    '<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>',
     '',
-    `<b>🟩 LEETCODE</b>  <code>${accounts.length} connected</code>`,
+    `<b>ðŸŸ© LEETCODE</b>  <code>${accounts.length} connected</code>`,
   ];
   if (accounts.length === 0) {
-    lines.push('📭 No LeetCode accounts configured. Send /renew with a cookie export.');
+    lines.push('ðŸ“­ No LeetCode accounts configured. Send /renew with a cookie export.');
   }
   for (const a of accounts) {
     const who = a.username ? ` (${escapeHtml(a.username)})` : '';
     const accepted = await latestAcceptedRunForAccount(a.id);
     const acceptedText = accepted ? `AC ${humanLocal(accepted.updatedAt)}` : 'no accepted run';
-    const checkedText = a.lastCheckedAt ? ` · checked ${humanLocal(a.lastCheckedAt)}` : '';
+    const checkedText = a.lastCheckedAt ? ` Â· checked ${humanLocal(a.lastCheckedAt)}` : '';
     lines.push(`${accountStatusIcon(a.status)} <b>${escapeHtml(a.label)}</b>${who}  <i>${escapeHtml(acceptedText)}${escapeHtml(checkedText)}</i>`);
-    if (a.lastError) lines.push(`   └ ⚠️ <i>${escapeHtml(a.lastError.slice(0, 120))}</i>`);
+    if (a.lastError) lines.push(`   â”” âš ï¸ <i>${escapeHtml(a.lastError.slice(0, 120))}</i>`);
   }
-  lines.push('', '<code>━━━━━━━━━━━━━━━━━━━━</code>', '', `<b>🏆 CODEFORCES</b>  <code>${codeforces.length} connected</code>`);
-  if (codeforces.length === 0) lines.push('📭 No Codeforces accounts configured.');
+  lines.push('', '<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>', '', `<b>ðŸ† CODEFORCES</b>  <code>${codeforces.length} connected</code>`);
+  if (codeforces.length === 0) lines.push('ðŸ“­ No Codeforces accounts configured.');
   for (const account of codeforces) {
     const progress = await getCodeforcesProgress(account.id);
     const who = account.username ? ` (${escapeHtml(account.username)})` : '';
-    const verdict = progress.lastVerdict ? ` · <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
+    const verdict = progress.lastVerdict ? ` Â· <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
     lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
-    lines.push(`   └ next <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>${progress.lastSubmissionId ? ` · #<code>${escapeHtml(progress.lastSubmissionId)}</code>` : ''}`);
-    if (account.lastError) lines.push(`   └ ⚠️ <i>${escapeHtml(account.lastError.slice(0, 140))}</i>`);
+    lines.push(`   â”” next <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>${progress.lastSubmissionId ? ` Â· #<code>${escapeHtml(progress.lastSubmissionId)}</code>` : ''}`);
+    if (account.lastError) lines.push(`   â”” âš ï¸ <i>${escapeHtml(account.lastError.slice(0, 140))}</i>`);
   }
   return lines.join('\n');
 }
 
 async function codeforcesAccountsText(): Promise<string> {
   const accounts = await listCodeforcesAccounts(true);
-  if (accounts.length === 0) return '📭 No Codeforces accounts configured. Send /renew with a Codeforces session JSON.';
-  const lines = [`<b>🏆 CODEFORCES</b>  <code>${accounts.length} connected</code>`, '<i>queue · verdict · transport health</i>', '<code>━━━━━━━━━━━━━━━━━━━━</code>', ''];
+  if (accounts.length === 0) return 'ðŸ“­ No Codeforces accounts configured. Send /renew with a Codeforces session JSON.';
+  const lines = [`<b>ðŸ† CODEFORCES</b>  <code>${accounts.length} connected</code>`, '<i>queue Â· verdict Â· transport health</i>', '<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>', ''];
   for (const account of accounts) {
     const progress = await (await import('../codeforces/storage')).getCodeforcesProgress(account.id);
-    lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${account.username ? ` (${escapeHtml(account.username)})` : ''}${progress.lastVerdict ? ` · <i>${escapeHtml(progress.lastVerdict)}</i>` : ''}`);
-    lines.push(`   └ next <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>${progress.lastSubmissionId ? ` · #<code>${escapeHtml(progress.lastSubmissionId)}</code>` : ''}`);
-    if (account.lastError) lines.push(`   └ ⚠️ <i>${escapeHtml(account.lastError.slice(0, 140))}</i>`);
+    lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${account.username ? ` (${escapeHtml(account.username)})` : ''}${progress.lastVerdict ? ` Â· <i>${escapeHtml(progress.lastVerdict)}</i>` : ''}`);
+    lines.push(`   â”” next <code>${escapeHtml(progress.nextKey ?? 'first queued source')}</code>${progress.lastSubmissionId ? ` Â· #<code>${escapeHtml(progress.lastSubmissionId)}</code>` : ''}`);
+    if (account.lastError) lines.push(`   â”” âš ï¸ <i>${escapeHtml(account.lastError.slice(0, 140))}</i>`);
   }
   return lines.join('\n');
 }
@@ -1567,31 +1572,31 @@ async function statusText(): Promise<string> {
   const expired = accounts.filter((a) => a.status === AccountStatus.EXPIRED).length;
   const rejected = accounts.filter((a) => a.status === AccountStatus.REJECTED).length;
   const lines = [
-    '<b>◈ AGENT PULSE</b>  <i>platform health</i>',
-    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    '<b>â—ˆ AGENT PULSE</b>  <i>platform health</i>',
+    '<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>',
     '',
-    `<b>🟩 LEETCODE</b>  <code>${accounts.length} total</code>`,
-    `👥 <b>${active}</b> active · <i>${expired} expired · ${rejected} rejected</i>`,
-    `🔐 <i>${escapeHtml(String(sys['authStatus'] ?? 'unknown'))}</i>${sys['authUsername'] ? ` · ${escapeHtml(String(sys['authUsername']))}` : ''}`,
+    `<b>ðŸŸ© LEETCODE</b>  <code>${accounts.length} total</code>`,
+    `ðŸ‘¥ <b>${active}</b> active Â· <i>${expired} expired Â· ${rejected} rejected</i>`,
+    `ðŸ” <i>${escapeHtml(String(sys['authStatus'] ?? 'unknown'))}</i>${sys['authUsername'] ? ` Â· ${escapeHtml(String(sys['authUsername']))}` : ''}`,
   ];
   if (lastAccepted) {
     lines.push(
-      `✅ <b>${escapeHtml(lastAccepted.title)}</b>${lastAccepted.submissionStatus ? ` · <i>${escapeHtml(lastAccepted.submissionStatus)}</i>` : ''} · ${escapeHtml(humanLocal(lastAccepted.updatedAt))}`,
+      `âœ… <b>${escapeHtml(lastAccepted.title)}</b>${lastAccepted.submissionStatus ? ` Â· <i>${escapeHtml(lastAccepted.submissionStatus)}</i>` : ''} Â· ${escapeHtml(humanLocal(lastAccepted.updatedAt))}`,
     );
   } else {
-    lines.push('✅ Last accepted: <i>none recorded</i>');
+    lines.push('âœ… Last accepted: <i>none recorded</i>');
   }
-  if (last && last.state !== 'SUCCESS' && last.error) lines.push(`❗ Latest run error: <i>${escapeHtml(last.error.slice(0, 300))}</i>`);
-  lines.push('', '<code>━━━━━━━━━━━━━━━━━━━━</code>', '', `<b>🏆 CODEFORCES</b>  <code>${codeforces.length} total</code>`);
+  if (last && last.state !== 'SUCCESS' && last.error) lines.push(`â— Latest run error: <i>${escapeHtml(last.error.slice(0, 300))}</i>`);
+  lines.push('', '<code>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</code>', '', `<b>ðŸ† CODEFORCES</b>  <code>${codeforces.length} total</code>`);
   if (codeforces.length === 0) {
-    lines.push('📭 No Codeforces accounts configured.');
+    lines.push('ðŸ“­ No Codeforces accounts configured.');
   } else {
     for (const account of codeforces) {
       const progress = await getCodeforcesProgress(account.id);
       const who = account.username ? ` (${escapeHtml(account.username)})` : '';
-      const verdict = progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
+      const verdict = progress.lastVerdict ? ` â€” <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
       lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
-      lines.push(`   └ next <code>${escapeHtml(progress.nextKey ?? 'queued')}</code>`);
+      lines.push(`   â”” next <code>${escapeHtml(progress.nextKey ?? 'queued')}</code>`);
     }
   }
   return lines.join('\n');
@@ -1603,11 +1608,11 @@ function escapeHtml(value: string): string {
 
 function accountStatusIcon(status: string): string {
   switch (status.toUpperCase()) {
-    case 'ACTIVE': return '🟢';
-    case 'EXPIRED': return '🟠';
-    case 'REJECTED': return '🔴';
-    case 'DISABLED': return '⚫';
-    default: return '⚪';
+    case 'ACTIVE': return 'ðŸŸ¢';
+    case 'EXPIRED': return 'ðŸŸ ';
+    case 'REJECTED': return 'ðŸ”´';
+    case 'DISABLED': return 'âš«';
+    default: return 'âšª';
   }
 }
 
