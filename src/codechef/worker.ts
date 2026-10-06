@@ -297,22 +297,95 @@ export function codeChefSchedule(hour: number, minute: number): string {
   return `${total % 60} ${Math.floor(total / 60)} * * *`;
 }
 
+export function isAfterCodeChefSchedule(
+  now: Date,
+  hour: number,
+  minute: number,
+  timezone: string,
+): boolean {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(now);
+  const currentHour = Number(parts.find((part) => part.type === 'hour')?.value ?? -1);
+  const currentMinute = Number(parts.find((part) => part.type === 'minute')?.value ?? -1);
+  return currentHour * 60 + currentMinute > hour * 60 + minute;
+}
+
+async function runAutomaticCodeChefDaily(
+  isRetry: boolean,
+  hour: number,
+  minute: number,
+  timezone: string,
+): Promise<void> {
+  if (runInProgress) return;
+  if (isLeetCodeBusy()) {
+    logger.info('LeetCode is currently running; deferring CodeChef execution to protect memory');
+    return;
+  }
+  if (isRetry && !isAfterCodeChefSchedule(new Date(), hour, minute, timezone)) return;
+
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date());
+  const currentHour = Number(parts.find((part) => part.type === 'hour')?.value ?? -1);
+  const currentMinute = Number(parts.find((part) => part.type === 'minute')?.value ?? -1);
+  const currentTotal = currentHour * 60 + currentMinute;
+  const scheduledTotal = hour * 60 + minute;
+
+  // Between 8:15 and 8:50 AM (must finish well before LeetCode at 09:00 AM)
+  if (isRetry && currentTotal > scheduledTotal + 35) return;
+
+  const today = todayInTimezone();
+  const accounts = await listCodeChefAccounts(true).catch(() => []);
+  const pending = accounts.filter((a) => a.lastSubmissionDate !== today);
+  if (pending.length === 0) return;
+
+  logger.info(
+    { date: today, retry: isRetry, accounts: pending.length, scheduled: `${hour}:${String(minute).padStart(2, '0')}` },
+    'automatic CodeChef daily run starting',
+  );
+
+  await runCodeChefNow('cron', { forceDailyAttempt: false });
+}
+
 export function startCodeChefScheduler(): () => void {
   const timezone = config.schedule.timezone;
-  // Daily schedule at 08:45 and 09:15 as requested
-  const morningTask = cron.schedule('45 8 * * *', () => {
-    logger.info('Starting 08:45 CodeChef daily scheduled run...');
-    void runCodeChefNow('cron', { forceDailyAttempt: true });
-  }, { timezone });
+  const requestedHour = Number(process.env.CODECHEF_RUN_HOUR ?? 8);
+  const requestedMinute = Number(process.env.CODECHEF_RUN_MINUTE ?? 15);
+  const hour = Number.isInteger(requestedHour) && requestedHour >= 0 && requestedHour <= 23
+    ? requestedHour
+    : 8;
+  const minute = Number.isInteger(requestedMinute) && requestedMinute >= 0 && requestedMinute <= 59
+    ? requestedMinute
+    : 15;
 
-  const postLeetCodeTask = cron.schedule('15 9 * * *', () => {
-    logger.info('Starting 09:15 CodeChef daily scheduled run...');
-    void runCodeChefNow('cron', { forceDailyAttempt: true });
-  }, { timezone });
+  const expression = `${minute} ${hour} * * *`;
+  const task = cron.schedule(
+    expression,
+    () => {
+      logger.info({ hour, minute }, 'Starting CodeChef daily scheduled run...');
+      void runAutomaticCodeChefDaily(false, hour, minute, timezone);
+    },
+    { timezone },
+  );
 
-  logger.info({ timezone, schedules: ['45 8 * * *', '15 9 * * *'] }, 'CodeChef scheduler armed');
+  const retryTask = cron.schedule(
+    '*/5 * * * *',
+    () => {
+      void runAutomaticCodeChefDaily(true, hour, minute, timezone);
+    },
+    { timezone },
+  );
+
+  logger.info({ timezone, expression, retryExpression: '*/5 * * * *' }, 'CodeChef scheduler armed');
   return () => {
-    morningTask.stop();
-    postLeetCodeTask.stop();
+    task.stop();
+    retryTask.stop();
   };
 }

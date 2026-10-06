@@ -29,7 +29,7 @@ vi.mock('../src/codeforces/submission', () => ({
 vi.mock('../src/codeforces/remoteSubmitter', () => ({
   isRemoteSubmitterConfigured: () => true, submitViaRemoteSubmitter: mocks.post,
 }));
-import { runCodeforcesNow } from '../src/codeforces/worker';
+import { runCodeforcesNow, isAfterCodeforcesSchedule } from '../src/codeforces/worker';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -81,4 +81,11 @@ it('marks every Codeforces final verdict as performed and advances its source cu
     expect(mocks.complete).toHaveBeenCalledTimes(2);
     expect(mocks.complete).toHaveBeenLastCalledWith('a2', expect.objectContaining({ completedKey: '8B', nextKey: '9A', verdict }));
   }
+});
+
+it('correctly determines whether the current time is after the scheduled Codeforces time', () => {
+  // 09:30 IST is 04:00 UTC
+  expect(isAfterCodeforcesSchedule(new Date('2026-10-06T03:59:00.000Z'), 9, 30, 'Asia/Kolkata')).toBe(false); // 09:29 IST
+  expect(isAfterCodeforcesSchedule(new Date('2026-10-06T04:00:00.000Z'), 9, 30, 'Asia/Kolkata')).toBe(false); // 09:30 IST
+  expect(isAfterCodeforcesSchedule(new Date('2026-10-06T04:01:00.000Z'), 9, 30, 'Asia/Kolkata')).toBe(true);  // 09:31 IST
 });

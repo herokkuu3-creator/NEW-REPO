@@ -3,7 +3,8 @@ import { CodeforcesAccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
 import { getSystemState, setSystemState, SystemKeys } from '../database/models';
-import { todayInTimezone } from '../scheduler/dailyWorker';
+import { isRunInProgress as isLeetCodeBusy, todayInTimezone } from '../scheduler/dailyWorker';
+import { isCodeChefRunInProgress } from '../codechef/worker';
 import {
   claimDailyAttempt,
   completeCurrentProblem,
@@ -739,6 +740,10 @@ export function isAfterCodeforcesSchedule(
 
 async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minute: number, timezone: string): Promise<void> {
   if (runInProgress) return;
+  if (isLeetCodeBusy() || isCodeChefRunInProgress()) {
+    logger.info('LeetCode or CodeChef is currently running; deferring Codeforces execution to protect memory');
+    return;
+  }
   if (isRetry && !isAfterCodeforcesSchedule(new Date(), hour, minute, timezone)) return;
 
   const date = todayInTimezone();
@@ -777,14 +782,14 @@ export function startCodeforcesScheduler(): () => void {
   // Staggered away from the LeetCode run by default (09:15 vs 09:00) so the two
   // never contend for the same 512MB container.
   const fallback = config.schedule;
-  const requestedHour = Number(process.env.CODEFORCES_RUN_HOUR ?? fallback.hour);
-  const requestedMinute = Number(process.env.CODEFORCES_RUN_MINUTE ?? fallback.minute);
+  const requestedHour = Number(process.env.CODEFORCES_RUN_HOUR ?? 9);
+  const requestedMinute = Number(process.env.CODEFORCES_RUN_MINUTE ?? 30);
   const hour = Number.isInteger(requestedHour) && requestedHour >= 0 && requestedHour <= 23
     ? requestedHour
-    : fallback.hour;
+    : 9;
   const minute = Number.isInteger(requestedMinute) && requestedMinute >= 0 && requestedMinute <= 59
     ? requestedMinute
-    : fallback.minute;
+    : 30;
   const timezone = fallback.timezone;
   const expression = `${minute} ${hour} * * *`;
   const task = cron.schedule(

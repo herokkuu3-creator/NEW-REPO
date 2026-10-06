@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { runCodeChefNow, codeChefSchedule, nextCodeChefSource } from '../src/codechef/worker';
+import { runCodeChefNow, codeChefSchedule, nextCodeChefSource, isAfterCodeChefSchedule } from '../src/codechef/worker';
 import * as storage from '../src/codechef/storage';
 import { submitDirectlyViaCodeChefApi, submitToCodeChef } from '../src/codechef/api';
 import { loginToCodeChef } from '../src/codechef/auth';
@@ -82,5 +82,11 @@ describe('CodeChef daily progress', () => {
     const queue = [{ problemCode: 'AAA' }] as CodeChefSourceEntry[];
     expect(nextCodeChefSource(queue, { nextKey: null, lastCompletedKey: 'AAA' })).toBe(1);
     expect(() => nextCodeChefSource(queue, { nextKey: 'MISSING', lastCompletedKey: null })).toThrow('missing');
+  });
+  it('correctly determines whether the current time is after the scheduled CodeChef time', () => {
+    // 08:15 IST is 02:45 UTC
+    expect(isAfterCodeChefSchedule(new Date('2026-10-06T02:44:00.000Z'), 8, 15, 'Asia/Kolkata')).toBe(false); // 08:14 IST
+    expect(isAfterCodeChefSchedule(new Date('2026-10-06T02:45:00.000Z'), 8, 15, 'Asia/Kolkata')).toBe(false); // 08:15 IST
+    expect(isAfterCodeChefSchedule(new Date('2026-10-06T02:46:00.000Z'), 8, 15, 'Asia/Kolkata')).toBe(true);  // 08:16 IST
   });
 });
