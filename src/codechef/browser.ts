@@ -25,7 +25,7 @@ export async function withCodeChefPage<T>(state: CodeChefState | undefined, acti
       if (parsed.hostname === 'challenges.cloudflare.com' || parsed.pathname.startsWith('/cdn-cgi/')) return route.continue();
       
       // Aggressive blocking to save memory on 512MB limit
-      const blockedTypes = ['image', 'font', 'media', 'stylesheet'];
+      const blockedTypes = ['image', 'font', 'media'];
       if (blockedTypes.includes(request.resourceType())) return route.abort();
       
       // Block common trackers and third-party scripts

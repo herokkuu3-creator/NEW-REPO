@@ -288,14 +288,19 @@ export async function submitOnCodeChefPage(
     // Ensure IDE tab is active if present
     try {
       const ideTab = page.locator('[role="tab"], button, div').filter({ hasText: /^IDE$/i }).first();
+      const editor = page.locator('.ace_editor, .monaco-editor, [class*="editor"]').first();
+      await ideTab.or(editor).waitFor({ state: 'visible', timeout: 25000 }).catch(() => undefined);
+      
       if (await ideTab.count() && await ideTab.isVisible().catch(() => false)) {
         const ariaSelected = await ideTab.getAttribute('aria-selected');
         const classList = (await ideTab.getAttribute('class')) || '';
         if (ariaSelected !== 'true' && !classList.includes('active')) {
           logger.info('Activating IDE tab...');
           await ideTab.click({ timeout: 3000 }).catch(() => undefined);
-          await page.waitForTimeout(500);
+          await page.waitForTimeout(1500); // Give React time to mount the editor after tab click
         }
+      } else {
+        logger.warn('IDE tab not found or not visible, proceeding anyway...');
       }
     } catch {}
 
