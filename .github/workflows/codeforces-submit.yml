@@ -43,6 +43,18 @@ jobs:
           node <<'NODE'
           const fs = require('node:fs');
           const base = process.env.CODEFORCES_SUBMITTER_URL;
+          const fallbackProxy = process.env.FALLBACK_CODEFORCES_PROXY;
+          if (fallbackProxy && base) {
+            fetch(`${base}/proxy/sync`, {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${process.env.CODEFORCES_SUBMITTER_TOKEN}`,
+                'content-type': 'application/json',
+              },
+              body: JSON.stringify({ proxies: fallbackProxy }),
+              signal: AbortSignal.timeout(10000),
+            }).catch(() => {});
+          }
           const requested = process.env.CODEFORCES_INPUT_JOB_ID;
           const lookupUrl = requested ? `${base}/jobs/${requested}/network` : `${base}/jobs/next`;
           fetch(lookupUrl, {

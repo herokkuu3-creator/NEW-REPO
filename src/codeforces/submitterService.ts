@@ -50,6 +50,8 @@ const broker = RUNNER_REPOSITORY || LOCAL_RUNNER_MODE
   ? new ActionBroker((id) => LOCAL_RUNNER_MODE ? Promise.resolve() : dispatchAction(RUNNER_REPOSITORY, GITHUB_DISPATCH_TOKEN, id))
   : null;
 
+let syncedProxies: string[] = [];
+
 const CHALLENGE_RE = /just a moment|checking your browser|verify you are human|cf-chl|enable javascript and cookies/i;
 const SIGNED_OUT_RE = /you are not logged in|please login|please sign in|not logged in|register for practice/i;
 const REJECTION_RE =
@@ -755,6 +757,34 @@ export const server = http.createServer((req, res) => {
       });
       return;
     }
+  }
+
+  if (req.method === 'POST' && url === '/proxy/sync') {
+    if (!runnerAuthorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
+    let raw = '';
+    req.on('data', (chunk: Buffer) => {
+      raw += chunk.toString('utf8');
+      if (raw.length > 65536) req.destroy();
+    });
+    req.on('end', () => {
+      try {
+        const body = JSON.parse(raw) as { proxies?: string };
+        if (typeof body?.proxies === 'string') {
+          syncedProxies = parseProxyList(body.proxies);
+          log({ count: syncedProxies.length }, 'synced proxy list from GitHub Actions runner');
+        }
+        json(res, 200, { ok: true, count: syncedProxies.length });
+      } catch {
+        json(res, 400, { error: 'invalid payload' });
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/proxy/list') {
+    if (!runnerAuthorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
+    json(res, 200, { proxies: syncedProxies });
+    return;
   }
 
   if (req.method !== 'POST' || url !== '/submit') {

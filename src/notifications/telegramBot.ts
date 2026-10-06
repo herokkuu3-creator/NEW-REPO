@@ -44,8 +44,10 @@ import {
   getAllConfiguredProxies,
   removeProxyByIndex,
   addCustomProxy,
+  addCustomProxies,
   restoreAllProxies,
   testAllProxiesOneByOne,
+  fetchRemoteSyncedProxies,
 } from '../codeforces/proxyManager';
 import { testProxyDetailed } from '../codeforces/proxyRotator';
 import {
@@ -148,11 +150,13 @@ const HELP_TEXT = [
   '└ <code>/cf_clear_cookies</code> — Delete Codeforces stored sessions',
   '',
   '<b>🌐 𝗣𝗥𝗢𝗫𝗬 &amp; 𝗡𝗘𝗧𝗪𝗢𝗥𝗞</b>',
-  '├ <code>/cfnetwork</code> — Switch network mode (Proxy / Tailscale)',
   '├ <code>/testproxy</code> — Test each proxy one-by-one &amp; show live health',
+  '├ <code>/setproxies</code> <i>&lt;urls&gt;</i> — Save &amp; verify multiple proxies in DB',
+  '├ <code>/addproxy</code> <i>&lt;url&gt;</i> — Add proxy to active pool',
   '├ <code>/removeproxy</code> <i>&lt;number&gt;</i> — Blacklist &amp; remove dead proxy in DB',
-  '├ <code>/addproxy</code> <i>&lt;url&gt;</i> — Add new proxy to active pool',
-  '└ <code>/restoreproxies</code> — Reset blacklist &amp; restore all proxies',
+  '├ <code>/restoreproxies</code> — Reset blacklist &amp; restore all proxies',
+  '├ <code>/syncproxies</code> — Sync proxies from GitHub Actions runner',
+  '└ <code>/cfnetwork</code> — Switch network mode (Proxy / Tailscale)',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ <code>/codechef</code> — Run daily CodeChef submission',
@@ -476,12 +480,21 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         await handleRemoveProxyCommand(arg);
         return;
       }
+      case '/setproxies':
+      case '/setproxy':
+      case '/addproxies':
       case '/addproxy':
-      case '/cfaddproxy': {
+      case '/cfaddproxy':
+      case '/cfsetproxies': {
         const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
         await handleAddProxyCommand(arg);
         return;
       }
+      case '/syncproxies':
+      case '/syncproxy':
+      case '/cfsyncproxies':
+        await handleSyncProxiesCommand();
+        return;
       case '/restoreproxies':
       case '/resetproxies':
       case '/restoreproxy':
@@ -548,7 +561,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /testproxy, /removeproxy, /addproxy, /restoreproxies, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -1560,10 +1573,18 @@ export async function handleTestProxyCommand(deps: ProxyUiDeps = defaultProxyUiD
     await deps.send([
       '<b>🌐 Configured Proxies</b>',
       '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-      '⚠️ No proxies configured.',
+      '⚠️ <b>No proxies found in active pool.</b>',
       '',
-      '👉 Add one now: <code>/addproxy &lt;proxy_url&gt;</code>',
-      '👉 Or add in GitHub Secrets / env: <code>CODEFORCES_RESIDENTIAL_PROXY</code>',
+      '<b>How to connect your proxies:</b>',
+      '1️⃣ <b>Directly in chat (Recommended & Instant):</b>',
+      '   Send: <code>/setproxies &lt;paste proxies here&gt;</code>',
+      '   <i>Accepts comma or newline separated proxy URLs.</i>',
+      '',
+      '2️⃣ <b>In Render Dashboard:</b>',
+      '   Add <code>CODEFORCES_RESIDENTIAL_PROXY</code> to Environment Variables in Render.',
+      '',
+      '3️⃣ <b>From GitHub Actions Secrets:</b>',
+      '   Send: <code>/syncproxies</code> to trigger sync from GitHub Actions.',
     ].join('\n'));
     return;
   }
@@ -1664,38 +1685,66 @@ export async function handleRemoveProxyCommand(arg?: string, deps: ProxyUiDeps =
 }
 
 export async function handleAddProxyCommand(arg?: string, deps: ProxyUiDeps = defaultProxyUiDeps): Promise<void> {
-  const url = (arg ?? '').trim();
-  if (!url) {
+  const text = (arg ?? '').trim();
+  if (!text) {
     await deps.send([
-      '<b>➕ Add New Proxy</b>',
+      '<b>➕ Set / Add Proxies</b>',
       '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-      'Please specify the proxy URL:',
-      '👉 <code>/addproxy http://username:password@host:port</code>',
-      '👉 <code>/addproxy socks5://username:password@host:port</code>',
+      'Please specify one or more proxy URLs (comma or newline separated):',
+      '👉 <code>/setproxies http://user:pass@host1:port, http://user:pass@host2:port</code>',
+      '',
+      '<i>Or send <code>/syncproxies</code> to sync from GitHub Secrets.</i>',
     ].join('\n'));
     return;
   }
 
-  const res = await addCustomProxy(url);
-  if (!res.ok || !res.proxy) {
-    await deps.send(`❌ Failed to add proxy: ${res.error ?? 'Invalid proxy format'}`);
+  const res = await addCustomProxies(text);
+  if (!res.ok || res.total === 0) {
+    await deps.send(`❌ Failed to parse proxies: ${res.error ?? 'Invalid proxy format'}`);
     return;
   }
 
-  await deps.send(`Testing new proxy <code>${escapeHtml(res.masked!)}</code> (~150B check)...`);
-  const check = await testProxyDetailed(res.proxy, 8);
+  await deps.send([
+    `✅ <b>Added ${res.added.length} proxy(ies) to database pool!</b> (Total pool: ${res.total})`,
+    '🔎 Running health checks on all proxies now...',
+  ].join('\n'));
 
-  const statusText = check.ok
-    ? `✅ <b>Verified &amp; Active</b> (${check.latencyMs}ms${check.ip ? ` · IP: ${check.ip}` : ''})`
-    : `⚠️ <b>Saved, but health check failed:</b> ${check.error ?? 'offline'}`;
+  await handleTestProxyCommand(deps);
+}
+
+export async function handleSyncProxiesCommand(deps: ProxyUiDeps = defaultProxyUiDeps): Promise<void> {
+  const runnerRepo = (process.env.CODEFORCES_RUNNER_REPOSITORY ?? '').trim();
+  const dispatchToken = (process.env.GITHUB_DISPATCH_TOKEN ?? '').trim();
+
+  await deps.send('🔄 Checking for proxies synced from GitHub Actions runner...');
+  const remote = await fetchRemoteSyncedProxies();
+  if (remote.length > 0) {
+    await deps.send(`✅ Found ${remote.length} proxy(ies) synced from GitHub Actions!`);
+    await handleTestProxyCommand(deps);
+    return;
+  }
+
+  if (runnerRepo && dispatchToken) {
+    try {
+      await deps.send('🚀 Triggering GitHub Actions workflow to sync secrets...');
+      const { dispatchAction } = await import('../codeforces/actionBroker');
+      const testJobId = randomUUID();
+      await dispatchAction(runnerRepo, dispatchToken, testJobId);
+      await deps.send('⏳ GitHub Actions sync dispatched! Please wait ~20-30 seconds, then run <code>/testproxy</code>.');
+      return;
+    } catch {
+      // fallback below
+    }
+  }
 
   await deps.send([
-    '<b>➕ Proxy Added to Active Pool</b>',
-    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-    `🌐 <code>${escapeHtml(res.masked!)}</code>`,
-    `⚡ Health: ${statusText}`,
+    '💡 <b>GitHub Secrets Info:</b>',
+    'GitHub repository secrets are private to GitHub Actions runners.',
     '',
-    'This proxy is now saved in the database and will be processed in all Codeforces runs.',
+    '👉 <b>Instant Fix:</b> Paste your proxies here using:',
+    '<code>/setproxies &lt;paste your proxies here&gt;</code>',
+    '',
+    'They will be saved in PostgreSQL and verified immediately!',
   ].join('\n'));
 }
 

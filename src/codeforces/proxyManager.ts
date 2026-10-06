@@ -67,26 +67,72 @@ export async function getCustomProxies(): Promise<string[]> {
   }
 }
 
-export async function addCustomProxy(proxyUrl: string): Promise<{ ok: boolean; error?: string; proxy?: string; masked?: string }> {
-  const parsed = parseProxyList(proxyUrl);
+export async function addCustomProxies(rawText: string): Promise<{
+  ok: boolean;
+  added: string[];
+  total: number;
+  error?: string;
+}> {
+  const parsed = parseProxyList(rawText);
   if (parsed.length === 0) {
-    return { ok: false, error: 'Invalid proxy URL. Supported protocols: http://, https://, socks5://' };
+    return {
+      ok: false,
+      added: [],
+      total: 0,
+      error: 'No valid proxy URLs found. Supported protocols: http://, https://, socks5://',
+    };
   }
-  const validated = parsed[0]!;
+
   const current = await getCustomProxies();
-  if (!current.includes(validated)) {
-    current.push(validated);
+  const newlyAdded: string[] = [];
+
+  for (const p of parsed) {
+    if (!current.includes(p)) {
+      current.push(p);
+      newlyAdded.push(p);
+    }
+  }
+
+  if (newlyAdded.length > 0) {
     await setSystemState(SystemKeys.codeforcesCustomProxies, JSON.stringify(current));
   }
 
-  // If this proxy was previously marked removed, unmark it
-  const hash = proxyHash(validated);
+  // If any were in removed list, unmark them
   const removed = await getRemovedProxyHashes();
-  if (removed.includes(hash)) {
-    await saveRemovedProxyHashes(removed.filter((h) => h !== hash));
+  const addedHashes = new Set(parsed.map(proxyHash));
+  const remainingRemoved = removed.filter((h) => !addedHashes.has(h));
+  if (remainingRemoved.length !== removed.length) {
+    await saveRemovedProxyHashes(remainingRemoved);
   }
 
-  return { ok: true, proxy: validated, masked: maskProxyUrl(validated) };
+  return { ok: true, added: newlyAdded, total: current.length };
+}
+
+export async function addCustomProxy(proxyUrl: string): Promise<{ ok: boolean; error?: string; proxy?: string; masked?: string }> {
+  const res = await addCustomProxies(proxyUrl);
+  if (!res.ok) {
+    return { ok: false, error: res.error };
+  }
+  const first = parseProxyList(proxyUrl)[0]!;
+  return { ok: true, proxy: first, masked: maskProxyUrl(first) };
+}
+
+export async function fetchRemoteSyncedProxies(): Promise<string[]> {
+  try {
+    const rawUrl = process.env.CODEFORCES_SUBMITTER_URL?.trim();
+    const token = process.env.CODEFORCES_SUBMITTER_TOKEN?.trim();
+    if (!rawUrl || !token) return [];
+    const url = rawUrl.replace(/\/+$/, '');
+    const res = await fetch(`${url}/proxy/list`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { proxies?: string[] };
+    return Array.isArray(data?.proxies) ? parseProxyList(data.proxies.join('\n')) : [];
+  } catch {
+    return [];
+  }
 }
 
 export async function getAllConfiguredProxies(envSource?: string): Promise<ManagedProxy[]> {
@@ -99,6 +145,7 @@ export async function getAllConfiguredProxies(envSource?: string): Promise<Manag
 
   const envProxies = parseProxyList(rawEnv);
   const customProxies = await getCustomProxies();
+  const remoteSynced = await fetchRemoteSyncedProxies();
 
   const allUrls: string[] = [];
   const customSet = new Set(customProxies);
@@ -107,6 +154,9 @@ export async function getAllConfiguredProxies(envSource?: string): Promise<Manag
     if (!allUrls.includes(p)) allUrls.push(p);
   }
   for (const p of customProxies) {
+    if (!allUrls.includes(p)) allUrls.push(p);
+  }
+  for (const p of remoteSynced) {
     if (!allUrls.includes(p)) allUrls.push(p);
   }
 

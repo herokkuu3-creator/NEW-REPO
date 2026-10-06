@@ -210,9 +210,9 @@ describe('telegram proxy commands', () => {
     };
 
     await handleAddProxyCommand('http://u:p@added.com:8080', deps);
-    expect(sent.length).toBe(2);
-    expect(sent[1]).toContain('Proxy Added to Active Pool');
-    expect(sent[1]).toContain('Verified &amp; Active');
+    expect(sent.length).toBe(3);
+    expect(sent[0]).toContain('Added 1 proxy(ies)');
+    expect(sent[2]).toContain('CODEFORCES PROXY HEALTH CHECK');
 
     const custom = await getCustomProxies();
     expect(custom).toContain('http://u:p@added.com:8080');
@@ -256,5 +256,22 @@ describe('telegram proxy commands', () => {
 
     await handleProxyButton(123, 456, 'q2', 'pxdone', deps);
     expect(edited[1]).toBe('✅ Done.');
+  });
+
+  it('handles /setproxies with multiple proxies', async () => {
+    const sent: string[] = [];
+    const deps: ProxyUiDeps = {
+      send: vi.fn(async (text) => {
+        sent.push(text);
+      }),
+      edit: vi.fn(),
+      answer: vi.fn(),
+    };
+
+    await handleAddProxyCommand('http://u1:p1@a.com:8080, http://u2:p2@b.com:8080', deps);
+    expect(sent.length).toBe(3); // confirmation + testing notice + results
+    expect(sent[0]).toContain('Added 2 proxy(ies)');
+    const custom = await getCustomProxies();
+    expect(custom.length).toBe(2);
   });
 });
