@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { RunState } from '@prisma/client';
-import { leetcodeDayKey, shouldSkipExistingDailyRun } from '../src/scheduler/dailyWorker';
+import { isPastScheduledDailyTime, leetcodeDayKey, shouldSkipExistingDailyRun, todayInTimezone } from '../src/scheduler/dailyWorker';
 
 describe('session-renewal daily dedupe', () => {
   it('does not re-submit an account whose daily submission already succeeded during cookie renewal', () => {
@@ -103,5 +103,20 @@ describe('session-renewal daily dedupe', () => {
   it('uses LeetCode UTC midnight instead of IST midnight for the daily key', () => {
     expect(leetcodeDayKey(new Date('2026-10-04T19:30:00.000Z'))).toBe('2026-10-04');
     expect(leetcodeDayKey(new Date('2026-10-05T00:00:00.000Z'))).toBe('2026-10-05');
+  });
+
+  it('prevents daily retry from triggering early before the scheduled run time', () => {
+    // 00:00 UTC (05:30 IST) when challenge rotates - NOT past 09:00 IST scheduled time
+    expect(isPastScheduledDailyTime(new Date('2026-10-06T00:00:00.000Z'))).toBe(false);
+    // 03:00 UTC (08:30 IST) - NOT past 09:00 IST
+    expect(isPastScheduledDailyTime(new Date('2026-10-06T03:00:00.000Z'))).toBe(false);
+    // 03:29 UTC (08:59 IST) - NOT past 09:00 IST
+    expect(isPastScheduledDailyTime(new Date('2026-10-06T03:29:00.000Z'))).toBe(false);
+    // 03:30 UTC (09:00 IST) - exactly scheduled time
+    expect(isPastScheduledDailyTime(new Date('2026-10-06T03:30:00.000Z'))).toBe(true);
+    // 03:35 UTC (09:05 IST) - after scheduled time (valid recovery window)
+    expect(isPastScheduledDailyTime(new Date('2026-10-06T03:35:00.000Z'))).toBe(true);
+    // 19:00 UTC (00:30 IST next day, but previous UTC day) - day key mismatch
+    expect(isPastScheduledDailyTime(new Date('2026-10-05T19:00:00.000Z'))).toBe(false);
   });
 });

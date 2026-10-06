@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runCodeChefNow, codeChefSchedule, nextCodeChefSource } from '../src/codechef/worker';
 import * as storage from '../src/codechef/storage';
-import { submitOnCodeChefPage } from '../src/codechef/api';
-import { loginOnCodeChefPage } from '../src/codechef/auth';
+import { submitDirectlyViaCodeChefApi, submitToCodeChef } from '../src/codechef/api';
+import { loginToCodeChef } from '../src/codechef/auth';
 import { isRunInProgress } from '../src/scheduler/dailyWorker';
 import type { CodeChefSourceEntry } from '../src/codechef/sourceRepo';
 
@@ -15,8 +15,12 @@ vi.mock('../src/codechef/sourceRepo', () => ({ loadCodeChefSourceIndex: vi.fn(as
   { problemCode: 'BBB', problemUrl: 'https://www.codechef.com/problems/BBB', language: 'cpp' },
 ]), fetchSourceCode: vi.fn(async () => 'code') }));
 vi.mock('../src/codechef/browser', () => ({ withCodeChefPage: vi.fn(async (_state, action) => action({})) }));
-vi.mock('../src/codechef/auth', () => ({ loginOnCodeChefPage: vi.fn() }));
-vi.mock('../src/codechef/api', () => ({ submitOnCodeChefPage: vi.fn() }));
+vi.mock('../src/codechef/auth', () => ({ loginToCodeChef: vi.fn(), loginOnCodeChefPage: vi.fn() }));
+vi.mock('../src/codechef/api', () => ({
+  submitDirectlyViaCodeChefApi: vi.fn(),
+  submitToCodeChef: vi.fn(),
+  submitOnCodeChefPage: vi.fn(),
+}));
 vi.mock('../src/scheduler/dailyWorker', () => ({ isRunInProgress: vi.fn(() => false) }));
 vi.mock('../src/notifications/telegram', () => ({ sendTelegramMessage: vi.fn(async () => true) }));
 
@@ -32,7 +36,7 @@ beforeEach(() => {
 
 describe('CodeChef daily progress', () => {
   it('advances after any confirmed terminal verdict, preserving the submission ID', async () => {
-    vi.mocked(submitOnCodeChefPage).mockResolvedValue({ ok: false, performed: true, clicked: true, submissionId: '123', verdict: 'Wrong Answer' });
+    vi.mocked(submitDirectlyViaCodeChefApi).mockResolvedValue({ ok: false, performed: true, clicked: true, submissionId: '123', verdict: 'Wrong Answer' });
     const report = await runCodeChefNow();
     expect(storage.completeCurrentProblem).toHaveBeenCalledWith('account', { completedKey: 'AAA', nextKey: 'BBB', submissionId: '123', verdict: 'Wrong Answer' });
     expect(report?.outcomes[0]?.performed).toBe(true);
@@ -41,29 +45,30 @@ describe('CodeChef daily progress', () => {
   it('never submits when another worker already owns today’s attempt', async () => {
     vi.mocked(storage.claimDailyAttempt).mockResolvedValue(false);
     const report = await runCodeChefNow();
-    expect(submitOnCodeChefPage).not.toHaveBeenCalled();
+    expect(submitDirectlyViaCodeChefApi).not.toHaveBeenCalled();
     expect(report?.outcomes[0]?.skipped).toBe(true);
   });
   it('retains an ambiguous click claim without advancing or claiming a submission date', async () => {
-    vi.mocked(submitOnCodeChefPage).mockResolvedValue({ ok: false, clicked: true, verdict: 'UNKNOWN', error: 'No confirmed ID' });
+    vi.mocked(submitDirectlyViaCodeChefApi).mockResolvedValue({ ok: false, clicked: true, verdict: 'UNKNOWN', error: 'No confirmed ID' });
     await runCodeChefNow();
     expect(storage.completeCurrentProblem).not.toHaveBeenCalled();
     expect(storage.releaseDailyAttempt).not.toHaveBeenCalled();
     expect(storage.patchCodeChefAccount).not.toHaveBeenCalledWith('account', expect.objectContaining({ lastSubmissionDate: expect.any(String) }));
   });
   it('releases a claim if preparation failed before Submit', async () => {
-    vi.mocked(submitOnCodeChefPage).mockResolvedValue({ ok: false, clicked: false, error: 'Editor not ready' });
+    vi.mocked(submitDirectlyViaCodeChefApi).mockResolvedValue({ ok: false, clicked: false, kind: 'error', error: 'Editor not ready' });
+    vi.mocked(submitToCodeChef).mockResolvedValue({ ok: false, clicked: false, error: 'Editor not ready' });
     await runCodeChefNow();
     expect(storage.releaseDailyAttempt).toHaveBeenCalledOnce();
     expect(storage.completeCurrentProblem).not.toHaveBeenCalled();
   });
   it('releases failed login claims and reports failure instead of saving false success', async () => {
     vi.mocked(storage.listCodeChefAccounts).mockResolvedValue([{ id: 'account', label: 'tester', storageState: JSON.stringify({ username: 'tester', password: 'fixture', cookies: [] }) }] as never);
-    vi.mocked(loginOnCodeChefPage).mockRejectedValue(new Error('Login not verified'));
+    vi.mocked(loginToCodeChef).mockRejectedValue(new Error('Login not verified'));
     const report = await runCodeChefNow();
     expect(report?.outcomes[0]?.error).toBe('Login not verified');
     expect(storage.releaseDailyAttempt).toHaveBeenCalledOnce();
-    expect(submitOnCodeChefPage).not.toHaveBeenCalled();
+    expect(submitDirectlyViaCodeChefApi).not.toHaveBeenCalled();
   });
   it('defers to an active LeetCode run before taking a daily claim', async () => {
     vi.mocked(isRunInProgress).mockReturnValue(true);

@@ -80,13 +80,13 @@ export function isRunInProgress(): boolean {
 }
 
 /** Today's date in the configured timezone — the dedupe key. */
-export function todayInTimezone(): string {
+export function todayInTimezone(now: Date = new Date()): string {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: config.schedule.timezone,
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
-  }).formatToParts(new Date());
+  }).formatToParts(now);
   const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
   return `${get('year')}-${get('month')}-${get('day')}`;
 }
@@ -94,6 +94,33 @@ export function todayInTimezone(): string {
 /** LeetCode rotates the daily challenge at 00:00 UTC (05:30 IST). */
 export function leetcodeDayKey(now: Date = new Date()): string {
   return now.toISOString().slice(0, 10);
+}
+
+/**
+ * Returns true only when the scheduled daily submission time (e.g. 09:00 AM in Asia/Kolkata)
+ * has passed for today's challenge. This prevents recovery/retry crons from jumping the gun
+ * at 05:30 AM when the question drops, before the configured daily submission hour.
+ */
+export function isPastScheduledDailyTime(now: Date = new Date()): boolean {
+  // If LeetCode's UTC day key hasn't reached today's timezone date yet (e.g. between 00:00 IST and 05:30 IST),
+  // today's challenge has not rotated on LeetCode.
+  if (leetcodeDayKey(now) !== todayInTimezone(now)) {
+    return false;
+  }
+
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: config.schedule.timezone,
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false,
+  }).formatToParts(now);
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? '0');
+  const minute = Number(parts.find((p) => p.type === 'minute')?.value ?? '0');
+
+  const currentMinutes = hour * 60 + minute;
+  const scheduledMinutes = config.schedule.hour * 60 + config.schedule.minute;
+
+  return currentMinutes >= scheduledMinutes;
 }
 
 export interface RunTriggerResult {
@@ -842,6 +869,7 @@ const DAILY_RETRY_LIMIT = 10;
 
 async function triggerDailyRetry(): Promise<void> {
   if (runInProgress) return;
+  if (!isPastScheduledDailyTime()) return;
   const today = leetcodeDayKey();
   const accounts = await listEnabledAccounts().catch(() => []);
   if (accounts.length === 0) return;
