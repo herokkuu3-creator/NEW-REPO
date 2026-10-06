@@ -140,10 +140,10 @@ const HELP_TEXT = [
   '',
   '<b>🏆 𝗖𝗢𝗗𝗘𝗙𝗢𝗥𝗖𝗘𝗦 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ <code>/submitnextsolution</code> — Submit next problem for all accounts',
-  '├ <code>/cfrange</code> <i>&lt;count&gt;</i> — Batch submit next N problems <i>(30s human pacing)</i>',
+  '├ <code>/cfrange</code> <i>&lt;count&gt;</i> — Batch submit next N problems <i>(account multi-selection · 30s pacing)</i>',
   '├ <code>/cfrangestatus</code> — Live batch progress &amp; ETA countdown',
   '├ <code>/cfcancelrange</code> — Cancel active batch submission',
-  '├ <code>/nextsubcustomaccount</code> — Select specific account to submit',
+  '├ <code>/nextsubcustomaccount</code> — Select specific account to submit 1 problem',
   '├ <code>/cfnetwork</code> — Switch network mode (Proxy / Tailscale)',
   '├ <code>/cfmanualnext</code> — Get next source &amp; mobile submit link',
   '├ <code>/cfaccounts</code> — View Codeforces accounts &amp; verdicts',
@@ -454,21 +454,30 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cf_range':
       case '/cfbatch':
       case '/cf_batch': {
-        const parsedCount = parseInt(commandArg, 10);
-        if (!commandArg || isNaN(parsedCount) || parsedCount <= 0) {
+        const tokens = commandArg.split(/\s+/).filter(Boolean);
+        const rawCount = tokens[0];
+        const parsedCount = parseInt(rawCount ?? '', 10);
+        if (!rawCount || isNaN(parsedCount) || parsedCount <= 0) {
           await replyHtml(
             [
               '<b>🔢 Codeforces Batch Submission</b>',
               '<code>━━━━━━━━━━━━━━━━━━━━</code>',
               'Please specify how many questions to submit:',
-              '👉 <code>/cfrange 5</code> (submit next 5 questions)',
-              '👉 <code>/cfrange 10</code> (submit next 10 questions)',
+              '👉 <code>/cfrange 5</code> (submit next 5 questions with account selection)',
+              '👉 <code>/cfrange 10</code> (submit next 10 questions with account selection)',
+              '',
+              '<i>After sending, you can select specific accounts or choose Select All.</i>',
             ].join('\n'),
           );
           return;
         }
         const count = Math.min(50, Math.max(1, parsedCount));
-        await handleCodeforcesTrigger({ forceNext: true, count });
+        const modifier = tokens[1]?.toLowerCase();
+        if (modifier === 'all' || modifier === '--all') {
+          await handleCodeforcesTrigger({ forceNext: true, count });
+          return;
+        }
+        await handleCodeforcesRangePickerCommand(count);
         return;
       }
       case '/cfrangestatus':
@@ -1195,12 +1204,12 @@ export async function handleCodeforcesRangeStatus(): Promise<void> {
 }
 
 export async function handleCodeforcesTrigger(
-  runnerOrOptions?: typeof runCodeforcesNow | { forceNext?: boolean; count?: number },
+  runnerOrOptions?: typeof runCodeforcesNow | { forceNext?: boolean; count?: number; accountIds?: readonly string[] },
   isBusyOrRunner?: (() => boolean) | typeof runCodeforcesNow,
   sendOrIsBusy?: ((text: string) => Promise<void>) | (() => boolean),
   maybeSend?: (text: string) => Promise<void>,
 ): Promise<{ done: Promise<void> } | null> {
-  let options: { forceNext?: boolean; count?: number } = {};
+  let options: { forceNext?: boolean; count?: number; accountIds?: readonly string[] } = {};
   let runner: typeof runCodeforcesNow = runCodeforcesNow;
   let isBusy: () => boolean = isCodeforcesRunInProgress;
   let send: ((text: string) => Promise<void>) | undefined;
@@ -1224,7 +1233,11 @@ export async function handleCodeforcesTrigger(
 
   if (send) {
     await send('🏆 Codeforces: checking configured accounts and submitting the next pending source.');
-    const done = runner(CODEFORCES_MANUAL_REASON, { forceDailyAttempt: true, batchCount: options.count ?? 1 }).then(async (report) => {
+    const done = runner(CODEFORCES_MANUAL_REASON, {
+      forceDailyAttempt: true,
+      batchCount: options.count ?? 1,
+      accountIds: options.accountIds,
+    }).then(async (report) => {
       if (!report) await send!('Another Codeforces run started; this command did not create a second run.');
     }).catch(async (err) => {
       await send!(`Codeforces could not start: ${err instanceof Error ? err.message : String(err)}`);
@@ -1232,7 +1245,10 @@ export async function handleCodeforcesTrigger(
     return { done };
   }
 
-  const configuredAccounts = await listCodeforcesAccounts(true).catch(() => []);
+  const allAccounts = await listCodeforcesAccounts(false).catch(() => []);
+  const configuredAccounts = options.accountIds && options.accountIds.length > 0
+    ? allAccounts.filter((a) => options.accountIds!.includes(a.id))
+    : allAccounts;
   const initialTotalAccounts = Math.max(1, configuredAccounts.length);
   const accountSections = new Map<number, CodeforcesAccountSectionState>();
 
@@ -1295,6 +1311,7 @@ export async function handleCodeforcesTrigger(
     const report = await runner(CODEFORCES_MANUAL_REASON, {
       forceDailyAttempt: options.forceNext ?? true,
       batchCount: options.count ?? 1,
+      accountIds: options.accountIds,
       onAccountProgress: async (event) => {
         if (event.accTotal && event.accTotal > totalAccounts) {
           totalAccounts = event.accTotal;
@@ -1482,6 +1499,7 @@ const defaultCodeforcesSubmitUiDeps: CodeforcesSubmitUiDeps = {
     await tgApi('sendMessage', {
       chat_id: config.telegram.chatId,
       text,
+      parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
     });
@@ -1491,6 +1509,7 @@ const defaultCodeforcesSubmitUiDeps: CodeforcesSubmitUiDeps = {
       chat_id: chatId,
       message_id: messageId,
       text,
+      parse_mode: 'HTML',
       disable_web_page_preview: true,
       reply_markup: { inline_keyboard: buttons ?? [] },
     });
@@ -1929,6 +1948,174 @@ async function handleCodeforcesSubmitButton(
   });
 }
 
+export interface CodeforcesRangeSelectionState {
+  count: number;
+  selectedAccountIds: Set<string>;
+}
+
+export const cfRangeSelections = new Map<string, CodeforcesRangeSelectionState>();
+
+/** Builds the multi-selection account picker for /cfrange <count>. */
+export function buildCodeforcesRangePicker(
+  count: number,
+  accounts: Awaited<ReturnType<typeof listCodeforcesAccounts>>,
+  selected: ReadonlySet<string>,
+): { text: string; buttons: InlineButton[][] } {
+  const allSelected = accounts.length > 0 && accounts.every((account) => selected.has(account.id));
+  const buttons: InlineButton[][] = accounts.map((account) => [{
+    text: `${selected.has(account.id) ? '✅' : '▫️'} ${cfAccountName(account)}`.slice(0, 60),
+    callback_data: `cfrange:a:${account.id}`,
+  }]);
+  buttons.push([{
+    text: `${allSelected ? '✅' : '👥'} Select All (${accounts.length})`,
+    callback_data: 'cfrange:all',
+  }]);
+  const startLabel = selected.size > 0
+    ? `🚀 Start Batch (${count} Qs · ${selected.size} acc)`
+    : `🚀 Start Batch (${count} Qs)`;
+  buttons.push([
+    { text: startLabel, callback_data: 'cfrange:run' },
+    { text: '✖️ Cancel', callback_data: 'cfrange:x' },
+  ]);
+
+  const plural = count === 1 ? 'question' : 'questions';
+  return {
+    text: [
+      `<b>🏆 CODEFORCES BATCH (${count} ${count === 1 ? 'QUESTION' : 'QUESTIONS'})</b>`,
+      '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+      'Select the accounts to submit for this batch:',
+      `<i>Each selected account will submit ${count} ${plural} with 30s pacing.</i>`,
+    ].join('\n'),
+    buttons,
+  };
+}
+
+/** Handles the /cfrange command by opening an interactive multi-selection account picker. */
+export async function handleCodeforcesRangePickerCommand(
+  count: number,
+  deps: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
+  chatId: number | string = config.telegram.chatId,
+): Promise<void> {
+  if (deps.inProgress()) {
+    await deps.send('🚧 A Codeforces run is already in progress — wait for its report, then try again.');
+    return;
+  }
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    await deps.send('📭 No active Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
+    return;
+  }
+  const key = String(chatId);
+  const selected = new Set<string>();
+  if (accounts.length === 1 && accounts[0]) {
+    selected.add(accounts[0].id);
+  }
+  cfRangeSelections.set(key, { count, selectedAccountIds: selected });
+  const picker = buildCodeforcesRangePicker(count, accounts, selected);
+  await deps.send(picker.text, picker.buttons);
+}
+
+/** Handles inline button taps for the /cfrange multi-selection picker. */
+export async function handleCodeforcesRangeButton(
+  chatId: number | string,
+  messageId: number,
+  callbackId: string,
+  data: string,
+  deps: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
+  triggerFn: typeof handleCodeforcesTrigger = handleCodeforcesTrigger,
+): Promise<void> {
+  const key = String(chatId);
+  if (data === 'cfrange:x') {
+    cfRangeSelections.delete(key);
+    await deps.answer(callbackId, 'Cancelled');
+    await deps.edit(chatId, messageId, '✖️ Codeforces batch submission cancelled.');
+    return;
+  }
+
+  if (deps.inProgress()) {
+    await deps.answer(callbackId, 'A Codeforces run is already in progress');
+    await deps.edit(chatId, messageId, '🚧 A Codeforces run is already in progress — wait for its report, then try again.');
+    return;
+  }
+
+  const state = cfRangeSelections.get(key);
+  if (!state) {
+    await deps.answer(callbackId, 'This batch picker expired');
+    await deps.edit(chatId, messageId, '⌛ This batch picker expired. Send <code>/cfrange &lt;count&gt;</code> again.');
+    return;
+  }
+
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    cfRangeSelections.delete(key);
+    await deps.answer(callbackId, 'No active accounts');
+    await deps.edit(chatId, messageId, '📭 No active Codeforces accounts configured.');
+    return;
+  }
+
+  if (data === 'cfrange:all') {
+    const allSelected = accounts.every((account) => state.selectedAccountIds.has(account.id));
+    state.selectedAccountIds.clear();
+    if (!allSelected) {
+      accounts.forEach((account) => state.selectedAccountIds.add(account.id));
+    }
+    await deps.answer(callbackId, allSelected ? 'Cleared all' : 'All accounts selected');
+    const picker = buildCodeforcesRangePicker(state.count, accounts, state.selectedAccountIds);
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data.startsWith('cfrange:a:')) {
+    const id = data.slice('cfrange:a:'.length);
+    if (!accounts.some((account) => account.id === id)) {
+      await deps.answer(callbackId, 'Account no longer available');
+      return;
+    }
+    if (state.selectedAccountIds.has(id)) {
+      state.selectedAccountIds.delete(id);
+    } else {
+      state.selectedAccountIds.add(id);
+    }
+    await deps.answer(callbackId, state.selectedAccountIds.has(id) ? 'Selected' : 'Unselected');
+    const picker = buildCodeforcesRangePicker(state.count, accounts, state.selectedAccountIds);
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data === 'cfrange:run') {
+    const selectedAccounts = accounts.filter((account) => state.selectedAccountIds.has(account.id));
+    if (selectedAccounts.length === 0) {
+      await deps.answer(callbackId, 'Select at least one account');
+      return;
+    }
+
+    const { count, selectedAccountIds } = state;
+    cfRangeSelections.delete(key);
+    await deps.answer(callbackId, 'Batch starting 🚀');
+
+    const desc = selectedAccounts.length === 1
+      ? cfAccountName(selectedAccounts[0]!)
+      : `${selectedAccounts.length} accounts (${selectedAccounts.map((a) => cfAccountName(a)).join(', ')})`;
+    await deps.edit(
+      chatId,
+      messageId,
+      `🚀 Starting Codeforces batch (${count} Qs) for ${desc}…`,
+    );
+
+    void triggerFn({
+      forceNext: true,
+      count,
+      accountIds: Array.from(selectedAccountIds),
+    }).catch(async (err) => {
+      logger.warn({ err: errText(err) }, 'Codeforces batch trigger failed');
+      await deps.send(`⚠️ Codeforces batch failed to start: ${errText(err)}`).catch(() => undefined);
+    });
+    return;
+  }
+
+  await deps.answer(callbackId);
+}
+
 export interface CodeforcesManualUiDeps {
   listAccounts: () => Promise<Awaited<ReturnType<typeof listCodeforcesAccounts>>>;
   nextEntry: (accountId: string) => Promise<SourceIndexEntry | null>;
@@ -2348,6 +2535,11 @@ export async function handleCallbackQuery(
 
   if (data.startsWith('cfsub:')) {
     await handleCodeforcesSubmitButton(chatId, messageId, q.id, data, codeforcesUi);
+    return;
+  }
+
+  if (data.startsWith('cfrange:')) {
+    await handleCodeforcesRangeButton(chatId, messageId, q.id, data, codeforcesUi);
     return;
   }
 
