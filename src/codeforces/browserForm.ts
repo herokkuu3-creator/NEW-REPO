@@ -17,66 +17,11 @@ export class BrowserFormError extends Error {
   }
 }
 
-/** Keep CSS and all verification resources; omit decorative assets, MathJax, third-party trackers, and background connections to minimize proxy bandwidth. */
+/** Keep CSS and all verification resources; only omit decorative page assets. */
 export function blockCodeforcesResource(url: string, type: string): boolean {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return true;
-  }
-
-  const host = parsed.hostname.toLowerCase();
-  const path = parsed.pathname.toLowerCase();
-
-  // Always keep Cloudflare Turnstile & verification resources (site challenge, tokens, widget scripts/iframes/assets)
-  if (
-    host === 'challenges.cloudflare.com' ||
-    host.endsWith('.challenges.cloudflare.com') ||
-    path.startsWith('/cdn-cgi/')
-  ) {
-    return false;
-  }
-
-  // Block all non-Codeforces third-party origins (Google Analytics, Yandex Metrika, Mail.ru, VK, ad networks, CDNs)
-  const isCodeforcesHost =
-    host === 'codeforces.com' ||
-    host.endsWith('.codeforces.com') ||
-    host === 'codeforces.org' ||
-    host.endsWith('.codeforces.org');
-
-  if (!isCodeforcesHost) {
-    return true;
-  }
-
-  // For Codeforces origins, block non-essential asset types
-  if (
-    type === 'image' ||
-    type === 'media' ||
-    type === 'font' ||
-    type === 'websocket' ||
-    type === 'eventsource' ||
-    type === 'manifest' ||
-    type === 'ping'
-  ) {
-    return true;
-  }
-
-  // Block heavy MathJax formula rendering scripts and styles (~2.5-3.5MB per load, unnecessary for submission)
-  if (path.includes('mathjax') || parsed.search.toLowerCase().includes('mathjax')) {
-    return true;
-  }
-
-  // Block avatars, photos, and icons
-  if (
-    path.includes('/avatar/') ||
-    path.includes('/userphoto/') ||
-    path.endsWith('/favicon.ico')
-  ) {
-    return true;
-  }
-
-  return false;
+  const parsed = new URL(url);
+  if (parsed.hostname === 'challenges.cloudflare.com' || parsed.pathname.startsWith('/cdn-cgi/')) return false;
+  return type === 'image' || type === 'media' || type === 'font';
 }
 
 /** Preserve Codeforces' editor teardown and submit handlers instead of replacing window.editor. */

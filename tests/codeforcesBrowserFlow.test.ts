@@ -88,17 +88,10 @@ afterAll(async () => {
 });
 
 describe('Codeforces native browser submission', () => {
-  it('retains CSS and every Cloudflare verification resource while blocking trackers, mathjax, and media', async () => {
+  it('retains CSS and every Cloudflare verification resource', async () => {
     expect(blockCodeforcesResource('https://challenges.cloudflare.com/widget/image', 'image')).toBe(false);
     expect(blockCodeforcesResource('https://codeforces.com/cdn-cgi/challenge-platform/image', 'image')).toBe(false);
     expect(blockCodeforcesResource('https://codeforces.com/logo.png', 'image')).toBe(true);
-    expect(blockCodeforcesResource('https://codeforces.org/s/89445/mathjax/MathJax.js', 'script')).toBe(true);
-    expect(blockCodeforcesResource('https://mc.yandex.ru/metrika/watch.js', 'script')).toBe(true);
-    expect(blockCodeforcesResource('https://www.google-analytics.com/analytics.js', 'script')).toBe(true);
-    expect(blockCodeforcesResource('wss://pubsub.codeforces.com/ws', 'websocket')).toBe(true);
-    expect(blockCodeforcesResource('https://codeforces.org/userphoto/title/sample.jpg', 'image')).toBe(true);
-    expect(blockCodeforcesResource('https://codeforces.org/s/89445/js/codeforces.js', 'script')).toBe(false);
-    expect(blockCodeforcesResource('https://codeforces.org/s/89445/css/community.css', 'stylesheet')).toBe(false);
     await fixture({ token: 'verified' });
     expect(await page.locator('#body').evaluate(e => getComputedStyle(e).color)).toBe('rgb(1, 2, 3)');
   });
