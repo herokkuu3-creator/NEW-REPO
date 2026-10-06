@@ -14,12 +14,25 @@ export async function withCodeChefPage<T>(state: CodeChefState | undefined, acti
   const watch = new MemoryWatch(() => { void browser.close().catch(() => undefined); });
   try {
     watch.start();
-    const context = await browser.newContext({ storageState: state, viewport: { width: 1000, height: 750 } });
+    const context = await browser.newContext({ 
+      storageState: state, 
+      viewport: { width: 1000, height: 750 },
+      serviceWorkers: 'block' 
+    });
     await context.route('**/*', route => {
       const request = route.request();
       const parsed = new URL(request.url());
       if (parsed.hostname === 'challenges.cloudflare.com' || parsed.pathname.startsWith('/cdn-cgi/')) return route.continue();
-      return ['image', 'font', 'media'].includes(request.resourceType()) ? route.abort() : route.continue();
+      
+      // Aggressive blocking to save memory on 512MB limit
+      const blockedTypes = ['image', 'font', 'media', 'stylesheet'];
+      if (blockedTypes.includes(request.resourceType())) return route.abort();
+      
+      // Block common trackers and third-party scripts
+      const blockedHosts = ['google-analytics.com', 'googletagmanager.com', 'clarity.ms', 'doubleclick.net'];
+      if (blockedHosts.some(h => parsed.hostname.includes(h))) return route.abort();
+
+      return route.continue();
     });
     return await action(await context.newPage());
   } finally {
