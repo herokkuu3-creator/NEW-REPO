@@ -26,6 +26,7 @@ import http from 'node:http';
 import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource } from './browserForm';
+import { parseProxyList } from './proxyRotator';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
 const PORT = Number(process.env.PORT ?? 10000);
@@ -195,8 +196,9 @@ function createBrowserTrafficMeter(): BrowserTrafficMeter {
  * Credentials remain separate from the server field and are never logged. */
 function browserProxy(raw: string): { server: string; username?: string; password?: string } | undefined {
   if (!raw) return undefined;
+  const first = parseProxyList(raw)[0] ?? raw.trim();
   try {
-    const endpoint = new URL(raw);
+    const endpoint = new URL(first);
     if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(endpoint.protocol) || !endpoint.hostname) return undefined;
     const server = `${endpoint.protocol}//${endpoint.host}`;
     const username = decodeURIComponent(endpoint.username);

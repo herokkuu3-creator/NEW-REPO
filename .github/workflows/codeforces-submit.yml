@@ -82,11 +82,20 @@ jobs:
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+      - name: Proxy rotation cache
+        if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
+        uses: actions/cache@v4
+        with:
+          path: .proxy_state
+          key: codeforces-proxy-state-${{ github.run_id }}
+          restore-keys: |
+            codeforces-proxy-state-
       - name: Select Codeforces network route
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
         env:
           TAILSCALE_STEP_OUTCOME: ${{ steps.tailscale.outcome }}
           CODEFORCES_NETWORK_MODE: ${{ steps.lookup.outputs.network_mode }}
+          FALLBACK_CODEFORCES_PROXY: ${{ secrets.CODEFORCES_RESIDENTIAL_PROXY }}
         run: |
           if [ "$CODEFORCES_NETWORK_MODE" = "tailscale" ] && [ "$TAILSCALE_STEP_OUTCOME" = "success" ] && [ -n "$TAILSCALE_EXIT_NODE" ] && sudo tailscale set --exit-node="$TAILSCALE_EXIT_NODE" && timeout 30 curl --fail --silent --show-error --output /dev/null https://www.cloudflare.com/cdn-cgi/trace; then
             echo 'CODEFORCES_PROXY=' >> "$GITHUB_ENV"
@@ -97,12 +106,7 @@ jobs:
               echo 'Tailscale was selected, but the phone exit node is unavailable.' >&2
               exit 1
             fi
-            if [ -z "$FALLBACK_CODEFORCES_PROXY" ]; then
-              echo 'Residential proxy mode was selected but CODEFORCES_RESIDENTIAL_PROXY is not configured.' >&2
-              exit 1
-            fi
-            printf 'CODEFORCES_PROXY=%s\n' "$FALLBACK_CODEFORCES_PROXY" >> "$GITHUB_ENV"
-            echo 'Codeforces browser will use the configured residential proxy.'
+            node dist/src/codeforces/proxyRotator.js
           fi
       - name: Submit once and return browser result
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
