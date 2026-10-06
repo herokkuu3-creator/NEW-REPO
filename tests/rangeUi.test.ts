@@ -17,7 +17,9 @@ vi.mock('../src/notifications/telegram', () => ({
 }));
 
 import {
+  buildQuickRangeButtons,
   buildRangePicker,
+  getPendingPromptType,
   handleCallbackQuery,
   handleCancelRange,
   handleQuestionRangeCommand,
@@ -100,10 +102,20 @@ describe('/questionrangesubmission', () => {
     ]);
   });
 
-  it('without a range it asks for one', async () => {
+  it('without a range it asks for one and includes quick-selection buttons', async () => {
     const { deps, sentViews } = makeDeps([acc('a1')]);
     await handleQuestionRangeCommand('', deps, makeUi(started(['a1'])).ui);
     expect(sentViews[0]!.text).toMatch(/Which questions\? Send the range, e\.g\. 200-400/);
+    expect(sentViews[0]!.text).toContain('How many questions do you want to submit?');
+    expect(sentViews[0]!.buttons).toEqual(buildQuickRangeButtons());
+    expect(getPendingPromptType()).toBe('leetcode');
+  });
+
+  it('without a range and no accounts it warns and does not set pending prompt', async () => {
+    const { deps, sentViews } = makeDeps([]);
+    await handleQuestionRangeCommand('', deps, makeUi(started([])).ui);
+    expect(sentViews[0]!.text).toMatch(/📭 No accounts configured/);
+    expect(getPendingPromptType()).toBeNull();
   });
 
   it('a malformed range is answered with the example', async () => {
@@ -177,6 +189,22 @@ describe('range picker buttons', () => {
     expect(calls).toEqual([]);
     expect(edits[0]!.text).toMatch(/✖️ Question-range submission cancelled/);
     expect(answers[0]!.text).toBe('Cancelled');
+  });
+
+  it('tapping a quick range button (qr:r:1-25) opens the account picker for that range', async () => {
+    const { deps, edits, answers } = makeDeps([acc('a1')]);
+    await handleCallbackQuery(
+      { id: 'c-quick', data: 'qr:r:1-25', message: { message_id: 7, chat: { id: '555' } } },
+      deps,
+      makeUi(started(['a1'])).ui,
+    );
+    expect(answers[0]).toEqual({ id: 'c-quick', text: 'Range #1–#25' });
+    expect(edits[0]!.text).toContain('🎯 Question range #1–#25 (25 questions)');
+    expect(edits[0]!.buttons).toEqual([
+      [{ text: '👤 a1', callback_data: 'qr:1-25:a1' }],
+      [{ text: '👥 All accounts (1, one by one)', callback_data: 'qr:1-25:all' }],
+      [{ text: '✖️ Cancel', callback_data: 'qr:x' }],
+    ]);
   });
 
   it('stale buttons are answered honestly', async () => {

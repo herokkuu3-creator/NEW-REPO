@@ -1,8 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
+
+vi.mock('../src/config', async (orig) => {
+  const real = (await orig()) as { config: Record<string, unknown> };
+  return { config: { ...real.config, telegram: { ...(real.config.telegram as object), chatId: '555', enabled: true, commands: true, botToken: 'T' } } };
+});
+
 import {
   handleCodeChefTrigger,
   renderCodeChefProgressSections,
   CodeChefAccountSectionState,
+  buildCodeChefRangeCountPicker,
+  handleCodeChefRangePrompt,
+  handleCodeChefRangeButton,
+  CodeChefUiDeps,
+  handleCallbackQuery,
 } from '../src/notifications/telegramBot';
 
 describe('/codechef manual trigger', () => {
@@ -113,3 +124,109 @@ describe('renderCodeChefProgressSections', () => {
     expect(rendered[0]).toContain('└ ⏳ Queued…');
   });
 });
+
+describe('/ccrange batch picker and button handling', () => {
+  function makeCodeChefUi(accounts: Array<{ id: string; label: string; username: string | null }>) {
+    const sent: Array<{ text: string; buttons?: unknown }> = [];
+    const edits: string[] = [];
+    const answers: Array<{ id: string; text?: string }> = [];
+    const ui: CodeChefUiDeps = {
+      listAccounts: async () => accounts as never,
+      inProgress: () => false,
+      send: async (text, buttons) => void sent.push({ text, buttons }),
+      edit: async (_c, _m, text) => void edits.push(text),
+      answer: async (id, text) => void answers.push({ id, text }),
+    };
+    return { ui, sent, edits, answers };
+  }
+
+  it('buildCodeChefRangeCountPicker builds batch size buttons and cancel', () => {
+    const picker = buildCodeChefRangeCountPicker();
+    expect(picker.text).toContain('CodeChef Batch Submission');
+    expect(picker.text).toContain('How many questions do you want to submit?');
+    expect(picker.buttons).toEqual([
+      [
+        { text: '5 Questions', callback_data: 'ccrange:run:5' },
+        { text: '10 Questions', callback_data: 'ccrange:run:10' },
+      ],
+      [
+        { text: '15 Questions', callback_data: 'ccrange:run:15' },
+        { text: '20 Questions', callback_data: 'ccrange:run:20' },
+      ],
+      [
+        { text: '✖️ Cancel', callback_data: 'ccrange:x' },
+      ],
+    ]);
+  });
+
+  it('handleCodeChefRangePrompt sends batch size prompt when invoked without arguments', async () => {
+    const { ui, sent } = makeCodeChefUi([{ id: 'c1', label: 'chef1', username: 'chef1' }]);
+    await handleCodeChefRangePrompt(ui);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.text).toContain('CodeChef Batch Submission');
+    expect(sent[0]?.buttons).toEqual(buildCodeChefRangeCountPicker().buttons);
+  });
+
+  it('handleCodeChefRangeButton starts batch with chosen count', async () => {
+    const { ui, edits, answers } = makeCodeChefUi([{ id: 'c1', label: 'chef1', username: 'chef1' }]);
+    const trigger = vi.fn(async () => null);
+
+    await handleCodeChefRangeButton('555', 42, 'cb-cc-10', 'ccrange:run:10', ui, trigger as never);
+
+    expect(answers[0]).toEqual({ id: 'cb-cc-10', text: 'Starting batch (10 Qs) 🚀' });
+    expect(edits[0]).toContain('Starting CodeChef batch (10 questions)');
+    expect(trigger).toHaveBeenCalledWith({ forceNext: true, count: 10 });
+  });
+
+  it('handleCodeChefRangeButton handles cancel cleanly', async () => {
+    const { ui, edits, answers } = makeCodeChefUi([{ id: 'c1', label: 'chef1', username: 'chef1' }]);
+
+    await handleCodeChefRangeButton('555', 42, 'cb-cc-x', 'ccrange:x', ui);
+
+    expect(answers[0]).toEqual({ id: 'cb-cc-x', text: 'Cancelled' });
+    expect(edits[0]).toContain('CodeChef batch submission cancelled');
+  });
+
+  it('routes ccrange callback query from handleCallbackQuery', async () => {
+    const { ui, answers, edits } = makeCodeChefUi([{ id: 'c1', label: 'chef1', username: 'chef1' }]);
+
+    await handleCallbackQuery(
+      { id: 'query-cc-5', data: 'ccrange:x', message: { message_id: 10, chat: { id: '555' } } },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      ui,
+    );
+
+    expect(answers).toEqual([{ id: 'query-cc-5', text: 'Cancelled' }]);
+    expect(edits[0]).toContain('CodeChef batch submission cancelled');
+  });
+
+  it('handleCodeChefRangePrompt stops early when a run is in progress', async () => {
+    const { ui, sent } = makeCodeChefUi([{ id: 'c1', label: 'chef1', username: 'chef1' }]);
+    ui.inProgress = () => true;
+    await handleCodeChefRangePrompt(ui);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.text).toContain('A CodeChef run is already in progress');
+  });
+
+  it('handleCodeChefRangePrompt stops early when no accounts configured', async () => {
+    const { ui, sent } = makeCodeChefUi([]);
+    await handleCodeChefRangePrompt(ui);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.text).toContain('No active CodeChef accounts configured');
+  });
+
+  it('handleCodeChefRangeButton blocks when a run is in progress', async () => {
+    const { ui, edits, answers } = makeCodeChefUi([{ id: 'c1', label: 'chef1', username: 'chef1' }]);
+    ui.inProgress = () => true;
+    await handleCodeChefRangeButton('555', 42, 'cb-cc-10', 'ccrange:run:10', ui);
+    expect(answers[0]).toEqual({ id: 'cb-cc-10', text: 'A CodeChef run is already in progress' });
+    expect(edits[0]).toContain('A CodeChef run is already in progress');
+  });
+});
+
+

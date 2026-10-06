@@ -4,6 +4,8 @@ import {
   buildCodeforcesSubmitPicker,
   buildCodeforcesNetworkPicker,
   buildCodeforcesRangePicker,
+  buildCodeforcesRangeCountPicker,
+  handleCodeforcesRangePrompt,
   handleCodeforcesRangePickerCommand,
   handleCodeforcesRangeButton,
   cfRangeSelections,
@@ -296,5 +298,68 @@ describe('/cfrange account multi-selection picker', () => {
     expect(answers).toEqual([{ id: 'query-1', text: 'Selected' }]);
     expect(cfRangeSelections.get('555')?.selectedAccountIds.has('a1')).toBe(true);
   });
+
+  it('buildCodeforcesRangeCountPicker produces batch size buttons and cancel', () => {
+    const picker = buildCodeforcesRangeCountPicker();
+    expect(picker.text).toContain('Codeforces Batch Submission');
+    expect(picker.text).toContain('How many questions do you want to submit?');
+    expect(picker.buttons).toEqual([
+      [
+        { text: '5 Questions', callback_data: 'cfrange:c:5' },
+        { text: '10 Questions', callback_data: 'cfrange:c:10' },
+      ],
+      [
+        { text: '15 Questions', callback_data: 'cfrange:c:15' },
+        { text: '20 Questions', callback_data: 'cfrange:c:20' },
+      ],
+      [
+        { text: '✖️ Cancel', callback_data: 'cfrange:x' },
+      ],
+    ]);
+  });
+
+  it('handleCodeforcesRangePrompt sends batch size prompt when invoked without arguments', async () => {
+    const { ui, sent } = makeCodeforcesUi([account('a1')]);
+    await handleCodeforcesRangePrompt(ui);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.text).toContain('Codeforces Batch Submission');
+    expect(sent[0]?.buttons).toEqual(buildCodeforcesRangeCountPicker().buttons);
+  });
+
+  it('handles cfrange:c:5 callback by selecting count and transitioning to account picker', async () => {
+    const { ui, edits, answers } = makeCodeforcesUi([account('a1', 'alice'), account('a2', 'bob')]);
+    await handleCodeforcesRangeButton('555', 42, 'cb-c5', 'cfrange:c:5', ui);
+
+    expect(answers[0]).toEqual({ id: 'cb-c5', text: '5 questions selected' });
+    const state = cfRangeSelections.get('555');
+    expect(state).toBeDefined();
+    expect(state?.count).toBe(5);
+    expect(edits[0]).toContain('CODEFORCES BATCH (5 QUESTIONS)');
+  });
+
+  it('handleCodeforcesRangePrompt stops early when a run is in progress', async () => {
+    const { ui, sent } = makeCodeforcesUi([account('a1')]);
+    ui.inProgress = () => true;
+    await handleCodeforcesRangePrompt(ui);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.text).toContain('A Codeforces run is already in progress');
+  });
+
+  it('handleCodeforcesRangePrompt stops early when no accounts configured', async () => {
+    const { ui, sent } = makeCodeforcesUi([]);
+    await handleCodeforcesRangePrompt(ui);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.text).toContain('No active Codeforces accounts configured');
+  });
+
+  it('handleCodeforcesRangeButton cancels batch cleanly on cfrange:x', async () => {
+    const { ui, edits, answers } = makeCodeforcesUi([account('a1')]);
+    cfRangeSelections.set('555', { count: 5, selectedAccountIds: new Set(['a1']) });
+    await handleCodeforcesRangeButton('555', 42, 'cb-cx', 'cfrange:x', ui);
+    expect(answers[0]).toEqual({ id: 'cb-cx', text: 'Cancelled' });
+    expect(edits[0]).toContain('Codeforces batch submission cancelled');
+    expect(cfRangeSelections.get('555')).toBeUndefined();
+  });
 });
+
 

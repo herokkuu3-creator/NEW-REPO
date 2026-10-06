@@ -125,7 +125,22 @@ interface TgUpdate {
   callback_query?: TgCallbackQuery;
 }
 
-const HELP_TEXT = [
+export type InlineButton = { text: string; callback_data: string };
+
+export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | null;
+let pendingPromptType: PendingPromptType = null;
+let pendingRangePrompt = false;
+
+export function getPendingPromptType(): PendingPromptType {
+  return pendingPromptType;
+}
+
+export function setPendingPromptType(val: PendingPromptType): void {
+  pendingPromptType = val;
+  pendingRangePrompt = val === 'leetcode';
+}
+
+export const HELP_TEXT = [
   '<b>⚡ 𝗟𝗘𝗘𝗧𝗖𝗢𝗗𝗘 𝗗𝗔𝗜𝗟𝗬 𝗔𝗚𝗘𝗡𝗧 ⚡</b>',
   '<i>Autonomous Multi-Platform Coding Assistant</i>',
   '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
@@ -140,7 +155,7 @@ const HELP_TEXT = [
   '',
   '<b>🏆 𝗖𝗢𝗗𝗘𝗙𝗢𝗥𝗖𝗘𝗦 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ <code>/submitnextsolution</code> — Submit next problem for all accounts',
-  '├ <code>/cfrange</code> <i>&lt;count&gt;</i> — Batch submit next N problems <i>(account multi-selection · 30s pacing)</i>',
+  '├ <code>/cfrange</code> — Batch submit next N problems <i>(account multi-selection · 30s pacing)</i>',
   '├ <code>/cfrangestatus</code> — Live batch progress &amp; ETA countdown',
   '├ <code>/cfcancelrange</code> — Cancel active batch submission',
   '├ <code>/nextsubcustomaccount</code> — Select specific account to submit 1 problem',
@@ -153,7 +168,7 @@ const HELP_TEXT = [
   '├ <code>/testproxy</code> — Test each proxy one-by-one &amp; show live health',
   '├ <code>/setproxies</code> <i>&lt;urls&gt;</i> — Save &amp; verify multiple proxies in DB',
   '├ <code>/addproxy</code> <i>&lt;url&gt;</i> — Add proxy to active pool',
-  '├ <code>/removeproxy</code> <i>&lt;number&gt;</i> — Blacklist &amp; remove dead proxy in DB',
+  '├ <code>/removeproxy</code> — Blacklist &amp; remove dead proxy in DB',
   '├ <code>/restoreproxies</code> — Reset blacklist &amp; restore all proxies',
   '├ <code>/syncproxies</code> — Sync proxies from GitHub Actions runner',
   '└ <code>/cfnetwork</code> — Switch network mode (Proxy / Tailscale)',
@@ -161,7 +176,7 @@ const HELP_TEXT = [
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ <code>/codechef</code> — Run daily CodeChef submission',
   '├ <code>/ccnextsubmit</code> — Force submit next solution in queue',
-  '├ <code>/ccrange</code> <i>&lt;count&gt;</i> — Batch submit next N problems <i>(30s human pacing)</i>',
+  '├ <code>/ccrange</code> — Batch submit next N problems <i>(30s human pacing)</i>',
   '├ <code>/ccrangestatus</code> — Live batch progress &amp; ETA countdown',
   '├ <code>/cccancelrange</code> — Cancel active batch submission',
   '└ <code>/ccaccounts</code> — View CodeChef accounts &amp; queue progress',
@@ -379,6 +394,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         if (!commandArg) {
           pendingRenewalLabel = undefined;
           pendingRangePrompt = false;
+          pendingPromptType = null;
           await reply(RENEW_INSTRUCTIONS);
           return;
         }
@@ -413,17 +429,13 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cc_batch': {
         const parsedCount = Number.parseInt(commandArg, 10);
         if (!Number.isFinite(parsedCount) || parsedCount <= 0) {
-          await replyHtml(
-            [
-              '<b>🔢 CodeChef Batch Submission</b>',
-              '<code>━━━━━━━━━━━━━━━━━━━━</code>',
-              'Please specify how many questions to submit:',
-              '👉 <code>/ccrange 5</code> (submit next 5 questions)',
-              '👉 <code>/ccrange 10</code> (submit next 10 questions)',
-            ].join('\n'),
-          );
+          pendingPromptType = 'codechef';
+          pendingRangePrompt = false;
+          await handleCodeChefRangePrompt(defaultCodeChefUiDeps);
           return;
         }
+        pendingPromptType = null;
+        pendingRangePrompt = false;
         const count = Math.min(50, Math.max(1, parsedCount));
         await handleCodeChefTrigger({ forceNext: true, count });
         return;
@@ -458,19 +470,13 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         const rawCount = tokens[0];
         const parsedCount = parseInt(rawCount ?? '', 10);
         if (!rawCount || isNaN(parsedCount) || parsedCount <= 0) {
-          await replyHtml(
-            [
-              '<b>🔢 Codeforces Batch Submission</b>',
-              '<code>━━━━━━━━━━━━━━━━━━━━</code>',
-              'Please specify how many questions to submit:',
-              '👉 <code>/cfrange 5</code> (submit next 5 questions with account selection)',
-              '👉 <code>/cfrange 10</code> (submit next 10 questions with account selection)',
-              '',
-              '<i>After sending, you can select specific accounts or choose Select All.</i>',
-            ].join('\n'),
-          );
+          pendingPromptType = 'codeforces';
+          pendingRangePrompt = false;
+          await handleCodeforcesRangePrompt(defaultCodeforcesSubmitUiDeps);
           return;
         }
+        pendingPromptType = null;
+        pendingRangePrompt = false;
         const count = Math.min(50, Math.max(1, parsedCount));
         const modifier = tokens[1]?.toLowerCase();
         if (modifier === 'all' || modifier === '--all') {
@@ -573,12 +579,14 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/question_range_submission':
       case '/rangesubmission':
         pendingRangePrompt = false;
+        pendingPromptType = null;
         await handleQuestionRangeCommand(commandArg);
         return;
       case '/cancelrange':
       case '/cancel_range':
       case '/stoprange':
         pendingRangePrompt = false;
+        pendingPromptType = null;
         await handleCancelRange();
         return;
       case '/rangestatus':
@@ -588,6 +596,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cancel':
         pendingRenewalLabel = undefined;
         pendingRangePrompt = false;
+        pendingPromptType = null;
         if (getCodeforcesRangeStatus() && getCodeforcesRangeStatus()?.state !== 'idle') {
           await handleCancelCodeforcesRange();
           return;
@@ -608,11 +617,30 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     }
   }
 
-  // Reply to "/questionrangesubmission" without a range: the next "200-400" message.
-  if (pendingRangePrompt && !msg.document && /^\s*#?\d/.test(text)) {
-    pendingRangePrompt = false;
-    await handleQuestionRangeCommand(text);
-    return;
+  // Text replies to interactive prompts (when not a document and starts with a digit/hash):
+  if (!msg.document && /^\s*#?\d/.test(text)) {
+    if (pendingPromptType === 'codeforces') {
+      pendingPromptType = null;
+      pendingRangePrompt = false;
+      const count = parseInt(text.replace(/^[#\s]+/, ''), 10);
+      if (!isNaN(count) && count > 0) {
+        await handleCodeforcesRangePickerCommand(Math.min(50, count));
+        return;
+      }
+    } else if (pendingPromptType === 'codechef') {
+      pendingPromptType = null;
+      pendingRangePrompt = false;
+      const count = parseInt(text.replace(/^[#\s]+/, ''), 10);
+      if (!isNaN(count) && count > 0) {
+        await handleCodeChefTrigger({ forceNext: true, count: Math.min(50, count) });
+        return;
+      }
+    } else if (pendingPromptType === 'leetcode' || pendingRangePrompt) {
+      pendingPromptType = null;
+      pendingRangePrompt = false;
+      await handleQuestionRangeCommand(text);
+      return;
+    }
   }
 
   // Non-command message: check if it's pasted proxy list first
@@ -1067,6 +1095,127 @@ export async function handleCodeChefRangeStatus(): Promise<void> {
     return;
   }
   await replyHtml(formatCodeChefRangeStatus(status));
+}
+
+export interface CodeChefUiDeps {
+  listAccounts: () => Promise<Awaited<ReturnType<typeof listCodeChefAccounts>>>;
+  inProgress: () => boolean;
+  send: (text: string, buttons?: InlineButton[][]) => Promise<void>;
+  edit: (chatId: number | string, messageId: number, text: string, buttons?: InlineButton[][]) => Promise<void>;
+  answer: (callbackId: string, text?: string) => Promise<void>;
+}
+
+export const defaultCodeChefUiDeps: CodeChefUiDeps = {
+  listAccounts: () => listCodeChefAccounts(true),
+  inProgress: isCodeChefRunInProgress,
+  send: async (text, buttons) => {
+    await tgApi('sendMessage', {
+      chat_id: config.telegram.chatId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+    });
+  },
+  edit: async (chatId, messageId, text, buttons) => {
+    await tgApi('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: buttons ?? [] },
+    });
+  },
+  answer: async (callbackId, text) => {
+    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text, show_alert: true } : {}) });
+  },
+};
+
+export function buildCodeChefRangeCountPicker(): { text: string; buttons: InlineButton[][] } {
+  const text = [
+    '<b>🔢 CodeChef Batch Submission</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    'How many questions do you want to submit?',
+    'Select a batch size below, or reply with <code>/ccrange &lt;count&gt;</code>:',
+  ].join('\n');
+  const buttons: InlineButton[][] = [
+    [
+      { text: '5 Questions', callback_data: 'ccrange:run:5' },
+      { text: '10 Questions', callback_data: 'ccrange:run:10' },
+    ],
+    [
+      { text: '15 Questions', callback_data: 'ccrange:run:15' },
+      { text: '20 Questions', callback_data: 'ccrange:run:20' },
+    ],
+    [
+      { text: '✖️ Cancel', callback_data: 'ccrange:x' },
+    ],
+  ];
+  return { text, buttons };
+}
+
+export async function handleCodeChefRangePrompt(
+  deps: CodeChefUiDeps = defaultCodeChefUiDeps,
+): Promise<void> {
+  if (deps.inProgress()) {
+    await deps.send('🚧 A CodeChef run is already in progress — wait for its report, then try again.');
+    return;
+  }
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    await deps.send('📭 No active CodeChef accounts configured.');
+    return;
+  }
+  const picker = buildCodeChefRangeCountPicker();
+  await deps.send(picker.text, picker.buttons);
+}
+
+export async function handleCodeChefRangeButton(
+  chatId: number | string,
+  messageId: number,
+  callbackId: string,
+  data: string,
+  deps: CodeChefUiDeps = defaultCodeChefUiDeps,
+  triggerFn: typeof handleCodeChefTrigger = handleCodeChefTrigger,
+): Promise<void> {
+  if (data === 'ccrange:x') {
+    pendingPromptType = null;
+    await deps.answer(callbackId, 'Cancelled');
+    await deps.edit(chatId, messageId, '✖️ CodeChef batch submission cancelled.');
+    return;
+  }
+
+  if (deps.inProgress()) {
+    await deps.answer(callbackId, 'A CodeChef run is already in progress');
+    await deps.edit(chatId, messageId, '🚧 A CodeChef run is already in progress — wait for its report, then try again.');
+    return;
+  }
+
+  if (data.startsWith('ccrange:run:')) {
+    pendingPromptType = null;
+    const rawCount = data.slice('ccrange:run:'.length);
+    const count = Math.min(50, Math.max(1, parseInt(rawCount, 10) || 5));
+    const accounts = await deps.listAccounts();
+    if (accounts.length === 0) {
+      await deps.answer(callbackId, 'No active accounts');
+      await deps.edit(chatId, messageId, '📭 No active CodeChef accounts configured.');
+      return;
+    }
+
+    await deps.answer(callbackId, `Starting batch (${count} Qs) 🚀`);
+    await deps.edit(chatId, messageId, `🚀 Starting CodeChef batch (${count} questions) with 30s pacing…`);
+
+    void triggerFn({
+      forceNext: true,
+      count,
+    }).catch(async (err) => {
+      logger.warn({ err: errText(err) }, 'CodeChef batch trigger failed');
+    });
+    return;
+  }
+
+  await deps.answer(callbackId, 'This button is no longer valid');
 }
 
 export async function handleTriggerSubmission(
@@ -2015,6 +2164,45 @@ export async function handleCodeforcesRangePickerCommand(
   await deps.send(picker.text, picker.buttons);
 }
 
+export function buildCodeforcesRangeCountPicker(): { text: string; buttons: InlineButton[][] } {
+  const text = [
+    '<b>🔢 Codeforces Batch Submission</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    'How many questions do you want to submit?',
+    'Select a batch size below, or reply with <code>/cfrange &lt;count&gt;</code>:',
+  ].join('\n');
+  const buttons: InlineButton[][] = [
+    [
+      { text: '5 Questions', callback_data: 'cfrange:c:5' },
+      { text: '10 Questions', callback_data: 'cfrange:c:10' },
+    ],
+    [
+      { text: '15 Questions', callback_data: 'cfrange:c:15' },
+      { text: '20 Questions', callback_data: 'cfrange:c:20' },
+    ],
+    [
+      { text: '✖️ Cancel', callback_data: 'cfrange:x' },
+    ],
+  ];
+  return { text, buttons };
+}
+
+export async function handleCodeforcesRangePrompt(
+  deps: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
+): Promise<void> {
+  if (deps.inProgress()) {
+    await deps.send('🚧 A Codeforces run is already in progress — wait for its report, then try again.');
+    return;
+  }
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    await deps.send('📭 No active Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
+    return;
+  }
+  const picker = buildCodeforcesRangeCountPicker();
+  await deps.send(picker.text, picker.buttons);
+}
+
 /** Handles inline button taps for the /cfrange multi-selection picker. */
 export async function handleCodeforcesRangeButton(
   chatId: number | string,
@@ -2027,6 +2215,7 @@ export async function handleCodeforcesRangeButton(
   const key = String(chatId);
   if (data === 'cfrange:x') {
     cfRangeSelections.delete(key);
+    pendingPromptType = null;
     await deps.answer(callbackId, 'Cancelled');
     await deps.edit(chatId, messageId, '✖️ Codeforces batch submission cancelled.');
     return;
@@ -2038,10 +2227,32 @@ export async function handleCodeforcesRangeButton(
     return;
   }
 
+  if (data.startsWith('cfrange:c:')) {
+    pendingPromptType = null;
+    const rawCount = data.slice('cfrange:c:'.length);
+    const count = Math.min(50, Math.max(1, parseInt(rawCount, 10) || 5));
+    const accounts = await deps.listAccounts();
+    if (accounts.length === 0) {
+      cfRangeSelections.delete(key);
+      await deps.answer(callbackId, 'No active accounts');
+      await deps.edit(chatId, messageId, '📭 No active Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
+      return;
+    }
+    const selected = new Set<string>();
+    if (accounts.length === 1 && accounts[0]) {
+      selected.add(accounts[0].id);
+    }
+    cfRangeSelections.set(key, { count, selectedAccountIds: selected });
+    await deps.answer(callbackId, `${count} questions selected`);
+    const picker = buildCodeforcesRangePicker(count, accounts, selected);
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
   const state = cfRangeSelections.get(key);
   if (!state) {
     await deps.answer(callbackId, 'This batch picker expired');
-    await deps.edit(chatId, messageId, '⌛ This batch picker expired. Send <code>/cfrange &lt;count&gt;</code> again.');
+    await deps.edit(chatId, messageId, '⌛ This batch picker expired. Send <code>/cfrange</code> again.');
     return;
   }
 
@@ -2205,8 +2416,6 @@ async function handleCodeforcesManualButton(
 // ---------------------------------------------------------------------------
 // Session removal (/removesession, /removeallsessions) — inline buttons
 // ---------------------------------------------------------------------------
-
-type InlineButton = { text: string; callback_data: string };
 
 // ---------------------------------------------------------------------------
 // LeetCode contest reward (/claimcoins) — multi-account inline picker
@@ -2517,6 +2726,7 @@ export async function handleCallbackQuery(
   codeforcesManualUi: CodeforcesManualUiDeps = defaultCodeforcesManualUiDeps,
   codeforcesNetworkUi: CodeforcesNetworkUiDeps = defaultCodeforcesNetworkUiDeps,
   coinClaimUi: CoinClaimUiDeps = defaultCoinClaimUiDeps,
+  codechefUi: CodeChefUiDeps = defaultCodeChefUiDeps,
 ): Promise<void> {
   const chatId = q.message?.chat.id;
   const messageId = q.message?.message_id;
@@ -2540,6 +2750,11 @@ export async function handleCallbackQuery(
 
   if (data.startsWith('cfrange:')) {
     await handleCodeforcesRangeButton(chatId, messageId, q.id, data, codeforcesUi);
+    return;
+  }
+
+  if (data.startsWith('ccrange:')) {
+    await handleCodeChefRangeButton(chatId, messageId, q.id, data, codechefUi);
     return;
   }
 
@@ -2661,9 +2876,6 @@ export async function handleCallbackQuery(
 // Question-range submission (/questionrangesubmission 200-400)
 // ---------------------------------------------------------------------------
 
-/** true after "/questionrangesubmission" with no range: the next "200-400" message is the range. */
-let pendingRangePrompt = false;
-
 const RANGE_GAP_MS = 30_000;
 
 /** Wiring for the range UI — injectable for tests. */
@@ -2704,16 +2916,51 @@ export function buildRangePicker(
   return { text, buttons };
 }
 
+export function buildQuickRangeButtons(): InlineButton[][] {
+  return [
+    [
+      { text: '1–25', callback_data: 'qr:r:1-25' },
+      { text: '26–50', callback_data: 'qr:r:26-50' },
+      { text: '51–100', callback_data: 'qr:r:51-100' },
+    ],
+    [
+      { text: '101–200', callback_data: 'qr:r:101-200' },
+      { text: '201–300', callback_data: 'qr:r:201-300' },
+      { text: '301–400', callback_data: 'qr:r:301-400' },
+    ],
+    [
+      { text: '✖️ Cancel', callback_data: 'qr:x' },
+    ],
+  ];
+}
+
 export async function handleQuestionRangeCommand(
   arg: string,
   deps: RemovalDeps = defaultRemovalDeps,
   ui: RangeUiDeps = defaultRangeUiDeps,
 ): Promise<void> {
   if (!arg.trim()) {
+    const accounts = await deps.listAccounts();
+    if (accounts.length === 0) {
+      pendingRangePrompt = false;
+      pendingPromptType = null;
+      await deps.send('📭 No accounts configured — send cookie .json files first (/renew).');
+      return;
+    }
     pendingRangePrompt = true;
-    await deps.send('🎯 Which questions? Send the range, e.g. 200-400\n(or in one go: /questionrangesubmission 200-400)');
+    pendingPromptType = 'leetcode';
+    const buttons = buildQuickRangeButtons();
+    const promptText = [
+      '🎯 Which questions? Send the range, e.g. 200-400',
+      'How many questions do you want to submit? Which range do you want to solve?',
+      'Pick a quick range below to solve:',
+      '(or in one go: /questionrangesubmission 200-400)',
+    ].join('\n');
+    await deps.send(promptText, buttons);
     return;
   }
+  pendingRangePrompt = false;
+  pendingPromptType = null;
   const parsed = parseQuestionRange(arg);
   if (!parsed.ok) {
     await deps.send(`⚠️ ${parsed.error}\nExample: /questionrangesubmission 200-400`);
@@ -2731,7 +2978,7 @@ export async function handleQuestionRangeCommand(
   await deps.send(picker.text, picker.buttons);
 }
 
-async function handleRangeButton(
+export async function handleRangeButton(
   chatId: number | string,
   messageId: number,
   callbackId: string,
@@ -2740,8 +2987,35 @@ async function handleRangeButton(
   ui: RangeUiDeps = defaultRangeUiDeps,
 ): Promise<void> {
   if (data === 'qr:x') {
+    pendingRangePrompt = false;
+    pendingPromptType = null;
     await deps.answer(callbackId, 'Cancelled');
     await deps.edit(chatId, messageId, '✖️ Question-range submission cancelled — nothing was started.');
+    return;
+  }
+  if (data.startsWith('qr:r:')) {
+    const rangeStr = data.slice('qr:r:'.length);
+    const parsedRange = parseQuestionRange(rangeStr);
+    if (!parsedRange.ok) {
+      await deps.answer(callbackId, 'Invalid range');
+      return;
+    }
+    const accounts = await deps.listAccounts();
+    if (accounts.length === 0) {
+      pendingRangePrompt = false;
+      pendingPromptType = null;
+      await deps.answer(callbackId, 'No accounts configured');
+      await deps.edit(chatId, messageId, '📭 No accounts configured — send cookie .json files first (/renew).');
+      return;
+    }
+    pendingRangePrompt = false;
+    pendingPromptType = null;
+    const picker = buildRangePicker(parsedRange.range, accounts);
+    if (ui.current()) {
+      picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
+    }
+    await deps.answer(callbackId, `Range #${parsedRange.range.from}–#${parsedRange.range.to}`);
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
     return;
   }
   const m = /^qr:(\d+)-(\d+):(.+)$/.exec(data);
