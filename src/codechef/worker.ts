@@ -188,11 +188,14 @@ export async function runCodeChefNow(
           const row: CodeChefOutcome = { label: account.label, performed: false, problem: entry.problemCode };
           logger.info({ account: account.label, problem: entry.problemCode, step: step + 1, batchCount, index, total: queue.length }, 'Starting CodeChef attempt');
 
-          await options.onProgress?.({ phase: 'loading-source', label: account.label, username: account.username, problemCode: entry.problemCode, index: step + 1, total: batchCount });
+          const progressIndex = accounts.length > 1 && batchCount === 1 ? accIndex + 1 : (accounts.length > 1 ? accIndex * batchCount + step + 1 : step + 1);
+          const progressTotal = accounts.length > 1 && batchCount === 1 ? accounts.length : (accounts.length > 1 ? accounts.length * batchCount : batchCount);
+
+          await options.onProgress?.({ phase: 'loading-source', label: account.label, username: account.username, problemCode: entry.problemCode, index: progressIndex, total: progressTotal });
           const code = await fetchSourceCode(entry);
 
-          await options.onProgress?.({ phase: 'opening-submit', label: account.label, username: account.username, problemCode: entry.problemCode, index: step + 1, total: batchCount });
-          await options.onProgress?.({ phase: 'submitting', label: account.label, username: account.username, problemCode: entry.problemCode, index: step + 1, total: batchCount });
+          await options.onProgress?.({ phase: 'opening-submit', label: account.label, username: account.username, problemCode: entry.problemCode, index: progressIndex, total: progressTotal });
+          await options.onProgress?.({ phase: 'submitting', label: account.label, username: account.username, problemCode: entry.problemCode, index: progressIndex, total: progressTotal });
 
           mayHaveSubmitted = true;
           // 1. Direct API submit (0MB browser RAM, takes 2-3s, completely avoids Render OOM)
@@ -244,8 +247,8 @@ export async function runCodeChefNow(
                 problemCode: entry.problemCode,
                 verdict: posted.verdict,
                 submissionId: posted.submissionId,
-                index: step + 1,
-                total: batchCount,
+                index: progressIndex,
+                total: progressTotal,
               });
             } else {
               await recordAttempt(account.id, { submissionId: posted.submissionId ?? null, verdict: posted.verdict ?? null });
@@ -257,13 +260,13 @@ export async function runCodeChefNow(
                 username: account.username,
                 problemCode: entry.problemCode,
                 error: posted.error,
-                index: step + 1,
-                total: batchCount,
+                index: progressIndex,
+                total: progressTotal,
               });
             }
 
             report.outcomes.push(row);
-            await options.onAccountOutcome?.(row, step + 1, batchCount);
+            await options.onAccountOutcome?.(row, progressIndex, progressTotal);
 
             if (step < batchCount - 1) {
               await new Promise((res) => setTimeout(res, 5000));

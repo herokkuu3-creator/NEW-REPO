@@ -665,6 +665,11 @@ export async function handleCodeChefTrigger(
       progressLines.set(0, '📭 No active CodeChef accounts configured. Add CODECHEF_1 in Render.');
       await editProgress();
     } else {
+      progressLines.clear();
+      report.outcomes.forEach((outcome, i) => {
+        progressLines.set(i + 1, formatCodeChefAccountMessage(outcome, i + 1, report.outcomes.length));
+      });
+      await editProgress();
       logger.info({ summary: report.outcomes.length }, 'telegram /codechef run finished');
     }
   })().catch(async (err) => {
