@@ -162,7 +162,7 @@ interface Session {
 
 /** Converts the standard provider endpoint into Playwright's proxy shape.
  * Credentials remain separate from the server field and are never logged. */
-function browserProxy(raw: string): { server: string; username?: string; password?: string } | undefined {
+function browserProxy(raw: string): { server: string; username?: string; password?: string; bypass?: string } | undefined {
   if (!raw) return undefined;
   try {
     const endpoint = new URL(raw);
@@ -170,7 +170,12 @@ function browserProxy(raw: string): { server: string; username?: string; passwor
     const server = `${endpoint.protocol}//${endpoint.host}`;
     const username = decodeURIComponent(endpoint.username);
     const password = decodeURIComponent(endpoint.password);
-    return { server, ...(username ? { username } : {}), ...(password ? { password } : {}) };
+    return {
+      server,
+      ...(username ? { username } : {}),
+      ...(password ? { password } : {}),
+      bypass: '<-loopback>,*.googleapis.com,*.google.com,*.gvt1.com,*.gstatic.com,*.yandex.ru,*.mail.ru',
+    };
   } catch {
     return undefined;
   }
@@ -191,22 +196,53 @@ async function launchFirefox(state: SubmitRequest['state'], label: string, netwo
     const active = (browser = await (BROWSER_ENGINE === 'chromium' ? chromium : firefox).launch({
       headless: HEADLESS,
       ...(proxy ? { proxy } : {}),
-      ...(BROWSER_ENGINE === 'firefox' ? { firefoxUserPrefs: {
-        'browser.cache.disk.enable': false,
-        'browser.cache.memory.enable': false,
-        'browser.cache.offline.enable': false,
-        'browser.cache.memory.capacity': 0,
-        'browser.sessionhistory.max_entries': 2,
-        'browser.sessionstore.max_tabs_undo': 0,
-        'browser.sessionstore.max_windows_undo': 0,
-        'network.prefetch-next': false,
-        'browser.newtabpage.enabled': false,
-        'toolkit.telemetry.enabled': false,
-        'datareporting.policy.dataSubmissionEnabled': false,
-        'dom.ipc.processCount': 1,
-        'dom.ipc.processPrelaunch.enabled': false,
-        'dom.ipc.keepProcessesAlive.web': 0,
-      } } : {}),
+      ...(BROWSER_ENGINE === 'chromium' ? {
+        args: [
+          '--disable-dev-shm-usage',
+          '--no-sandbox',
+          '--disable-gpu',
+          '--disable-extensions',
+          '--disable-background-networking',
+          '--disable-background-timer-throttling',
+          '--disable-renderer-backgrounding',
+          '--disable-component-update',
+          '--disable-component-extensions-with-background-pages',
+          '--disable-client-side-phishing-detection',
+          '--disable-default-apps',
+          '--disable-sync',
+          '--disable-domain-reliability',
+          '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,Translate,OptimizationHints,MediaRouter',
+          '--metrics-recording-only',
+          '--no-first-run',
+          '--safebrowsing-disable-auto-update',
+          '--no-default-browser-check',
+          '--no-pings',
+        ],
+      } : {
+        firefoxUserPrefs: {
+          'browser.cache.disk.enable': false,
+          'browser.cache.memory.enable': false,
+          'browser.cache.offline.enable': false,
+          'browser.cache.memory.capacity': 0,
+          'browser.sessionhistory.max_entries': 2,
+          'browser.sessionstore.max_tabs_undo': 0,
+          'browser.sessionstore.max_windows_undo': 0,
+          'network.prefetch-next': false,
+          'network.http.speculative-parallel-limit': 0,
+          'network.dns.disablePrefetch': true,
+          'browser.newtabpage.enabled': false,
+          'toolkit.telemetry.enabled': false,
+          'datareporting.policy.dataSubmissionEnabled': false,
+          'app.normandy.enabled': false,
+          'extensions.update.enabled': false,
+          'browser.safebrowsing.downloads.enabled': false,
+          'browser.safebrowsing.malware.enabled': false,
+          'browser.safebrowsing.phishing.enabled': false,
+          'dom.ipc.processCount': 1,
+          'dom.ipc.processPrelaunch.enabled': false,
+          'dom.ipc.keepProcessesAlive.web': 0,
+        },
+      }),
     }));
     const context = await active.newContext({
       storageState: { cookies: state.cookies, origins: state.origins ?? [] } as Parameters<
@@ -251,9 +287,9 @@ async function launchFirefox(state: SubmitRequest['state'], label: string, netwo
 function candidates(entry: SubmitterEntry): string[] {
   if (entry.gym) return [`/gym/${entry.contestId}/submit`];
   return [
-    `/contest/${entry.contestId}/submit`,
     `/problemset/submit/${entry.contestId}/${entry.problemIndex}`,
     `/problemset/submit?contestId=${entry.contestId}&problemIndex=${entry.problemIndex}`,
+    `/contest/${entry.contestId}/submit`,
   ];
 }
 
