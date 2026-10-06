@@ -14,6 +14,8 @@ export interface CodeforcesAccountOutcome {
   note?: string;
   /** A Codeforces submission was accepted by the form and reached a final verdict, or was already present. */
   performed?: boolean;
+  /** The account reached the proxied browser during this run. Used only to bound automatic daily retries. */
+  browserAttempted?: boolean;
 }
 
 export interface CodeforcesRunReport {

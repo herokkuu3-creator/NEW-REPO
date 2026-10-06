@@ -17,11 +17,38 @@ export class BrowserFormError extends Error {
   }
 }
 
-/** Keep CSS and all verification resources; only omit decorative page assets. */
+/**
+ * Keep the native Codeforces form and Cloudflare verification intact, while
+ * dropping resources which cannot affect a submission. This route runs inside
+ * the residential-proxy browser, so it is also the boundary that prevents
+ * analytics and decorative page assets from spending proxy data.
+ */
 export function blockCodeforcesResource(url: string, type: string): boolean {
-  const parsed = new URL(url);
-  if (parsed.hostname === 'challenges.cloudflare.com' || parsed.pathname.startsWith('/cdn-cgi/')) return false;
-  return type === 'image' || type === 'media' || type === 'font';
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return true;
+  }
+  const host = parsed.hostname.toLowerCase();
+  const path = parsed.pathname.toLowerCase();
+
+  // Never block Cloudflare's challenge page, iframe, or token requests.
+  if (host === 'challenges.cloudflare.com' || host.endsWith('.challenges.cloudflare.com') || path.startsWith('/cdn-cgi/')) {
+    return false;
+  }
+
+  if (['image', 'media', 'font', 'websocket', 'eventsource', 'manifest', 'ping'].includes(type)) return true;
+
+  // The submit form is self-contained on Codeforces. Third-party analytics,
+  // ads, and telemetry are not needed to render, verify, or POST the form.
+  const isCodeforcesHost = host === 'codeforces.com' || host.endsWith('.codeforces.com') ||
+    host === 'codeforces.org' || host.endsWith('.codeforces.org');
+  if (!isCodeforcesHost) return true;
+
+  // MathJax can download several megabytes but is only used to typeset problem
+  // statements; the submit page does not need it.
+  return path.includes('mathjax') || parsed.search.toLowerCase().includes('mathjax');
 }
 
 /** Preserve Codeforces' editor teardown and submit handlers instead of replacing window.editor. */

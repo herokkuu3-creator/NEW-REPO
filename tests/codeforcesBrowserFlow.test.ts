@@ -92,6 +92,9 @@ describe('Codeforces native browser submission', () => {
     expect(blockCodeforcesResource('https://challenges.cloudflare.com/widget/image', 'image')).toBe(false);
     expect(blockCodeforcesResource('https://codeforces.com/cdn-cgi/challenge-platform/image', 'image')).toBe(false);
     expect(blockCodeforcesResource('https://codeforces.com/logo.png', 'image')).toBe(true);
+    expect(blockCodeforcesResource('https://www.google-analytics.com/collect', 'script')).toBe(true);
+    expect(blockCodeforcesResource('https://codeforces.com/mathjax/MathJax.js', 'script')).toBe(true);
+    expect(blockCodeforcesResource('https://codeforces.com/scripts/submit.js', 'script')).toBe(false);
     await fixture({ token: 'verified' });
     expect(await page.locator('#body').evaluate(e => getComputedStyle(e).color)).toBe('rgb(1, 2, 3)');
   });

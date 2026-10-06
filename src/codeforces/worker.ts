@@ -517,6 +517,10 @@ async function runForAccount(
   const entry = current;
   const handle = account.username ?? label;
   let username = handle;
+  // This is deliberately tracked separately from `performed`: an attempt
+  // which reached the proxied browser may be safe to retry in principle,
+  // but repeatedly reopening it every five minutes is very expensive.
+  let browserAttempted = false;
   await Promise.resolve(onProgress?.('verified', username));
   try {
     const originalCode = await fetchSourceCode(entry);
@@ -575,6 +579,7 @@ async function runForAccount(
       let attemptUsername = attempt.handle ?? username;
       if (!attempt.ok && attempt.kind === 'blocked') {
         logger.warn({ label, problem: problemLabel(entry), error: attempt.error }, 'Codeforces HTTP submission blocked; falling back to browser transport');
+        browserAttempted = true;
         const viaBrowser = await runSubmissionAttempts((deadline, attemptNumber) => submitViaBrowser(
           stored.state,
           label,
@@ -677,6 +682,7 @@ async function runForAccount(
         username,
         kind: 'solved',
         performed: true,
+        browserAttempted,
         note,
         problem: problemLabel(entry),
         problemUrl: entry.problemUrl ?? null,
@@ -717,6 +723,7 @@ async function runForAccount(
       username,
       kind: result.kind === 'signed-out' ? 'rejected' : 'failed',
       performed: finalVerdict || duplicateSubmission,
+      browserAttempted,
       note: duplicateSubmission
         ? `${note ? `${note} ` : ''}Codeforces already had this exact source; marked it performed and advanced to the next solution.`
         : note,
@@ -742,6 +749,7 @@ async function runForAccount(
       note,
       problem: problemLabel(entry),
       problemUrl: entry.problemUrl ?? null,
+      browserAttempted,
       error: msg,
     };
   }
@@ -1001,6 +1009,8 @@ interface CodeforcesDailyState {
   date: string;
   retryCount: number;
   completedAccountIds: string[];
+  /** Accounts that already opened the expensive proxy browser today. */
+  browserAttemptedAccountIds: string[];
 }
 
 const CODEFORCES_DAILY_RETRY_LIMIT = 10;
@@ -1016,12 +1026,15 @@ async function readCodeforcesDailyState(date: string): Promise<CodeforcesDailySt
         completedAccountIds: Array.isArray(parsed.completedAccountIds)
           ? parsed.completedAccountIds.filter((id): id is string => typeof id === 'string')
           : [],
+        browserAttemptedAccountIds: Array.isArray(parsed.browserAttemptedAccountIds)
+          ? parsed.browserAttemptedAccountIds.filter((id): id is string => typeof id === 'string')
+          : [],
       };
     }
   } catch {
     // Reset malformed state; account progress remains durable in its own table.
   }
-  return { date, retryCount: 0, completedAccountIds: [] };
+  return { date, retryCount: 0, completedAccountIds: [], browserAttemptedAccountIds: [] };
 }
 
 async function writeCodeforcesDailyState(state: CodeforcesDailyState): Promise<void> {
@@ -1059,13 +1072,17 @@ async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minut
 
   const accounts = await listCodeforcesAccounts(false);
   const completed = new Set(state.completedAccountIds);
-  const pending = accounts.filter((account) => !completed.has(account.id));
+  const browserAttempted = new Set(state.browserAttemptedAccountIds);
+  // A normal daily submission gets one browser delivery. The browser path
+  // itself still has its bounded three-attempt recovery; subsequent cron ticks
+  // only retry failures that occurred before any proxy browser was opened.
+  const pending = accounts.filter((account) => !completed.has(account.id) && !browserAttempted.has(account.id));
   if (pending.length === 0) return;
 
   if (isRetry) state.retryCount += 1;
   await writeCodeforcesDailyState(state);
   logger.info(
-    { date, retry: isRetry, retryAttempt: state.retryCount, retryLimit: CODEFORCES_DAILY_RETRY_LIMIT, accounts: pending.length },
+    { date, retry: isRetry, retryAttempt: state.retryCount, retryLimit: CODEFORCES_DAILY_RETRY_LIMIT, accounts: pending.length, browserAttempted: browserAttempted.size },
     'automatic Codeforces daily run starting',
   );
 
@@ -1079,6 +1096,10 @@ async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minut
       if (outcome.performed || terminalWithoutSource) {
         completed.add(account.id);
         state.completedAccountIds = [...completed];
+        await writeCodeforcesDailyState(state);
+      } else if (outcome.browserAttempted) {
+        browserAttempted.add(account.id);
+        state.browserAttemptedAccountIds = [...browserAttempted];
         await writeCodeforcesDailyState(state);
       }
     },

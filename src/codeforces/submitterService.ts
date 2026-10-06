@@ -157,7 +157,38 @@ interface Session {
   browser: Browser;
   context: BrowserContext;
   page: Page;
+  traffic: BrowserTrafficMeter;
   close: () => Promise<void>;
+}
+
+interface BrowserTrafficMeter {
+  record: (url: string, type: string, bytes: number) => void;
+  summary: () => { responses: number; bytes: number; codeforcesBytes: number; challengeBytes: number; otherBytes: number };
+}
+
+function createBrowserTrafficMeter(): BrowserTrafficMeter {
+  let responses = 0;
+  let bytes = 0;
+  let codeforcesBytes = 0;
+  let challengeBytes = 0;
+  let otherBytes = 0;
+  return {
+    record(url, type, size) {
+      // Only count useful page response bodies. Headers and the proxy tunnel
+      // overhead are provider-specific, but this makes unexpected payloads
+      // visible in the GitHub runner log without recording URLs or secrets.
+      if (!Number.isFinite(size) || size <= 0 || type === 'document' && size > 10 * 1024 * 1024) return;
+      responses += 1;
+      bytes += size;
+      try {
+        const host = new URL(url).hostname.toLowerCase();
+        if (host === 'challenges.cloudflare.com' || host.endsWith('.challenges.cloudflare.com')) challengeBytes += size;
+        else if (host === 'codeforces.com' || host.endsWith('.codeforces.com')) codeforcesBytes += size;
+        else otherBytes += size;
+      } catch { otherBytes += size; }
+    },
+    summary: () => ({ responses, bytes, codeforcesBytes, challengeBytes, otherBytes }),
+  };
 }
 
 /** Converts the standard provider endpoint into Playwright's proxy shape.
@@ -202,6 +233,12 @@ async function launchFirefox(state: SubmitRequest['state'], label: string, netwo
           '--disable-sync',
           '--disable-default-apps',
           '--no-default-browser-check',
+          '--disable-background-networking',
+          '--disable-domain-reliability',
+          '--disable-client-side-phishing-detection',
+          '--metrics-recording-only',
+          '--no-pings',
+          '--disable-features=Translate,OptimizationHints,MediaRouter',
         ],
       } : {
         firefoxUserPrefs: {
@@ -242,11 +279,18 @@ async function launchFirefox(state: SubmitRequest['state'], label: string, netwo
         await route.continue();
       });
     }
+    const traffic = createBrowserTrafficMeter();
+    context.on('response', (response) => {
+      void response.allHeaders()
+        .then((headers) => traffic.record(response.url(), response.request().resourceType(), Number(headers['content-length'] ?? 0)))
+        .catch(() => undefined);
+    });
     const page = context.pages()[0] ?? (await context.newPage());
     return {
       browser: active,
       context,
       page,
+      traffic,
       close: async () => {
         await context.close().catch(() => undefined);
         await active.close().catch(() => undefined);
@@ -602,7 +646,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
     try {
       await Promise.race([session.close(), new Promise<void>(resolve => { closeTimer = setTimeout(resolve, 3000); })]);
     } finally { if (closeTimer) clearTimeout(closeTimer); }
-    log({ usedMb: cgroupUsedMb() }, 'isolated Codeforces browser closed');
+    log({ usedMb: cgroupUsedMb(), proxiedPageTraffic: session.traffic.summary() }, 'isolated Codeforces browser closed');
   }
 }
 
