@@ -199,6 +199,83 @@ export async function fillCodeChefSource(page: Page, code: string): Promise<void
   }
 }
 
+/**
+ * Submits straight to CodeChef's /api/ide/submit (form field `sourceCode`) using the
+ * authenticated browser-context cookies, then polls /api/ide/submit?solution_id=<upid>.
+ * Returns null when the API path is unusable *before* anything was submitted, so the
+ * caller can fall back to the UI flow. Once a submission id exists it never returns null
+ * (avoids duplicate submissions).
+ */
+async function submitViaCodeChefApi(
+  page: Page,
+  problemCode: string,
+  code: string,
+  language: string,
+  timeoutMs: number,
+): Promise<CodeChefSubmitResult | null> {
+  const request = page.context().request;
+  const base = 'https://www.codechef.com';
+  try {
+    const pageRes = await request.get(`${base}/problems/${problemCode}`, { timeout: 20000 });
+    if (/\/login(?:[/?#]|$)/.test(pageRes.url())) {
+      return { ok: false, clicked: false, kind: 'signed-out', error: 'CodeChef session redirected to login' };
+    }
+    if (!pageRes.ok()) return null;
+    const html = await pageRes.text();
+    const csrf = /window\.csrfToken\s*=\s*["']([^"']+)["']/.exec(html)?.[1];
+    if (!csrf || !/"username"\s*:\s*"/.test(html)) {
+      logger.warn({ hasCsrf: Boolean(csrf) }, 'CodeChef API submit unavailable (no csrf/session); falling back to UI');
+      return null;
+    }
+
+    logger.info({ problemCode }, 'Submitting to CodeChef via /api/ide/submit...');
+    const lang = /^c\+\+(\d+)$/i.exec(language)?.[1] ?? '17';
+    const postRes = await request.post(`${base}/api/ide/submit`, {
+      timeout: 30000,
+      headers: {
+        'x-csrf-token': csrf,
+        'x-requested-with': 'XMLHttpRequest',
+        origin: base,
+        referer: `${base}/problems/${problemCode}?tab=ide`,
+      },
+      form: {
+        sourceCode: code,
+        language: `CPP${lang}`,
+        problemCode,
+        contestCode: 'PRACTICE',
+      },
+    });
+    const posted = await postRes.json().catch(() => null);
+    const first = responseDetails(posted);
+    if (!first.id) {
+      logger.warn({ status: postRes.status(), body: posted }, 'CodeChef API submit returned no submission id; falling back to UI');
+      return null;
+    }
+
+    const submissionId = first.id;
+    let verdict = first.verdict;
+    logger.info({ submissionId }, 'CodeChef API submission accepted for judging');
+    const deadline = Date.now() + timeoutMs;
+    while (!verdict && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      const poll = await request.get(`${base}/api/ide/submit?solution_id=${encodeURIComponent(submissionId)}`, {
+        timeout: 15000,
+        headers: { 'x-requested-with': 'XMLHttpRequest', referer: `${base}/problems/${problemCode}?tab=ide` },
+      }).catch(() => null);
+      const data = poll ? await poll.json().catch(() => null) : null;
+      verdict = responseDetails(data).verdict;
+    }
+    if (!verdict) {
+      return { ok: false, performed: true, clicked: true, submissionId, verdict: 'Submitted', error: 'CodeChef verdict still pending' };
+    }
+    logger.info({ submissionId, verdict }, 'CodeChef API verdict received');
+    return { ok: verdict === 'Accepted', performed: true, clicked: true, submissionId, verdict };
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'CodeChef API submit failed before submission; falling back to UI');
+    return null;
+  }
+}
+
 export async function submitOnCodeChefPage(
   page: Page,
   problemUrl: string,
@@ -253,6 +330,12 @@ export async function submitOnCodeChefPage(
     const match = /(?:\/problems\/|\/submit\/)([a-zA-Z0-9_]+)/i.exec(url.pathname);
     if (!/(^|\.)codechef\.com$/.test(url.hostname) || !match || !match[1]) throw new Error('Invalid CodeChef problem URL');
     const problemCode = match[1].toUpperCase();
+
+    // Fast path: call CodeChef's own /api/ide/submit directly with the logged-in cookies.
+    // This renders no page, so the 512MB Render container never hits the MemoryWatch limit.
+    const direct = await submitViaCodeChefApi(page, problemCode, code, language, timeoutMs);
+    if (direct) return direct;
+
     const targetUrl = `https://www.codechef.com/problems/${problemCode}?tab=ide`;
     logger.info({ targetUrl, problemCode }, 'Navigating to CodeChef problem IDE page...');
 
