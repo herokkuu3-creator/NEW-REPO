@@ -191,22 +191,36 @@ async function launchFirefox(state: SubmitRequest['state'], label: string, netwo
     const active = (browser = await (BROWSER_ENGINE === 'chromium' ? chromium : firefox).launch({
       headless: HEADLESS,
       ...(proxy ? { proxy } : {}),
-      ...(BROWSER_ENGINE === 'firefox' ? { firefoxUserPrefs: {
-        'browser.cache.disk.enable': false,
-        'browser.cache.memory.enable': false,
-        'browser.cache.offline.enable': false,
-        'browser.cache.memory.capacity': 0,
-        'browser.sessionhistory.max_entries': 2,
-        'browser.sessionstore.max_tabs_undo': 0,
-        'browser.sessionstore.max_windows_undo': 0,
-        'network.prefetch-next': false,
-        'browser.newtabpage.enabled': false,
-        'toolkit.telemetry.enabled': false,
-        'datareporting.policy.dataSubmissionEnabled': false,
-        'dom.ipc.processCount': 1,
-        'dom.ipc.processPrelaunch.enabled': false,
-        'dom.ipc.keepProcessesAlive.web': 0,
-      } } : {}),
+      ...(BROWSER_ENGINE === 'chromium' ? {
+        args: [
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--no-first-run',
+          '--disable-component-update',
+          '--safebrowsing-disable-auto-update',
+          '--disable-sync',
+          '--disable-default-apps',
+          '--no-default-browser-check',
+        ],
+      } : {
+        firefoxUserPrefs: {
+          'browser.cache.disk.enable': false,
+          'browser.cache.memory.enable': false,
+          'browser.cache.offline.enable': false,
+          'browser.cache.memory.capacity': 0,
+          'browser.sessionhistory.max_entries': 2,
+          'browser.sessionstore.max_tabs_undo': 0,
+          'browser.sessionstore.max_windows_undo': 0,
+          'network.prefetch-next': false,
+          'browser.newtabpage.enabled': false,
+          'toolkit.telemetry.enabled': false,
+          'datareporting.policy.dataSubmissionEnabled': false,
+          'dom.ipc.processCount': 1,
+          'dom.ipc.processPrelaunch.enabled': false,
+          'dom.ipc.keepProcessesAlive.web': 0,
+        },
+      }),
     }));
     const context = await active.newContext({
       storageState: { cookies: state.cookies, origins: state.origins ?? [] } as Parameters<
