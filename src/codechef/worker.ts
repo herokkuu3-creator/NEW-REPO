@@ -15,9 +15,9 @@ import {
   recordAttempt,
 } from './storage';
 import { loadCodeChefSourceIndex, fetchSourceCode, type CodeChefSourceEntry } from './sourceRepo';
-import { loginOnCodeChefPage } from './auth';
-import { submitOnCodeChefPage } from './api';
-import { withCodeChefPage, type CodeChefState } from './browser';
+import { loginToCodeChef } from './auth';
+import { submitDirectlyViaCodeChefApi, submitToCodeChef, type CodeChefSubmitResult } from './api';
+import { type CodeChefState } from './browser';
 
 let runInProgress = false;
 export function isCodeChefRunInProgress(): boolean { return runInProgress; }
@@ -159,58 +159,67 @@ export async function runCodeChefNow(
 
       let mayHaveSubmitted = false;
       const credentials = JSON.parse(account.storageState) as Partial<CodeChefState> & { username?: string; password?: string };
-      let state: CodeChefState | undefined = credentials.cookies?.length ? { cookies: credentials.cookies, origins: credentials.origins ?? [] } : undefined;
+      let state: CodeChefState | undefined = credentials.cookies?.length ? { cookies: credentials.cookies, origins: [] } : undefined;
+
+      const login = async (): Promise<void> => {
+        await options.onProgress?.({ phase: 'logging-in', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length });
+        logger.info({ account: account.label }, 'Authenticating account on CodeChef...');
+        const updated = await loginToCodeChef(credentials.username ?? account.username ?? account.label, credentials.password ?? '');
+        state = { cookies: updated.cookies, origins: [] };
+        await patchCodeChefAccount(account.id, { storageState: JSON.stringify({ username: credentials.username, password: credentials.password, ...updated }), checked: true });
+        logger.info({ account: account.label }, 'CodeChef account session saved to DB');
+        await options.onProgress?.({ phase: 'session-ready', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length });
+      };
 
       try {
-        await withCodeChefPage(state, async (page) => {
-          const login = async () => {
-            await options.onProgress?.({ phase: 'logging-in', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length });
-            logger.info({ account: account.label }, 'Authenticating account on CodeChef...');
-            const updated = await loginOnCodeChefPage(page, credentials.username ?? account.username ?? account.label, credentials.password ?? '');
-            state = updated;
-            await patchCodeChefAccount(account.id, { storageState: JSON.stringify({ username: credentials.username, password: credentials.password, ...updated }), checked: true });
-            logger.info({ account: account.label }, 'CodeChef account session saved to DB');
-            await options.onProgress?.({ phase: 'session-ready', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length });
-          };
+        if (!state) await login();
 
-          if (!state) await login();
-
-          for (let step = 0; step < batchCount; step++) {
-            if (step > 0) {
-              currentProgress = await getCodeChefProgress(account.id);
-              index = nextCodeChefSource(queue, currentProgress);
-              entry = queue[index];
-              if (!entry) break;
-              claimed = await claimDailyAttempt(account.id, report.date, entry.problemCode!, true);
-              mayHaveSubmitted = false;
-            }
+        for (let step = 0; step < batchCount; step++) {
+          if (step > 0) {
+            currentProgress = await getCodeChefProgress(account.id);
+            index = nextCodeChefSource(queue, currentProgress);
+            entry = queue[index];
             if (!entry) break;
+            claimed = await claimDailyAttempt(account.id, report.date, entry.problemCode!, true);
+            mayHaveSubmitted = false;
+          }
+          if (!entry) break;
 
-            const row: CodeChefOutcome = { label: account.label, performed: false, problem: entry.problemCode };
-            logger.info({ account: account.label, problem: entry.problemCode, step: step + 1, batchCount, index, total: queue.length }, 'Starting CodeChef attempt');
+          const row: CodeChefOutcome = { label: account.label, performed: false, problem: entry.problemCode };
+          logger.info({ account: account.label, problem: entry.problemCode, step: step + 1, batchCount, index, total: queue.length }, 'Starting CodeChef attempt');
 
-            await options.onProgress?.({ phase: 'loading-source', label: account.label, username: account.username, problemCode: entry.problemCode, index: step + 1, total: batchCount });
-            const code = await fetchSourceCode(entry);
+          await options.onProgress?.({ phase: 'loading-source', label: account.label, username: account.username, problemCode: entry.problemCode, index: step + 1, total: batchCount });
+          const code = await fetchSourceCode(entry);
 
-            await options.onProgress?.({ phase: 'opening-submit', label: account.label, username: account.username, problemCode: entry.problemCode, index: step + 1, total: batchCount });
-            await options.onProgress?.({ phase: 'submitting', label: account.label, username: account.username, problemCode: entry.problemCode, index: step + 1, total: batchCount });
+          await options.onProgress?.({ phase: 'opening-submit', label: account.label, username: account.username, problemCode: entry.problemCode, index: step + 1, total: batchCount });
+          await options.onProgress?.({ phase: 'submitting', label: account.label, username: account.username, problemCode: entry.problemCode, index: step + 1, total: batchCount });
 
-            mayHaveSubmitted = true;
-            let posted = await submitOnCodeChefPage(page, entry.problemUrl!, code, entry.language, 90000, account.username ?? credentials.username);
-            mayHaveSubmitted = posted.clicked === true;
+          mayHaveSubmitted = true;
+          // 1. Direct API submit (0MB browser RAM, takes 2-3s, completely avoids Render OOM)
+          let posted: CodeChefSubmitResult | null = null;
+          if (state) {
+            posted = await submitDirectlyViaCodeChefApi(state, entry.problemUrl!, code, entry.language, 90000);
+          }
 
-            if (posted.kind === 'signed-out' && !posted.clicked) {
-              logger.warn({ account: account.label }, 'CodeChef session expired before submit click; re-authenticating...');
-              await login();
-              mayHaveSubmitted = true;
-              posted = await submitOnCodeChefPage(page, entry.problemUrl!, code, entry.language, 90000, account.username ?? credentials.username);
-              mayHaveSubmitted = posted.clicked === true;
-            }
+          // 2. If signed-out, re-login and retry
+          if (posted?.kind === 'signed-out' && !posted.clicked) {
+            logger.warn({ account: account.label }, 'CodeChef session expired before submit click; re-authenticating...');
+            await login();
+            posted = await submitDirectlyViaCodeChefApi(state, entry.problemUrl!, code, entry.language, 90000);
+          }
 
-            row.submissionId = posted.submissionId;
-            row.verdict = posted.verdict;
-            row.error = posted.error;
-            row.performed = posted.performed === true && !!posted.submissionId;
+          // 3. Fallback to browser submit flow if API submit could not proceed
+          if (!posted || (!posted.performed && !posted.clicked && posted.kind === 'error')) {
+            logger.info({ account: account.label }, 'Falling back to browser submit flow for CodeChef...');
+            posted = await submitToCodeChef(state, entry.problemUrl!, code, entry.language, account.username ?? credentials.username);
+          }
+
+          mayHaveSubmitted = posted.clicked === true;
+
+          row.submissionId = posted.submissionId;
+          row.verdict = posted.verdict;
+          row.error = posted.error;
+          row.performed = posted.performed === true && !!posted.submissionId;
 
             const isCompleted = row.performed || (posted.submissionId && isTerminalCodeChefVerdict(posted.verdict)) || isTerminalCodeChefVerdict(posted.verdict);
             if (isCompleted) {
@@ -260,7 +269,6 @@ export async function runCodeChefNow(
               await new Promise((res) => setTimeout(res, 5000));
             }
           }
-        });
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         logger.warn({ accountId: account.id, error: errorMsg }, 'CodeChef account run failed');

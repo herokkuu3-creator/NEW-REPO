@@ -14,8 +14,12 @@ export async function withCodeChefPage<T>(state: CodeChefState | undefined, acti
   const watch = new MemoryWatch(() => { void browser.close().catch(() => undefined); });
   try {
     watch.start();
+    const safeState = state ? {
+      cookies: state.cookies || [],
+      origins: [],
+    } : undefined;
     const context = await browser.newContext({ 
-      storageState: state, 
+      storageState: safeState, 
       viewport: { width: 1000, height: 750 },
       serviceWorkers: 'block' 
     });

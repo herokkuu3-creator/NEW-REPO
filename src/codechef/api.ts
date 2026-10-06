@@ -1,4 +1,4 @@
-import type { Page, Response } from 'playwright';
+import { request as playwrightRequest, type APIRequestContext, type Page, type Response } from 'playwright';
 import { withCodeChefPage, type CodeChefState } from './browser';
 import { logger } from '../logger';
 
@@ -201,19 +201,18 @@ export async function fillCodeChefSource(page: Page, code: string): Promise<void
 
 /**
  * Submits straight to CodeChef's /api/ide/submit (form field `sourceCode`) using the
- * authenticated browser-context cookies, then polls /api/ide/submit?solution_id=<upid>.
+ * authenticated request context, then polls /api/ide/submit?solution_id=<upid>.
  * Returns null when the API path is unusable *before* anything was submitted, so the
  * caller can fall back to the UI flow. Once a submission id exists it never returns null
  * (avoids duplicate submissions).
  */
-async function submitViaCodeChefApi(
-  page: Page,
+export async function submitViaCodeChefApi(
+  request: APIRequestContext,
   problemCode: string,
   code: string,
   language: string,
   timeoutMs: number,
 ): Promise<CodeChefSubmitResult | null> {
-  const request = page.context().request;
   const base = 'https://www.codechef.com';
   try {
     const pageRes = await request.get(`${base}/problems/${problemCode}`, { timeout: 20000 });
@@ -223,24 +222,41 @@ async function submitViaCodeChefApi(
     if (!pageRes.ok()) return null;
     const html = await pageRes.text();
     const csrf = /window\.csrfToken\s*=\s*["']([^"']+)["']/.exec(html)?.[1];
-    if (!csrf || !/"username"\s*:\s*"/.test(html)) {
-      logger.warn({ hasCsrf: Boolean(csrf) }, 'CodeChef API submit unavailable (no csrf/session); falling back to UI');
+    const isLoggedIn = /"username"\s*:\s*"[^"]+"/.test(html) || /"isLoggedIn"\s*:\s*true/i.test(html);
+    if (!csrf || !isLoggedIn) {
+      logger.warn({ hasCsrf: Boolean(csrf), isLoggedIn }, 'CodeChef API submit unavailable (no csrf or not logged in); falling back to UI');
       return null;
     }
 
-    logger.info({ problemCode }, 'Submitting to CodeChef via /api/ide/submit...');
-    const lang = /^c\+\+(\d+)$/i.exec(language)?.[1] ?? '17';
+    let langId = '42'; // Default C++ on CodeChef
+    try {
+      const langRes = await request.get(`${base}/api/ide/PRACTICE/languages/${problemCode}`, { timeout: 10000 });
+      if (langRes.ok()) {
+        const langData = await langRes.json().catch(() => null);
+        if (Array.isArray(langData?.languages)) {
+          const match = langData.languages.find((l: any) =>
+            /^(?:cpp|c\+\+)/i.test(l.short_name) ||
+            /^(?:cpp|c\+\+)/i.test(l.short_qualified_name) ||
+            /^(?:cpp|c\+\+)/i.test(l.full_name)
+          );
+          if (match?.id) langId = String(match.id);
+        }
+      }
+    } catch {}
+
+    logger.info({ problemCode, langId }, 'Submitting to CodeChef via /api/ide/submit...');
     const postRes = await request.post(`${base}/api/ide/submit`, {
       timeout: 30000,
       headers: {
         'x-csrf-token': csrf,
         'x-requested-with': 'XMLHttpRequest',
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         origin: base,
         referer: `${base}/problems/${problemCode}?tab=ide`,
       },
       form: {
         sourceCode: code,
-        language: `CPP${lang}`,
+        language: langId,
         problemCode,
         contestCode: 'PRACTICE',
       },
@@ -254,7 +270,7 @@ async function submitViaCodeChefApi(
 
     const submissionId = first.id;
     let verdict = first.verdict;
-    logger.info({ submissionId }, 'CodeChef API submission accepted for judging');
+    logger.info({ submissionId, verdict: verdict ?? 'judging' }, 'CodeChef API submission accepted for judging');
     const deadline = Date.now() + timeoutMs;
     while (!verdict && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 2000));
@@ -273,6 +289,35 @@ async function submitViaCodeChefApi(
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'CodeChef API submit failed before submission; falling back to UI');
     return null;
+  }
+}
+
+export async function submitDirectlyViaCodeChefApi(
+  state: CodeChefState | undefined,
+  problemUrl: string,
+  code: string,
+  language = 'cpp',
+  timeoutMs = 90000,
+): Promise<CodeChefSubmitResult | null> {
+  const url = new URL(problemUrl);
+  const match = /(?:\/problems\/|\/submit\/)([a-zA-Z0-9_]+)/i.exec(url.pathname);
+  if (!match || !match[1]) return null;
+  const problemCode = match[1].toUpperCase();
+
+  const safeState = state ? {
+    cookies: state.cookies || [],
+    origins: [],
+  } : undefined;
+
+  const apiContext = await playwrightRequest.newContext({
+    storageState: safeState,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  });
+
+  try {
+    return await submitViaCodeChefApi(apiContext, problemCode, code, language, timeoutMs);
+  } finally {
+    await apiContext.dispose().catch(() => undefined);
   }
 }
 
@@ -333,7 +378,7 @@ export async function submitOnCodeChefPage(
 
     // Fast path: call CodeChef's own /api/ide/submit directly with the logged-in cookies.
     // This renders no page, so the 512MB Render container never hits the MemoryWatch limit.
-    const direct = await submitViaCodeChefApi(page, problemCode, code, language, timeoutMs);
+    const direct = await submitViaCodeChefApi(page.context().request, problemCode, code, language, timeoutMs);
     if (direct) return direct;
 
     const targetUrl = `https://www.codechef.com/problems/${problemCode}?tab=ide`;
@@ -550,6 +595,6 @@ export async function submitOnCodeChefPage(
   }
 }
 
-export async function submitToCodeChef(state: CodeChefState, problemUrl: string, code: string, language = 'cpp', userHandle?: string): Promise<CodeChefSubmitResult> {
+export async function submitToCodeChef(state: CodeChefState | undefined, problemUrl: string, code: string, language = 'cpp', userHandle?: string): Promise<CodeChefSubmitResult> {
   return withCodeChefPage(state, page => submitOnCodeChefPage(page, problemUrl, code, language, 90000, userHandle));
 }
