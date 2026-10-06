@@ -57,6 +57,9 @@ jobs:
               fs.appendFileSync(process.env.GITHUB_OUTPUT, `job_id=${jobId}\n`);
               const networkMode = body.networkMode;
               fs.appendFileSync(process.env.GITHUB_OUTPUT, `network_mode=${networkMode === 'tailscale' ? 'tailscale' : 'proxy'}\n`);
+              if (body.removedProxies && Array.isArray(body.removedProxies)) {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, `removed_proxies=${JSON.stringify(body.removedProxies)}\n`);
+              }
             }
           }).catch(error => { console.error(error.message); process.exitCode = 1; });
           NODE
@@ -96,6 +99,7 @@ jobs:
           TAILSCALE_STEP_OUTCOME: ${{ steps.tailscale.outcome }}
           CODEFORCES_NETWORK_MODE: ${{ steps.lookup.outputs.network_mode }}
           FALLBACK_CODEFORCES_PROXY: ${{ secrets.CODEFORCES_RESIDENTIAL_PROXY }}
+          REMOVED_PROXIES: ${{ steps.lookup.outputs.removed_proxies }}
         run: |
           if [ "$CODEFORCES_NETWORK_MODE" = "tailscale" ] && [ "$TAILSCALE_STEP_OUTCOME" = "success" ] && [ -n "$TAILSCALE_EXIT_NODE" ] && sudo tailscale set --exit-node="$TAILSCALE_EXIT_NODE" && timeout 30 curl --fail --silent --show-error --output /dev/null https://www.cloudflare.com/cdn-cgi/trace; then
             echo 'CODEFORCES_PROXY=' >> "$GITHUB_ENV"

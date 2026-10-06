@@ -94,6 +94,8 @@ export const SystemKeys = {
   codeforcesDailyState: 'codeforcesDailyState', // JSON { date, retryCount, completedAccountIds }
   storageState: 'storageStateJson', // Playwright storageState snapshot (DB-persisted, legacy single-session)
   codeforcesNetworkMode: 'codeforcesNetworkMode', // 'proxy' | 'tailscale'
+  codeforcesRemovedProxies: 'codeforcesRemovedProxies', // JSON string[] of blacklisted proxy hashes or URLs
+  codeforcesCustomProxies: 'codeforcesCustomProxies', // JSON string[] of user-added proxy URLs
 } as const;
 
 /**

@@ -40,3 +40,5 @@ local-auth/chrome-capture-profile/
 
 # Android Chrome session capture output
 leetcode-session.json
+
+.proxy_state/

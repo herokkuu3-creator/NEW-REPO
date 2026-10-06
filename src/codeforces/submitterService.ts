@@ -706,7 +706,11 @@ export const server = http.createServer((req, res) => {
   const jobRoute = /^\/jobs\/([a-f0-9-]{36})(?:\/(claim|result|network|cancel|authorize-post))?$/.exec(url);
   if (broker && req.method === 'GET' && url === '/jobs/next') {
     if (!runnerAuthorized(req)) { json(res, 401, { error: 'unauthorized' }); return; }
-    json(res, 200, { jobId: broker.nextId, networkMode: broker.nextId ? broker.nextNetworkMode : null });
+    json(res, 200, {
+      jobId: broker.nextId,
+      networkMode: broker.nextId ? broker.nextNetworkMode : null,
+      removedProxies: broker.nextId ? broker.nextRemovedProxies : [],
+    });
     return;
   }
   if (broker && jobRoute) {
@@ -720,7 +724,7 @@ export const server = http.createServer((req, res) => {
     }
     if (req.method === 'GET' && action === 'network') {
       const networkMode = broker.networkMode(id);
-      json(res, networkMode ? 200 : 404, networkMode ? { networkMode } : { error: 'job not found or expired' });
+      json(res, networkMode ? 200 : 404, networkMode ? { networkMode, removedProxies: broker.removedProxies(id) } : { error: 'job not found or expired' });
       return;
     }
     if (req.method === 'POST' && action === 'claim') {

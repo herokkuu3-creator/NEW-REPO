@@ -41,6 +41,14 @@ import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../co
 import { loadRuntimeSourceIndex, SourceIndexEntry } from '../codeforces/sourceRepo';
 import { submitPageUrl } from '../codeforces/handoff';
 import {
+  getAllConfiguredProxies,
+  removeProxyByIndex,
+  addCustomProxy,
+  restoreAllProxies,
+  testAllProxiesOneByOne,
+} from '../codeforces/proxyManager';
+import { testProxyDetailed } from '../codeforces/proxyRotator';
+import {
   isRunInProgress,
   runSubmissionNow,
   triggerRun,
@@ -138,6 +146,13 @@ const HELP_TEXT = [
   '├ <code>/cfmanualnext</code> — Get next source &amp; mobile submit link',
   '├ <code>/cfaccounts</code> — View Codeforces accounts &amp; verdicts',
   '└ <code>/cf_clear_cookies</code> — Delete Codeforces stored sessions',
+  '',
+  '<b>🌐 𝗣𝗥𝗢𝗫𝗬 &amp; 𝗡𝗘𝗧𝗪𝗢𝗥𝗞</b>',
+  '├ <code>/cfnetwork</code> — Switch network mode (Proxy / Tailscale)',
+  '├ <code>/testproxy</code> — Test each proxy one-by-one &amp; show live health',
+  '├ <code>/removeproxy</code> <i>&lt;number&gt;</i> — Blacklist &amp; remove dead proxy in DB',
+  '├ <code>/addproxy</code> <i>&lt;url&gt;</i> — Add new proxy to active pool',
+  '└ <code>/restoreproxies</code> — Reset blacklist &amp; restore all proxies',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ <code>/codechef</code> — Run daily CodeChef submission',
@@ -446,6 +461,32 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cftransport':
         await handleCodeforcesNetworkCommand();
         return;
+      case '/testproxy':
+      case '/testproxies':
+      case '/cfproxy':
+      case '/cfproxies':
+      case '/proxytest':
+      case '/proxystatus':
+        await handleTestProxyCommand();
+        return;
+      case '/removeproxy':
+      case '/cfremoveproxy':
+      case '/rmproxy': {
+        const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
+        await handleRemoveProxyCommand(arg);
+        return;
+      }
+      case '/addproxy':
+      case '/cfaddproxy': {
+        const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
+        await handleAddProxyCommand(arg);
+        return;
+      }
+      case '/restoreproxies':
+      case '/resetproxies':
+      case '/restoreproxy':
+        await handleRestoreProxiesCommand();
+        return;
       case '/cfaccounts':
       case '/cf_accounts':
         await replyHtml(await codeforcesAccountsText());
@@ -507,7 +548,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /testproxy, /removeproxy, /addproxy, /restoreproxies, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -1482,6 +1523,226 @@ async function handleCodeforcesNetworkButton(
   );
 }
 
+export interface ProxyUiDeps {
+  send: (text: string, buttons?: InlineButton[][]) => Promise<void>;
+  edit: (chatId: number | string, messageId: number, text: string, buttons?: InlineButton[][]) => Promise<void>;
+  answer: (callbackId: string, text?: string) => Promise<void>;
+}
+
+export const defaultProxyUiDeps: ProxyUiDeps = {
+  send: async (text, buttons) => {
+    await tgApi('sendMessage', {
+      chat_id: config.telegram.chatId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+    });
+  },
+  edit: async (chatId, messageId, text, buttons) => {
+    await tgApi('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: buttons ?? [] },
+    });
+  },
+  answer: async (callbackId, text) => {
+    await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text, show_alert: true } : {}) });
+  },
+};
+
+export async function handleTestProxyCommand(deps: ProxyUiDeps = defaultProxyUiDeps): Promise<void> {
+  const all = await getAllConfiguredProxies();
+  if (all.length === 0) {
+    await deps.send([
+      '<b>🌐 Configured Proxies</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+      '⚠️ No proxies configured.',
+      '',
+      '👉 Add one now: <code>/addproxy &lt;proxy_url&gt;</code>',
+      '👉 Or add in GitHub Secrets / env: <code>CODEFORCES_RESIDENTIAL_PROXY</code>',
+    ].join('\n'));
+    return;
+  }
+
+  await deps.send([
+    '<b>🌐 CODEFORCES PROXY HEALTH CHECK</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    `🔎 Testing ${all.length} configured proxy(ies) one-by-one (~150B trace check)...`,
+    '<i>Please wait...</i>',
+  ].join('\n'));
+
+  const results = await testAllProxiesOneByOne();
+
+  let workingCount = 0;
+  let failedCount = 0;
+  let removedCount = 0;
+
+  const lines = [
+    '<b>🌐 CODEFORCES PROXY HEALTH CHECK</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+  ];
+
+  const buttons: InlineButton[][] = [];
+
+  for (const item of results) {
+    const { proxy, result } = item;
+    if (proxy.isRemoved) {
+      removedCount++;
+      lines.push(`🚫 [${proxy.index}/${all.length}] <code>${escapeHtml(proxy.masked)}</code> — <b>Blacklisted in DB</b>`);
+    } else if (result.ok) {
+      workingCount++;
+      lines.push(`✅ [${proxy.index}/${all.length}] <code>${escapeHtml(proxy.masked)}</code> — <b>Working</b> (${result.latencyMs}ms${result.ip ? ` · IP: ${result.ip}` : ''})`);
+    } else {
+      failedCount++;
+      lines.push(`❌ [${proxy.index}/${all.length}] <code>${escapeHtml(proxy.masked)}</code> — <b>Failed</b> (offline/quota exceeded)`);
+      buttons.push([{ text: `❌ Blacklist #${proxy.index} in DB`, callback_data: `pxrm:${proxy.index}` }]);
+    }
+  }
+
+  lines.push('');
+  lines.push(`📊 <b>Status:</b> ${workingCount} working · ${failedCount} failed · ${removedCount} blacklisted`);
+  if (failedCount > 0) {
+    lines.push('💡 <i>Tap a button below or send <code>/removeproxy &lt;number&gt;</code> to blacklist a dead proxy in DB.</i>');
+  }
+  buttons.push([
+    { text: '🔄 Retest All', callback_data: 'pxretest' },
+    { text: '✅ Done', callback_data: 'pxdone' },
+  ]);
+
+  await deps.send(lines.join('\n'), buttons);
+}
+
+export async function handleRemoveProxyCommand(arg?: string, deps: ProxyUiDeps = defaultProxyUiDeps): Promise<void> {
+  const index = Number.parseInt((arg ?? '').trim(), 10);
+  if (!Number.isFinite(index) || index <= 0) {
+    const all = await getAllConfiguredProxies();
+    if (all.length === 0) {
+      await deps.send('⚠️ No proxies configured.');
+      return;
+    }
+    const lines = [
+      '<b>🗑️ Remove / Blacklist Proxy</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+      'Select a proxy to blacklist in the DB (it will NOT be used even if in GitHub Secrets):',
+      '',
+    ];
+    const buttons: InlineButton[][] = [];
+    for (const p of all) {
+      const tag = p.isRemoved ? '🚫 Blacklisted' : 'Active';
+      lines.push(`${p.index}. <code>${escapeHtml(p.masked)}</code> — ${tag}`);
+      if (!p.isRemoved) {
+        buttons.push([{ text: `❌ Remove #${p.index}`, callback_data: `pxrm:${p.index}` }]);
+      }
+    }
+    lines.push('');
+    lines.push('👉 <i>Or send: <code>/removeproxy &lt;number&gt;</code> (e.g. <code>/removeproxy 2</code>)</i>');
+    buttons.push([{ text: '✅ Done', callback_data: 'pxdone' }]);
+    await deps.send(lines.join('\n'), buttons);
+    return;
+  }
+
+  const res = await removeProxyByIndex(index);
+  if (!res.ok || !res.proxy) {
+    await deps.send(`⚠️ ${res.error ?? `Proxy #${index} not found.`}`);
+    return;
+  }
+
+  await deps.send([
+    `🗑️ <b>Proxy #${index} Removed &amp; Blacklisted</b>`,
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    `🌐 <code>${escapeHtml(res.proxy.masked)}</code>`,
+    '',
+    '✅ <b>Saved to database blacklist.</b>',
+    'This proxy will <b>NOT</b> be used for any future submissions, even if it remains in GitHub Action secrets.',
+    '',
+    '💡 <i>To re-enable all proxies, use <code>/restoreproxies</code>.</i>',
+  ].join('\n'));
+}
+
+export async function handleAddProxyCommand(arg?: string, deps: ProxyUiDeps = defaultProxyUiDeps): Promise<void> {
+  const url = (arg ?? '').trim();
+  if (!url) {
+    await deps.send([
+      '<b>➕ Add New Proxy</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+      'Please specify the proxy URL:',
+      '👉 <code>/addproxy http://username:password@host:port</code>',
+      '👉 <code>/addproxy socks5://username:password@host:port</code>',
+    ].join('\n'));
+    return;
+  }
+
+  const res = await addCustomProxy(url);
+  if (!res.ok || !res.proxy) {
+    await deps.send(`❌ Failed to add proxy: ${res.error ?? 'Invalid proxy format'}`);
+    return;
+  }
+
+  await deps.send(`Testing new proxy <code>${escapeHtml(res.masked!)}</code> (~150B check)...`);
+  const check = await testProxyDetailed(res.proxy, 8);
+
+  const statusText = check.ok
+    ? `✅ <b>Verified &amp; Active</b> (${check.latencyMs}ms${check.ip ? ` · IP: ${check.ip}` : ''})`
+    : `⚠️ <b>Saved, but health check failed:</b> ${check.error ?? 'offline'}`;
+
+  await deps.send([
+    '<b>➕ Proxy Added to Active Pool</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    `🌐 <code>${escapeHtml(res.masked!)}</code>`,
+    `⚡ Health: ${statusText}`,
+    '',
+    'This proxy is now saved in the database and will be processed in all Codeforces runs.',
+  ].join('\n'));
+}
+
+export async function handleRestoreProxiesCommand(deps: ProxyUiDeps = defaultProxyUiDeps): Promise<void> {
+  const count = await restoreAllProxies();
+  await deps.send([
+    '<b>♻️ Proxy Blacklist Cleared</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    `Restored ${count} previously blacklisted proxy(ies).`,
+    'All configured proxies in GitHub Secrets and database will now be considered and tested.',
+  ].join('\n'));
+}
+
+export async function handleProxyButton(
+  chatId: number | string,
+  messageId: number,
+  callbackId: string,
+  data: string,
+  deps: ProxyUiDeps = defaultProxyUiDeps,
+): Promise<void> {
+  if (data === 'pxdone') {
+    await deps.answer(callbackId, 'Done');
+    await deps.edit(chatId, messageId, '✅ Done.');
+    return;
+  }
+  if (data === 'pxretest') {
+    await deps.answer(callbackId, 'Retesting proxies...');
+    await handleTestProxyCommand(deps);
+    return;
+  }
+  if (data.startsWith('pxrm:')) {
+    const index = Number.parseInt(data.slice(5), 10);
+    const res = await removeProxyByIndex(index);
+    if (!res.ok || !res.proxy) {
+      await deps.answer(callbackId, res.error ?? 'Proxy not found');
+      return;
+    }
+    await deps.answer(callbackId, `Proxy #${index} blacklisted in DB`);
+    await deps.edit(
+      chatId,
+      messageId,
+      `🗑️ <b>Proxy #${index} (<code>${escapeHtml(res.proxy.masked)}</code>) removed &amp; blacklisted in DB.</b>\nIt will NOT be used for submissions even if in GitHub Secrets.`,
+    );
+    return;
+  }
+}
+
 /** One account per button, followed by the explicit all-accounts choice. */
 export function buildCodeforcesSubmitPicker(
   accounts: Awaited<ReturnType<typeof listCodeforcesAccounts>>,
@@ -2009,6 +2270,11 @@ export async function handleCallbackQuery(
 
   if (data.startsWith('lccoin:')) {
     await handleCoinClaimButton(chatId, messageId, q.id, data, coinClaimUi);
+    return;
+  }
+
+  if (data.startsWith('px')) {
+    await handleProxyButton(chatId, messageId, q.id, data);
     return;
   }
 

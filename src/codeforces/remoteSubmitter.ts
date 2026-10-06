@@ -6,6 +6,7 @@ import type { SourceIndexEntry } from './sourceRepo';
 import type { BrowserPostOutcome } from './submission';
 import type { CodeforcesNetworkMode } from './worker';
 import { CODEFORCES_ATTEMPT_MS } from './attempts';
+import { getRemovedProxyHashes } from './proxyManager';
 
 /**
  * Client for the isolated Codeforces submitter.
@@ -130,6 +131,7 @@ export async function submitViaRemoteSubmitter(
     },
     state: { cookies: state.cookies, origins: state.origins ?? [] },
     networkMode,
+    removedProxies: await getRemovedProxyHashes().catch(() => []),
     attemptDeadline: deadline,
     requiresPostAuthorization: true,
   };

@@ -50,6 +50,20 @@ export class ActionBroker {
     return payload.networkMode === 'tailscale' ? 'tailscale' : 'proxy';
   }
 
+  get nextRemovedProxies(): string[] {
+    this.expire();
+    if (!this.job || !this.job.ready || this.job.claimed || this.job.result !== null) return [];
+    const payload = this.job.payload as { removedProxies?: unknown };
+    return Array.isArray(payload?.removedProxies) ? (payload.removedProxies as unknown[]).map(String) : [];
+  }
+
+  removedProxies(id: string): string[] {
+    this.expire();
+    if (!this.job || this.job.id !== id) return [];
+    const payload = this.job.payload as { removedProxies?: unknown };
+    return Array.isArray(payload?.removedProxies) ? (payload.removedProxies as unknown[]).map(String) : [];
+  }
+
   async enqueue(payload: unknown, requestedId?: string): Promise<string> {
     if (requestedId && this.job?.id === requestedId) return requestedId;
     if (this.busy) throw new Error('a Codeforces submission is already running');

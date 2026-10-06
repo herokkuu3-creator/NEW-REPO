@@ -55,19 +55,28 @@ export function proxyHash(proxyUrl: string): string {
   return crypto.createHash('sha256').update(proxyUrl.trim()).digest('hex').slice(0, 16);
 }
 
+export interface ProxyTestResult {
+  ok: boolean;
+  latencyMs: number;
+  ip?: string;
+  error?: string;
+}
+
 /**
  * Tests proxy health with minimal data (~150 bytes) using Cloudflare's trace endpoint.
- * Returns true if the proxy connects successfully and returns a 200 trace with `ip=`.
+ * Returns detailed latency, discovered IP, and success state.
  */
-export async function testProxyWithCurl(
+export async function testProxyDetailed(
   proxyUrl: string,
   timeoutSeconds = 8,
-): Promise<boolean> {
+): Promise<ProxyTestResult> {
+  const start = Date.now();
   const testEndpoints = [
     'https://challenges.cloudflare.com/cdn-cgi/trace',
     'https://www.cloudflare.com/cdn-cgi/trace',
   ];
 
+  let lastError = 'Failed to connect';
   for (const endpoint of testEndpoints) {
     try {
       const { stdout } = await execFileAsync('curl', [
@@ -80,25 +89,49 @@ export async function testProxyWithCurl(
         proxyUrl,
         endpoint,
       ]);
+      const latencyMs = Date.now() - start;
       if (stdout && stdout.includes('ip=')) {
-        return true;
+        const ipMatch = stdout.match(/^ip=(.+)$/m);
+        return {
+          ok: true,
+          latencyMs,
+          ip: ipMatch ? ipMatch[1]?.trim() : undefined,
+        };
       }
-    } catch {
-      // try next endpoint if any
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
     }
   }
-  return false;
+  return {
+    ok: false,
+    latencyMs: Date.now() - start,
+    error: lastError,
+  };
+}
+
+/**
+ * Tests proxy health with minimal data (~150 bytes) using Cloudflare's trace endpoint.
+ * Returns true if the proxy connects successfully and returns a 200 trace with `ip=`.
+ */
+export async function testProxyWithCurl(
+  proxyUrl: string,
+  timeoutSeconds = 8,
+): Promise<boolean> {
+  const res = await testProxyDetailed(proxyUrl, timeoutSeconds);
+  return res.ok;
 }
 
 export interface SelectProxyOptions {
   stateDir?: string;
   tester?: (proxyUrl: string) => Promise<boolean>;
   log?: (msg: string) => void;
+  removedHashes?: string[] | Set<string>;
 }
 
 /**
  * Selects the first verified working proxy from a list.
- * Automatically skips previously dead/expired proxies recorded in stateDir,
+ * Automatically filters out any blacklisted/removed proxies recorded in DB,
+ * skips previously dead/expired proxies recorded in stateDir,
  * tests each candidate with minimal data, updates state on failure/success,
  * and falls back to testing any dead proxies if all proxies appear dead.
  */
@@ -106,8 +139,8 @@ export async function selectWorkingProxy(
   rawProxies: string,
   options: SelectProxyOptions = {},
 ): Promise<{ selectedProxy: string; masked: string; index: number; total: number }> {
-  const proxies = parseProxyList(rawProxies);
-  if (proxies.length === 0) {
+  const allProxies = parseProxyList(rawProxies);
+  if (allProxies.length === 0) {
     throw new Error('No valid proxies configured in proxy list');
   }
 
@@ -115,6 +148,29 @@ export async function selectWorkingProxy(
   const tester = options.tester ?? ((p: string) => testProxyWithCurl(p));
   const stateDir = options.stateDir ?? path.resolve('.proxy_state');
   const stateFile = path.join(stateDir, 'proxy_state.json');
+
+  const removedSet = new Set<string>();
+  if (options.removedHashes) {
+    for (const h of options.removedHashes) {
+      if (h) removedSet.add(h.trim().toLowerCase());
+    }
+  }
+
+  // Filter out any proxies that have been removed/blacklisted in DB
+  const proxies: string[] = [];
+  for (const p of allProxies) {
+    const h = proxyHash(p);
+    if (removedSet.has(h)) {
+      log(`Proxy ${maskProxyUrl(p)} was removed in database. Skipping completely.`);
+    } else {
+      proxies.push(p);
+    }
+  }
+
+  if (proxies.length === 0) {
+    throw new Error(`All ${allProxies.length} configured proxies are blacklisted/removed in DB.`);
+  }
+
 
   let state: ProxyState = { deadProxyHashes: [], updatedAt: new Date().toISOString() };
   try {
@@ -213,8 +269,18 @@ export async function runCli(): Promise<void> {
     process.exit(1);
   }
 
+  let removedHashes: string[] = [];
+  if (process.env.REMOVED_PROXIES) {
+    try {
+      const parsed = JSON.parse(process.env.REMOVED_PROXIES);
+      if (Array.isArray(parsed)) removedHashes = parsed.map(String);
+    } catch {
+      removedHashes = process.env.REMOVED_PROXIES.split(/[\s,;]+/).filter(Boolean);
+    }
+  }
+
   try {
-    const result = await selectWorkingProxy(raw);
+    const result = await selectWorkingProxy(raw, { removedHashes });
     process.stdout.write(`Selected working proxy: ${result.masked} (index ${result.index + 1} of ${result.total})\n`);
 
     const envFile = process.env.GITHUB_ENV;
