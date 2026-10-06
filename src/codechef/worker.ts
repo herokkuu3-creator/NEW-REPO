@@ -14,7 +14,13 @@ import {
   releaseDailyAttempt,
   recordAttempt,
 } from './storage';
-import { loadCodeChefSourceIndex, fetchSourceCode, type CodeChefSourceEntry } from './sourceRepo';
+import {
+  loadCodeChefSourceIndex,
+  fetchSourceCode,
+  isCodeChefProblemListed,
+  RETIRED_OR_INVALID_CODECHEF_PROBLEMS,
+  type CodeChefSourceEntry,
+} from './sourceRepo';
 import { loginToCodeChef } from './auth';
 import { submitDirectlyViaCodeChefApi, submitToCodeChef, type CodeChefSubmitResult } from './api';
 import { type CodeChefState } from './browser';
@@ -80,6 +86,86 @@ export function nextCodeChefSource(queue: CodeChefSourceEntry[], progress: { nex
   return index + 1;
 }
 
+/**
+ * Resiliently resolves the next problem index. If nextKey or lastCompletedKey
+ * was retired, removed, or missing from the queue, falls back to the next
+ * alphabetical problem in line instead of throwing an error.
+ */
+export function findNextCodeChefSourceIndex(
+  queue: CodeChefSourceEntry[],
+  progress: { nextKey: string | null; lastCompletedKey: string | null },
+): number {
+  if (queue.length === 0) return 0;
+  try {
+    const idx = nextCodeChefSource(queue, progress);
+    return idx < queue.length ? idx : 0;
+  } catch {
+    const refKey = progress.nextKey ?? progress.lastCompletedKey;
+    if (refKey) {
+      const idx = queue.findIndex(e => (e.problemCode ?? '').localeCompare(refKey) > 0);
+      if (idx >= 0) return idx;
+    }
+    return 0;
+  }
+}
+
+/**
+ * Validates candidate problems against CodeChef before attempting submit.
+ * If a problem is unlisted, retired, or invalid on CodeChef, it automatically
+ * advances the database cursor and skips past it until a valid problem is found.
+ */
+export async function advanceToNextValidProblem(
+  accountId: string,
+  accountLabel: string,
+  accountUsername: string | null | undefined,
+  queue: CodeChefSourceEntry[],
+  startIndex: number,
+  onProgress?: (event: CodeChefProgressEvent) => Promise<void> | void,
+  progressIndex = 1,
+  progressTotal = 1,
+): Promise<{ entry: CodeChefSourceEntry; index: number } | null> {
+  let currIdx = startIndex;
+  let skips = 0;
+
+  while (currIdx < queue.length && skips < 50) {
+    const candidate = queue[currIdx];
+    if (!candidate || !candidate.problemCode) break;
+
+    const check = await isCodeChefProblemListed(candidate.problemCode);
+    if (check.valid) {
+      return { entry: candidate, index: currIdx };
+    }
+
+    logger.warn({ account: accountLabel, problem: candidate.problemCode, reason: check.reason }, 'CodeChef problem is unlisted or URL is invalid; auto-skipping...');
+    skips++;
+    const nextCandidate = queue[currIdx + 1];
+    await completeCurrentProblem(accountId, {
+      completedKey: candidate.problemCode,
+      nextKey: nextCandidate?.problemCode ?? null,
+      submissionId: null,
+      verdict: 'SKIPPED_RETIRED',
+    });
+    await patchCodeChefAccount(accountId, {
+      lastError: `Problem ${candidate.problemCode} not listed on CodeChef (${check.reason})`,
+      checked: true,
+    });
+    await onProgress?.({
+      phase: 'skipped',
+      label: accountLabel,
+      username: accountUsername,
+      problemCode: candidate.problemCode,
+      index: progressIndex,
+      total: progressTotal,
+      error: `Skipped unlisted problem ${candidate.problemCode}: ${check.reason}`,
+    });
+
+    currIdx++;
+  }
+
+  const remaining = currIdx < queue.length ? queue[currIdx] : undefined;
+  return remaining?.problemCode ? { entry: remaining, index: currIdx } : null;
+}
+
 export function formatCodeChefAccountMessage(outcome: CodeChefOutcome, index: number, total: number): string {
   const escape = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const emoji = outcome.skipped
@@ -138,15 +224,26 @@ export async function runCodeChefNow(
       await options.onProgress?.({ phase: 'checking', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length });
 
       let currentProgress = await getCodeChefProgress(account.id);
-      let index = nextCodeChefSource(queue, currentProgress);
-      let entry = queue[index];
+      let validCandidate = await advanceToNextValidProblem(
+        account.id,
+        account.label,
+        account.username,
+        queue,
+        findNextCodeChefSourceIndex(queue, currentProgress),
+        options.onProgress,
+        accIndex + 1,
+        accounts.length,
+      );
 
-      if (!entry) {
-        const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, error: 'Source queue exhausted' };
+      if (!validCandidate) {
+        const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, error: 'Source queue exhausted or no valid problems remain' };
         report.outcomes.push(row);
         await options.onProgress?.({ phase: 'skipped', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length, error: row.error });
         continue;
       }
+
+      let index = validCandidate.index;
+      let entry = validCandidate.entry;
 
       let claimed = await claimDailyAttempt(account.id, report.date, entry.problemCode!, forceAttempt);
       if (!claimed) {
@@ -176,21 +273,32 @@ export async function runCodeChefNow(
 
         let retiredSkips = 0;
         for (let step = 0; step < batchCount; step++) {
-          currentProgress = await getCodeChefProgress(account.id);
-          index = nextCodeChefSource(queue, currentProgress);
-          entry = queue[index];
-          if (!entry) break;
+          const progressIndex = accounts.length > 1 && batchCount === 1 ? accIndex + 1 : (accounts.length > 1 ? accIndex * batchCount + step + 1 : step + 1);
+          const progressTotal = accounts.length > 1 && batchCount === 1 ? accounts.length : (accounts.length > 1 ? accounts.length * batchCount : batchCount);
 
-          if (step > 0) {
+          currentProgress = await getCodeChefProgress(account.id);
+          const candidate = await advanceToNextValidProblem(
+            account.id,
+            account.label,
+            account.username,
+            queue,
+            findNextCodeChefSourceIndex(queue, currentProgress),
+            options.onProgress,
+            progressIndex,
+            progressTotal,
+          );
+          if (!candidate) break;
+
+          index = candidate.index;
+          entry = candidate.entry;
+
+          if (step > 0 || retiredSkips > 0) {
             claimed = await claimDailyAttempt(account.id, report.date, entry.problemCode!, true);
             mayHaveSubmitted = false;
           }
 
           const row: CodeChefOutcome = { label: account.label, performed: false, problem: entry.problemCode };
           logger.info({ account: account.label, problem: entry.problemCode, step: step + 1, batchCount, index, total: queue.length }, 'Starting CodeChef attempt');
-
-          const progressIndex = accounts.length > 1 && batchCount === 1 ? accIndex + 1 : (accounts.length > 1 ? accIndex * batchCount + step + 1 : step + 1);
-          const progressTotal = accounts.length > 1 && batchCount === 1 ? accounts.length : (accounts.length > 1 ? accounts.length * batchCount : batchCount);
 
           await options.onProgress?.({ phase: 'loading-source', label: account.label, username: account.username, problemCode: entry.problemCode, index: progressIndex, total: progressTotal });
           const code = await fetchSourceCode(entry);
@@ -215,6 +323,7 @@ export async function runCodeChefNow(
           const isProblemInvalid = posted?.problemInvalid || /does not belong to the contest|no such problem|does not exist in Practice/i.test(posted?.error ?? '');
           if (isProblemInvalid) {
             logger.warn({ account: account.label, problem: entry.problemCode }, 'CodeChef problem is retired or contest-restricted; advancing cursor past it...');
+            RETIRED_OR_INVALID_CODECHEF_PROBLEMS.add(entry.problemCode!);
             await completeCurrentProblem(account.id, {
               completedKey: entry.problemCode!,
               nextKey: queue[index + 1]?.problemCode ?? null,

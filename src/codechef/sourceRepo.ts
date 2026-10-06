@@ -23,6 +23,63 @@ export const RETIRED_OR_INVALID_CODECHEF_PROBLEMS = new Set([
   'CARVANS', 'COLGLF2', 'PTMSSNG', 'STACKS', 'WEIGHTBL', 'ADAKNG',
 ]);
 
+const problemValidityCache = new Map<string, { valid: boolean; reason?: string }>();
+
+/**
+ * Checks whether a problem code is currently listed and active on CodeChef.
+ * Calls CodeChef's PRACTICE contest API endpoint.
+ * Results are cached in memory so each problem code is checked at most once per process run.
+ */
+export async function isCodeChefProblemListed(
+  problemCode: string,
+): Promise<{ valid: boolean; reason?: string }> {
+  const code = (problemCode || '').trim().toUpperCase();
+  if (!code) return { valid: false, reason: 'Empty problem code' };
+  if (RETIRED_OR_INVALID_CODECHEF_PROBLEMS.has(code)) {
+    return { valid: false, reason: 'Known retired or contest-restricted problem on CodeChef' };
+  }
+  const cached = problemValidityCache.get(code);
+  if (cached) return cached;
+
+  try {
+    const res = await fetch(`https://www.codechef.com/api/contests/PRACTICE/problems/${encodeURIComponent(code)}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'application/json, text/plain, */*',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (res.status === 404) {
+      const outcome = { valid: false, reason: 'Problem not found on CodeChef (HTTP 404)' };
+      problemValidityCache.set(code, outcome);
+      RETIRED_OR_INVALID_CODECHEF_PROBLEMS.add(code);
+      return outcome;
+    }
+
+    if (!res.ok) {
+      // Server error (500/502/503) — don't treat temporary glitch as permanent retirement
+      return { valid: true };
+    }
+
+    const data = (await res.json().catch(() => null)) as { status?: string; message?: string } | null;
+    if (data?.status === 'error') {
+      const reason = data.message || 'Problem does not exist or is not available in Practice';
+      const outcome = { valid: false, reason };
+      problemValidityCache.set(code, outcome);
+      RETIRED_OR_INVALID_CODECHEF_PROBLEMS.add(code);
+      return outcome;
+    }
+
+    const outcome = { valid: true };
+    problemValidityCache.set(code, outcome);
+    return outcome;
+  } catch (err) {
+    logger.warn({ problemCode: code, err: err instanceof Error ? err.message : String(err) }, 'CodeChef problem listing check timed out or errored');
+    return { valid: true };
+  }
+}
+
 const SOLUTIONS_DIR = path.join(process.cwd(), 'codechef-solutions');
 
 export async function loadCodeChefSourceIndex(force = false): Promise<CodeChefSourceEntry[]> {
@@ -44,11 +101,11 @@ export async function loadCodeChefSourceIndex(force = false): Promise<CodeChefSo
 
   let rows = await readRows();
 
-  if (rows.length === 0 || force || await getSystemState('codechef.source-index-version') !== '3') {
+  if (rows.length === 0 || force || await getSystemState('codechef.source-index-version') !== '4') {
     logger.info('Building CodeChef source index from local files...');
     const entries = await buildLocalIndex();
     await persistAudit(entries);
-    await setSystemState('codechef.source-index-version', '3');
+    await setSystemState('codechef.source-index-version', '4');
     rows = await readRows();
   }
 
