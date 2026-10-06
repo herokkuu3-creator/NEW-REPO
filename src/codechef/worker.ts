@@ -143,6 +143,10 @@ export interface CodeChefProgressEvent {
   problemCode?: string | null;
   index: number;
   total: number;
+  accIndex?: number;
+  accTotal?: number;
+  stepIndex?: number;
+  stepTotal?: number;
   verdict?: string | null;
   submissionId?: string | null;
   error?: string | null;
@@ -212,6 +216,10 @@ export async function advanceToNextValidProblem(
   progressIndex = 1,
   progressTotal = 1,
   signal?: AbortSignal,
+  accIndex?: number,
+  accTotal?: number,
+  stepIndex?: number,
+  stepTotal?: number,
 ): Promise<{ entry: CodeChefSourceEntry; index: number } | null> {
   let currIdx = startIndex;
   let skips = 0;
@@ -247,6 +255,10 @@ export async function advanceToNextValidProblem(
       problemCode: candidate.problemCode,
       index: progressIndex,
       total: progressTotal,
+      accIndex,
+      accTotal,
+      stepIndex,
+      stepTotal,
       error: `Skipped unlisted problem ${candidate.problemCode}: ${check.reason}`,
     });
 
@@ -328,7 +340,15 @@ export async function runCodeChefNow(
         continue;
       }
 
-      await options.onProgress?.({ phase: 'checking', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length });
+      await options.onProgress?.({
+        phase: 'checking',
+        label: account.label,
+        username: account.username,
+        index: accIndex + 1,
+        total: accounts.length,
+        accIndex,
+        accTotal: accounts.length,
+      });
 
       let currentProgress = await getCodeChefProgress(account.id);
       let validCandidate = await advanceToNextValidProblem(
@@ -341,6 +361,10 @@ export async function runCodeChefNow(
         accIndex + 1,
         accounts.length,
         signal,
+        accIndex,
+        accounts.length,
+        1,
+        batchCount,
       );
 
       if (signal.aborted) break;
@@ -348,7 +372,16 @@ export async function runCodeChefNow(
       if (!validCandidate) {
         const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, error: 'Source queue exhausted or no valid problems remain' };
         report.outcomes.push(row);
-        await options.onProgress?.({ phase: 'skipped', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length, error: row.error });
+        await options.onProgress?.({
+          phase: 'skipped',
+          label: account.label,
+          username: account.username,
+          index: accIndex + 1,
+          total: accounts.length,
+          accIndex,
+          accTotal: accounts.length,
+          error: row.error,
+        });
         continue;
       }
 
@@ -360,7 +393,17 @@ export async function runCodeChefNow(
         logger.info({ account: account.label, problem: entry.problemCode }, 'Today’s CodeChef attempt is already claimed');
         const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, problem: entry.problemCode, error: 'Today’s CodeChef attempt is already completed or awaiting confirmation' };
         report.outcomes.push(row);
-        await options.onProgress?.({ phase: 'skipped', label: account.label, username: account.username, problemCode: entry.problemCode, index: accIndex + 1, total: accounts.length, error: row.error });
+        await options.onProgress?.({
+          phase: 'skipped',
+          label: account.label,
+          username: account.username,
+          problemCode: entry.problemCode,
+          index: accIndex + 1,
+          total: accounts.length,
+          accIndex,
+          accTotal: accounts.length,
+          error: row.error,
+        });
         continue;
       }
 
@@ -369,13 +412,29 @@ export async function runCodeChefNow(
       let state: CodeChefState | undefined = credentials.cookies?.length ? { cookies: credentials.cookies, origins: [] } : undefined;
 
       const login = async (): Promise<void> => {
-        await options.onProgress?.({ phase: 'logging-in', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length });
+        await options.onProgress?.({
+          phase: 'logging-in',
+          label: account.label,
+          username: account.username,
+          index: accIndex + 1,
+          total: accounts.length,
+          accIndex,
+          accTotal: accounts.length,
+        });
         logger.info({ account: account.label }, 'Authenticating account on CodeChef...');
         const updated = await loginToCodeChef(credentials.username ?? account.username ?? account.label, credentials.password ?? '');
         state = { cookies: updated.cookies, origins: [] };
         await patchCodeChefAccount(account.id, { storageState: JSON.stringify({ username: credentials.username, password: credentials.password, ...updated }), checked: true });
         logger.info({ account: account.label }, 'CodeChef account session saved to DB');
-        await options.onProgress?.({ phase: 'session-ready', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length });
+        await options.onProgress?.({
+          phase: 'session-ready',
+          label: account.label,
+          username: account.username,
+          index: accIndex + 1,
+          total: accounts.length,
+          accIndex,
+          accTotal: accounts.length,
+        });
       };
 
       try {
@@ -399,6 +458,10 @@ export async function runCodeChefNow(
             progressIndex,
             progressTotal,
             signal,
+            accIndex,
+            accounts.length,
+            step + 1,
+            batchCount,
           );
           if (signal.aborted || !candidate) break;
 
@@ -419,11 +482,44 @@ export async function runCodeChefNow(
           const row: CodeChefOutcome = { label: account.label, performed: false, problem: entry.problemCode };
           logger.info({ account: account.label, problem: entry.problemCode, step: step + 1, batchCount, index, total: queue.length }, 'Starting CodeChef attempt');
 
-          await options.onProgress?.({ phase: 'loading-source', label: account.label, username: account.username, problemCode: entry.problemCode, index: progressIndex, total: progressTotal });
+          await options.onProgress?.({
+            phase: 'loading-source',
+            label: account.label,
+            username: account.username,
+            problemCode: entry.problemCode,
+            index: progressIndex,
+            total: progressTotal,
+            accIndex,
+            accTotal: accounts.length,
+            stepIndex: step + 1,
+            stepTotal: batchCount,
+          });
           const code = await fetchSourceCode(entry);
 
-          await options.onProgress?.({ phase: 'opening-submit', label: account.label, username: account.username, problemCode: entry.problemCode, index: progressIndex, total: progressTotal });
-          await options.onProgress?.({ phase: 'submitting', label: account.label, username: account.username, problemCode: entry.problemCode, index: progressIndex, total: progressTotal });
+          await options.onProgress?.({
+            phase: 'opening-submit',
+            label: account.label,
+            username: account.username,
+            problemCode: entry.problemCode,
+            index: progressIndex,
+            total: progressTotal,
+            accIndex,
+            accTotal: accounts.length,
+            stepIndex: step + 1,
+            stepTotal: batchCount,
+          });
+          await options.onProgress?.({
+            phase: 'submitting',
+            label: account.label,
+            username: account.username,
+            problemCode: entry.problemCode,
+            index: progressIndex,
+            total: progressTotal,
+            accIndex,
+            accTotal: accounts.length,
+            stepIndex: step + 1,
+            stepTotal: batchCount,
+          });
 
           mayHaveSubmitted = true;
           // 1. Direct API submit (0MB browser RAM, takes 2-3s, completely avoids Render OOM)
@@ -461,6 +557,10 @@ export async function runCodeChefNow(
               problemCode: entry.problemCode,
               index: progressIndex,
               total: progressTotal,
+              accIndex,
+              accTotal: accounts.length,
+              stepIndex: step + 1,
+              stepTotal: batchCount,
               error: `Retired problem ${entry.problemCode} skipped`,
             });
             retiredSkips++;
@@ -509,6 +609,10 @@ export async function runCodeChefNow(
                 submissionId: posted.submissionId,
                 index: progressIndex,
                 total: progressTotal,
+                accIndex,
+                accTotal: accounts.length,
+                stepIndex: step + 1,
+                stepTotal: batchCount,
               });
             } else {
               if (activeRangeJob) activeRangeJob.failed++;
@@ -523,6 +627,10 @@ export async function runCodeChefNow(
                 error: posted.error,
                 index: progressIndex,
                 total: progressTotal,
+                accIndex,
+                accTotal: accounts.length,
+                stepIndex: step + 1,
+                stepTotal: batchCount,
               });
             }
 
@@ -541,6 +649,10 @@ export async function runCodeChefNow(
                 problemCode: entry.problemCode,
                 index: progressIndex,
                 total: progressTotal,
+                accIndex,
+                accTotal: accounts.length,
+                stepIndex: step + 1,
+                stepTotal: batchCount,
                 waitSeconds: Math.round(CODECHEF_RANGE_GAP_MS / 1000),
               });
               await sleepWithAbort(CODECHEF_RANGE_GAP_MS, signal);
@@ -560,7 +672,16 @@ export async function runCodeChefNow(
         await patchCodeChefAccount(account.id, { lastError: errorMsg, checked: true }).catch(() => undefined);
         if (claimed && !mayHaveSubmitted) await releaseDailyAttempt(account.id, report.date).catch(() => undefined);
         report.outcomes.push({ label: account.label, performed: false, error: errorMsg, problem: entry?.problemCode });
-        await options.onProgress?.({ phase: 'failed', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length, error: errorMsg });
+        await options.onProgress?.({
+          phase: 'failed',
+          label: account.label,
+          username: account.username,
+          index: accIndex + 1,
+          total: accounts.length,
+          accIndex,
+          accTotal: accounts.length,
+          error: errorMsg,
+        });
       }
 
       if (signal.aborted) {
@@ -573,6 +694,8 @@ export async function runCodeChefNow(
           username: account.username,
           index: accIndex + 1,
           total: accounts.length,
+          accIndex,
+          accTotal: accounts.length,
           error: 'CodeChef batch cancelled by user',
         });
         break;

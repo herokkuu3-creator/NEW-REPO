@@ -582,6 +582,76 @@ function scheduleBatchRun(): void {
  * The run is started in the background so the bot keeps answering other
  * commands (/status etc.) while the submissions are in progress.
  */
+export interface CodeChefAccountSectionState {
+  accIndex: number;
+  label: string;
+  username?: string | null;
+  completedItems: string[];
+  activeLine?: string;
+  accountStatus?: string;
+}
+
+export function renderCodeChefProgressSections(
+  sections: ReadonlyMap<number, CodeChefAccountSectionState>,
+  totalAccounts: number,
+): string[] {
+  const sorted = [...sections.values()].sort((a, b) => a.accIndex - b.accIndex);
+  if (sorted.length === 0) {
+    return ['<i>Waiting for progress updates…</i>'];
+  }
+
+  const effectiveTotal = Math.max(totalAccounts, sorted.length);
+  const escape = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const buildBlocks = (pruneThreshold?: number): string[] => {
+    return sorted.map((sec) => {
+      const accNum = sec.accIndex + 1;
+      const name = escape(sec.username ?? sec.label);
+      const header = `👤 <b>Account ${accNum}/${effectiveTotal} · <code>${name}</code></b>`;
+
+      let completed = sec.completedItems;
+      let prunedNotice: string | null = null;
+      if (pruneThreshold && completed.length > pruneThreshold) {
+        const skippedCount = completed.length - pruneThreshold;
+        prunedNotice = `<i>… ${skippedCount} earlier completed question(s)</i>`;
+        completed = completed.slice(completed.length - pruneThreshold);
+      }
+
+      const items: string[] = [];
+      if (prunedNotice) items.push(prunedNotice);
+      items.push(...completed);
+
+      if (sec.activeLine) {
+        items.push(sec.activeLine);
+      } else if (sec.accountStatus && items.length === 0) {
+        items.push(sec.accountStatus);
+      }
+
+      if (items.length === 0) {
+        items.push('⏳ Queued…');
+      }
+
+      const treeLines = items.map((item, idx) => {
+        const isLast = idx === items.length - 1;
+        const connector = isLast ? '└ ' : '├ ';
+        return `${connector}${item}`;
+      });
+
+      return [header, ...treeLines].join('\n');
+    });
+  };
+
+  let blocks = buildBlocks();
+  if (blocks.join('\n\n').length > 3400) {
+    blocks = buildBlocks(6);
+  }
+  if (blocks.join('\n\n').length > 3400) {
+    blocks = buildBlocks(3);
+  }
+
+  return blocks;
+}
+
 export function renderCodeChefProgressLines(progress: ReadonlyMap<number, string>): string[] {
   const rows = [...progress.entries()].sort(([a], [b]) => a - b);
   const selected: string[] = [];
@@ -631,6 +701,22 @@ export async function handleCodeChefTrigger(
     return { done };
   }
 
+  const configuredAccounts = await listCodeChefAccounts(true).catch(() => []);
+  const initialTotalAccounts = Math.max(1, configuredAccounts.length);
+  const accountSections = new Map<number, CodeChefAccountSectionState>();
+
+  for (let i = 0; i < configuredAccounts.length; i++) {
+    const acc = configuredAccounts[i];
+    if (!acc) continue;
+    accountSections.set(i, {
+      accIndex: i,
+      label: acc.label,
+      username: acc.username,
+      completedItems: [],
+      activeLine: i === 0 ? '🔎 Initializing session…' : '⏳ Queued…',
+    });
+  }
+
   const title = options.count && options.count > 1
     ? `<b>👨‍🍳 CODECHEF BATCH (${options.count} Questions)</b>`
     : options.forceNext
@@ -641,21 +727,31 @@ export async function handleCodeChefTrigger(
     ? `🔎 Initializing batch (${options.count} questions)…\n<i>⏳ 30s pacing between questions · /ccrangestatus · /cccancelrange</i>`
     : `🔎 Initializing CodeChef…`;
 
+  const initialBlocks = configuredAccounts.length > 0
+    ? renderCodeChefProgressSections(accountSections, initialTotalAccounts).join('\n\n')
+    : initialSubtitle;
+
   const statusMessage = await tgApi<{ message_id: number }>('sendMessage', {
     chat_id: config.telegram.chatId,
-    text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${initialSubtitle}`,
+    text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${initialBlocks}`,
     parse_mode: 'HTML',
     disable_web_page_preview: true,
   });
 
-  const progressLines = new Map<number, string>();
   const html = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const editProgress = async (): Promise<boolean> => {
-    const lines = renderCodeChefProgressLines(progressLines);
+  let totalAccounts = initialTotalAccounts;
+
+  const editProgress = async (extraFooter?: string): Promise<boolean> => {
+    const blocks = renderCodeChefProgressSections(accountSections, totalAccounts);
+    let body = blocks.join('\n\n');
+    if (extraFooter) body += extraFooter;
+
+    const fullText = `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${body}`;
+
     const updated = await tgApi('editMessageText', {
       chat_id: config.telegram.chatId,
       message_id: statusMessage.message_id,
-      text: [title, '<code>━━━━━━━━━━━━━━━━━━━━</code>', ...lines].join('\n'),
+      text: fullText,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     }).then(() => true).catch((err) => {
@@ -671,50 +767,131 @@ export async function handleCodeChefTrigger(
       forceDailyAttempt: options.forceNext ?? false,
       batchCount: options.count ?? 1,
       onProgress: async (event) => {
-        const acc = html(event.username ?? event.label);
-        const prob = event.problemCode ? ` · <code>${html(event.problemCode)}</code>` : '';
-        const phaseText: Record<string, string> = {
-          checking: `🔎 <b>Account ${event.index}/${event.total}</b> · checking <code>${acc}</code>…`,
-          'logging-in': `🔑 <b>Account ${event.index}/${event.total}</b> · logging in to CodeChef…`,
-          'session-ready': `🍪 <b>Account ${event.index}/${event.total}</b> · session verified for <code>${acc}</code>`,
-          'loading-source': `📦 <b>Account ${event.index}/${event.total}</b> · source loaded${prob}`,
-          'opening-submit': `🖥️ <b>Account ${event.index}/${event.total}</b> · opening submit page${prob}`,
-          submitting: `🚀 <b>Account ${event.index}/${event.total}</b> · submitting signed form${prob}`,
-          judging: `⏳ <b>Account ${event.index}/${event.total}</b> · waiting for CodeChef verdict${prob}`,
-          completed: `✅ <b>Account ${event.index}/${event.total}</b> · ${acc}${prob} — <b>${html(event.verdict ?? 'Accepted')}</b>${event.submissionId ? ` · #${html(event.submissionId)}` : ''}`,
-          failed: `❌ <b>Account ${event.index}/${event.total}</b> · ${acc}${prob} — <i>${html(event.error ?? 'Failed')}</i>`,
-          skipped: `⏭️ <b>Account ${event.index}/${event.total}</b> · ${acc}${prob} — <i>${html(event.error ?? 'Skipped')}</i>`,
-          waiting: `⏳ <b>[${event.index}/${event.total}]</b> · waiting ${event.waitSeconds ?? 30}s before next question (human pacing)…`,
-          cancelled: `🛑 <b>CodeChef batch cancelled by user</b>`,
-        };
-        progressLines.set(event.index, phaseText[event.phase] ?? `⚙️ ${event.phase}${prob}`);
+        if (event.accTotal && event.accTotal > totalAccounts) {
+          totalAccounts = event.accTotal;
+        }
+        const accIdx = event.accIndex ?? Math.max(0, event.index - 1);
+        let sec = accountSections.get(accIdx);
+        if (!sec) {
+          sec = {
+            accIndex: accIdx,
+            label: event.label,
+            username: event.username,
+            completedItems: [],
+          };
+          accountSections.set(accIdx, sec);
+        }
+        if (event.username && !sec.username) {
+          sec.username = event.username;
+        }
+
+        const stepPrefix = event.stepTotal && event.stepTotal > 1 ? `[${event.stepIndex ?? 1}/${event.stepTotal}] ` : '';
+        const probTag = event.problemCode ? `<code>${html(event.problemCode)}</code>` : '';
+
+        switch (event.phase) {
+          case 'checking':
+            sec.activeLine = '🔎 Checking session…';
+            break;
+          case 'logging-in':
+            sec.activeLine = '🔑 Logging in to CodeChef…';
+            break;
+          case 'session-ready':
+            sec.activeLine = '🍪 Session verified';
+            break;
+          case 'loading-source':
+            sec.activeLine = `📦 ${stepPrefix}Source loaded${probTag ? ` · ${probTag}` : ''}`;
+            break;
+          case 'opening-submit':
+            sec.activeLine = `🖥️ ${stepPrefix}Opening submit page${probTag ? ` · ${probTag}` : ''}`;
+            break;
+          case 'submitting':
+            sec.activeLine = `🚀 ${stepPrefix}Submitting signed form${probTag ? ` · ${probTag}` : ''}`;
+            break;
+          case 'judging':
+            sec.activeLine = `⏳ ${stepPrefix}Waiting for CodeChef verdict${probTag ? ` · ${probTag}` : ''}`;
+            break;
+          case 'completed': {
+            const verdict = html(event.verdict ?? 'Accepted');
+            const sub = event.submissionId
+              ? ` · <a href="https://www.codechef.com/viewsolution/${html(event.submissionId)}">#${html(event.submissionId)}</a>`
+              : '';
+            const line = `✅ ${stepPrefix}${probTag ? `${probTag} — ` : ''}<b>${verdict}</b>${sub}`;
+            sec.completedItems.push(line);
+            sec.activeLine = undefined;
+            break;
+          }
+          case 'failed': {
+            const err = html(event.error ?? 'Failed');
+            const line = `❌ ${stepPrefix}${probTag ? `${probTag} — ` : ''}<i>${err}</i>`;
+            sec.completedItems.push(line);
+            sec.activeLine = undefined;
+            break;
+          }
+          case 'skipped': {
+            const err = html(event.error ?? 'Skipped');
+            const line = `⏭️ ${stepPrefix}${probTag ? `${probTag} — ` : ''}<i>${err}</i>`;
+            sec.completedItems.push(line);
+            sec.activeLine = undefined;
+            break;
+          }
+          case 'waiting': {
+            const nextStep = (event.stepIndex ?? 1) + 1;
+            const nextStepStr = event.stepTotal && event.stepTotal > 1 ? ` before question [${nextStep}/${event.stepTotal}]` : '';
+            sec.activeLine = `⏳ Waiting ${event.waitSeconds ?? 30}s${nextStepStr} (human pacing)…`;
+            break;
+          }
+          case 'cancelled':
+            sec.activeLine = '🛑 Batch cancelled by user';
+            sec.accountStatus = '🛑 Cancelled';
+            break;
+          default:
+            sec.activeLine = `⚙️ ${event.phase}${probTag ? ` · ${probTag}` : ''}`;
+            break;
+        }
+
         await editProgress();
       },
-      onAccountOutcome: async (outcome, index, total) => {
-        const line = formatCodeChefAccountMessage(outcome, index, total);
-        progressLines.set(index, line);
+      onAccountOutcome: async () => {
         await editProgress();
       },
     });
 
     if (!report) {
-      progressLines.set(0, '⏳ Not started: another run began concurrently.');
-      await editProgress();
+      await tgApi('editMessageText', {
+        chat_id: config.telegram.chatId,
+        message_id: statusMessage.message_id,
+        text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⏳ Not started: another run began concurrently.`,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }).catch(() => undefined);
     } else if (report.outcomes.length === 0) {
-      progressLines.set(0, '📭 No active CodeChef accounts configured. Add CODECHEF_1 in Render.');
-      await editProgress();
+      await tgApi('editMessageText', {
+        chat_id: config.telegram.chatId,
+        message_id: statusMessage.message_id,
+        text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n📭 No active CodeChef accounts configured. Add CODECHEF_1 in Render.`,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }).catch(() => undefined);
     } else {
-      progressLines.clear();
-      report.outcomes.forEach((outcome, i) => {
-        progressLines.set(i + 1, formatCodeChefAccountMessage(outcome, i + 1, report.outcomes.length));
-      });
-      await editProgress();
-      logger.info({ summary: report.outcomes.length }, 'telegram /codechef run finished');
+      for (const sec of accountSections.values()) {
+        sec.activeLine = undefined;
+      }
+      const solved = report.outcomes.filter(o => o.verdict === 'Accepted' || (o.performed && !o.error)).length;
+      const failed = report.outcomes.filter(o => !o.skipped && (o.error || (o.verdict && o.verdict !== 'Accepted'))).length;
+      const skipped = report.outcomes.filter(o => o.skipped).length;
+      const summaryText = `\n\n🏆 <b>Finished:</b> ${solved} solved · ${failed} failed · ${skipped} skipped`;
+      await editProgress(summaryText);
+      logger.info({ summary: report.outcomes.length, solved, failed, skipped }, 'telegram /codechef run finished');
     }
   })().catch(async (err) => {
     logger.warn({ err: errText(err) }, 'CodeChef telegram run failed');
-    progressLines.set(999, `⚠️ Error: ${html(errText(err))}`);
-    await editProgress().catch(() => undefined);
+    await tgApi('editMessageText', {
+      chat_id: config.telegram.chatId,
+      message_id: statusMessage.message_id,
+      text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${html(errText(err))}`,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    }).catch(() => undefined);
   });
 
   return { done };
