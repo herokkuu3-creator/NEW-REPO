@@ -28,6 +28,93 @@ import { type CodeChefState } from './browser';
 let runInProgress = false;
 export function isCodeChefRunInProgress(): boolean { return runInProgress; }
 
+export interface CodeChefRangeJobInfo {
+  totalRequested: number;
+  completed: number;
+  skipped: number;
+  failed: number;
+  currentStep: number;
+  currentAccount: string | null;
+  currentProblem: string | null;
+  startedAt: number;
+  state: 'running' | 'waiting' | 'cancelling' | 'idle';
+  waitEndsAt?: number;
+}
+
+let activeRangeAbortController: AbortController | null = null;
+let activeRangeJob: CodeChefRangeJobInfo | null = null;
+
+export const CODECHEF_RANGE_GAP_MS = 30000; // 30-second pacing between batch questions to mimic human behavior
+
+export function cancelCodeChefRun(): boolean {
+  if (!runInProgress) return false;
+  if (activeRangeJob) activeRangeJob.state = 'cancelling';
+  if (activeRangeAbortController) {
+    activeRangeAbortController.abort();
+    return true;
+  }
+  return false;
+}
+
+export function getCodeChefRangeStatus(): CodeChefRangeJobInfo | null {
+  return activeRangeJob ? { ...activeRangeJob } : null;
+}
+
+export function formatCodeChefRangeStatus(info: CodeChefRangeJobInfo, now = Date.now()): string {
+  const elapsedSec = Math.max(0, Math.floor((now - info.startedAt) / 1000));
+  const elapsedMin = Math.floor(elapsedSec / 60);
+  const elapsedRemSec = elapsedSec % 60;
+  const elapsedStr = elapsedMin > 0 ? `${elapsedMin}m ${elapsedRemSec}s` : `${elapsedSec}s`;
+
+  const doneCount = info.completed + info.skipped;
+  const remaining = Math.max(0, info.totalRequested - doneCount);
+  const pct = info.totalRequested > 0 ? Math.round((doneCount / info.totalRequested) * 100) : 0;
+
+  let stateIcon = '🏃';
+  let stateDesc = 'Running';
+  if (info.state === 'waiting' && info.waitEndsAt) {
+    const waitSec = Math.max(0, Math.ceil((info.waitEndsAt - now) / 1000));
+    stateIcon = '⏳';
+    stateDesc = `Pacing delay (${waitSec}s remaining before next submit)`;
+  } else if (info.state === 'cancelling') {
+    stateIcon = '🛑';
+    stateDesc = 'Cancelling…';
+  }
+
+  const escape = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  return [
+    '<b>👨‍🍳 CODECHEF RANGE STATUS</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    `⚙️ <b>Status:</b> ${stateIcon} <i>${stateDesc}</i>`,
+    `🎯 <b>Progress:</b> <b>${info.completed}</b> / ${info.totalRequested} questions (<b>${pct}%</b>)`,
+    `✅ <b>Completed:</b> ${info.completed}`,
+    `⏭️ <b>Skipped:</b> ${info.skipped}`,
+    `❌ <b>Failed:</b> ${info.failed}`,
+    `⏳ <b>Remaining:</b> ${remaining}`,
+    info.currentAccount ? `👤 <b>Account:</b> <code>${escape(info.currentAccount)}</code>` : '',
+    info.currentProblem ? `📝 <b>Current Problem:</b> <code>${escape(info.currentProblem)}</code>` : '',
+    `⏱️ <b>Elapsed Time:</b> ${elapsedStr}`,
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    '<i>Send <code>/cccancelrange</code> to stop this batch job.</i>',
+  ].filter(Boolean).join('\n');
+}
+
+export function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      resolve();
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 export function isTerminalCodeChefVerdict(verdict: string | null | undefined): boolean {
   if (!verdict) return false;
   const v = verdict.toLowerCase();
@@ -50,7 +137,7 @@ export interface CodeChefReport {
 }
 
 export interface CodeChefProgressEvent {
-  phase: 'checking' | 'logging-in' | 'session-ready' | 'loading-source' | 'opening-submit' | 'submitting' | 'judging' | 'completed' | 'failed' | 'skipped';
+  phase: 'checking' | 'logging-in' | 'session-ready' | 'loading-source' | 'opening-submit' | 'submitting' | 'judging' | 'completed' | 'failed' | 'skipped' | 'waiting' | 'cancelled';
   label: string;
   username?: string | null;
   problemCode?: string | null;
@@ -59,6 +146,7 @@ export interface CodeChefProgressEvent {
   verdict?: string | null;
   submissionId?: string | null;
   error?: string | null;
+  waitSeconds?: number;
 }
 
 export interface CodeChefRunOptions {
@@ -123,11 +211,13 @@ export async function advanceToNextValidProblem(
   onProgress?: (event: CodeChefProgressEvent) => Promise<void> | void,
   progressIndex = 1,
   progressTotal = 1,
+  signal?: AbortSignal,
 ): Promise<{ entry: CodeChefSourceEntry; index: number } | null> {
   let currIdx = startIndex;
   let skips = 0;
 
   while (currIdx < queue.length && skips < 50) {
+    if (signal?.aborted) return null;
     const candidate = queue[currIdx];
     if (!candidate || !candidate.problemCode) break;
 
@@ -138,6 +228,7 @@ export async function advanceToNextValidProblem(
 
     logger.warn({ account: accountLabel, problem: candidate.problemCode, reason: check.reason }, 'CodeChef problem is unlisted or URL is invalid; auto-skipping...');
     skips++;
+    if (activeRangeJob) activeRangeJob.skipped++;
     const nextCandidate = queue[currIdx + 1];
     await completeCurrentProblem(accountId, {
       completedKey: candidate.problemCode,
@@ -205,6 +296,8 @@ export async function runCodeChefNow(
 ): Promise<CodeChefReport | null> {
   if (runInProgress) return null;
   runInProgress = true;
+  activeRangeAbortController = new AbortController();
+  const signal = activeRangeAbortController.signal;
   try {
     const report: CodeChefReport = { date: todayInTimezone(), outcomes: [] };
     await ensureCodeChefAccountsSeeded();
@@ -213,7 +306,21 @@ export async function runCodeChefNow(
     const batchCount = Math.max(1, options.batchCount ?? 1);
     const forceAttempt = options.forceDailyAttempt ?? (reason === 'manual');
 
+    activeRangeJob = {
+      totalRequested: accounts.length * batchCount,
+      completed: 0,
+      skipped: 0,
+      failed: 0,
+      currentStep: 0,
+      currentAccount: null,
+      currentProblem: null,
+      startedAt: Date.now(),
+      state: 'running',
+    };
+
     for (const [accIndex, account] of accounts.entries()) {
+      if (signal.aborted) break;
+
       if (isLeetCodeBusy()) {
         const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, error: 'LeetCode is running; CodeChef was deferred to avoid competing for memory' };
         report.outcomes.push(row);
@@ -233,7 +340,10 @@ export async function runCodeChefNow(
         options.onProgress,
         accIndex + 1,
         accounts.length,
+        signal,
       );
+
+      if (signal.aborted) break;
 
       if (!validCandidate) {
         const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, error: 'Source queue exhausted or no valid problems remain' };
@@ -273,6 +383,8 @@ export async function runCodeChefNow(
 
         let retiredSkips = 0;
         for (let step = 0; step < batchCount; step++) {
+          if (signal.aborted) break;
+
           const progressIndex = accounts.length > 1 && batchCount === 1 ? accIndex + 1 : (accounts.length > 1 ? accIndex * batchCount + step + 1 : step + 1);
           const progressTotal = accounts.length > 1 && batchCount === 1 ? accounts.length : (accounts.length > 1 ? accounts.length * batchCount : batchCount);
 
@@ -286,11 +398,18 @@ export async function runCodeChefNow(
             options.onProgress,
             progressIndex,
             progressTotal,
+            signal,
           );
-          if (!candidate) break;
+          if (signal.aborted || !candidate) break;
 
           index = candidate.index;
           entry = candidate.entry;
+
+          if (activeRangeJob) {
+            activeRangeJob.currentStep = progressIndex;
+            activeRangeJob.currentAccount = account.label;
+            activeRangeJob.currentProblem = entry.problemCode ?? null;
+          }
 
           if (step > 0 || retiredSkips > 0) {
             claimed = await claimDailyAttempt(account.id, report.date, entry.problemCode!, true);
@@ -324,6 +443,7 @@ export async function runCodeChefNow(
           if (isProblemInvalid) {
             logger.warn({ account: account.label, problem: entry.problemCode }, 'CodeChef problem is retired or contest-restricted; advancing cursor past it...');
             RETIRED_OR_INVALID_CODECHEF_PROBLEMS.add(entry.problemCode!);
+            if (activeRangeJob) activeRangeJob.skipped++;
             await completeCurrentProblem(account.id, {
               completedKey: entry.problemCode!,
               nextKey: queue[index + 1]?.problemCode ?? null,
@@ -365,6 +485,7 @@ export async function runCodeChefNow(
 
             const isCompleted = row.performed || (posted.submissionId && isTerminalCodeChefVerdict(posted.verdict)) || isTerminalCodeChefVerdict(posted.verdict);
             if (isCompleted) {
+              if (activeRangeJob) activeRangeJob.completed++;
               await completeCurrentProblem(account.id, {
                 completedKey: entry.problemCode!,
                 nextKey: queue[index + 1]?.problemCode ?? null,
@@ -390,6 +511,7 @@ export async function runCodeChefNow(
                 total: progressTotal,
               });
             } else {
+              if (activeRangeJob) activeRangeJob.failed++;
               await recordAttempt(account.id, { submissionId: posted.submissionId ?? null, verdict: posted.verdict ?? null });
               await patchCodeChefAccount(account.id, { lastError: posted.error ?? 'No confirmed CodeChef result', checked: true });
               if (!mayHaveSubmitted) await releaseDailyAttempt(account.id, report.date);
@@ -407,8 +529,29 @@ export async function runCodeChefNow(
             report.outcomes.push(row);
             await options.onAccountOutcome?.(row, progressIndex, progressTotal);
 
-            if (step < batchCount - 1) {
-              await new Promise((res) => setTimeout(res, 5000));
+            if (step < batchCount - 1 && !signal.aborted) {
+              if (activeRangeJob) {
+                activeRangeJob.state = 'waiting';
+                activeRangeJob.waitEndsAt = Date.now() + CODECHEF_RANGE_GAP_MS;
+              }
+              await options.onProgress?.({
+                phase: 'waiting',
+                label: account.label,
+                username: account.username,
+                problemCode: entry.problemCode,
+                index: progressIndex,
+                total: progressTotal,
+                waitSeconds: Math.round(CODECHEF_RANGE_GAP_MS / 1000),
+              });
+              await sleepWithAbort(CODECHEF_RANGE_GAP_MS, signal);
+              if (activeRangeJob) {
+                activeRangeJob.state = 'running';
+                activeRangeJob.waitEndsAt = undefined;
+              }
+              if (signal.aborted) {
+                logger.info('CodeChef batch run aborted by user during pacing delay');
+                break;
+              }
             }
           }
       } catch (err) {
@@ -420,18 +563,35 @@ export async function runCodeChefNow(
         await options.onProgress?.({ phase: 'failed', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length, error: errorMsg });
       }
 
-      if (accIndex < accounts.length - 1) {
-        await new Promise((res) => setTimeout(res, 4000));
+      if (signal.aborted) {
+        logger.info({ account: account.label }, 'CodeChef run aborted by user');
+        const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, error: 'Cancelled by user' };
+        report.outcomes.push(row);
+        await options.onProgress?.({
+          phase: 'cancelled',
+          label: account.label,
+          username: account.username,
+          index: accIndex + 1,
+          total: accounts.length,
+          error: 'CodeChef batch cancelled by user',
+        });
+        break;
+      }
+
+      if (accIndex < accounts.length - 1 && !signal.aborted) {
+        await sleepWithAbort(4000, signal);
       }
     }
 
-    if (reason === 'cron') {
+    if (reason === 'cron' && !signal.aborted) {
       await sendTelegramMessage(formatCodeChefReport(report), { parseMode: 'HTML' }).catch(() => undefined);
     }
     logger.info({ reason, accounts: report.outcomes.length, performed: report.outcomes.filter((row) => row.performed).length }, 'CodeChef run finished');
     return report;
   } finally {
     runInProgress = false;
+    activeRangeJob = null;
+    activeRangeAbortController = null;
   }
 }
 

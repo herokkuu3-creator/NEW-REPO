@@ -129,4 +129,32 @@ describe('CodeChef daily progress', () => {
     // 'ZZZ' is missing from queue; wraps around to 0
     expect(findNextCodeChefSourceIndex(queue, { nextKey: 'ZZZ', lastCompletedKey: null })).toBe(0);
   });
+  it('formats range status correctly including pacing countdown and progress', async () => {
+    const { formatCodeChefRangeStatus } = await import('../src/codechef/worker');
+    const now = 100000;
+    const text = formatCodeChefRangeStatus({
+      totalRequested: 10,
+      completed: 3,
+      skipped: 1,
+      failed: 0,
+      currentStep: 4,
+      currentAccount: 'tester',
+      currentProblem: 'FLOW001',
+      startedAt: now - 35000,
+      state: 'waiting',
+      waitEndsAt: now + 25000,
+    }, now);
+
+    expect(text).toContain('CODECHEF RANGE STATUS');
+    expect(text).toContain('<b>3</b> / 10 questions (<b>40%</b>)');
+    expect(text).toContain('Pacing delay (25s remaining');
+    expect(text).toContain('tester');
+    expect(text).toContain('FLOW001');
+    expect(text).toContain('35s');
+    expect(text).toContain('/cccancelrange');
+  });
+  it('cancelCodeChefRun returns false when idle', async () => {
+    const { cancelCodeChefRun } = await import('../src/codechef/worker');
+    expect(cancelCodeChefRun()).toBe(false);
+  });
 });

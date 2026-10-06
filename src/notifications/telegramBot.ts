@@ -18,7 +18,14 @@ import { describeIngest, ingestCookiePayload, Validator } from '../accounts/inge
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
 import { CODEFORCES_MANUAL_REASON, isCodeforcesRunInProgress, resolveCurrentEntry, runCodeforcesNow, type CodeforcesNetworkMode } from '../codeforces/worker';
-import { isCodeChefRunInProgress, runCodeChefNow, formatCodeChefAccountMessage } from '../codechef/worker';
+import {
+  isCodeChefRunInProgress,
+  runCodeChefNow,
+  formatCodeChefAccountMessage,
+  cancelCodeChefRun,
+  getCodeChefRangeStatus,
+  formatCodeChefRangeStatus,
+} from '../codechef/worker';
 import { listCodeChefAccounts, getCodeChefProgress as getCodeChefAccountProgress } from '../codechef/storage';
 import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts, getCodeforcesProgress, listCodeforcesAccounts } from '../codeforces/storage';
 import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../codeforces/report';
@@ -123,7 +130,9 @@ const HELP_TEXT = [
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ <code>/codechef</code> — Run daily CodeChef submission',
   '├ <code>/ccnextsubmit</code> — Force submit next solution in queue',
-  '├ <code>/ccrange</code> <i>&lt;count&gt;</i> — Batch submit next N problems <i>(e.g. <code>/ccrange 5</code>)</i>',
+  '├ <code>/ccrange</code> <i>&lt;count&gt;</i> — Batch submit next N problems <i>(30s human pacing)</i>',
+  '├ <code>/ccrangestatus</code> — Live batch progress &amp; ETA countdown',
+  '├ <code>/cccancelrange</code> — Cancel active batch submission',
   '└ <code>/ccaccounts</code> — View CodeChef accounts &amp; queue progress',
   '',
   '<b>🍪 𝗦𝗘𝗦𝗦𝗜𝗢𝗡 𝗠𝗔𝗡𝗔𝗚𝗘𝗠𝗘𝗡𝗧</b>',
@@ -356,6 +365,20 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cc_accounts':
         await replyHtml(await codechefAccountsText());
         return;
+      case '/ccrangestatus':
+      case '/cc_range_status':
+      case '/ccstatusrange':
+      case '/cc_status_range':
+        await handleCodeChefRangeStatus();
+        return;
+      case '/cccancelrange':
+      case '/cc_cancel_range':
+      case '/cccancel':
+      case '/cc_cancel':
+      case '/cancelccrange':
+      case '/cancel_cc_range':
+        await handleCancelCodeChefRange();
+        return;
       case '/submitnextsolution':
       case '/submit_next_solution':
         await handleCodeforcesSubmitNext();
@@ -421,6 +444,10 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cancel':
         pendingRenewalLabel = undefined;
         pendingRangePrompt = false;
+        if (getCodeChefRangeStatus() && getCodeChefRangeStatus()?.state !== 'idle') {
+          await handleCancelCodeChefRange();
+          return;
+        }
         await reply(
           currentRangeJob()
             ? '❌ No renewal is in progress. To stop the question-range job, send /cancelrange.'
@@ -610,9 +637,13 @@ export async function handleCodeChefTrigger(
       ? `<b>👨‍🍳 CODECHEF NEXT SUBMISSION</b>`
       : `<b>👨‍🍳 CODECHEF SUBMISSION</b>`;
 
+  const initialSubtitle = options.count && options.count > 1
+    ? `🔎 Initializing batch (${options.count} questions)…\n<i>⏳ 30s pacing between questions · /ccrangestatus · /cccancelrange</i>`
+    : `🔎 Initializing CodeChef…`;
+
   const statusMessage = await tgApi<{ message_id: number }>('sendMessage', {
     chat_id: config.telegram.chatId,
-    text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n🔎 Initializing CodeChef…`,
+    text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${initialSubtitle}`,
     parse_mode: 'HTML',
     disable_web_page_preview: true,
   });
@@ -653,6 +684,8 @@ export async function handleCodeChefTrigger(
           completed: `✅ <b>Account ${event.index}/${event.total}</b> · ${acc}${prob} — <b>${html(event.verdict ?? 'Accepted')}</b>${event.submissionId ? ` · #${html(event.submissionId)}` : ''}`,
           failed: `❌ <b>Account ${event.index}/${event.total}</b> · ${acc}${prob} — <i>${html(event.error ?? 'Failed')}</i>`,
           skipped: `⏭️ <b>Account ${event.index}/${event.total}</b> · ${acc}${prob} — <i>${html(event.error ?? 'Skipped')}</i>`,
+          waiting: `⏳ <b>[${event.index}/${event.total}]</b> · waiting ${event.waitSeconds ?? 30}s before next question (human pacing)…`,
+          cancelled: `🛑 <b>CodeChef batch cancelled by user</b>`,
         };
         progressLines.set(event.index, phaseText[event.phase] ?? `⚙️ ${event.phase}${prob}`);
         await editProgress();
@@ -685,6 +718,24 @@ export async function handleCodeChefTrigger(
   });
 
   return { done };
+}
+
+export async function handleCancelCodeChefRange(): Promise<void> {
+  const cancelled = cancelCodeChefRun();
+  if (cancelled) {
+    await reply('🛑 Cancelling CodeChef batch submission… Stopping immediately.');
+  } else {
+    await reply('🤷 No CodeChef batch submission is currently running.');
+  }
+}
+
+export async function handleCodeChefRangeStatus(): Promise<void> {
+  const status = getCodeChefRangeStatus();
+  if (!status || status.state === 'idle') {
+    await replyHtml('💤 No CodeChef batch job is currently running.\nStart one with <code>/ccrange 10</code>.');
+    return;
+  }
+  await replyHtml(formatCodeChefRangeStatus(status));
 }
 
 export async function handleTriggerSubmission(
