@@ -322,6 +322,44 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
   };
 }
 
+export function extractTelegramCommand(text: string): { command: string; arg: string } {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('/')) {
+    return { command: '', arg: '' };
+  }
+  const match = trimmed.match(/^\/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/);
+  if (!match) {
+    const firstSpace = trimmed.search(/\s/);
+    if (firstSpace === -1) {
+      return { command: trimmed.split('@')[0]!.toLowerCase(), arg: '' };
+    }
+    return {
+      command: trimmed.slice(0, firstSpace).split('@')[0]!.toLowerCase(),
+      arg: trimmed.slice(firstSpace).trim(),
+    };
+  }
+  return {
+    command: `/${match[1]!.toLowerCase()}`,
+    arg: (match[2] ?? '').trim(),
+  };
+}
+
+export function isLikelyProxyPayload(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    return false;
+  }
+  const lines = trimmed.split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return false;
+  return lines.every((line) => {
+    return (
+      /^(?:https?|socks[45]h?):\/\/\S+/i.test(line) ||
+      /^(?:[^:@\s]+:[^@\s]+@)?[a-zA-Z0-9_.-]+:\d+$/i.test(line) ||
+      /^[a-zA-Z0-9_.-]+:\d+:[^:@\s]+:[^@\s]+$/i.test(line)
+    );
+  });
+}
+
 async function handleMessage(msg: TgMessage): Promise<void> {
   // Access control: one allowed chat only.
   if (String(msg.chat.id) !== config.telegram.chatId) {
@@ -331,26 +369,25 @@ async function handleMessage(msg: TgMessage): Promise<void> {
 
   const text = (msg.text ?? '').trim();
   if (text.startsWith('/')) {
-    const cmd = text.split(/[\s@]+/)[0]?.toLowerCase();
+    const { command: cmd, arg: commandArg } = extractTelegramCommand(text);
     switch (cmd) {
       case '/start':
       case '/help':
         await replyHtml(HELP_TEXT);
         return;
       case '/renew': {
-        const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
-        if (!arg) {
+        if (!commandArg) {
           pendingRenewalLabel = undefined;
           pendingRangePrompt = false;
           await reply(RENEW_INSTRUCTIONS);
           return;
         }
-        if (!ACCOUNT_LABEL_RE.test(arg)) {
+        if (!ACCOUNT_LABEL_RE.test(commandArg)) {
           await reply('Labels may contain letters, digits, dot, dash and underscore (max 32 characters). Try again, e.g. /renew main');
           return;
         }
-        pendingRenewalLabel = arg;
-        await reply(`🏷️ Renewing the "${arg}" account. Send its cookie export (text or file) in your next message. /cancel aborts.`);
+        pendingRenewalLabel = commandArg;
+        await reply(`🏷️ Renewing the "${commandArg}" account. Send its cookie export (text or file) in your next message. /cancel aborts.`);
         return;
       }
       case '/accounts':
@@ -374,8 +411,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cc_range':
       case '/ccbatch':
       case '/cc_batch': {
-        const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
-        const parsedCount = Number.parseInt(arg, 10);
+        const parsedCount = Number.parseInt(commandArg, 10);
         if (!Number.isFinite(parsedCount) || parsedCount <= 0) {
           await replyHtml(
             [
@@ -418,9 +454,8 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cf_range':
       case '/cfbatch':
       case '/cf_batch': {
-        const rawArg = text.split(/\s+/)[1];
-        const parsedCount = parseInt(rawArg ?? '', 10);
-        if (!rawArg || isNaN(parsedCount) || parsedCount <= 0) {
+        const parsedCount = parseInt(commandArg, 10);
+        if (!commandArg || isNaN(parsedCount) || parsedCount <= 0) {
           await replyHtml(
             [
               '<b>🔢 Codeforces Batch Submission</b>',
@@ -476,8 +511,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/removeproxy':
       case '/cfremoveproxy':
       case '/rmproxy': {
-        const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
-        await handleRemoveProxyCommand(arg);
+        await handleRemoveProxyCommand(commandArg);
         return;
       }
       case '/setproxies':
@@ -486,8 +520,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/addproxy':
       case '/cfaddproxy':
       case '/cfsetproxies': {
-        const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
-        await handleAddProxyCommand(arg);
+        await handleAddProxyCommand(commandArg);
         return;
       }
       case '/syncproxies':
@@ -531,7 +564,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/question_range_submission':
       case '/rangesubmission':
         pendingRangePrompt = false;
-        await handleQuestionRangeCommand(text.split(/\s+/).slice(1).join(' '));
+        await handleQuestionRangeCommand(commandArg);
         return;
       case '/cancelrange':
       case '/cancel_range':
@@ -570,6 +603,12 @@ async function handleMessage(msg: TgMessage): Promise<void> {
   if (pendingRangePrompt && !msg.document && /^\s*#?\d/.test(text)) {
     pendingRangePrompt = false;
     await handleQuestionRangeCommand(text);
+    return;
+  }
+
+  // Non-command message: check if it's pasted proxy list first
+  if (!msg.document && isLikelyProxyPayload(text)) {
+    await handleAddProxyCommand(text);
     return;
   }
 
@@ -1619,7 +1658,8 @@ export async function handleTestProxyCommand(deps: ProxyUiDeps = defaultProxyUiD
       lines.push(`✅ [${proxy.index}/${all.length}] <code>${escapeHtml(proxy.masked)}</code> — <b>Working</b> (${result.latencyMs}ms${result.ip ? ` · IP: ${result.ip}` : ''})`);
     } else {
       failedCount++;
-      lines.push(`❌ [${proxy.index}/${all.length}] <code>${escapeHtml(proxy.masked)}</code> — <b>Failed</b> (offline/quota exceeded)`);
+      const errDetail = result.error ? ` (${escapeHtml(result.error)})` : ' (offline/quota exceeded)';
+      lines.push(`❌ [${proxy.index}/${all.length}] <code>${escapeHtml(proxy.masked)}</code> — <b>Failed</b>${errDetail}`);
       buttons.push([{ text: `❌ Blacklist #${proxy.index} in DB`, callback_data: `pxrm:${proxy.index}` }]);
     }
   }
@@ -1690,7 +1730,7 @@ export async function handleAddProxyCommand(arg?: string, deps: ProxyUiDeps = de
     await deps.send([
       '<b>➕ Set / Add Proxies</b>',
       '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-      'Please specify one or more proxy URLs (comma or newline separated):',
+      'Please specify one or more proxy URLs (comma, space, or newline separated):',
       '👉 <code>/setproxies http://user:pass@host1:port, http://user:pass@host2:port</code>',
       '',
       '<i>Or send <code>/syncproxies</code> to sync from GitHub Secrets.</i>',
@@ -1704,8 +1744,12 @@ export async function handleAddProxyCommand(arg?: string, deps: ProxyUiDeps = de
     return;
   }
 
+  const statusMsg = res.added.length > 0
+    ? `✅ <b>Added ${res.added.length} proxy(ies) to database pool!</b> (Total pool: ${res.total})`
+    : `ℹ️ <b>${res.total} proxy(ies) active in database pool!</b>`;
+
   await deps.send([
-    `✅ <b>Added ${res.added.length} proxy(ies) to database pool!</b> (Total pool: ${res.total})`,
+    statusMsg,
     '🔎 Running health checks on all proxies now...',
   ].join('\n'));
 

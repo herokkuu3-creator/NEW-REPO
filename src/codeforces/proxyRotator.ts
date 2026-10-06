@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import net from 'node:net';
+import tls from 'node:tls';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -12,28 +14,103 @@ export interface ProxyState {
   updatedAt: string;
 }
 
+function cleanProxyUrl(u: URL): string {
+  const auth = u.username ? `${u.username}${u.password ? `:${u.password}` : ''}@` : '';
+  const port = u.port ? `:${u.port}` : '';
+  const path = (u.pathname === '/' || !u.pathname) ? '' : u.pathname;
+  const search = u.search || '';
+  return `${u.protocol}//${auth}${u.hostname}${port}${path}${search}`;
+}
+
+/**
+ * Normalizes a single proxy string into a standard valid URL (http://, https://, socks5://).
+ * Supports:
+ * - standard URLs: http://user:pass@host:port
+ * - no-scheme credentials: user:pass@host:port
+ * - standard provider format: host:port:user:pass
+ * - IP:port whitelist: host:port
+ */
+export function normalizeSingleProxy(raw: string): string | null {
+  let s = raw.trim();
+  if (!s || s.startsWith('#')) return null;
+
+  // Remove surrounding quotes, brackets, angle brackets
+  s = s.replace(/^["'`<(\[]+|["'`>)\]]+$/g, '').trim();
+
+  // If already has supported protocol
+  if (/^(https?|socks[45]h?):\/\//i.test(s)) {
+    try {
+      const u = new URL(s);
+      if (['http:', 'https:', 'socks4:', 'socks5:', 'socks5h:'].includes(u.protocol) && u.hostname) {
+        return cleanProxyUrl(u);
+      }
+    } catch {
+      // Might have special characters in credentials; attempt reconstruction
+      const match = s.match(/^((?:https?|socks[45]h?):\/\/)([^:]+):([^@]+)@([^:/]+)(?::(\d+))?(\/.*)?$/i);
+      if (match && match[1] && match[2] && match[3] && match[4]) {
+        const proto = match[1];
+        const user = match[2];
+        const pass = match[3];
+        const host = match[4];
+        const portPart = match[5] ? `:${match[5]}` : '';
+        const pathPart = match[6] || '';
+        return `${proto.toLowerCase()}${encodeURIComponent(decodeURIComponent(user))}:${encodeURIComponent(decodeURIComponent(pass))}@${host}${portPart}${pathPart}`;
+      }
+    }
+  }
+
+  // Check host:port:user:pass (e.g. gateway.brightdata.com:33335:user:pass)
+  const hpupMatch = s.match(/^([a-zA-Z0-9_.-]+):(\d+):([^:@\s]+):([^@\s]+)$/);
+  if (hpupMatch && hpupMatch[1] && hpupMatch[2] && hpupMatch[3] && hpupMatch[4]) {
+    const [, host, port, user, pass] = hpupMatch;
+    return `http://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+  }
+
+  // Check user:pass@host:port (e.g. user:pass@gateway.brightdata.com:33335)
+  const uphMatch = s.match(/^([^:@\s]+):([^@\s]+)@([a-zA-Z0-9_.-]+):(\d+)$/);
+  if (uphMatch && uphMatch[1] && uphMatch[2] && uphMatch[3] && uphMatch[4]) {
+    const [, user, pass, host, port] = uphMatch;
+    return `http://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+  }
+
+  // Check host:port without scheme (e.g. 1.2.3.4:8080)
+  const hpMatch = s.match(/^([a-zA-Z0-9_.-]+):(\d+)$/);
+  if (hpMatch && hpMatch[1] && hpMatch[2]) {
+    const [, host, port] = hpMatch;
+    return `http://${host}:${port}`;
+  }
+
+  return null;
+}
+
 /**
  * Parses raw proxy configuration string supporting:
  * - comma separated: proxy1, proxy2
  * - newline separated: proxy1\nproxy2
+ * - space separated: proxy1 proxy2
  * - combined comma and newline: proxy1,\nproxy2
  * - semicolon separated: proxy1; proxy2
  * Ignores comments (lines starting with #) and invalid URLs.
  */
 export function parseProxyList(raw: string | undefined | null): string[] {
   if (!raw) return [];
-  return raw
-    .split(/[\r\n,;]+/)
-    .map((s) => s.trim())
-    .filter((s) => {
-      if (!s || s.startsWith('#')) return false;
-      try {
-        const u = new URL(s);
-        return ['http:', 'https:', 'socks4:', 'socks5:', 'socks5h:'].includes(u.protocol) && !!u.hostname;
-      } catch {
-        return false;
-      }
-    });
+  const lines = raw.split(/[\r\n,;]+/);
+  const tokens: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const parts = trimmed.split(/\s+/).filter(Boolean);
+    tokens.push(...parts);
+  }
+
+  const results: string[] = [];
+  for (const token of tokens) {
+    const normalized = normalizeSingleProxy(token);
+    if (normalized && !results.includes(normalized)) {
+      results.push(normalized);
+    }
+  }
+  return results;
 }
 
 /**
@@ -63,10 +140,169 @@ export interface ProxyTestResult {
 }
 
 /**
- * Tests proxy health with minimal data (~150 bytes) using Cloudflare's trace endpoint.
- * Returns detailed latency, discovered IP, and success state.
+ * Native Node.js TCP HTTP CONNECT test.
+ * Zero dependency on curl binary — runs anywhere Node runs with minimal data (~150 bytes).
  */
-export async function testProxyDetailed(
+async function testHttpProxyNative(
+  proxyUrl: string,
+  timeoutSeconds = 8,
+): Promise<ProxyTestResult> {
+  const start = Date.now();
+  const u = new URL(proxyUrl);
+  const isHttpsProxy = u.protocol === 'https:';
+  const proxyHost = u.hostname;
+  const proxyPort = Number(u.port) || (isHttpsProxy ? 443 : 80);
+  const timeoutMs = timeoutSeconds * 1000;
+
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = (res: ProxyTestResult) => {
+      if (!finished) {
+        finished = true;
+        resolve(res);
+      }
+    };
+
+    const targetHost = 'challenges.cloudflare.com';
+    const targetPort = 443;
+
+    let authHeader = '';
+    if (u.username || u.password) {
+      const user = decodeURIComponent(u.username);
+      const pass = decodeURIComponent(u.password);
+      const creds = Buffer.from(`${user}:${pass}`).toString('base64');
+      authHeader = `Proxy-Authorization: Basic ${creds}\r\n`;
+    }
+
+    let socket: net.Socket;
+    try {
+      if (isHttpsProxy) {
+        socket = tls.connect({
+          host: proxyHost,
+          port: proxyPort,
+          servername: proxyHost,
+          rejectUnauthorized: false,
+        });
+      } else {
+        socket = net.createConnection({
+          host: proxyHost,
+          port: proxyPort,
+        });
+      }
+    } catch (err) {
+      return finish({
+        ok: false,
+        latencyMs: Date.now() - start,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    const timer = setTimeout(() => {
+      try { socket.destroy(); } catch {}
+      finish({ ok: false, latencyMs: Date.now() - start, error: `Connection timed out after ${timeoutSeconds}s` });
+    }, timeoutMs);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      try { socket.destroy(); } catch {}
+    };
+
+    socket.on('error', (err) => {
+      cleanup();
+      finish({ ok: false, latencyMs: Date.now() - start, error: err.message });
+    });
+
+    const onConnected = () => {
+      const connectReq =
+        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
+        `Host: ${targetHost}:${targetPort}\r\n` +
+        `User-Agent: curl/8.4.0\r\n` +
+        authHeader +
+        `\r\n`;
+      socket.write(connectReq);
+    };
+
+    if (isHttpsProxy) {
+      socket.on('secureConnect', onConnected);
+    } else {
+      socket.on('connect', onConnected);
+    }
+
+    let responseBuffer = '';
+    socket.on('data', (chunk) => {
+      responseBuffer += chunk.toString('latin1');
+      if (responseBuffer.includes('\r\n\r\n') || responseBuffer.includes('\n\n')) {
+        const firstLine = (responseBuffer.split(/\r?\n/)[0] ?? '').trim();
+        const statusMatch = firstLine.match(/HTTP\/\d(?:\.\d)?\s+(\d+)/i);
+        const statusCode = statusMatch ? Number(statusMatch[1]) : 0;
+
+        if (statusCode === 200) {
+          const latencyMs = Date.now() - start;
+          socket.removeAllListeners('data');
+          socket.removeAllListeners('error');
+
+          // Tunnel is established! Try quick TLS query to get outbound IP
+          try {
+            const tlsTunnel = tls.connect({
+              socket,
+              servername: targetHost,
+              rejectUnauthorized: false,
+            }, () => {
+              tlsTunnel.write(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${targetHost}\r\nUser-Agent: curl/8.4.0\r\nConnection: close\r\n\r\n`);
+            });
+
+            let traceBody = '';
+            tlsTunnel.on('data', (data) => {
+              traceBody += data.toString('utf8');
+              if (traceBody.includes('ip=')) {
+                cleanup();
+                try { tlsTunnel.destroy(); } catch {}
+                const ipMatch = traceBody.match(/^ip=([^\r\n]+)/m);
+                finish({
+                  ok: true,
+                  latencyMs: Date.now() - start,
+                  ip: ipMatch ? ipMatch[1]?.trim() : undefined,
+                });
+              }
+            });
+
+            tlsTunnel.on('error', () => {
+              cleanup();
+              finish({ ok: true, latencyMs });
+            });
+
+            tlsTunnel.on('end', () => {
+              cleanup();
+              const ipMatch = traceBody.match(/^ip=([^\r\n]+)/m);
+              finish({
+                ok: true,
+                latencyMs: Date.now() - start,
+                ip: ipMatch ? ipMatch[1]?.trim() : undefined,
+              });
+            });
+          } catch {
+            cleanup();
+            finish({ ok: true, latencyMs });
+          }
+        } else if (statusCode === 407) {
+          cleanup();
+          finish({ ok: false, latencyMs: Date.now() - start, error: 'Proxy 407 (Invalid credentials / authentication failed)' });
+        } else if (statusCode === 403 || statusCode === 402) {
+          cleanup();
+          finish({ ok: false, latencyMs: Date.now() - start, error: `Proxy ${statusCode} (Quota expired / access forbidden)` });
+        } else if (statusCode >= 500) {
+          cleanup();
+          finish({ ok: false, latencyMs: Date.now() - start, error: `Proxy ${statusCode} (Upstream gateway error)` });
+        } else {
+          cleanup();
+          finish({ ok: false, latencyMs: Date.now() - start, error: `Proxy returned HTTP ${statusCode}: ${firstLine}` });
+        }
+      }
+    });
+  });
+}
+
+async function testProxyWithCurlFallback(
   proxyUrl: string,
   timeoutSeconds = 8,
 ): Promise<ProxyTestResult> {
@@ -107,6 +343,37 @@ export async function testProxyDetailed(
     latencyMs: Date.now() - start,
     error: lastError,
   };
+}
+
+/**
+ * Tests proxy health with minimal data (~150 bytes) using Cloudflare's trace endpoint.
+ * First tries native Node.js HTTP CONNECT (zero external dependencies),
+ * then falls back to curl if needed (e.g. for socks proxies).
+ */
+export async function testProxyDetailed(
+  proxyUrl: string,
+  timeoutSeconds = 8,
+): Promise<ProxyTestResult> {
+  let u: URL;
+  try {
+    u = new URL(proxyUrl);
+  } catch {
+    return { ok: false, latencyMs: 0, error: 'Invalid proxy URL format' };
+  }
+
+  if (u.protocol === 'http:' || u.protocol === 'https:') {
+    try {
+      const nativeRes = await testHttpProxyNative(proxyUrl, timeoutSeconds);
+      if (nativeRes.ok) return nativeRes;
+      if (nativeRes.error && /Proxy (?:407|403|402|50\d)/i.test(nativeRes.error)) {
+        return nativeRes;
+      }
+    } catch {
+      // Fall through to curl fallback
+    }
+  }
+
+  return testProxyWithCurlFallback(proxyUrl, timeoutSeconds);
 }
 
 /**

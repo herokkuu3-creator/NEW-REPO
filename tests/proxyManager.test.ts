@@ -16,6 +16,8 @@ import {
   handleAddProxyCommand,
   handleRestoreProxiesCommand,
   handleProxyButton,
+  extractTelegramCommand,
+  isLikelyProxyPayload,
   type ProxyUiDeps,
 } from '../src/notifications/telegramBot';
 
@@ -273,5 +275,53 @@ describe('telegram proxy commands', () => {
     expect(sent[0]).toContain('Added 2 proxy(ies)');
     const custom = await getCustomProxies();
     expect(custom.length).toBe(2);
+  });
+
+  describe('extractTelegramCommand', () => {
+    it('preserves @ in proxy passwords without stripping', () => {
+      const text = '/setproxies http://bi_sticky:FYkZGhF73hJzSids@gateway-residential.brightdata.com:33335';
+      const parsed = extractTelegramCommand(text);
+      expect(parsed.command).toBe('/setproxies');
+      expect(parsed.arg).toBe('http://bi_sticky:FYkZGhF73hJzSids@gateway-residential.brightdata.com:33335');
+    });
+
+    it('strips @botname mention while preserving credentials', () => {
+      const text = '/setproxies@LEETCODE_BOT http://user:pass@host:8080';
+      const parsed = extractTelegramCommand(text);
+      expect(parsed.command).toBe('/setproxies');
+      expect(parsed.arg).toBe('http://user:pass@host:8080');
+    });
+
+    it('preserves multiline proxy strings', () => {
+      const text = '/setproxies\nhttp://u1:p1@h1:8080\nhttp://u2:p2@h2:8080';
+      const parsed = extractTelegramCommand(text);
+      expect(parsed.command).toBe('/setproxies');
+      expect(parsed.arg).toBe('http://u1:p1@h1:8080\nhttp://u2:p2@h2:8080');
+    });
+
+    it('parses commands with integer arguments', () => {
+      expect(extractTelegramCommand('/cfrange 10')).toEqual({ command: '/cfrange', arg: '10' });
+      expect(extractTelegramCommand('/removeproxy 3')).toEqual({ command: '/removeproxy', arg: '3' });
+    });
+
+    it('returns empty command for non-command text', () => {
+      expect(extractTelegramCommand('hello bot')).toEqual({ command: '', arg: '' });
+      expect(extractTelegramCommand('')).toEqual({ command: '', arg: '' });
+    });
+  });
+
+  describe('isLikelyProxyPayload', () => {
+    it('returns true for proxy lists', () => {
+      expect(isLikelyProxyPayload('http://user:pass@gateway.com:8080')).toBe(true);
+      expect(isLikelyProxyPayload('gateway.com:8080:user:pass')).toBe(true);
+      expect(isLikelyProxyPayload('user:pass@gateway.com:8080')).toBe(true);
+      expect(isLikelyProxyPayload('http://u:p@h1:8080\nhttp://u:p@h2:8080')).toBe(true);
+    });
+
+    it('returns false for JSON cookies or plain text', () => {
+      expect(isLikelyProxyPayload('[{"name":"cf_clearance","value":"123"}]')).toBe(false);
+      expect(isLikelyProxyPayload('{"key":"value"}')).toBe(false);
+      expect(isLikelyProxyPayload('hello how are you')).toBe(false);
+    });
   });
 });

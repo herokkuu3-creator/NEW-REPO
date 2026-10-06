@@ -33,6 +33,10 @@ RUN npm run build \
 # ---------------------------------------------------------------------------
 FROM mcr.microsoft.com/playwright:v1.63.0-noble AS runtime
 
+# Install curl and ca-certificates for network utilities and proxy verification
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
+
+
 ENV NODE_ENV=production \
     HEADLESS=true \
     BROWSER_PROFILE_PATH=/tmp/browser-profile \

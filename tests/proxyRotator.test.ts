@@ -62,6 +62,40 @@ describe('proxyRotator', () => {
       ]);
     });
 
+    it('parses space-separated proxies', () => {
+      const raw = 'http://u:p@p1.example.com:8080 http://u:p@p2.example.com:8080';
+      expect(parseProxyList(raw)).toEqual([
+        'http://u:p@p1.example.com:8080',
+        'http://u:p@p2.example.com:8080',
+      ]);
+    });
+
+    it('normalizes Bright Data style residential proxies with complex sticky usernames', () => {
+      const raw = 'http://bi_6f4af7e584_country-us_session-Y147k0Uu_lifetime-24h_streaming-1_cost-0_sticky:FYkZGhF73hJzSids@gateway-residential.brightdata.com:33335';
+      expect(parseProxyList(raw)).toEqual([raw]);
+    });
+
+    it('normalizes host:port:user:pass format', () => {
+      const raw = 'gateway.brightdata.com:33335:myuser:mypass';
+      expect(parseProxyList(raw)).toEqual([
+        'http://myuser:mypass@gateway.brightdata.com:33335',
+      ]);
+    });
+
+    it('normalizes user:pass@host:port without scheme', () => {
+      const raw = 'myuser:mypass@gateway.brightdata.com:33335';
+      expect(parseProxyList(raw)).toEqual([
+        'http://myuser:mypass@gateway.brightdata.com:33335',
+      ]);
+    });
+
+    it('normalizes host:port whitelist format without scheme', () => {
+      const raw = '192.168.1.1:8080';
+      expect(parseProxyList(raw)).toEqual([
+        'http://192.168.1.1:8080',
+      ]);
+    });
+
     it('ignores invalid URLs', () => {
       expect(parseProxyList('not-a-url, http://u:p@p1.example.com:8080, ftp://invalid')).toEqual([
         'http://u:p@p1.example.com:8080',
