@@ -330,6 +330,10 @@ export async function runCodeChefNow(
       state: 'running',
     };
 
+    if (reason === 'cron' && accounts.length > 0) {
+      await sendTelegramMessage('🚀 <b>Starting daily submission for CodeChef…</b>', { parseMode: 'HTML' }).catch(() => undefined);
+    }
+
     for (const [accIndex, account] of accounts.entries()) {
       if (signal.aborted) break;
 

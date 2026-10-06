@@ -29,6 +29,9 @@ vi.mock('../src/codeforces/submission', () => ({
 vi.mock('../src/codeforces/remoteSubmitter', () => ({
   isRemoteSubmitterConfigured: () => true, submitViaRemoteSubmitter: mocks.post,
 }));
+vi.mock('../src/notifications/telegram', () => ({
+  sendTelegramMessage: vi.fn(async () => true),
+}));
 import { runCodeforcesNow, isAfterCodeforcesSchedule } from '../src/codeforces/worker';
 
 beforeEach(() => {
@@ -88,4 +91,16 @@ it('correctly determines whether the current time is after the scheduled Codefor
   expect(isAfterCodeforcesSchedule(new Date('2026-10-06T03:59:00.000Z'), 9, 30, 'Asia/Kolkata')).toBe(false); // 09:29 IST
   expect(isAfterCodeforcesSchedule(new Date('2026-10-06T04:00:00.000Z'), 9, 30, 'Asia/Kolkata')).toBe(false); // 09:30 IST
   expect(isAfterCodeforcesSchedule(new Date('2026-10-06T04:01:00.000Z'), 9, 30, 'Asia/Kolkata')).toBe(true);  // 09:31 IST
+});
+
+it('sends starting notification and final verdict report when reason is cron', async () => {
+  const { sendTelegramMessage } = await import('../src/notifications/telegram');
+  vi.mocked(sendTelegramMessage).mockClear();
+  mocks.post.mockResolvedValue(posted);
+  mocks.poll.mockResolvedValue({ id: 101, verdict: 'OK' });
+  const report = await runCodeforcesNow('cron', { forceDailyAttempt: true });
+  expect(report?.totals).toMatchObject({ solved: 2, failed: 0 });
+  expect(sendTelegramMessage).toHaveBeenCalledTimes(2);
+  expect(vi.mocked(sendTelegramMessage).mock.calls[0]?.[0]).toContain('Starting daily submission for Codeforces');
+  expect(vi.mocked(sendTelegramMessage).mock.calls[1]?.[0]).toContain('Codeforces Daily');
 });

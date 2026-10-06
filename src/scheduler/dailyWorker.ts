@@ -45,6 +45,7 @@ import { SolutionCache } from '../solutions/solutionCache';
 import { ensureLanguage, openProblemPage, setEditorCode } from '../leetcode/editor';
 import { submitCurrentEditor } from '../leetcode/submission';
 import { notifyMultiRunReport } from '../notifications/notifier';
+import { sendTelegramMessage } from '../notifications/telegram';
 import { isoLocal } from '../time';
 import { shouldRetryWithOriginal, stripCppComments } from '../codeforces/codeSanitizer';
 
@@ -249,6 +250,10 @@ export async function executeDailyRun(
       const report = buildReport({ date: today, reason, startedAt, outcomes: [] });
       await setSystemState(SystemKeys.lastReport, JSON.stringify(report));
       return report;
+    }
+
+    if ((reason === 'cron' || reason === 'cron-retry') && accounts.length > 0) {
+      await sendTelegramMessage('🚀 <b>Starting daily submission for LeetCode…</b>', { parseMode: 'HTML' }).catch(() => undefined);
     }
 
     const outcomes: AccountOutcome[] = [];

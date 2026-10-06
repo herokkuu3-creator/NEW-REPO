@@ -157,4 +157,14 @@ describe('CodeChef daily progress', () => {
     const { cancelCodeChefRun } = await import('../src/codechef/worker');
     expect(cancelCodeChefRun()).toBe(false);
   });
+  it('sends starting notification and completion report when reason is cron', async () => {
+    const { sendTelegramMessage } = await import('../src/notifications/telegram');
+    vi.mocked(sendTelegramMessage).mockClear();
+    vi.mocked(submitDirectlyViaCodeChefApi).mockResolvedValue({ ok: true, performed: true, clicked: true, submissionId: '999', verdict: 'Accepted' });
+    const report = await runCodeChefNow('cron');
+    expect(report?.outcomes[0]?.performed).toBe(true);
+    expect(sendTelegramMessage).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(sendTelegramMessage).mock.calls[0]?.[0]).toContain('Starting daily submission for CodeChef');
+    expect(vi.mocked(sendTelegramMessage).mock.calls[1]?.[0]).toContain('CODECHEF SUBMISSION');
+  });
 });

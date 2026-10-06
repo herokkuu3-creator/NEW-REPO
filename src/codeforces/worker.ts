@@ -32,6 +32,7 @@ import {
   CodeforcesRunReport,
   formatCodeforcesReport,
 } from './report';
+import { sendTelegramMessage } from '../notifications/telegram';
 
 const CODEFORCES_LAST_REPORT_KEY = 'codeforcesLastReport';
 let runInProgress = false;
@@ -135,6 +136,10 @@ export async function executeCodeforcesRun(
       return report;
     }
 
+    if (reason === 'cron') {
+      await sendTelegramMessage('🚀 <b>Starting daily submission for Codeforces…</b>', { parseMode: 'HTML' }).catch(() => undefined);
+    }
+
     for (const account of accounts) {
       await Promise.resolve(options.onAccountProgress?.({ phase: 'checking', label: account.label, username: account.username, index: outcomes.length + 1, total: accounts.length }));
       const outcome = await runForAccount(account, today, source, forceDailyAttempt, networkMode, (phase, username, attempt) =>
@@ -150,6 +155,9 @@ export async function executeCodeforcesRun(
 
     const report = buildCodeforcesReport({ date: today, reason, startedAt, outcomes });
     await setSystemState(CODEFORCES_LAST_REPORT_KEY, JSON.stringify(report));
+    if (reason === 'cron') {
+      await sendTelegramMessage(formatCodeforcesReport(report)).catch(() => undefined);
+    }
     logger.info({ summary: formatCodeforcesReport(report) }, 'Codeforces daily run finished');
     return report;
   } finally {
