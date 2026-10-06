@@ -15,6 +15,14 @@ export interface CodeChefSourceEntry {
   reason: string;
 }
 
+export const RETIRED_OR_INVALID_CODECHEF_PROBLEMS = new Set([
+  'SCHOOL', 'ATTND', 'HMAPPY2', 'TWOSTR', 'SUBINC', 'RECIPE', 'COPS',
+  'CFRTEST', 'FLOW016', 'LUCKFOUR', 'MATCHES', 'SIMPSTAT', 'ALPHABET',
+  'SNAKPROC', 'TWODISH', 'SMPAIR', 'VCS', 'MAGDOORS', 'CHEFWORK',
+  'VACCINQ', 'SPCTRIPS', 'PRIGAME', 'TANDJ1', 'VDATES', 'CSUB',
+  'CARVANS', 'COLGLF2', 'PTMSSNG', 'STACKS', 'WEIGHTBL', 'ADAKNG',
+]);
+
 const SOLUTIONS_DIR = path.join(process.cwd(), 'codechef-solutions');
 
 export async function loadCodeChefSourceIndex(force = false): Promise<CodeChefSourceEntry[]> {
@@ -36,11 +44,11 @@ export async function loadCodeChefSourceIndex(force = false): Promise<CodeChefSo
 
   let rows = await readRows();
 
-  if (rows.length === 0 || force || await getSystemState('codechef.source-index-version') !== '2') {
+  if (rows.length === 0 || force || await getSystemState('codechef.source-index-version') !== '3') {
     logger.info('Building CodeChef source index from local files...');
     const entries = await buildLocalIndex();
     await persistAudit(entries);
-    await setSystemState('codechef.source-index-version', '2');
+    await setSystemState('codechef.source-index-version', '3');
     rows = await readRows();
   }
 
@@ -55,6 +63,7 @@ export async function loadCodeChefSourceIndex(force = false): Promise<CodeChefSo
   })).sort((a, b) => a.problemCode!.localeCompare(b.problemCode!));
   const seen = new Set<string>();
   const queue = sorted.filter(entry => {
+    if (RETIRED_OR_INVALID_CODECHEF_PROBLEMS.has(entry.problemCode!)) return false;
     if (seen.has(entry.problemCode!)) return false;
     seen.add(entry.problemCode!);
     return true;
@@ -83,6 +92,7 @@ export async function buildLocalIndex(root = SOLUTIONS_DIR): Promise<CodeChefSou
         if (file.isDirectory()) {
           await walk(res);
         } else if (file.name.toLowerCase() === 'readme.md') {
+          if (path.resolve(dir) === path.resolve(root)) continue;
           // Check if there is a cpp file in this directory
           const dirFiles = await fs.readdir(dir);
           const cppFile = dirFiles.sort().find(f => f.toLowerCase().endsWith('.cpp'));
@@ -92,15 +102,26 @@ export async function buildLocalIndex(root = SOLUTIONS_DIR): Promise<CodeChefSou
             const relativePath = path.relative(root, path.join(dir, cppFile)).split(path.sep).join('/');
             
             if (match && match[1]) {
-              entries.push({
-                path: relativePath,
-                fileName: cppFile,
-                language: 'cpp',
-                kind: 'CODECHEF' as const,
-                problemCode: match[1].toUpperCase(),
-                problemUrl: `https://www.codechef.com/problems/${match[1].toUpperCase()}`,
-                reason: 'Resolved from local directory readme.md',
-              });
+              const code = match[1].toUpperCase();
+              if (RETIRED_OR_INVALID_CODECHEF_PROBLEMS.has(code)) {
+                entries.push({
+                  path: relativePath,
+                  fileName: cppFile,
+                  language: 'cpp',
+                  kind: 'UNRESOLVED' as const,
+                  reason: `Problem ${code} retired or no longer in CodeChef Practice`,
+                });
+              } else {
+                entries.push({
+                  path: relativePath,
+                  fileName: cppFile,
+                  language: 'cpp',
+                  kind: 'CODECHEF' as const,
+                  problemCode: code,
+                  problemUrl: `https://www.codechef.com/problems/${code}`,
+                  reason: 'Resolved from local directory readme.md',
+                });
+              }
             } else {
               entries.push({
                 path: relativePath,

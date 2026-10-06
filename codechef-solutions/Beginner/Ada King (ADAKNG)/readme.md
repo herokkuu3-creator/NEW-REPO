@@ -1,1 +1,1 @@
-### https://www.codechef.com/problems/ADAKNG
+### https://www.codechef.com/problems/ADAKING

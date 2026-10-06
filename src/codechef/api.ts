@@ -10,6 +10,7 @@ export interface CodeChefSubmitResult {
   submissionId?: string;
   verdict?: string;
   error?: string;
+  problemInvalid?: boolean;
 }
 
 export function normalizeCodeChefVerdict(value: unknown): string | null {
@@ -261,11 +262,54 @@ export async function submitViaCodeChefApi(
         contestCode: 'PRACTICE',
       },
     });
-    const posted = await postRes.json().catch(() => null);
+    let posted = await postRes.json().catch(() => null);
+
+    // If rate-limited (1 submission in 3s on CodeChef), wait 4 seconds and retry once
+    if (Array.isArray(posted?.errors) && posted.errors.some((e: string) => /1 submissions in 3 seconds/i.test(e))) {
+      logger.info('CodeChef 3s rate-limit hit; waiting 4s and retrying API submit...');
+      await new Promise(resolve => setTimeout(resolve, 4000));
+      const retryRes = await request.post(`${base}/api/ide/submit`, {
+        timeout: 30000,
+        headers: {
+          'x-csrf-token': csrf,
+          'x-requested-with': 'XMLHttpRequest',
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          origin: base,
+          referer: `${base}/problems/${problemCode}?tab=ide`,
+        },
+        form: {
+          sourceCode: code,
+          language: langId,
+          problemCode,
+          contestCode: 'PRACTICE',
+        },
+      });
+      posted = await retryRes.json().catch(() => null);
+    }
+
+    if (Array.isArray(posted?.errors) && posted.errors.some((e: string) => /does not belong to the contest|no such problem/i.test(e))) {
+      logger.warn({ problemCode, errors: posted.errors }, 'Problem does not belong to contest or is retired on CodeChef');
+      return {
+        ok: false,
+        performed: false,
+        clicked: false,
+        kind: 'error',
+        problemInvalid: true,
+        error: `Problem ${problemCode} does not exist in Practice contest on CodeChef`,
+      };
+    }
+
     const first = responseDetails(posted);
     if (!first.id) {
-      logger.warn({ status: postRes.status(), body: posted }, 'CodeChef API submit returned no submission id; falling back to UI');
-      return null;
+      const errStr = Array.isArray(posted?.errors) ? posted.errors.join('; ') : posted?.message || 'No submission ID received';
+      logger.warn({ status: postRes.status(), body: posted }, 'CodeChef API submit returned no submission id');
+      return {
+        ok: false,
+        performed: false,
+        clicked: false,
+        kind: 'error',
+        error: `CodeChef submit error: ${errStr}`,
+      };
     }
 
     const submissionId = first.id;

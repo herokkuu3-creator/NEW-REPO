@@ -29,4 +29,13 @@ describe('CodeChef solution index', () => {
   it('rejects source paths that escape the shipped solution directory', async () => {
     await expect(fetchSourceCode({ path: '../../package.json', fileName: '', language: 'cpp', kind: 'CODECHEF', reason: '' })).rejects.toThrow('outside');
   });
+  it('marks known retired problems as UNRESOLVED so they are not queued', async () => {
+    const retiredDir = path.join(root, 'retired');
+    await fs.mkdir(retiredDir);
+    await fs.writeFile(path.join(retiredDir, 'README.md'), '# Problem\nhttps://www.codechef.com/problems/FLOW016');
+    await fs.writeFile(path.join(retiredDir, 'solution.cpp'), 'int main(){}');
+    const entries = await buildLocalIndex(root);
+    const flow = entries.find(e => e.path.includes('FLOW016') || e.path.includes('retired'));
+    expect(flow?.kind).toBe('UNRESOLVED');
+  });
 });

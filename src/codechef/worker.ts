@@ -174,16 +174,17 @@ export async function runCodeChefNow(
       try {
         if (!state) await login();
 
+        let retiredSkips = 0;
         for (let step = 0; step < batchCount; step++) {
+          currentProgress = await getCodeChefProgress(account.id);
+          index = nextCodeChefSource(queue, currentProgress);
+          entry = queue[index];
+          if (!entry) break;
+
           if (step > 0) {
-            currentProgress = await getCodeChefProgress(account.id);
-            index = nextCodeChefSource(queue, currentProgress);
-            entry = queue[index];
-            if (!entry) break;
             claimed = await claimDailyAttempt(account.id, report.date, entry.problemCode!, true);
             mayHaveSubmitted = false;
           }
-          if (!entry) break;
 
           const row: CodeChefOutcome = { label: account.label, performed: false, problem: entry.problemCode };
           logger.info({ account: account.label, problem: entry.problemCode, step: step + 1, batchCount, index, total: queue.length }, 'Starting CodeChef attempt');
@@ -211,8 +212,37 @@ export async function runCodeChefNow(
             posted = await submitDirectlyViaCodeChefApi(state, entry.problemUrl!, code, entry.language, 90000);
           }
 
-          // 3. Fallback to browser submit flow if API submit could not proceed
-          if (!posted || (!posted.performed && !posted.clicked && posted.kind === 'error')) {
+          const isProblemInvalid = posted?.problemInvalid || /does not belong to the contest|no such problem|does not exist in Practice/i.test(posted?.error ?? '');
+          if (isProblemInvalid) {
+            logger.warn({ account: account.label, problem: entry.problemCode }, 'CodeChef problem is retired or contest-restricted; advancing cursor past it...');
+            await completeCurrentProblem(account.id, {
+              completedKey: entry.problemCode!,
+              nextKey: queue[index + 1]?.problemCode ?? null,
+              submissionId: null,
+              verdict: 'SKIPPED_RETIRED',
+            });
+            await patchCodeChefAccount(account.id, {
+              lastError: `Problem ${entry.problemCode} retired or contest-restricted on CodeChef`,
+              checked: true,
+            });
+            await options.onProgress?.({
+              phase: 'skipped',
+              label: account.label,
+              username: account.username,
+              problemCode: entry.problemCode,
+              index: progressIndex,
+              total: progressTotal,
+              error: `Retired problem ${entry.problemCode} skipped`,
+            });
+            retiredSkips++;
+            if (retiredSkips <= 50) {
+              step--;
+            }
+            continue;
+          }
+
+          // 3. Fallback to browser submit flow ONLY if explicitly allowed and API had a generic error
+          if (!posted || (!posted.performed && !posted.clicked && posted.kind === 'error' && process.env.CODECHEF_ALLOW_BROWSER_FALLBACK === 'true')) {
             logger.info({ account: account.label }, 'Falling back to browser submit flow for CodeChef...');
             posted = await submitToCodeChef(state, entry.problemUrl!, code, entry.language, account.username ?? credentials.username);
           }
@@ -279,6 +309,10 @@ export async function runCodeChefNow(
         if (claimed && !mayHaveSubmitted) await releaseDailyAttempt(account.id, report.date).catch(() => undefined);
         report.outcomes.push({ label: account.label, performed: false, error: errorMsg, problem: entry?.problemCode });
         await options.onProgress?.({ phase: 'failed', label: account.label, username: account.username, index: accIndex + 1, total: accounts.length, error: errorMsg });
+      }
+
+      if (accIndex < accounts.length - 1) {
+        await new Promise((res) => setTimeout(res, 4000));
       }
     }
 

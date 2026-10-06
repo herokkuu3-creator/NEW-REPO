@@ -100,38 +100,44 @@ interface TgUpdate {
 }
 
 const HELP_TEXT = [
-  '🤖 LeetCode Daily Agent',
+  '<b>⚡ 𝗟𝗘𝗘𝗧𝗖𝗢𝗗𝗘 𝗗𝗔𝗜𝗟𝗬 𝗔𝗚𝗘𝗡𝗧 ⚡</b>',
+  '<i>Autonomous Multi-Platform Coding Assistant</i>',
+  '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
   '',
-  '📎 Just send cookie .json files (one per account) — each file is added as an account named after its LeetCode username; a file for a user that already exists overrides that account.',
+  '<b>✨ 𝗟𝗘𝗘𝗧𝗖𝗢𝗗𝗘 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
+  '├ <code>/triggersubmission</code> — Submit today’s daily question',
+  '├ <code>/claimcoins</code> — Collect contest coins &amp; rewards',
+  '├ <code>/questionrangesubmission</code> — Range solver <i>(e.g. 200-400)</i>',
+  '├ <code>/rangestatus</code> — Check active range job progress',
+  '├ <code>/cancelrange</code> — Stop running range job',
+  '└ <code>/accounts</code> — View LeetCode accounts &amp; session status',
   '',
-  '🍪 Sessions',
-  '🔄 /renew - send a LeetCode or Codeforces session JSON; site is detected automatically',
-  '🏷️ /renew <label> - store the NEXT file under this exact label',
-  '👥 /accounts - list every account with its cookie status',
-  '🗑️ /removesession - list every account with a Remove button (tap to delete that account\'s session)',
-  '🧹 /removeallsessions - delete the sessions of ALL accounts (asks for confirmation)',
+  '<b>🏆 𝗖𝗢𝗗𝗘𝗙𝗢𝗥𝗖𝗘𝗦 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
+  '├ <code>/submitnextsolution</code> — Submit next problem for all accounts',
+  '├ <code>/nextsubcustomaccount</code> — Select specific account to submit',
+  '├ <code>/cfnetwork</code> — Switch network mode (Proxy / Tailscale)',
+  '├ <code>/cfmanualnext</code> — Get next source &amp; mobile submit link',
+  '├ <code>/cfaccounts</code> — View Codeforces accounts &amp; verdicts',
+  '└ <code>/cf_clear_cookies</code> — Delete Codeforces stored sessions',
   '',
-  '🚀 Submissions',
-  '⚡ /triggersubmission - submit today\'s daily question again for ALL accounts (one reply per account)',
-  '🎁 /claimcoins - check and collect the contest-page coin offer for selected LeetCode accounts',
-  '🏆 /submitnextsolution - submit the next Codeforces source solution for every Codeforces account',
-  '🎯 /nextsubcustomaccount - choose one Codeforces account, or all, for the next source solution',
-  '🌐 /cfnetwork - choose residential proxy or phone Tailscale for Codeforces',
-  '📱 /cfmanualnext - send the next source and submit link for a phone-browser fallback',
-  '📋 /cfaccounts - list Codeforces accounts, cursor and last verdict',
-  '🗑️ /cf_clear_cookies - list every Codeforces account with a Remove button, plus a Remove All option',
-  '👨‍🍳 /codechef - trigger CodeChef daily submissions for all accounts',
-  '⚡ /ccnextsubmit - force submit the next CodeChef solution (advances queue)',
-  '🔢 /ccrange <count> - batch submit next N CodeChef solutions (e.g. /ccrange 5)',
-  '📋 /ccaccounts - list CodeChef accounts, current cursor and last verdict',
-  '🎯 /questionrangesubmission 200-400 - submit every question in a range (pick one account or All)',
-  '📍 /rangestatus - progress of the running range job',
-  '🛑 /cancelrange - stop the running range job',
+  '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
+  '├ <code>/codechef</code> — Run daily CodeChef submission',
+  '├ <code>/ccnextsubmit</code> — Force submit next solution in queue',
+  '├ <code>/ccrange</code> <i>&lt;count&gt;</i> — Batch submit next N problems <i>(e.g. <code>/ccrange 5</code>)</i>',
+  '└ <code>/ccaccounts</code> — View CodeChef accounts &amp; queue progress',
   '',
-  'ℹ️ Info',
-  '📊 /status - show authentication status and the last run',
-  '❌ /cancel - cancel a renewal in progress',
-  '❓ /help - show this message',
+  '<b>🍪 𝗦𝗘𝗦𝗦𝗜𝗢𝗡 𝗠𝗔𝗡𝗔𝗚𝗘𝗠𝗘𝗡𝗧</b>',
+  '├ <code>/renew</code> — Session renewal guide &amp; instructions',
+  '├ <code>/renew</code> <i>&lt;label&gt;</i> — Tag next uploaded JSON with label',
+  '├ <code>/removesession</code> — Remove a single account session',
+  '└ <code>/removeallsessions</code> — Purge all stored accounts',
+  '',
+  '<b>📊 𝗦𝗬𝗦𝗧𝗘𝗠 &amp; 𝗜𝗡𝗙𝗢</b>',
+  '├ <code>/status</code> — System uptime &amp; last run summary',
+  '├ <code>/cancel</code> — Abort ongoing prompt / renewal',
+  '└ <code>/help</code> — Display this command menu',
+  '',
+  '<blockquote>💡 <b>Pro Tip:</b> Tap any command above to run it instantly! To add accounts, simply drop a browser cookie JSON file into this chat.</blockquote>',
 ].join('\n');
 
 const RENEW_INSTRUCTIONS = [
@@ -289,7 +295,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     switch (cmd) {
       case '/start':
       case '/help':
-        await reply(HELP_TEXT);
+        await replyHtml(HELP_TEXT);
         return;
       case '/renew': {
         const arg = text.split(/[\s@]+/).slice(1).join(' ').trim();
