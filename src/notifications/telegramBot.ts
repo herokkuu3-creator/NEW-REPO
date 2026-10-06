@@ -17,7 +17,16 @@ import { AccountRecord, deleteAccountById, deleteAllAccounts, listAccounts } fro
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
-import { CODEFORCES_MANUAL_REASON, isCodeforcesRunInProgress, resolveCurrentEntry, runCodeforcesNow, type CodeforcesNetworkMode } from '../codeforces/worker';
+import {
+  CODEFORCES_MANUAL_REASON,
+  cancelCodeforcesRun,
+  formatCodeforcesRangeStatus,
+  getCodeforcesRangeStatus,
+  isCodeforcesRunInProgress,
+  resolveCurrentEntry,
+  runCodeforcesNow,
+  type CodeforcesNetworkMode,
+} from '../codeforces/worker';
 import {
   isCodeChefRunInProgress,
   runCodeChefNow,
@@ -121,6 +130,9 @@ const HELP_TEXT = [
   '',
   '<b>🏆 𝗖𝗢𝗗𝗘𝗙𝗢𝗥𝗖𝗘𝗦 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ <code>/submitnextsolution</code> — Submit next problem for all accounts',
+  '├ <code>/cfrange</code> <i>&lt;count&gt;</i> — Batch submit next N problems <i>(30s human pacing)</i>',
+  '├ <code>/cfrangestatus</code> — Live batch progress &amp; ETA countdown',
+  '├ <code>/cfcancelrange</code> — Cancel active batch submission',
   '├ <code>/nextsubcustomaccount</code> — Select specific account to submit',
   '├ <code>/cfnetwork</code> — Switch network mode (Proxy / Tailscale)',
   '├ <code>/cfmanualnext</code> — Get next source &amp; mobile submit link',
@@ -383,6 +395,42 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/submit_next_solution':
         await handleCodeforcesSubmitNext();
         return;
+      case '/cfrange':
+      case '/cf_range':
+      case '/cfbatch':
+      case '/cf_batch': {
+        const rawArg = text.split(/\s+/)[1];
+        const parsedCount = parseInt(rawArg ?? '', 10);
+        if (!rawArg || isNaN(parsedCount) || parsedCount <= 0) {
+          await replyHtml(
+            [
+              '<b>🔢 Codeforces Batch Submission</b>',
+              '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+              'Please specify how many questions to submit:',
+              '👉 <code>/cfrange 5</code> (submit next 5 questions)',
+              '👉 <code>/cfrange 10</code> (submit next 10 questions)',
+            ].join('\n'),
+          );
+          return;
+        }
+        const count = Math.min(50, Math.max(1, parsedCount));
+        await handleCodeforcesTrigger({ forceNext: true, count });
+        return;
+      }
+      case '/cfrangestatus':
+      case '/cf_range_status':
+      case '/cfstatusrange':
+      case '/cf_status_range':
+        await handleCodeforcesRangeStatus();
+        return;
+      case '/cfcancelrange':
+      case '/cf_cancel_range':
+      case '/cfcancel':
+      case '/cf_cancel':
+      case '/cancelcfrange':
+      case '/cancel_cf_range':
+        await handleCancelCodeforcesRange();
+        return;
       case '/nextsubcustomaccount':
       case '/nextsubcustomaccout':
       case '/next_sub_custom_account':
@@ -444,6 +492,10 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cancel':
         pendingRenewalLabel = undefined;
         pendingRangePrompt = false;
+        if (getCodeforcesRangeStatus() && getCodeforcesRangeStatus()?.state !== 'idle') {
+          await handleCancelCodeforcesRange();
+          return;
+        }
         if (getCodeChefRangeStatus() && getCodeChefRangeStatus()?.state !== 'idle') {
           await handleCancelCodeChefRange();
           return;
@@ -455,7 +507,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /nextsubcustomaccount, /cfnetwork, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -961,28 +1013,181 @@ export function renderCodeforcesProgressLines(progress: ReadonlyMap<number, stri
   return selected;
 }
 
-export async function handleCodeforcesSubmitNext(
-  runner: typeof runCodeforcesNow = runCodeforcesNow,
-  inProgress: () => boolean = isCodeforcesRunInProgress,
+export interface CodeforcesAccountSectionState {
+  accIndex: number;
+  label: string;
+  username?: string | null;
+  completedItems: string[];
+  activeLine?: string;
+  accountStatus?: string;
+}
+
+export function renderCodeforcesProgressSections(
+  sections: ReadonlyMap<number, CodeforcesAccountSectionState>,
+  totalAccounts: number,
+): string[] {
+  const sorted = [...sections.values()].sort((a, b) => a.accIndex - b.accIndex);
+  if (sorted.length === 0) {
+    return ['<i>Waiting for progress updates…</i>'];
+  }
+
+  const effectiveTotal = Math.max(totalAccounts, sorted.length);
+  const escape = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const buildBlocks = (pruneThreshold?: number): string[] => {
+    return sorted.map((sec) => {
+      const accNum = sec.accIndex + 1;
+      const name = escape(sec.username ?? sec.label);
+      const header = `👤 <b>Account ${accNum}/${effectiveTotal} · <code>${name}</code></b>`;
+
+      let completed = sec.completedItems;
+      let prunedNotice: string | null = null;
+      if (pruneThreshold && completed.length > pruneThreshold) {
+        const skippedCount = completed.length - pruneThreshold;
+        prunedNotice = `<i>… ${skippedCount} earlier completed question(s)</i>`;
+        completed = completed.slice(completed.length - pruneThreshold);
+      }
+
+      const items: string[] = [];
+      if (prunedNotice) items.push(prunedNotice);
+      items.push(...completed);
+
+      if (sec.activeLine) {
+        items.push(sec.activeLine);
+      } else if (sec.accountStatus && items.length === 0) {
+        items.push(sec.accountStatus);
+      }
+
+      if (items.length === 0) {
+        items.push('⏳ Queued…');
+      }
+
+      const treeLines = items.map((item, idx) => {
+        const isLast = idx === items.length - 1;
+        const connector = isLast ? '└ ' : '├ ';
+        return `${connector}${item}`;
+      });
+
+      return [header, ...treeLines].join('\n');
+    });
+  };
+
+  let blocks = buildBlocks();
+  if (blocks.join('\n\n').length > 3400) {
+    blocks = buildBlocks(6);
+  }
+  if (blocks.join('\n\n').length > 3400) {
+    blocks = buildBlocks(3);
+  }
+
+  return blocks;
+}
+
+export async function handleCancelCodeforcesRange(): Promise<void> {
+  const cancelled = cancelCodeforcesRun();
+  if (cancelled) {
+    await reply('🛑 Cancelling Codeforces batch submission… Stopping immediately.');
+  } else {
+    await reply('🤷 No Codeforces batch submission is currently running.');
+  }
+}
+
+export async function handleCodeforcesRangeStatus(): Promise<void> {
+  const status = getCodeforcesRangeStatus();
+  if (!status || status.state === 'idle') {
+    await replyHtml('💤 No Codeforces batch job is currently running.\nStart one with <code>/cfrange 10</code>.');
+    return;
+  }
+  await replyHtml(formatCodeforcesRangeStatus(status));
+}
+
+export async function handleCodeforcesTrigger(
+  runnerOrOptions?: typeof runCodeforcesNow | { forceNext?: boolean; count?: number },
+  isBusyOrRunner?: (() => boolean) | typeof runCodeforcesNow,
+  sendOrIsBusy?: ((text: string) => Promise<void>) | (() => boolean),
+  maybeSend?: (text: string) => Promise<void>,
 ): Promise<{ done: Promise<void> } | null> {
-  if (inProgress()) {
-    await reply('🚧 A Codeforces run is already in progress — wait for its report, then send /submitnextsolution again.');
+  let options: { forceNext?: boolean; count?: number } = {};
+  let runner: typeof runCodeforcesNow = runCodeforcesNow;
+  let isBusy: () => boolean = isCodeforcesRunInProgress;
+  let send: ((text: string) => Promise<void>) | undefined;
+
+  if (typeof runnerOrOptions === 'function') {
+    runner = runnerOrOptions;
+    if (typeof isBusyOrRunner === 'function') isBusy = isBusyOrRunner as () => boolean;
+    if (typeof sendOrIsBusy === 'function') send = sendOrIsBusy as (text: string) => Promise<void>;
+  } else if (typeof runnerOrOptions === 'object' && runnerOrOptions !== null) {
+    options = runnerOrOptions;
+    if (typeof isBusyOrRunner === 'function') runner = isBusyOrRunner as typeof runCodeforcesNow;
+    if (typeof sendOrIsBusy === 'function') isBusy = sendOrIsBusy as () => boolean;
+    if (typeof maybeSend === 'function') send = maybeSend;
+  }
+
+  if (isBusy()) {
+    if (send) await send('A Codeforces run is already active. Please wait for its result.');
+    else await reply('🚧 A Codeforces run is already in progress — wait for its report, then try again.');
     return null;
   }
+
+  if (send) {
+    await send('🏆 Codeforces: checking configured accounts and submitting the next pending source.');
+    const done = runner(CODEFORCES_MANUAL_REASON, { forceDailyAttempt: true, batchCount: options.count ?? 1 }).then(async (report) => {
+      if (!report) await send!('Another Codeforces run started; this command did not create a second run.');
+    }).catch(async (err) => {
+      await send!(`Codeforces could not start: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return { done };
+  }
+
+  const configuredAccounts = await listCodeforcesAccounts(true).catch(() => []);
+  const initialTotalAccounts = Math.max(1, configuredAccounts.length);
+  const accountSections = new Map<number, CodeforcesAccountSectionState>();
+
+  for (let i = 0; i < configuredAccounts.length; i++) {
+    const acc = configuredAccounts[i];
+    if (!acc) continue;
+    accountSections.set(i, {
+      accIndex: i,
+      label: acc.label,
+      username: acc.username,
+      completedItems: [],
+      activeLine: i === 0 ? '🔎 Initializing session…' : '⏳ Queued…',
+    });
+  }
+
+  const title = options.count && options.count > 1
+    ? `<b>🏆 CODEFORCES BATCH (${options.count} Questions)</b>`
+    : `<b>🏆 CODEFORCES SUBMISSION</b>`;
+
+  const initialSubtitle = options.count && options.count > 1
+    ? `🔎 Initializing batch (${options.count} questions)…\n<i>⏳ 30s pacing between questions · /cfrangestatus · /cfcancelrange</i>`
+    : `🔎 Initializing Codeforces…`;
+
+  const initialBlocks = configuredAccounts.length > 0
+    ? renderCodeforcesProgressSections(accountSections, initialTotalAccounts).join('\n\n')
+    : initialSubtitle;
+
   const statusMessage = await tgApi<{ message_id: number }>('sendMessage', {
     chat_id: config.telegram.chatId,
-    text: '<b>🏆 CODEFORCES SUBMISSION</b>\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n🔎 Checking all accounts…',
+    text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${initialBlocks}`,
     parse_mode: 'HTML',
     disable_web_page_preview: true,
   });
-  const progressLines = new Map<number, string>();
+
   const html = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const editProgress = async (): Promise<boolean> => {
-    const lines = renderCodeforcesProgressLines(progressLines);
+  let totalAccounts = initialTotalAccounts;
+
+  const editProgress = async (extraFooter?: string): Promise<boolean> => {
+    const blocks = renderCodeforcesProgressSections(accountSections, totalAccounts);
+    let body = blocks.join('\n\n');
+    if (extraFooter) body += extraFooter;
+
+    const fullText = `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${body}`;
+
     const updated = await tgApi('editMessageText', {
       chat_id: config.telegram.chatId,
       message_id: statusMessage.message_id,
-      text: ['<b>🏆 CODEFORCES SUBMISSION</b>', '<code>━━━━━━━━━━━━━━━━━━━━</code>', ...lines].join('\n'),
+      text: fullText,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     }).then(() => true).catch((err) => {
@@ -992,64 +1197,179 @@ export async function handleCodeforcesSubmitNext(
     });
     return updated;
   };
+
   const done = (async () => {
     const report = await runner(CODEFORCES_MANUAL_REASON, {
-      forceDailyAttempt: true,
-      onAccountProgress: async ({ phase, label, username, index, total, networkMode, attempt }) => {
-        const account = html(username ?? label);
-        const route = networkMode === 'tailscale' ? '📱 PHONE TAILSCALE' : '🏠 RESIDENTIAL PROXY';
-        const phaseText = {
-          checking: `🔎 <b>Account ${index}/${total}</b> · checking <code>${account}</code>…`,
-          verified: `✅ <b>Account ${index}/${total}</b> · verified <code>${account}</code>`,
-          source: `📦 <b>Account ${index}/${total}</b> · source loaded for <code>${account}</code>`,
-          network: `🌐 <b>Account ${index}/${total}</b> · route: <b>${route}</b>`,
-          opening: `🖥️ <b>Account ${index}/${total}</b> · opening Codeforces submit page`,
-          submitting: `🚀 <b>Account ${index}/${total}</b> · submitting signed form`,
-          verdict: `⏳ <b>Account ${index}/${total}</b> · waiting for Codeforces verdict`,
-          attempt: `⏱️ <b>${account}</b> · attempt ${attempt ?? 1}/3 · limit: 8 minutes`,
-          retry: `🔄 <b>${account}</b> · no submission sent · retrying the same source · attempt ${attempt ?? 1}/3`,
-          queued: `🕓 <b>${account}</b> · attempt ${attempt ?? 1}/3 · waiting for GitHub Actions`,
-          running: `🖥️ <b>${account}</b> · attempt ${attempt ?? 1}/3 · cloud browser is running`,
-          'session-restored': `💾 <b>${account}</b> · saved browser session restored`,
-          'session-fresh': `🍪 <b>${account}</b> · starting from uploaded session cookies`,
-          verification: `🔐 <b>${account}</b> · checking verification · waiting for the page to complete normally`,
-          'verification-retry': `⏳ <b>${account}</b> · verification has not cleared · one retry before submitting`,
-          'verification-blocked': `⚠️ <b>${account}</b> · verification did not clear automatically · attention required`,
-          'verification-cleared': `✅ <b>${account}</b> · verification completed · preparing submission`,
-          'verification-not-required': `✅ <b>${account}</b> · no form verification required`,
-        }[phase];
-        progressLines.set(
-          index,
-          phaseText,
-        );
+      forceDailyAttempt: options.forceNext ?? true,
+      batchCount: options.count ?? 1,
+      onAccountProgress: async (event) => {
+        if (event.accTotal && event.accTotal > totalAccounts) {
+          totalAccounts = event.accTotal;
+        }
+        const accIdx = event.accIndex ?? Math.max(0, event.index - 1);
+        let sec = accountSections.get(accIdx);
+        if (!sec) {
+          sec = {
+            accIndex: accIdx,
+            label: event.label,
+            username: event.username,
+            completedItems: [],
+          };
+          accountSections.set(accIdx, sec);
+        }
+        if (event.username && !sec.username) {
+          sec.username = event.username;
+        }
+
+        const stepPrefix = event.stepTotal && event.stepTotal > 1 ? `[${event.stepIndex ?? 1}/${event.stepTotal}] ` : '';
+        const probTag = event.problem ? `<code>${html(event.problem)}</code>` : '';
+        const route = event.networkMode === 'tailscale' ? '📱 Phone Tailscale' : '🏠 Residential Proxy';
+
+        switch (event.phase) {
+          case 'checking':
+            sec.activeLine = `🔎 ${stepPrefix}Checking session…`;
+            break;
+          case 'verified':
+            sec.activeLine = `✅ ${stepPrefix}Session verified`;
+            break;
+          case 'source':
+            sec.activeLine = `📦 ${stepPrefix}Source loaded${probTag ? ` · ${probTag}` : ''}`;
+            break;
+          case 'network':
+            sec.activeLine = `🌐 ${stepPrefix}Route: ${route}`;
+            break;
+          case 'opening':
+            sec.activeLine = `🖥️ ${stepPrefix}Opening submit page${probTag ? ` · ${probTag}` : ''}`;
+            break;
+          case 'submitting':
+            sec.activeLine = `🚀 ${stepPrefix}Submitting signed form${probTag ? ` · ${probTag}` : ''}`;
+            break;
+          case 'verdict':
+            sec.activeLine = `⏳ ${stepPrefix}Waiting for Codeforces verdict${probTag ? ` · ${probTag}` : ''}`;
+            break;
+          case 'attempt':
+            sec.activeLine = `⏱️ ${stepPrefix}Attempt ${event.attempt ?? 1}/3`;
+            break;
+          case 'retry':
+            sec.activeLine = `🔄 ${stepPrefix}Retrying source · attempt ${event.attempt ?? 1}/3`;
+            break;
+          case 'queued':
+            sec.activeLine = `🕓 ${stepPrefix}Waiting for cloud browser · attempt ${event.attempt ?? 1}/3`;
+            break;
+          case 'running':
+            sec.activeLine = `🖥️ ${stepPrefix}Cloud browser running · attempt ${event.attempt ?? 1}/3`;
+            break;
+          case 'session-restored':
+            sec.activeLine = `💾 ${stepPrefix}Session restored`;
+            break;
+          case 'session-fresh':
+            sec.activeLine = `🍪 ${stepPrefix}Fresh session cookies`;
+            break;
+          case 'verification':
+            sec.activeLine = `🔐 ${stepPrefix}Checking verification`;
+            break;
+          case 'verification-retry':
+            sec.activeLine = `⏳ ${stepPrefix}Verification retrying`;
+            break;
+          case 'verification-blocked':
+            sec.activeLine = `⚠️ ${stepPrefix}Verification blocked`;
+            break;
+          case 'verification-cleared':
+            sec.activeLine = `✅ ${stepPrefix}Verification cleared`;
+            break;
+          case 'verification-not-required':
+            sec.activeLine = `✅ ${stepPrefix}No verification required`;
+            break;
+          case 'completed': {
+            const verdict = html(event.verdict ?? 'OK');
+            const sub = event.submissionId ? ` · #${html(event.submissionId)}` : '';
+            const line = `✅ ${stepPrefix}${probTag ? `${probTag} — ` : ''}<b>${verdict}</b>${sub}`;
+            sec.completedItems.push(line);
+            sec.activeLine = undefined;
+            break;
+          }
+          case 'failed': {
+            const err = html(event.error ? event.error.slice(0, 300) : 'Failed');
+            const line = `❌ ${stepPrefix}${probTag ? `${probTag} — ` : ''}<i>${err}</i>`;
+            sec.completedItems.push(line);
+            sec.activeLine = undefined;
+            break;
+          }
+          case 'skipped': {
+            const err = html(event.error ? event.error.slice(0, 300) : 'Skipped');
+            const line = `⏭️ ${stepPrefix}${probTag ? `${probTag} — ` : ''}<i>${err}</i>`;
+            sec.completedItems.push(line);
+            sec.activeLine = undefined;
+            break;
+          }
+          case 'waiting': {
+            const nextStep = (event.stepIndex ?? 1) + 1;
+            const nextStepStr = event.stepTotal && event.stepTotal > 1 ? ` before question [${nextStep}/${event.stepTotal}]` : '';
+            sec.activeLine = `⏳ Waiting ${event.waitSeconds ?? 30}s${nextStepStr} (human pacing)…`;
+            break;
+          }
+          case 'cancelled':
+            sec.activeLine = '🛑 Batch cancelled by user';
+            sec.accountStatus = '🛑 Cancelled';
+            break;
+          default:
+            sec.activeLine = `⚙️ ${event.phase}${probTag ? ` · ${probTag}` : ''}`;
+            break;
+        }
+
         await editProgress();
       },
-      onAccountOutcome: async (outcome, index, total) => {
-        const line = html(formatCodeforcesAccountMessage({ ...outcome,
-          error: outcome.error ? outcome.error.slice(0, 450) : outcome.error,
-        }, index, total).slice(0, 1600));
-        progressLines.set(index, line);
-        if (!await editProgress()) await replyHtml(line).catch(() => undefined);
+      onAccountOutcome: async () => {
+        await editProgress();
       },
     });
+
     if (!report) {
-      progressLines.set(0, '⏳ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
-      await editProgress();
+      await tgApi('editMessageText', {
+        chat_id: config.telegram.chatId,
+        message_id: statusMessage.message_id,
+        text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⏳ Not started: another run began concurrently.`,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }).catch(() => undefined);
     } else if (report.totals.accounts === 0) {
-      progressLines.set(0, '📭 No Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
-      await editProgress();
+      await tgApi('editMessageText', {
+        chat_id: config.telegram.chatId,
+        message_id: statusMessage.message_id,
+        text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n📭 No active Codeforces accounts configured. Send /renew with a Codeforces session JSON.`,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }).catch(() => undefined);
     } else {
-      report.accounts.forEach((outcome, index) => progressLines.set(index + 1,
-        html(formatCodeforcesAccountMessage({ ...outcome, error: outcome.error?.slice(0, 450) }, index + 1, report.totals.accounts).slice(0, 1600))));
-      await editProgress();
-      logger.info({ summary: summarizeCodeforcesReport(report) }, 'telegram /submitnextsolution finished');
+      for (const sec of accountSections.values()) {
+        sec.activeLine = undefined;
+      }
+      const solved = report.totals.solved;
+      const failed = report.totals.failed;
+      const skipped = report.totals.skipped;
+      const summaryText = `\n\n🏆 <b>Finished:</b> ${solved} solved · ${failed} failed · ${skipped} skipped`;
+      await editProgress(summaryText);
+      logger.info({ summary: report.accounts.length, solved, failed, skipped }, 'telegram /codeforces run finished');
     }
   })().catch(async (err) => {
-    logger.warn({ err: errText(err) }, '/submitnextsolution failed');
-      progressLines.set(0, `⚠️ <b>/submitnextsolution failed:</b> ${html(errText(err))}`);
-    await editProgress().catch(() => undefined);
+    logger.warn({ err: errText(err) }, 'Codeforces telegram run failed');
+    await tgApi('editMessageText', {
+      chat_id: config.telegram.chatId,
+      message_id: statusMessage.message_id,
+      text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${html(errText(err))}`,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    }).catch(() => undefined);
   });
+
   return { done };
+}
+
+export async function handleCodeforcesSubmitNext(
+  runner: typeof runCodeforcesNow = runCodeforcesNow,
+  inProgress: () => boolean = isCodeforcesRunInProgress,
+): Promise<{ done: Promise<void> } | null> {
+  return handleCodeforcesTrigger({ forceNext: true, count: 1 }, runner, inProgress);
 }
 
 export interface CodeforcesSubmitUiDeps {

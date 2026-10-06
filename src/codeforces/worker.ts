@@ -65,19 +65,143 @@ export function isCodeforcesRunInProgress(): boolean {
   return runInProgress;
 }
 
+export interface CodeforcesRangeJobInfo {
+  totalRequested: number;
+  completed: number;
+  skipped: number;
+  failed: number;
+  currentStep: number;
+  currentAccount: string | null;
+  currentProblem: string | null;
+  startedAt: number;
+  state: 'running' | 'waiting' | 'cancelling' | 'idle';
+  waitEndsAt?: number;
+}
+
+let activeCodeforcesRangeAbortController: AbortController | null = null;
+let activeCodeforcesRangeJob: CodeforcesRangeJobInfo | null = null;
+
+export const CODEFORCES_RANGE_GAP_MS = 30000; // 30-second pacing between batch questions to mimic human behavior
+
+export function cancelCodeforcesRun(): boolean {
+  if (!runInProgress) return false;
+  if (activeCodeforcesRangeJob) activeCodeforcesRangeJob.state = 'cancelling';
+  if (activeCodeforcesRangeAbortController) {
+    activeCodeforcesRangeAbortController.abort();
+    return true;
+  }
+  return false;
+}
+
+export function getCodeforcesRangeStatus(): CodeforcesRangeJobInfo | null {
+  return activeCodeforcesRangeJob ? { ...activeCodeforcesRangeJob } : null;
+}
+
+export function formatCodeforcesRangeStatus(info: CodeforcesRangeJobInfo, now = Date.now()): string {
+  const elapsedSec = Math.max(0, Math.floor((now - info.startedAt) / 1000));
+  const elapsedMin = Math.floor(elapsedSec / 60);
+  const elapsedRemSec = elapsedSec % 60;
+  const elapsedStr = elapsedMin > 0 ? `${elapsedMin}m ${elapsedRemSec}s` : `${elapsedSec}s`;
+
+  const doneCount = info.completed + info.skipped;
+  const remaining = Math.max(0, info.totalRequested - doneCount);
+  const pct = info.totalRequested > 0 ? Math.round((doneCount / info.totalRequested) * 100) : 0;
+
+  let stateIcon = '🏃';
+  let stateDesc = 'Running';
+  if (info.state === 'waiting' && info.waitEndsAt) {
+    const waitSec = Math.max(0, Math.ceil((info.waitEndsAt - now) / 1000));
+    stateIcon = '⏳';
+    stateDesc = `Pacing delay (${waitSec}s remaining before next submit)`;
+  } else if (info.state === 'cancelling') {
+    stateIcon = '🛑';
+    stateDesc = 'Cancelling…';
+  }
+
+  const escape = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  return [
+    '<b>🏆 CODEFORCES RANGE STATUS</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    `⚙️ <b>Status:</b> ${stateIcon} <i>${stateDesc}</i>`,
+    `🎯 <b>Progress:</b> <b>${info.completed}</b> / ${info.totalRequested} questions (<b>${pct}%</b>)`,
+    `✅ <b>Completed:</b> ${info.completed}`,
+    `⏭️ <b>Skipped:</b> ${info.skipped}`,
+    `❌ <b>Failed:</b> ${info.failed}`,
+    `⏳ <b>Remaining:</b> ${remaining}`,
+    info.currentAccount ? `👤 <b>Account:</b> <code>${escape(info.currentAccount)}</code>` : '',
+    info.currentProblem ? `📝 <b>Current Problem:</b> <code>${escape(info.currentProblem)}</code>` : '',
+    `⏱️ <b>Elapsed Time:</b> ${elapsedStr}`,
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    '<i>Send <code>/cfcancelrange</code> to stop this batch job.</i>',
+  ].filter(Boolean).join('\n');
+}
+
+export function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      resolve();
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+export interface CodeforcesProgressEvent {
+  phase:
+    | 'checking'
+    | 'verified'
+    | 'source'
+    | 'network'
+    | 'opening'
+    | 'submitting'
+    | 'verdict'
+    | 'attempt'
+    | 'retry'
+    | 'queued'
+    | 'running'
+    | 'session-restored'
+    | 'session-fresh'
+    | 'verification'
+    | 'verification-retry'
+    | 'verification-blocked'
+    | 'verification-cleared'
+    | 'verification-not-required'
+    | 'completed'
+    | 'failed'
+    | 'skipped'
+    | 'waiting'
+    | 'cancelled';
+  label: string;
+  username?: string | null;
+  index: number;
+  total: number;
+  networkMode?: CodeforcesNetworkMode;
+  attempt?: number;
+  accIndex?: number;
+  accTotal?: number;
+  stepIndex?: number;
+  stepTotal?: number;
+  problem?: string | null;
+  problemKey?: string | null;
+  problemUrl?: string | null;
+  verdict?: string | null;
+  submissionId?: string | null;
+  error?: string | null;
+  waitSeconds?: number;
+}
+
 export interface CodeforcesRunOptions {
   onAccountOutcome?: (outcome: CodeforcesAccountOutcome, index: number, total: number) => Promise<void> | void;
-  onAccountProgress?: (progress: {
-    phase: 'checking' | 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict' | 'attempt' | 'retry' | 'queued' | 'running';
-    label: string;
-    username?: string | null;
-    index: number;
-    total: number;
-    networkMode?: CodeforcesNetworkMode;
-    attempt?: number;
-  }) => Promise<void> | void;
+  onAccountProgress?: (progress: CodeforcesProgressEvent) => Promise<void> | void;
   /** Manual triggers may reuse a day's single attempt after it failed. */
   forceDailyAttempt?: boolean;
+  batchCount?: number;
   /** When present, run only these active Codeforces account IDs. */
   accountIds?: readonly string[];
   networkMode?: CodeforcesNetworkMode;
@@ -116,10 +240,13 @@ export async function executeCodeforcesRun(
     return buildCodeforcesReport({ date: todayInTimezone(), reason, startedAt: new Date().toISOString(), outcomes: [] });
   }
   runInProgress = true;
+  activeCodeforcesRangeAbortController = new AbortController();
+  const signal = activeCodeforcesRangeAbortController.signal;
   const startedAt = new Date().toISOString();
   const today = todayInTimezone();
-  const forceDailyAttempt =
+  const baseForceDailyAttempt =
     options.forceDailyAttempt ?? reason === CODEFORCES_MANUAL_REASON;
+  const batchCount = Math.max(1, options.batchCount ?? 1);
 
   try {
     const source = await loadRuntimeSourceIndex();
@@ -129,6 +256,18 @@ export async function executeCodeforcesRun(
       (account) => !requestedAccountIds || requestedAccountIds.has(account.id),
     );
     const outcomes: CodeforcesAccountOutcome[] = [];
+
+    activeCodeforcesRangeJob = {
+      totalRequested: accounts.length * batchCount,
+      completed: 0,
+      skipped: 0,
+      failed: 0,
+      currentStep: 0,
+      currentAccount: null,
+      currentProblem: null,
+      startedAt: Date.now(),
+      state: 'running',
+    };
 
     if (accounts.length === 0) {
       const report = buildCodeforcesReport({ date: today, reason, startedAt, outcomes });
@@ -140,16 +279,174 @@ export async function executeCodeforcesRun(
       await sendTelegramMessage('🚀 <b>Starting daily submission for Codeforces…</b>', { parseMode: 'HTML' }).catch(() => undefined);
     }
 
-    for (const account of accounts) {
-      await Promise.resolve(options.onAccountProgress?.({ phase: 'checking', label: account.label, username: account.username, index: outcomes.length + 1, total: accounts.length }));
-      const outcome = await runForAccount(account, today, source, forceDailyAttempt, networkMode, (phase, username, attempt) =>
-        options.onAccountProgress?.({ phase, label: account.label, username, index: outcomes.length + 1, total: accounts.length, networkMode, attempt }),
-      );
-      outcomes.push(outcome);
-      if (options.onAccountOutcome) {
-        await Promise.resolve(options.onAccountOutcome(outcome, outcomes.length, accounts.length)).catch((err) =>
-          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Codeforces outcome callback failed'),
+    for (const [accIndex, account] of accounts.entries()) {
+      if (signal.aborted) break;
+
+      for (let step = 0; step < batchCount; step++) {
+        if (signal.aborted) break;
+
+        const progressIndex = accounts.length > 1 && batchCount === 1
+          ? accIndex + 1
+          : (accounts.length > 1 ? accIndex * batchCount + step + 1 : step + 1);
+        const progressTotal = accounts.length > 1 && batchCount === 1
+          ? accounts.length
+          : (accounts.length > 1 ? accounts.length * batchCount : batchCount);
+
+        if (activeCodeforcesRangeJob) {
+          activeCodeforcesRangeJob.currentStep = progressIndex;
+          activeCodeforcesRangeJob.currentAccount = account.label;
+        }
+
+        const stepForceAttempt = step > 0 ? true : baseForceDailyAttempt;
+
+        await Promise.resolve(options.onAccountProgress?.({
+          phase: 'checking',
+          label: account.label,
+          username: account.username,
+          index: progressIndex,
+          total: progressTotal,
+          accIndex,
+          accTotal: accounts.length,
+          stepIndex: step + 1,
+          stepTotal: batchCount,
+        }));
+
+        const outcome = await runForAccount(
+          account,
+          today,
+          source,
+          stepForceAttempt,
+          networkMode,
+          (phase, username, attempt) =>
+            options.onAccountProgress?.({
+              phase: phase as any,
+              label: account.label,
+              username,
+              index: progressIndex,
+              total: progressTotal,
+              networkMode,
+              attempt,
+              accIndex,
+              accTotal: accounts.length,
+              stepIndex: step + 1,
+              stepTotal: batchCount,
+            }),
         );
+
+        outcomes.push(outcome);
+
+        if (activeCodeforcesRangeJob) {
+          activeCodeforcesRangeJob.currentProblem = outcome.problem ?? null;
+          if (outcome.kind === 'solved') {
+            activeCodeforcesRangeJob.completed++;
+          } else if (outcome.kind === 'skipped') {
+            activeCodeforcesRangeJob.skipped++;
+          } else {
+            activeCodeforcesRangeJob.failed++;
+          }
+        }
+
+        if (outcome.kind === 'solved') {
+          await options.onAccountProgress?.({
+            phase: 'completed',
+            label: account.label,
+            username: outcome.username,
+            problem: outcome.problem,
+            verdict: outcome.verdict ?? 'OK',
+            submissionId: outcome.submissionId,
+            index: progressIndex,
+            total: progressTotal,
+            accIndex,
+            accTotal: accounts.length,
+            stepIndex: step + 1,
+            stepTotal: batchCount,
+          });
+        } else if (outcome.kind === 'skipped') {
+          await options.onAccountProgress?.({
+            phase: 'skipped',
+            label: account.label,
+            username: outcome.username,
+            problem: outcome.problem,
+            error: outcome.error ?? 'Skipped',
+            index: progressIndex,
+            total: progressTotal,
+            accIndex,
+            accTotal: accounts.length,
+            stepIndex: step + 1,
+            stepTotal: batchCount,
+          });
+        } else {
+          await options.onAccountProgress?.({
+            phase: 'failed',
+            label: account.label,
+            username: outcome.username,
+            problem: outcome.problem,
+            error: outcome.error ?? 'Failed',
+            index: progressIndex,
+            total: progressTotal,
+            accIndex,
+            accTotal: accounts.length,
+            stepIndex: step + 1,
+            stepTotal: batchCount,
+          });
+        }
+
+        if (options.onAccountOutcome) {
+          await Promise.resolve(options.onAccountOutcome(outcome, progressIndex, progressTotal)).catch((err) =>
+            logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Codeforces outcome callback failed'),
+          );
+        }
+
+        // If the queue was exhausted or account auth was completely invalid, break step loop for this account
+        if (outcome.kind === 'skipped' && outcome.error?.includes('exhausted')) {
+          break;
+        }
+        if (outcome.kind === 'failed' && outcome.error?.includes('storageState')) {
+          break;
+        }
+
+        // Pacing delay between batch steps for this account
+        if (step < batchCount - 1 && !signal.aborted) {
+          if (activeCodeforcesRangeJob) {
+            activeCodeforcesRangeJob.state = 'waiting';
+            activeCodeforcesRangeJob.waitEndsAt = Date.now() + CODEFORCES_RANGE_GAP_MS;
+          }
+          await options.onAccountProgress?.({
+            phase: 'waiting',
+            label: account.label,
+            username: account.username,
+            index: progressIndex,
+            total: progressTotal,
+            accIndex,
+            accTotal: accounts.length,
+            stepIndex: step + 1,
+            stepTotal: batchCount,
+            waitSeconds: Math.round(CODEFORCES_RANGE_GAP_MS / 1000),
+          });
+          await sleepWithAbort(CODEFORCES_RANGE_GAP_MS, signal);
+          if (activeCodeforcesRangeJob) {
+            activeCodeforcesRangeJob.state = 'running';
+            activeCodeforcesRangeJob.waitEndsAt = undefined;
+          }
+          if (signal.aborted) {
+            logger.info('Codeforces batch run aborted by user during pacing delay');
+            break;
+          }
+        }
+      }
+
+      if (signal.aborted) {
+        logger.info({ account: account.label }, 'Codeforces run aborted by user');
+        await options.onAccountProgress?.({
+          phase: 'cancelled',
+          label: account.label,
+          username: account.username,
+          index: outcomes.length,
+          total: accounts.length * batchCount,
+          accIndex,
+          accTotal: accounts.length,
+        });
+        break;
       }
     }
 
@@ -162,6 +459,8 @@ export async function executeCodeforcesRun(
     return report;
   } finally {
     runInProgress = false;
+    activeCodeforcesRangeJob = null;
+    activeCodeforcesRangeAbortController = null;
   }
 }
 
