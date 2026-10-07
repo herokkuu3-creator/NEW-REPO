@@ -92,10 +92,12 @@ export const SystemKeys = {
   lastReport: 'lastMultiRunReport', // JSON RunReport of the latest multi-account batch
   dailyRetryState: 'leetcodeDailyRetryState', // JSON { date, count }
   codeforcesDailyState: 'codeforcesDailyState', // JSON { date, retryCount, completedAccountIds }
+  codechefDailyState: 'codechefDailyState', // JSON { date, retryCount }
   storageState: 'storageStateJson', // Playwright storageState snapshot (DB-persisted, legacy single-session)
   codeforcesNetworkMode: 'codeforcesNetworkMode', // 'proxy' | 'tailscale'
   codeforcesRemovedProxies: 'codeforcesRemovedProxies', // JSON string[] of blacklisted proxy hashes or URLs
   codeforcesCustomProxies: 'codeforcesCustomProxies', // JSON string[] of user-added proxy URLs
+  codeforcesPreferredProxy: 'codeforcesPreferredProxy', // string (proxy URL or hash/identifier)
 } as const;
 
 /**

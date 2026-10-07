@@ -393,6 +393,7 @@ export interface SelectProxyOptions {
   tester?: (proxyUrl: string) => Promise<boolean>;
   log?: (msg: string) => void;
   removedHashes?: string[] | Set<string>;
+  preferredProxy?: string;
 }
 
 /**
@@ -464,11 +465,30 @@ export async function selectWorkingProxy(
 
   let selected: { proxy: string; index: number } | null = null;
 
+  // 0. Test preferredProxy first if specified
+  if (options.preferredProxy) {
+    const prefMatch = proxies.find((p) => p === options.preferredProxy || proxyHash(p) === options.preferredProxy || maskProxyUrl(p) === options.preferredProxy);
+    if (prefMatch) {
+      const prefHash = proxyHash(prefMatch);
+      const prefMasked = maskProxyUrl(prefMatch);
+      log(`Testing preferred proxy ${prefMasked} (~150B trace check)...`);
+      const ok = await tester(prefMatch);
+      if (ok) {
+        log(`Preferred proxy ${prefMasked} is alive and verified!`);
+        selected = { proxy: prefMatch, index: proxies.indexOf(prefMatch) };
+      } else {
+        log(`Preferred proxy ${prefMasked} failed health check. Falling back to default pool rotation.`);
+        deadSet.add(prefHash);
+      }
+    }
+  }
+
   // 1. Test proxies that are not in deadSet
-  for (let i = 0; i < proxies.length; i++) {
-    const candidate = proxies[i]!;
-    const hash = proxyHash(candidate);
-    const masked = maskProxyUrl(candidate);
+  if (!selected) {
+    for (let i = 0; i < proxies.length; i++) {
+      const candidate = proxies[i]!;
+      const hash = proxyHash(candidate);
+      const masked = maskProxyUrl(candidate);
 
     if (deadSet.has(hash)) {
       log(`Proxy [${i + 1}/${proxies.length}] ${masked} was previously marked expired/dead. Skipping.`);
@@ -485,6 +505,7 @@ export async function selectWorkingProxy(
       log(`Proxy [${i + 1}/${proxies.length}] ${masked} failed health check (expired or unreachable). Marking dead.`);
       deadSet.add(hash);
     }
+  }
   }
 
   // 2. If all non-dead proxies failed, retry dead ones as a last resort
@@ -546,8 +567,10 @@ export async function runCli(): Promise<void> {
     }
   }
 
+  const preferredProxy = (process.env.PREFERRED_PROXY || process.env.CODEFORCES_PREFERRED_PROXY || '').trim() || undefined;
+
   try {
-    const result = await selectWorkingProxy(raw, { removedHashes });
+    const result = await selectWorkingProxy(raw, { removedHashes, preferredProxy });
     process.stdout.write(`Selected working proxy: ${result.masked} (index ${result.index + 1} of ${result.total})\n`);
 
     const envFile = process.env.GITHUB_ENV;

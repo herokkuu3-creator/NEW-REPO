@@ -6,7 +6,25 @@ import type { SourceIndexEntry } from './sourceRepo';
 import type { BrowserPostOutcome } from './submission';
 import type { CodeforcesNetworkMode } from './worker';
 import { CODEFORCES_ATTEMPT_MS } from './attempts';
-import { getRemovedProxyHashes } from './proxyManager';
+import { getRemovedProxyHashes, resolveActiveProxy, type ActiveProxyResult } from './proxyManager';
+import { sendTelegramMessage } from '../notifications/telegram';
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+export async function notifyProxyInUse(networkMode: CodeforcesNetworkMode = 'proxy'): Promise<ActiveProxyResult | null> {
+  if (networkMode === 'tailscale') return null;
+  const activeProxy = await resolveActiveProxy().catch((err) => {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'failed to resolve active proxy for submission');
+    return null;
+  });
+  if (activeProxy) {
+    const msg = `🌐 Proxy in use: <b>${escapeHtml(activeProxy.host)}</b> (user: <code>${escapeHtml(activeProxy.username)}</code>)`;
+    await sendTelegramMessage(msg, { parseMode: 'HTML' }).catch(() => undefined);
+  }
+  return activeProxy;
+}
 
 /**
  * Client for the isolated Codeforces submitter.
@@ -86,7 +104,11 @@ export async function submitViaRemoteSubmitter(
   entry: SourceIndexEntry,
   code: string,
   networkMode: CodeforcesNetworkMode = 'proxy',
-  options: { deadline?: number; onProgress?: (phase: 'queued' | 'running') => Promise<void> | void } = {},
+  options: {
+    deadline?: number;
+    onProgress?: (phase: 'queued' | 'running') => Promise<void> | void;
+    activeProxy?: ActiveProxyResult | null;
+  } = {},
 ): Promise<PostedResult | null> {
   const deadline = options.deadline ?? Date.now() + CODEFORCES_ATTEMPT_MS;
   const url = remoteSubmitterUrl();
@@ -111,6 +133,10 @@ export async function submitViaRemoteSubmitter(
     return failed('source entry has no contestId/problemIndex');
   }
 
+  const activeProxy = options.activeProxy !== undefined
+    ? options.activeProxy
+    : await notifyProxyInUse(networkMode).catch(() => null);
+
   if (!(await wakeSubmitter(url, deadline))) {
     return failed(
       `the isolated submitter at ${url} did not answer /health within ${Math.round(WAKE_TIMEOUT_MS / 1000)}s`,
@@ -131,6 +157,8 @@ export async function submitViaRemoteSubmitter(
     },
     state: { cookies: state.cookies, origins: state.origins ?? [] },
     networkMode,
+    proxy: activeProxy?.url,
+    preferredProxy: activeProxy?.url,
     removedProxies: await getRemovedProxyHashes().catch(() => []),
     attemptDeadline: deadline,
     requiresPostAuthorization: true,

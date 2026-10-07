@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { CodeChefAccountStatus } from '@prisma/client';
 import { logger } from '../logger';
 import { config } from '../config';
+import { getSystemState, setSystemState, SystemKeys } from '../database/models';
 import { isRunInProgress as isLeetCodeBusy } from '../scheduler/dailyWorker';
 import { sendTelegramMessage } from '../notifications/telegram';
 import {
@@ -744,7 +745,37 @@ export function isAfterCodeChefSchedule(
   return currentHour * 60 + currentMinute > hour * 60 + minute;
 }
 
-async function runAutomaticCodeChefDaily(
+export interface CodeChefDailyState {
+  date: string;
+  retryCount: number;
+}
+
+export const CODECHEF_DAILY_RETRY_LIMIT = 10;
+
+export async function readCodeChefDailyState(date: string): Promise<CodeChefDailyState> {
+  try {
+    const raw = await getSystemState(SystemKeys.codechefDailyState);
+    const parsed = raw ? (JSON.parse(raw) as Partial<CodeChefDailyState>) : null;
+    if (parsed?.date === date) {
+      return {
+        date,
+        retryCount:
+          Number.isInteger(parsed.retryCount) && Number(parsed.retryCount) >= 0
+            ? Number(parsed.retryCount)
+            : 0,
+      };
+    }
+  } catch {
+    // Reset malformed state
+  }
+  return { date, retryCount: 0 };
+}
+
+export async function writeCodeChefDailyState(state: CodeChefDailyState): Promise<void> {
+  await setSystemState(SystemKeys.codechefDailyState, JSON.stringify(state));
+}
+
+export async function runAutomaticCodeChefDaily(
   isRetry: boolean,
   hour: number,
   minute: number,
@@ -755,33 +786,45 @@ async function runAutomaticCodeChefDaily(
     logger.info('LeetCode is currently running; deferring CodeChef execution to protect memory');
     return;
   }
+  try {
+    const { isCodeforcesRunInProgress } = await import('../codeforces/worker');
+    if (isCodeforcesRunInProgress()) {
+      logger.info('Codeforces is currently running; deferring CodeChef execution to protect memory');
+      return;
+    }
+  } catch {
+    // ignore
+  }
+
   if (isRetry && !isAfterCodeChefSchedule(new Date(), hour, minute, timezone)) return;
 
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: timezone,
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-  }).formatToParts(new Date());
-  const currentHour = Number(parts.find((part) => part.type === 'hour')?.value ?? -1);
-  const currentMinute = Number(parts.find((part) => part.type === 'minute')?.value ?? -1);
-  const currentTotal = currentHour * 60 + currentMinute;
-  const scheduledTotal = hour * 60 + minute;
-
-  // Between 8:15 and 8:50 AM (must finish well before LeetCode at 09:00 AM)
-  if (isRetry && currentTotal > scheduledTotal + 35) return;
-
   const today = todayInTimezone();
+  const state = await readCodeChefDailyState(today);
+  if (isRetry && state.retryCount >= CODECHEF_DAILY_RETRY_LIMIT) return;
+
+  await Promise.resolve(ensureCodeChefAccountsSeeded()).catch(() => {});
   const accounts = await listCodeChefAccounts(true).catch(() => []);
   const pending = accounts.filter((a) => a.lastSubmissionDate !== today);
   if (pending.length === 0) return;
 
+  if (isRetry) {
+    state.retryCount += 1;
+    await writeCodeChefDailyState(state);
+  }
+
   logger.info(
-    { date: today, retry: isRetry, accounts: pending.length, scheduled: `${hour}:${String(minute).padStart(2, '0')}` },
+    {
+      date: today,
+      retry: isRetry,
+      retryAttempt: state.retryCount,
+      retryLimit: CODECHEF_DAILY_RETRY_LIMIT,
+      accounts: pending.length,
+      scheduled: `${hour}:${String(minute).padStart(2, '0')}`,
+    },
     'automatic CodeChef daily run starting',
   );
 
-  await runCodeChefNow('cron', { forceDailyAttempt: false });
+  await runCodeChefNow('cron', { forceDailyAttempt: true });
 }
 
 export function startCodeChefScheduler(): () => void {
@@ -794,6 +837,8 @@ export function startCodeChefScheduler(): () => void {
   const minute = Number.isInteger(requestedMinute) && requestedMinute >= 0 && requestedMinute <= 59
     ? requestedMinute
     : 15;
+
+  void Promise.resolve(ensureCodeChefAccountsSeeded()).catch(() => {});
 
   const expression = `${minute} ${hour} * * *`;
   const task = cron.schedule(
@@ -813,7 +858,7 @@ export function startCodeChefScheduler(): () => void {
     { timezone },
   );
 
-  logger.info({ timezone, expression, retryExpression: '*/5 * * * *' }, 'CodeChef scheduler armed');
+  logger.info({ timezone, expression, retryExpression: '*/5 * * * *', retryLimit: CODECHEF_DAILY_RETRY_LIMIT }, 'CodeChef scheduler armed');
   return () => {
     task.stop();
     retryTask.stop();

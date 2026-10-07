@@ -6,20 +6,19 @@ import {
 } from '../src/notifications/telegramBot';
 
 describe('HELP_TEXT command clickable formatting', () => {
-  it('formats /cfrange, /ccrange, and /questionrangesubmission as clean clickable commands without inline argument placeholders', () => {
-    expect(HELP_TEXT).toContain('├ <code>/cfrange</code> — Batch submit next N problems');
-    expect(HELP_TEXT).toContain('├ <code>/ccrange</code> — Batch submit next N problems');
-    expect(HELP_TEXT).toContain('├ <code>/questionrangesubmission</code> — Range solver');
+  it('formats commands as bare clickable slash commands without <code> wrapping so Telegram treats them as executable bot commands', () => {
+    expect(HELP_TEXT).toContain('├ /cfrange — Batch submit next N problems');
+    expect(HELP_TEXT).toContain('├ /ccrange — Batch submit next N problems');
+    expect(HELP_TEXT).toContain('├ /questionrangesubmission — Range solver');
+    expect(HELP_TEXT).toContain('├ /useproxy — Select &amp; switch active Codeforces proxy');
+    expect(HELP_TEXT).toContain('├ /removeproxy — Blacklist &amp; remove dead proxy in DB');
 
-    // Ensure placeholders like <i><count></i> are NOT directly attached to the command tags
-    expect(HELP_TEXT).not.toContain('<code>/cfrange</code> <i>&lt;count&gt;</i>');
-    expect(HELP_TEXT).not.toContain('<code>/ccrange</code> <i>&lt;count&gt;</i>');
-    expect(HELP_TEXT).not.toContain('<code>/questionrangesubmission</code> <i>&lt;range&gt;</i>');
-  });
-
-  it('formats /removeproxy as clean clickable command without number argument placeholder', () => {
-    expect(HELP_TEXT).toContain('├ <code>/removeproxy</code> — Blacklist &amp; remove dead proxy in DB');
-    expect(HELP_TEXT).not.toContain('<code>/removeproxy</code> <i>&lt;number&gt;</i>');
+    // Ensure commands are not wrapped in <code>/cmd</code> which causes Telegram to only copy to clipboard on click
+    expect(HELP_TEXT).not.toContain('<code>/cfrange</code>');
+    expect(HELP_TEXT).not.toContain('<code>/ccrange</code>');
+    expect(HELP_TEXT).not.toContain('<code>/questionrangesubmission</code>');
+    expect(HELP_TEXT).not.toContain('<code>/useproxy</code>');
+    expect(HELP_TEXT).not.toContain('<code>/removeproxy</code>');
   });
 
   it('contains pro tip guiding users to tap commands directly', () => {

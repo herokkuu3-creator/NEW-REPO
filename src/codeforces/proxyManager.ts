@@ -1,4 +1,5 @@
-import { getSystemState, setSystemState, SystemKeys } from '../database/models';
+import { deleteSystemState, getSystemState, setSystemState, SystemKeys } from '../database/models';
+import { logger } from '../logger';
 import {
   parseProxyList,
   maskProxyUrl,
@@ -14,6 +15,7 @@ export interface ManagedProxy {
   hash: string;
   isRemoved: boolean;
   isCustom: boolean;
+  isPreferred?: boolean;
 }
 
 export interface ProxyCheckStatus {
@@ -161,9 +163,11 @@ export async function getAllConfiguredProxies(envSource?: string): Promise<Manag
   }
 
   const removedHashes = new Set(await getRemovedProxyHashes());
+  const preferred = await getPreferredProxy();
 
   return allUrls.map((url, i) => {
     const hash = proxyHash(url);
+    const isPreferred = preferred ? (url === preferred || hash === preferred) : false;
     return {
       index: i + 1,
       url,
@@ -171,7 +175,64 @@ export async function getAllConfiguredProxies(envSource?: string): Promise<Manag
       hash,
       isRemoved: removedHashes.has(hash),
       isCustom: customSet.has(url),
+      isPreferred,
     };
+  });
+}
+
+export function extractProxyDetails(proxyUrl: string): { host: string; username: string } {
+  try {
+    const u = new URL(proxyUrl);
+    const host = u.host || u.hostname || 'unknown';
+    const username = u.username ? decodeURIComponent(u.username) : 'none';
+    return { host, username };
+  } catch {
+    return { host: 'unknown', username: 'none' };
+  }
+}
+
+export async function getPreferredProxy(): Promise<string | null> {
+  try {
+    const raw = await getSystemState(SystemKeys.codeforcesPreferredProxy);
+    return raw?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setPreferredProxy(
+  proxyUrlOrHash: string,
+  envSource?: string,
+): Promise<ManagedProxy | null> {
+  const all = await getAllConfiguredProxies(envSource);
+  const target = all.find(
+    (p) =>
+      p.url === proxyUrlOrHash ||
+      p.hash === proxyUrlOrHash.toLowerCase() ||
+      String(p.index) === proxyUrlOrHash.trim() ||
+      p.masked === proxyUrlOrHash,
+  );
+  if (!target) return null;
+  await setSystemState(SystemKeys.codeforcesPreferredProxy, target.url);
+  return { ...target, isPreferred: true };
+}
+
+export async function setPreferredProxyByIndex(
+  index: number,
+  envSource?: string,
+): Promise<{ ok: boolean; proxy?: ManagedProxy; error?: string }> {
+  const all = await getAllConfiguredProxies(envSource);
+  const target = all.find((p) => p.index === index);
+  if (!target) {
+    return { ok: false, error: `Proxy #${index} not found. Available indices: 1 to ${all.length}.` };
+  }
+  await setSystemState(SystemKeys.codeforcesPreferredProxy, target.url);
+  return { ok: true, proxy: { ...target, isPreferred: true } };
+}
+
+export async function clearPreferredProxy(): Promise<void> {
+  await deleteSystemState(SystemKeys.codeforcesPreferredProxy).catch(async () => {
+    await setSystemState(SystemKeys.codeforcesPreferredProxy, '');
   });
 }
 
@@ -205,4 +266,88 @@ export async function testAllProxiesOneByOne(
   }
 
   return results;
+}
+
+export interface ActiveProxyResult {
+  proxy: ManagedProxy;
+  url: string;
+  host: string;
+  username: string;
+  fromPreferred: boolean;
+  fallbackOccurred: boolean;
+}
+
+export async function resolveActiveProxy(
+  options: {
+    envSource?: string;
+    tester?: (proxyUrl: string) => Promise<boolean>;
+    log?: (msg: string) => void;
+  } = {},
+): Promise<ActiveProxyResult | null> {
+  const log = options.log ?? ((msg: string) => logger.info({ msg }, 'codeforces proxy resolver'));
+  const tester = options.tester ?? ((url: string) => testProxyDetailed(url, 8).then((r) => r.ok));
+
+  const all = await getAllConfiguredProxies(options.envSource);
+  const available = all.filter((p) => !p.isRemoved);
+  if (available.length === 0) {
+    log('No available (non-blacklisted) proxies found.');
+    return null;
+  }
+
+  const preferredUrlOrHash = await getPreferredProxy();
+  let fallbackOccurred = false;
+
+  if (preferredUrlOrHash) {
+    const preferredCandidate = available.find(
+      (p) => p.url === preferredUrlOrHash || p.hash === preferredUrlOrHash || p.masked === preferredUrlOrHash,
+    );
+    if (preferredCandidate) {
+      log(`Testing preferred proxy #${preferredCandidate.index} (${preferredCandidate.masked})...`);
+      const ok = await tester(preferredCandidate.url).catch(() => false);
+      if (ok) {
+        log(`Preferred proxy #${preferredCandidate.index} (${preferredCandidate.masked}) is live! Selected.`);
+        const details = extractProxyDetails(preferredCandidate.url);
+        return {
+          proxy: preferredCandidate,
+          url: preferredCandidate.url,
+          host: details.host,
+          username: details.username,
+          fromPreferred: true,
+          fallbackOccurred: false,
+        };
+      }
+      logger.warn(
+        { proxy: preferredCandidate.masked, index: preferredCandidate.index },
+        'Preferred Codeforces proxy failed health check. Falling back to pool rotation from beginning.',
+      );
+      fallbackOccurred = true;
+    } else {
+      logger.warn(
+        { preferred: preferredUrlOrHash },
+        'Preferred Codeforces proxy is blacklisted or missing from pool. Falling back to pool rotation.',
+      );
+      fallbackOccurred = true;
+    }
+  }
+
+  // Fallback / default: Walk available proxies in pool order starting from index 0
+  for (const candidate of available) {
+    log(`Testing proxy [${candidate.index}/${all.length}] ${candidate.masked}...`);
+    const ok = await tester(candidate.url).catch(() => false);
+    if (ok) {
+      log(`Proxy [${candidate.index}/${all.length}] ${candidate.masked} is live! Selected.`);
+      const details = extractProxyDetails(candidate.url);
+      return {
+        proxy: candidate,
+        url: candidate.url,
+        host: details.host,
+        username: details.username,
+        fromPreferred: false,
+        fallbackOccurred,
+      };
+    }
+    logger.warn({ proxy: candidate.masked, index: candidate.index }, 'Proxy failed health check, testing next.');
+  }
+
+  return null;
 }

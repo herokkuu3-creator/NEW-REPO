@@ -21,7 +21,7 @@ import { fetchSolvedProblemKeys } from './api';
 import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
 import type { HttpSubmitResult } from './httpSubmit';
 import { captureBefore, pollForVerdict, postSubmitForm, type BrowserPostOutcome } from './submission';
-import { isRemoteSubmitterConfigured, submitViaRemoteSubmitter } from './remoteSubmitter';
+import { isRemoteSubmitterConfigured, notifyProxyInUse, submitViaRemoteSubmitter } from './remoteSubmitter';
 import { shouldRetryWithOriginal, stripCppComments } from './codeSanitizer';
 import { runSubmissionAttempts, readBeforeDeadline, CODEFORCES_ATTEMPT_MS } from './attempts';
 import { launchFirefoxWithStorageStateObject } from '../browser/playwright';
@@ -799,7 +799,7 @@ async function submitViaBrowser(
 
   const posted = isRemoteSubmitterConfigured()
     ? await submitViaRemoteSubmitter(state, label, user, entry, code, networkMode, { deadline, onProgress })
-    : await postViaLocalBrowser(state, label, entry, code, deadline);
+    : await postViaLocalBrowser(state, label, entry, code, deadline, networkMode);
 
   if (!posted) {
     return {
@@ -888,7 +888,11 @@ async function postViaLocalBrowser(
   entry: SourceIndexEntry,
   code: string,
   deadline = Date.now() + CODEFORCES_ATTEMPT_MS,
+  networkMode: CodeforcesNetworkMode = 'proxy',
 ): Promise<LocalPostOutcome | null> {
+  if (networkMode !== 'tailscale') {
+    await notifyProxyInUse(networkMode).catch(() => null);
+  }
   releaseHeap();
   await new Promise<void>((resolve) => setTimeout(resolve, 100));
   const available = availableMemoryMb();

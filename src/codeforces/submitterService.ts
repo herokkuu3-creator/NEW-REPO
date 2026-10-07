@@ -74,6 +74,7 @@ interface SubmitRequest {
   entry: SubmitterEntry;
   state: { cookies: unknown[]; origins?: unknown[] };
   networkMode?: 'proxy' | 'tailscale';
+  proxy?: string;
 }
 
 interface SubmitResponse {
@@ -216,10 +217,16 @@ function proxyLabel(proxy: ReturnType<typeof browserProxy>): string {
   try { return new URL(proxy.server).origin; } catch { return 'configured'; }
 }
 
-async function launchFirefox(state: SubmitRequest['state'], label: string, networkMode: SubmitRequest['networkMode'] = 'proxy'): Promise<Session> {
+async function launchFirefox(
+  state: SubmitRequest['state'],
+  label: string,
+  networkMode: SubmitRequest['networkMode'] = 'proxy',
+  proxyUrl?: string,
+): Promise<Session> {
   let browser: Browser | null = null;
-  const proxy = networkMode === 'tailscale' ? undefined : browserProxy(PROXY_SERVER);
-  if (networkMode !== 'tailscale' && PROXY_SERVER && !proxy) {
+  const configuredProxy = (proxyUrl || PROXY_SERVER || '').trim();
+  const proxy = networkMode === 'tailscale' ? undefined : browserProxy(configuredProxy);
+  if (networkMode !== 'tailscale' && configuredProxy && !proxy) {
     throw new Error('CODEFORCES_PROXY must be a http(s), socks4, or socks5 endpoint');
   }
   try {
@@ -539,7 +546,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
   }
 
   releaseHeap();
-  const session = await launchFirefox(request.state, label, request.networkMode);
+  const session = await launchFirefox(request.state, label, request.networkMode, request.proxy);
   log({ label, browser: BROWSER_ENGINE, usedMb: cgroupUsedMb() }, 'browser launched for isolated Codeforces submission');
 
   const flags = { turnstile: false, interactive: false };
@@ -712,6 +719,7 @@ export const server = http.createServer((req, res) => {
       jobId: broker.nextId,
       networkMode: broker.nextId ? broker.nextNetworkMode : null,
       removedProxies: broker.nextId ? broker.nextRemovedProxies : [],
+      proxy: broker.nextId ? broker.nextProxy : null,
     });
     return;
   }
@@ -726,7 +734,11 @@ export const server = http.createServer((req, res) => {
     }
     if (req.method === 'GET' && action === 'network') {
       const networkMode = broker.networkMode(id);
-      json(res, networkMode ? 200 : 404, networkMode ? { networkMode, removedProxies: broker.removedProxies(id) } : { error: 'job not found or expired' });
+      json(res, networkMode ? 200 : 404, networkMode ? {
+        networkMode,
+        removedProxies: broker.removedProxies(id),
+        proxy: broker.proxy(id),
+      } : { error: 'job not found or expired' });
       return;
     }
     if (req.method === 'POST' && action === 'claim') {

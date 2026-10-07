@@ -1,10 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { runCodeChefNow, codeChefSchedule, nextCodeChefSource, isAfterCodeChefSchedule } from '../src/codechef/worker';
+import {
+  runCodeChefNow,
+  codeChefSchedule,
+  nextCodeChefSource,
+  isAfterCodeChefSchedule,
+  runAutomaticCodeChefDaily,
+  readCodeChefDailyState,
+  writeCodeChefDailyState,
+  CODECHEF_DAILY_RETRY_LIMIT,
+} from '../src/codechef/worker';
 import * as storage from '../src/codechef/storage';
 import { submitDirectlyViaCodeChefApi, submitToCodeChef } from '../src/codechef/api';
 import { loginToCodeChef } from '../src/codechef/auth';
 import { isRunInProgress } from '../src/scheduler/dailyWorker';
 import type { CodeChefSourceEntry } from '../src/codechef/sourceRepo';
+import { getSystemState, setSystemState } from '../src/database/models';
+
+vi.mock('../src/database/models', () => ({
+  getSystemState: vi.fn(),
+  setSystemState: vi.fn(),
+  SystemKeys: { codechefDailyState: 'codechefDailyState' },
+}));
 
 vi.mock('../src/codechef/storage', () => ({
   ensureCodeChefAccountsSeeded: vi.fn(), listCodeChefAccounts: vi.fn(), patchCodeChefAccount: vi.fn(),
@@ -37,6 +53,8 @@ beforeEach(() => {
   vi.mocked(storage.listCodeChefAccounts).mockResolvedValue([{ id: 'account', label: 'tester', username: 'tester', storageState: JSON.stringify({ cookies: [{ name: 'session' }], origins: [] }) }] as never);
   vi.mocked(storage.getCodeChefProgress).mockResolvedValue({ nextKey: 'AAA', lastCompletedKey: null, lastAttemptDate: null } as never);
   vi.mocked(storage.claimDailyAttempt).mockResolvedValue(true);
+  vi.mocked(getSystemState).mockResolvedValue(null);
+  vi.mocked(setSystemState).mockResolvedValue(undefined);
 });
 
 describe('CodeChef daily progress', () => {
@@ -166,5 +184,45 @@ describe('CodeChef daily progress', () => {
     expect(sendTelegramMessage).toHaveBeenCalledTimes(2);
     expect(vi.mocked(sendTelegramMessage).mock.calls[0]?.[0]).toContain('Starting daily submission for CodeChef');
     expect(vi.mocked(sendTelegramMessage).mock.calls[1]?.[0]).toContain('CODECHEF SUBMISSION');
+  });
+});
+
+describe('CodeChef daily scheduler and retries', () => {
+  it('reads and writes daily retry state correctly', async () => {
+    vi.mocked(getSystemState).mockResolvedValueOnce(JSON.stringify({ date: '2026-10-07', retryCount: 3 }));
+    const state = await readCodeChefDailyState('2026-10-07');
+    expect(state).toEqual({ date: '2026-10-07', retryCount: 3 });
+
+    await writeCodeChefDailyState({ date: '2026-10-07', retryCount: 4 });
+    expect(setSystemState).toHaveBeenCalledWith('codechefDailyState', JSON.stringify({ date: '2026-10-07', retryCount: 4 }));
+  });
+
+  it('runAutomaticCodeChefDaily skips when LeetCode is busy', async () => {
+    vi.mocked(isRunInProgress).mockReturnValue(true);
+    await runAutomaticCodeChefDaily(true, 8, 15, 'Asia/Kolkata');
+    expect(submitDirectlyViaCodeChefApi).not.toHaveBeenCalled();
+  });
+
+  it('runAutomaticCodeChefDaily stops when retry limit is reached', async () => {
+    vi.mocked(getSystemState).mockResolvedValue(JSON.stringify({ date: '2026-10-07', retryCount: CODECHEF_DAILY_RETRY_LIMIT }));
+    await runAutomaticCodeChefDaily(true, 8, 15, 'Asia/Kolkata');
+    expect(submitDirectlyViaCodeChefApi).not.toHaveBeenCalled();
+  });
+
+  it('runAutomaticCodeChefDaily ensures accounts are seeded and triggers run with forceDailyAttempt=true', async () => {
+    vi.mocked(getSystemState).mockResolvedValue(JSON.stringify({ date: '2026-10-07', retryCount: 0 }));
+    vi.mocked(storage.listCodeChefAccounts).mockResolvedValue([
+      { id: 'acc1', label: 'tester', username: 'tester', lastSubmissionDate: null, storageState: JSON.stringify({ cookies: [{ name: 'session' }], origins: [] }) },
+    ] as never);
+    vi.mocked(submitDirectlyViaCodeChefApi).mockResolvedValue({ ok: true, performed: true, clicked: true, submissionId: '555', verdict: 'Accepted' });
+
+    // Simulate calling after schedule (e.g. 10:00 AM)
+    const { sendTelegramMessage } = await import('../src/notifications/telegram');
+    vi.mocked(sendTelegramMessage).mockClear();
+
+    await runAutomaticCodeChefDaily(false, 8, 15, 'Asia/Kolkata');
+    expect(storage.ensureCodeChefAccountsSeeded).toHaveBeenCalled();
+    expect(submitDirectlyViaCodeChefApi).toHaveBeenCalled();
+    expect(sendTelegramMessage).toHaveBeenCalled();
   });
 });

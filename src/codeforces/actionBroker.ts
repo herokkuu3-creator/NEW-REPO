@@ -64,6 +64,28 @@ export class ActionBroker {
     return Array.isArray(payload?.removedProxies) ? (payload.removedProxies as unknown[]).map(String) : [];
   }
 
+  get nextProxy(): string | null {
+    this.expire();
+    if (!this.job || !this.job.ready || this.job.claimed || this.job.result !== null) return null;
+    const payload = this.job.payload as { proxy?: unknown; preferredProxy?: unknown };
+    return typeof payload?.proxy === 'string'
+      ? payload.proxy
+      : typeof payload?.preferredProxy === 'string'
+      ? payload.preferredProxy
+      : null;
+  }
+
+  proxy(id: string): string | null {
+    this.expire();
+    if (!this.job || this.job.id !== id) return null;
+    const payload = this.job.payload as { proxy?: unknown; preferredProxy?: unknown };
+    return typeof payload?.proxy === 'string'
+      ? payload.proxy
+      : typeof payload?.preferredProxy === 'string'
+      ? payload.preferredProxy
+      : null;
+  }
+
   async enqueue(payload: unknown, requestedId?: string): Promise<string> {
     if (requestedId && this.job?.id === requestedId) return requestedId;
     if (this.busy) throw new Error('a Codeforces submission is already running');

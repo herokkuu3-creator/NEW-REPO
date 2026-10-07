@@ -48,8 +48,12 @@ import {
   restoreAllProxies,
   testAllProxiesOneByOne,
   fetchRemoteSyncedProxies,
+  getPreferredProxy,
+  setPreferredProxyByIndex,
+  clearPreferredProxy,
+  extractProxyDetails,
 } from '../codeforces/proxyManager';
-import { testProxyDetailed } from '../codeforces/proxyRotator';
+import { testProxyDetailed, type ProxyTestResult } from '../codeforces/proxyRotator';
 import {
   isRunInProgress,
   runSubmissionNow,
@@ -146,51 +150,52 @@ export const HELP_TEXT = [
   '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
   '',
   '<b>✨ 𝗟𝗘𝗘𝗧𝗖𝗢𝗗𝗘 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
-  '├ <code>/triggersubmission</code> — Submit today’s daily question',
-  '├ <code>/claimcoins</code> — Collect contest coins &amp; rewards',
-  '├ <code>/questionrangesubmission</code> — Range solver <i>(e.g. 200-400)</i>',
-  '├ <code>/rangestatus</code> — Check active range job progress',
-  '├ <code>/cancelrange</code> — Stop running range job',
-  '└ <code>/accounts</code> — View LeetCode accounts &amp; session status',
+  '├ /triggersubmission — Submit today’s daily question',
+  '├ /claimcoins — Collect contest coins &amp; rewards',
+  '├ /questionrangesubmission — Range solver <i>(e.g. 200-400)</i>',
+  '├ /rangestatus — Check active range job progress',
+  '├ /cancelrange — Stop running range job',
+  '└ /accounts — View LeetCode accounts &amp; session status',
   '',
   '<b>🏆 𝗖𝗢𝗗𝗘𝗙𝗢𝗥𝗖𝗘𝗦 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
-  '├ <code>/submitnextsolution</code> — Submit next problem for all accounts',
-  '├ <code>/cfrange</code> — Batch submit next N problems <i>(account multi-selection · 30s pacing)</i>',
-  '├ <code>/cfrangestatus</code> — Live batch progress &amp; ETA countdown',
-  '├ <code>/cfcancelrange</code> — Cancel active batch submission',
-  '├ <code>/nextsubcustomaccount</code> — Select specific account to submit 1 problem',
-  '├ <code>/cfnetwork</code> — Switch network mode (Proxy / Tailscale)',
-  '├ <code>/cfmanualnext</code> — Get next source &amp; mobile submit link',
-  '├ <code>/cfaccounts</code> — View Codeforces accounts &amp; verdicts',
-  '└ <code>/cf_clear_cookies</code> — Delete Codeforces stored sessions',
+  '├ /submitnextsolution — Submit next problem for all accounts',
+  '├ /cfrange — Batch submit next N problems <i>(account multi-selection · 30s pacing)</i>',
+  '├ /cfrangestatus — Live batch progress &amp; ETA countdown',
+  '├ /cfcancelrange — Cancel active batch submission',
+  '├ /nextsubcustomaccount — Select specific account to submit 1 problem',
+  '├ /cfnetwork — Switch network mode (Proxy / Tailscale)',
+  '├ /cfmanualnext — Get next source &amp; mobile submit link',
+  '├ /cfaccounts — View Codeforces accounts &amp; verdicts',
+  '└ /cf_clear_cookies — Delete Codeforces stored sessions',
   '',
   '<b>🌐 𝗣𝗥𝗢𝗫𝗬 &amp; 𝗡𝗘𝗧𝗪𝗢𝗥𝗞</b>',
-  '├ <code>/testproxy</code> — Test each proxy one-by-one &amp; show live health',
-  '├ <code>/setproxies</code> <i>&lt;urls&gt;</i> — Save &amp; verify multiple proxies in DB',
-  '├ <code>/addproxy</code> <i>&lt;url&gt;</i> — Add proxy to active pool',
-  '├ <code>/removeproxy</code> — Blacklist &amp; remove dead proxy in DB',
-  '├ <code>/restoreproxies</code> — Reset blacklist &amp; restore all proxies',
-  '├ <code>/syncproxies</code> — Sync proxies from GitHub Actions runner',
-  '└ <code>/cfnetwork</code> — Switch network mode (Proxy / Tailscale)',
+  '├ /useproxy — Select &amp; switch active Codeforces proxy',
+  '├ /testproxy — Test each proxy one-by-one &amp; show live health',
+  '├ /setproxies <i>&lt;urls&gt;</i> — Save &amp; verify multiple proxies in DB',
+  '├ /addproxy <i>&lt;url&gt;</i> — Add proxy to active pool',
+  '├ /removeproxy — Blacklist &amp; remove dead proxy in DB',
+  '├ /restoreproxies — Reset blacklist &amp; restore all proxies',
+  '├ /syncproxies — Sync proxies from GitHub Actions runner',
+  '└ /cfnetwork — Switch network mode (Proxy / Tailscale)',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
-  '├ <code>/codechef</code> — Run daily CodeChef submission',
-  '├ <code>/ccnextsubmit</code> — Force submit next solution in queue',
-  '├ <code>/ccrange</code> — Batch submit next N problems <i>(30s human pacing)</i>',
-  '├ <code>/ccrangestatus</code> — Live batch progress &amp; ETA countdown',
-  '├ <code>/cccancelrange</code> — Cancel active batch submission',
-  '└ <code>/ccaccounts</code> — View CodeChef accounts &amp; queue progress',
+  '├ /codechef — Run daily CodeChef submission',
+  '├ /ccnextsubmit — Force submit next solution in queue',
+  '├ /ccrange — Batch submit next N problems <i>(30s human pacing)</i>',
+  '├ /ccrangestatus — Live batch progress &amp; ETA countdown',
+  '├ /cccancelrange — Cancel active batch submission',
+  '└ /ccaccounts — View CodeChef accounts &amp; queue progress',
   '',
   '<b>🍪 𝗦𝗘𝗦𝗦𝗜𝗢𝗡 𝗠𝗔𝗡𝗔𝗚𝗘𝗠𝗘𝗡𝗧</b>',
-  '├ <code>/renew</code> — Session renewal guide &amp; instructions',
-  '├ <code>/renew</code> <i>&lt;label&gt;</i> — Tag next uploaded JSON with label',
-  '├ <code>/removesession</code> — Remove a single account session',
-  '└ <code>/removeallsessions</code> — Purge all stored accounts',
+  '├ /renew — Session renewal guide &amp; instructions',
+  '├ /renew <i>&lt;label&gt;</i> — Tag next uploaded JSON with label',
+  '├ /removesession — Remove a single account session',
+  '└ /removeallsessions — Purge all stored accounts',
   '',
   '<b>📊 𝗦𝗬𝗦𝗧𝗘𝗠 &amp; 𝗜𝗡𝗙𝗢</b>',
-  '├ <code>/status</code> — System uptime &amp; last run summary',
-  '├ <code>/cancel</code> — Abort ongoing prompt / renewal',
-  '└ <code>/help</code> — Display this command menu',
+  '├ /status — System uptime &amp; last run summary',
+  '├ /cancel — Abort ongoing prompt / renewal',
+  '└ /help — Display this command menu',
   '',
   '<blockquote>💡 <b>Pro Tip:</b> Tap any command above to run it instantly! To add accounts, simply drop a browser cookie JSON file into this chat.</blockquote>',
 ].join('\n');
@@ -515,6 +520,13 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cftransport':
         await handleCodeforcesNetworkCommand();
         return;
+      case '/useproxy':
+      case '/selectproxy':
+      case '/cfuseproxy':
+      case '/cfselectproxy':
+      case '/chooseproxy':
+        await handleUseProxyCommand(commandArg);
+        return;
       case '/testproxy':
       case '/testproxies':
       case '/cfproxy':
@@ -612,7 +624,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
         return;
     }
   }
@@ -1845,6 +1857,125 @@ export async function handleTestProxyCommand(deps: ProxyUiDeps = defaultProxyUiD
   await deps.send(lines.join('\n'), buttons);
 }
 
+export async function handleUseProxyCommand(arg?: string, deps: ProxyUiDeps = defaultProxyUiDeps): Promise<void> {
+  const trimmed = (arg ?? '').trim();
+
+  // Reset to auto pool rotation
+  if (trimmed.toLowerCase() === 'auto' || trimmed.toLowerCase() === 'reset') {
+    await clearPreferredProxy();
+    await deps.send([
+      '✅ <b>Reset to Automatic Proxy Rotation</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+      'Preferred proxy cleared. Future Codeforces submissions will test proxies starting from the beginning of the pool and pick the first live proxy.',
+    ].join('\n'));
+    return;
+  }
+
+  // Direct selection by number e.g. "/useproxy 2" or "/useproxy #2"
+  const index = Number.parseInt(trimmed.replace(/^#/, ''), 10);
+  if (Number.isFinite(index) && index > 0) {
+    const res = await setPreferredProxyByIndex(index);
+    if (!res.ok || !res.proxy) {
+      await deps.send(`❌ Proxy #${index} not found. Available proxies can be viewed with /useproxy or /testproxy.`);
+      return;
+    }
+
+    const check: ProxyTestResult = await testProxyDetailed(res.proxy.url, 8).catch(() => ({ ok: false, latencyMs: 0, error: 'Check error' } as ProxyTestResult));
+    const details = extractProxyDetails(res.proxy.url);
+    const statusIcon = check.ok ? '🟢 <b>Live</b>' : '🔴 <b>Down/Unreachable</b>';
+    const latencyText = check.ok
+      ? ` (${check.latencyMs}ms${check.ip ? ` · IP: ${check.ip}` : ''})`
+      : (check.error ? ` (${escapeHtml(check.error)})` : '');
+
+    await deps.send([
+      `✅ <b>Preferred Proxy Selected: #${index}</b>`,
+      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+      `🌐 <b>Host:</b> <code>${escapeHtml(details.host)}</code>`,
+      `👤 <b>User:</b> <code>${escapeHtml(details.username)}</code>`,
+      `🔒 <b>Proxy:</b> <code>${escapeHtml(res.proxy.masked)}</code>`,
+      `⚡ <b>Current Status:</b> ${statusIcon}${latencyText}`,
+      '',
+      '<i>This proxy will be tested and used first for Codeforces submissions. If it goes down, the system will automatically fall back to testing the pool from the beginning.</i>',
+    ].join('\n'));
+    return;
+  }
+
+  // Interactive selection: fetch all proxies, test health, display buttons
+  const all = await getAllConfiguredProxies();
+  if (all.length === 0) {
+    await deps.send([
+      '<b>🌐 Codeforces Proxies</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+      '⚠️ <b>No proxies found in active pool.</b>',
+      '',
+      'Add proxies first with /addproxy <url> or /setproxies <urls>.',
+    ].join('\n'));
+    return;
+  }
+
+  await deps.send([
+    '<b>🌐 CODEFORCES PROXY SELECTION</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    `🔎 Testing ${all.length} configured proxy(ies) to check live status...`,
+    '<i>Please wait...</i>',
+  ].join('\n'));
+
+  const results = await testAllProxiesOneByOne();
+  const currentPreferred = await getPreferredProxy();
+
+  const lines = [
+    '<b>🌐 CODEFORCES PROXY SELECTION</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    'Select a proxy to prioritize for future Codeforces submissions:',
+    '',
+  ];
+
+  const buttons: InlineButton[][] = [];
+
+  for (const item of results) {
+    const { proxy, result } = item;
+    const details = extractProxyDetails(proxy.url);
+    const isPref = currentPreferred ? (proxy.url === currentPreferred || proxy.hash === currentPreferred) : false;
+    const prefTag = isPref ? ' <b>[CURRENT ACTIVE]</b>' : '';
+
+    if (proxy.isRemoved) {
+      lines.push(`🚫 [${proxy.index}/${all.length}] <code>${escapeHtml(proxy.masked)}</code> — <b>Blacklisted in DB</b>${prefTag}`);
+    } else if (result.ok) {
+      lines.push(`🟢 [${proxy.index}/${all.length}] <code>${escapeHtml(proxy.masked)}</code> — <b>Live</b> (${result.latencyMs}ms${result.ip ? ` · IP: ${result.ip}` : ''})${prefTag}`);
+      lines.push(`   └ Host: <code>${escapeHtml(details.host)}</code> · User: <code>${escapeHtml(details.username)}</code>`);
+      buttons.push([{
+        text: `${isPref ? '⭐ ' : ''}🟢 Use #${proxy.index}: ${details.host}`,
+        callback_data: `pxuse:${proxy.index}`,
+      }]);
+    } else {
+      const errDetail = result.error ? ` (${escapeHtml(result.error)})` : ' (offline)';
+      lines.push(`🔴 [${proxy.index}/${all.length}] <code>${escapeHtml(proxy.masked)}</code> — <b>Failed</b>${errDetail}${prefTag}`);
+      lines.push(`   └ Host: <code>${escapeHtml(details.host)}</code> · User: <code>${escapeHtml(details.username)}</code>`);
+      buttons.push([{
+        text: `${isPref ? '⭐ ' : ''}🔴 Use #${proxy.index}: ${details.host}`,
+        callback_data: `pxuse:${proxy.index}`,
+      }]);
+    }
+  }
+
+  lines.push('');
+  if (currentPreferred) {
+    const prefProxy = all.find((p) => p.url === currentPreferred || p.hash === currentPreferred);
+    lines.push(`⭐ <b>Active Preferred:</b> #${prefProxy?.index ?? '?'} (<code>${escapeHtml(prefProxy?.masked ?? currentPreferred)}</code>)`);
+  } else {
+    lines.push('⚙️ <b>Active Mode:</b> Automatic pool rotation (picks first live proxy from start)');
+  }
+  lines.push('');
+  lines.push('💡 <i>Tap a button below or send /useproxy <number> to set preferred proxy. Send /useproxy auto to reset to automatic rotation.</i>');
+
+  buttons.push([
+    { text: '🔄 Reset to Auto Fallback', callback_data: 'pxuse:auto' },
+    { text: '✅ Done', callback_data: 'pxdone' },
+  ]);
+
+  await deps.send(lines.join('\n'), buttons);
+}
+
 export async function handleRemoveProxyCommand(arg?: string, deps: ProxyUiDeps = defaultProxyUiDeps): Promise<void> {
   const index = Number.parseInt((arg ?? '').trim(), 10);
   if (!Number.isFinite(index) || index <= 0) {
@@ -1999,6 +2130,47 @@ export async function handleProxyButton(
       chatId,
       messageId,
       `🗑️ <b>Proxy #${index} (<code>${escapeHtml(res.proxy.masked)}</code>) removed &amp; blacklisted in DB.</b>\nIt will NOT be used for submissions even if in GitHub Secrets.`,
+    );
+    return;
+  }
+  if (data.startsWith('pxuse:')) {
+    const target = data.slice('pxuse:'.length).trim();
+    if (target === 'auto' || target === 'reset') {
+      await clearPreferredProxy();
+      await deps.answer(callbackId, 'Reset to auto proxy rotation');
+      await deps.edit(
+        chatId,
+        messageId,
+        [
+          '✅ <b>Reset to Automatic Proxy Rotation</b>',
+          '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+          'Preferred proxy cleared. Future Codeforces submissions will test proxies starting from the beginning of the pool and pick the first live proxy.',
+        ].join('\n'),
+      );
+      return;
+    }
+
+    const index = Number.parseInt(target, 10);
+    const res = await setPreferredProxyByIndex(index);
+    if (!res.ok || !res.proxy) {
+      await deps.answer(callbackId, res.error ?? `Proxy #${index} not found`);
+      return;
+    }
+
+    const details = extractProxyDetails(res.proxy.url);
+    await deps.answer(callbackId, `Preferred proxy #${index} selected!`);
+    await deps.edit(
+      chatId,
+      messageId,
+      [
+        `✅ <b>Preferred Proxy Selected: #${index}</b>`,
+        '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+        `🌐 <b>Host:</b> <code>${escapeHtml(details.host)}</code>`,
+        `👤 <b>User:</b> <code>${escapeHtml(details.username)}</code>`,
+        `🔒 <b>Proxy:</b> <code>${escapeHtml(res.proxy.masked)}</code>`,
+        '',
+        '<i>This proxy will be tested and used first for future Codeforces submissions. If it goes down, the system will automatically fall back to testing the pool from the beginning.</i>',
+      ].join('\n'),
     );
     return;
   }
