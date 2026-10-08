@@ -133,9 +133,10 @@ interface TgUpdate {
 
 export type InlineButton = { text: string; callback_data: string };
 
-export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | null;
+export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | null;
 let pendingPromptType: PendingPromptType = null;
 let pendingRangePrompt = false;
+let pendingQueuePrompt = false;
 
 export function getPendingPromptType(): PendingPromptType {
   return pendingPromptType;
@@ -144,12 +145,32 @@ export function getPendingPromptType(): PendingPromptType {
 export function setPendingPromptType(val: PendingPromptType): void {
   pendingPromptType = val;
   pendingRangePrompt = val === 'leetcode';
+  pendingQueuePrompt = val === 'queue';
+}
+
+export function isPendingQueuePrompt(): boolean {
+  return pendingQueuePrompt;
+}
+
+export function setPendingQueuePrompt(val: boolean): void {
+  pendingQueuePrompt = val;
+  if (val) {
+    pendingPromptType = 'queue';
+    pendingRangePrompt = false;
+  } else if (pendingPromptType === 'queue') {
+    pendingPromptType = null;
+  }
 }
 
 export const HELP_TEXT = [
   '<b>⚡ 𝗟𝗘𝗘𝗧𝗖𝗢𝗗𝗘 𝗗𝗔𝗜𝗟𝗬 𝗔𝗚𝗘𝗡𝗧 ⚡</b>',
   '<i>Autonomous Multi-Platform Coding Assistant</i>',
   '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+  '',
+  '<b>📥 𝗤𝗨𝗘𝗨𝗘 𝗠𝗔𝗡𝗔𝗚𝗘𝗠𝗘𝗡𝗧</b>',
+  '├ /startqueue — Queue next command (sequential execution)',
+  '├ /queuestatus — View active process &amp; queued commands',
+  '└ /clearqueue — Cancel &amp; purge pending queue',
   '',
   '<b>✨ 𝗟𝗘𝗘𝗧𝗖𝗢𝗗𝗘 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ /triggersubmission — Submit today’s daily question',
@@ -389,6 +410,40 @@ async function handleMessage(msg: TgMessage): Promise<void> {
   }
 
   const text = (msg.text ?? '').trim();
+  const lowerText = text.toLowerCase();
+
+  // Support plain text "start queue" / "queue start"
+  if (lowerText === 'start queue' || lowerText === 'queue start') {
+    pendingQueuePrompt = true;
+    pendingPromptType = 'queue';
+    pendingRangePrompt = false;
+    await replyHtml(formatQueuePromptMessage());
+    return;
+  }
+  if (lowerText.startsWith('start queue ') || lowerText.startsWith('queue start ')) {
+    const directCmd = text.slice(12).trim();
+    if (directCmd) {
+      await handleQueueCommandInput(directCmd);
+      return;
+    }
+  }
+
+  // Handle active queue prompt
+  if (pendingQueuePrompt) {
+    if (text === '/cancel' || lowerText === 'cancel') {
+      pendingQueuePrompt = false;
+      pendingPromptType = null;
+      await reply('✖️ Command queuing cancelled.');
+      return;
+    }
+    const handled = await handleQueueCommandInput(text);
+    if (handled) {
+      pendingQueuePrompt = false;
+      pendingPromptType = null;
+    }
+    return;
+  }
+
   if (text.startsWith('/')) {
     const { command: cmd, arg: commandArg } = extractTelegramCommand(text);
     switch (cmd) {
@@ -606,10 +661,63 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/range_status':
         await handleRangeStatus();
         return;
+      case '/startqueue':
+      case '/start_queue':
+      case '/queuestart':
+      case '/queue_start': {
+        if (commandArg && commandArg.toLowerCase() !== 'start') {
+          await handleQueueCommandInput(commandArg);
+          return;
+        }
+        pendingQueuePrompt = true;
+        pendingPromptType = 'queue';
+        pendingRangePrompt = false;
+        await replyHtml(formatQueuePromptMessage());
+        return;
+      }
+      case '/queue': {
+        const lowerArg = commandArg.toLowerCase();
+        if (!commandArg || lowerArg === 'start') {
+          pendingQueuePrompt = true;
+          pendingPromptType = 'queue';
+          pendingRangePrompt = false;
+          await replyHtml(formatQueuePromptMessage());
+          return;
+        }
+        if (lowerArg === 'status' || lowerArg === 'show' || lowerArg === 'list') {
+          await replyHtml(formatQueueStatusText());
+          return;
+        }
+        if (lowerArg === 'clear' || lowerArg === 'cancel' || lowerArg === 'stop') {
+          await reply(handleClearQueue());
+          return;
+        }
+        await handleQueueCommandInput(commandArg);
+        return;
+      }
+      case '/queuestatus':
+      case '/queue_status':
+      case '/showqueue':
+      case '/show_queue':
+      case '/queuelist':
+      case '/queue_list':
+        await replyHtml(formatQueueStatusText());
+        return;
+      case '/clearqueue':
+      case '/clear_queue':
+      case '/cancelqueue':
+      case '/cancel_queue':
+        await reply(handleClearQueue());
+        return;
       case '/cancel':
         pendingRenewalLabel = undefined;
         pendingRangePrompt = false;
         pendingPromptType = null;
+        if (pendingQueuePrompt) {
+          pendingQueuePrompt = false;
+          await reply('✖️ Command queuing cancelled.');
+          return;
+        }
         if (getCodeforcesRangeStatus() && getCodeforcesRangeStatus()?.state !== 'idle') {
           await handleCancelCodeforcesRange();
           return;
@@ -625,7 +733,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /startqueue, /queuestatus, /clearqueue, /cancel, /help');
         return;
     }
   }
@@ -3361,6 +3469,434 @@ export async function handleRangeStatus(ui: RangeUiDeps = defaultRangeUiDeps): P
         ? `🗂️ ${queued} range job(s) waiting in the queue. A waiting job starts automatically when the active job finishes or is cancelled.`
         : '💤 No question-range process is running. Start one with /questionrangesubmission 200-400',
   );
+}
+
+// ---------------------------------------------------------------------------
+// Command Queue (sequential FIFO execution)
+// ---------------------------------------------------------------------------
+
+export interface QueuedCommandItem {
+  id: string;
+  rawText: string;
+  command: string;
+  arg: string;
+  queuedAt: number;
+}
+
+const commandQueue: QueuedCommandItem[] = [];
+let queueWorkerActive = false;
+let queueExecutionInProgress = false;
+
+export const VALID_QUEUE_COMMANDS = new Set([
+  // Codeforces
+  '/cfrange', '/cf_range', '/cfbatch', '/cf_batch',
+  '/submitnextsolution', '/submit_next_solution',
+  '/cfmanualnext', '/cf_manual_next',
+  '/nextsubcustomaccount', '/nextsubcustomaccout', '/next_sub_custom_account', '/cfsubmitcustom',
+  '/cfrangestatus', '/cf_range_status', '/cfstatusrange', '/cf_status_range',
+  '/cfcancelrange', '/cf_cancel_range', '/cfcancel', '/cf_cancel', '/cancelcfrange', '/cancel_cf_range',
+  '/cfaccounts', '/cf_accounts',
+  '/cfnetwork', '/cf_network', '/cftransport',
+  // CodeChef
+  '/ccrange', '/cc_range', '/ccbatch', '/cc_batch',
+  '/ccnextsubmit', '/cc_next_submit', '/ccnext', '/cc_next', '/ccsubmit', '/cc_submit',
+  '/codechef',
+  '/ccrangestatus', '/cc_range_status', '/ccstatusrange', '/cc_status_range',
+  '/cccancelrange', '/cc_cancel_range', '/cccancel', '/cc_cancel', '/cancelccrange', '/cancel_cc_range',
+  '/ccaccounts', '/cc_accounts',
+  // LeetCode
+  '/questionrangesubmission', '/question_range_submission', '/rangesubmission',
+  '/triggersubmission', '/trigger_submission',
+  '/claimcoins', '/claim_coins', '/claimoffer', '/claimreward',
+  '/rangestatus', '/range_status',
+  '/cancelrange', '/cancel_range', '/stoprange',
+  '/accounts',
+  // Proxies
+  '/useproxy', '/selectproxy', '/cfuseproxy', '/cfselectproxy', '/chooseproxy',
+  '/testproxy', '/testproxies', '/cfproxy', '/cfproxies', '/proxytest', '/proxystatus',
+  '/setproxies', '/setproxy', '/addproxies', '/addproxy', '/cfaddproxy', '/cfsetproxies',
+  '/removeproxy', '/cfremoveproxy', '/rmproxy',
+  '/restoreproxies', '/resetproxies', '/restoreproxy',
+  '/syncproxies', '/syncproxy', '/cfsyncproxies',
+  // System / Session
+  '/status',
+  '/removesession', '/remove_session',
+  '/removeallsessions', '/remove_all_sessions', '/removeallsession',
+  '/cf_clear_cookies', '/cfclearcookies',
+  '/renew',
+]);
+
+export function getCommandQueue(): QueuedCommandItem[] {
+  return [...commandQueue];
+}
+
+export function clearCommandQueue(): number {
+  const count = commandQueue.length;
+  commandQueue.length = 0;
+  return count;
+}
+
+export function enqueueCommand(rawText: string): { position: number; item: QueuedCommandItem } {
+  const { command, arg } = extractTelegramCommand(rawText);
+  const item: QueuedCommandItem = {
+    id: randomUUID(),
+    rawText,
+    command,
+    arg,
+    queuedAt: Date.now(),
+  };
+  commandQueue.push(item);
+  return { position: commandQueue.length, item };
+}
+
+export function isAnyWorkerBusy(): boolean {
+  return (
+    isCodeforcesRunInProgress() ||
+    isCodeChefRunInProgress() ||
+    isRunInProgress() ||
+    Boolean(currentRangeJob()) ||
+    coinClaimInProgress
+  );
+}
+
+export function describeActiveWorker(): string | null {
+  if (isCodeforcesRunInProgress()) return '🏆 Codeforces batch/submission';
+  if (isCodeChefRunInProgress()) return '👨‍🍳 CodeChef batch/submission';
+  if (isRunInProgress()) return '⚡ LeetCode daily submission';
+  if (currentRangeJob()) return '🎯 LeetCode question-range submission';
+  if (coinClaimInProgress) return '🪙 LeetCode reward claim';
+  return null;
+}
+
+export function isQueueTaskRunning(): boolean {
+  return queueExecutionInProgress;
+}
+
+export function isQueueWorkerActive(): boolean {
+  return queueWorkerActive;
+}
+
+export function resetQueueForTest(): void {
+  commandQueue.length = 0;
+  pendingQueuePrompt = false;
+  queueWorkerActive = false;
+  queueExecutionInProgress = false;
+}
+
+export function validateQueueCommand(input: string): { valid: boolean; normalized: string; error?: string } {
+  let trimmed = input.trim();
+  if (!trimmed) return { valid: false, normalized: '', error: 'Command cannot be empty' };
+
+  if (trimmed.startsWith('/')) {
+    trimmed = trimmed.replace(/^(\/[a-zA-Z0-9_]+)@[a-zA-Z0-9_]+/, '$1');
+  } else {
+    const firstWord = trimmed.split(/\s+/)[0]!.toLowerCase();
+    if (VALID_QUEUE_COMMANDS.has(`/${firstWord}`)) {
+      trimmed = `/${trimmed}`;
+    }
+  }
+
+  const { command: cmd } = extractTelegramCommand(trimmed);
+  if (!cmd) {
+    return { valid: false, normalized: trimmed, error: 'Commands must start with /' };
+  }
+
+  const metaCommands = new Set([
+    '/startqueue', '/start_queue', '/queuestart', '/queue_start',
+    '/queue', '/queuestatus', '/queue_status', '/showqueue', '/show_queue', '/queuelist', '/queue_list',
+    '/clearqueue', '/clear_queue', '/cancelqueue', '/cancel_queue',
+    '/cancel', '/help', '/start',
+  ]);
+  if (metaCommands.has(cmd)) {
+    return { valid: false, normalized: trimmed, error: 'Queue management commands cannot be queued' };
+  }
+
+  if (VALID_QUEUE_COMMANDS.has(cmd)) {
+    return { valid: true, normalized: trimmed };
+  }
+
+  return { valid: false, normalized: trimmed, error: `Unknown command: ${cmd}` };
+}
+
+export function formatQueuePromptMessage(): string {
+  return [
+    '📥 <b>Command Queue</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    'Please enter or tap the command you want to queue:',
+    '',
+    '<b>Common Examples:</b>',
+    '• /cfrange 5 — Codeforces batch submit',
+    '• /ccrange 5 — CodeChef batch submit',
+    '• /questionrangesubmission 200-400 — LeetCode range submit',
+    '• /submitnextsolution — Codeforces submit next',
+    '• /codechef — CodeChef daily submit',
+    '• /triggersubmission — LeetCode daily submit',
+    '',
+    '<i>Reply with any valid command, or send /cancel to abort.</i>',
+  ].join('\n');
+}
+
+export function formatQueueStatusText(): string {
+  const active = describeActiveWorker();
+  const queue = getCommandQueue();
+  const lines: string[] = [
+    '📋 <b>COMMAND QUEUE STATUS</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+  ];
+  if (active) {
+    lines.push(`🔄 <b>Active Process:</b> ${active} in progress`);
+  } else {
+    lines.push('💤 <b>Active Process:</b> None (idle)');
+  }
+  lines.push('');
+  if (queue.length === 0) {
+    lines.push('📭 <b>Queue:</b> Empty');
+    lines.push('');
+    lines.push('💡 <i>Use /startqueue to queue a command to run after the active process.</i>');
+  } else {
+    lines.push(`📥 <b>Queued Commands (${queue.length}):</b>`);
+    queue.forEach((item, idx) => {
+      lines.push(`  ${idx + 1}. <code>${escapeHtml(item.rawText)}</code>`);
+    });
+    lines.push('');
+    lines.push('💡 <i>Commands run sequentially in FIFO order. Use /clearqueue to cancel pending items.</i>');
+  }
+  return lines.join('\n');
+}
+
+export function handleClearQueue(): string {
+  const count = clearCommandQueue();
+  if (count === 0) {
+    return '📭 Command queue was already empty.';
+  }
+  return `🗑️ Command queue cleared. Removed ${count} pending command${count === 1 ? '' : 's'}.`;
+}
+
+export async function handleQueueCommandInput(
+  input: string,
+  deps?: {
+    notify?: (text: string, html?: boolean) => Promise<void>;
+    startWorker?: () => void;
+  },
+): Promise<boolean> {
+  const trimmed = input.trim();
+  if (!trimmed) return false;
+
+  const validation = validateQueueCommand(trimmed);
+  const notifyFn = deps?.notify ?? ((text, html) => html ? replyHtml(text) : reply(text));
+
+  if (!validation.valid) {
+    await notifyFn(
+      `⚠️ <b>Invalid Command:</b> <code>${escapeHtml(trimmed)}</code>\n` +
+      `Please provide a valid bot command to queue.\n\n` +
+      `<b>Examples:</b>\n` +
+      `• <code>/cfrange 5</code>\n` +
+      `• <code>/ccrange 5</code>\n` +
+      `• <code>/questionrangesubmission 200-400</code>\n` +
+      `• <code>/submitnextsolution</code>\n` +
+      `• <code>/codechef</code>\n` +
+      `• <code>/triggersubmission</code>\n\n` +
+      `<i>Send /cancel to abort.</i>`,
+      true,
+    );
+    return false;
+  }
+
+  const { position, item } = enqueueCommand(validation.normalized);
+  const activeDesc = describeActiveWorker();
+
+  let statusNote = '';
+  if (activeDesc) {
+    statusNote = `⏳ <b>${activeDesc}</b> is currently active.\nThis command will start automatically once ongoing tasks finish.`;
+  } else if (position > 1) {
+    statusNote = `⏳ Will execute sequentially after previous queued commands (#1..#${position - 1}) complete.`;
+  } else {
+    statusNote = `▶️ No process is currently running — starting execution now!`;
+  }
+
+  await notifyFn(
+    `📥 <b>Command Queued (#${position} in queue)</b>\n` +
+    `<code>━━━━━━━━━━━━━━━━━━━━</code>\n` +
+    `<b>Command:</b> <code>${escapeHtml(item.rawText)}</code>\n\n` +
+    `${statusNote}\n\n` +
+    `💡 <i>To queue another command, send /startqueue again. Use /queuestatus to view queue.</i>`,
+    true,
+  );
+
+  if (deps?.startWorker) {
+    deps.startWorker();
+  } else {
+    ensureQueueWorkerRunning();
+  }
+  return true;
+}
+
+export function ensureQueueWorkerRunning(deps?: {
+  isBusy?: () => boolean;
+  execute?: (item: QueuedCommandItem) => Promise<void>;
+  sleep?: (ms: number) => Promise<void>;
+  notify?: (text: string, html?: boolean) => Promise<void>;
+}): void {
+  if (queueWorkerActive) return;
+  void runQueueWorker(deps).catch((err) => {
+    logger.error({ err: errText(err) }, 'Fatal queue worker error');
+    queueWorkerActive = false;
+    queueExecutionInProgress = false;
+  });
+}
+
+export async function runQueueWorker(deps?: {
+  isBusy?: () => boolean;
+  execute?: (item: QueuedCommandItem) => Promise<void>;
+  sleep?: (ms: number) => Promise<void>;
+  notify?: (text: string, html?: boolean) => Promise<void>;
+}): Promise<void> {
+  if (queueWorkerActive) return;
+  queueWorkerActive = true;
+  const isBusyFn = deps?.isBusy ?? isAnyWorkerBusy;
+  const executeFn = deps?.execute ?? ((item) => executeQueuedCommand(item));
+  const sleepFn = deps?.sleep ?? sleep;
+  const notifyFn = deps?.notify ?? ((text, html) => html ? replyHtml(text) : reply(text));
+
+  let processedCount = 0;
+  try {
+    while (commandQueue.length > 0) {
+      // 1. Wait until no background worker is busy
+      while (isBusyFn()) {
+        await sleepFn(2000);
+      }
+
+      // Check if queue was cleared while waiting
+      if (commandQueue.length === 0) break;
+
+      // Small delay between tasks
+      await sleepFn(2000);
+      if (isBusyFn()) continue;
+
+      const nextItem = commandQueue.shift()!;
+      queueExecutionInProgress = true;
+      processedCount++;
+      try {
+        await notifyFn(
+          `🚀 <b>Dispatching Queued Command:</b> <code>${escapeHtml(nextItem.rawText)}</code>\n` +
+          `<i>(${commandQueue.length} item${commandQueue.length === 1 ? '' : 's'} remaining in queue)</i>`,
+          true,
+        );
+
+        await executeFn(nextItem);
+
+        // Give the triggered task a moment to register its busy state or complete
+        await sleepFn(3000);
+
+        // Wait while this task completes
+        while (isBusyFn()) {
+          await sleepFn(2000);
+        }
+      } catch (err) {
+        logger.error({ err: errText(err), command: nextItem.rawText }, 'Error executing queued command');
+        await notifyFn(
+          `⚠️ Error executing queued command <code>${escapeHtml(nextItem.rawText)}</code>: ${escapeHtml(errText(err))}`,
+          true,
+        );
+      } finally {
+        queueExecutionInProgress = false;
+      }
+    }
+
+    if (processedCount > 0) {
+      await notifyFn('🏁 <b>Command Queue Completed!</b>\nAll queued tasks have finished.', true);
+    }
+  } finally {
+    queueWorkerActive = false;
+    queueExecutionInProgress = false;
+  }
+}
+
+export async function executeQueuedCommand(item: QueuedCommandItem): Promise<void> {
+  const { command: cmd, arg: commandArg } = extractTelegramCommand(item.rawText);
+
+  switch (cmd) {
+    case '/cfrange':
+    case '/cf_range':
+    case '/cfbatch':
+    case '/cf_batch': {
+      const tokens = commandArg.split(/\s+/).filter(Boolean);
+      const parsedCount = parseInt(tokens[0] ?? '', 10);
+      const count = !isNaN(parsedCount) && parsedCount > 0 ? Math.min(50, parsedCount) : 5;
+      const res = await handleCodeforcesTrigger({ forceNext: true, count });
+      if (res?.done) await res.done;
+      return;
+    }
+    case '/ccrange':
+    case '/cc_range':
+    case '/ccbatch':
+    case '/cc_batch': {
+      const parsedCount = parseInt(commandArg, 10);
+      const count = !isNaN(parsedCount) && parsedCount > 0 ? Math.min(50, parsedCount) : 5;
+      const res = await handleCodeChefTrigger({ forceNext: true, count });
+      if (res?.done) await res.done;
+      return;
+    }
+    case '/questionrangesubmission':
+    case '/question_range_submission':
+    case '/rangesubmission': {
+      const parsed = parseQuestionRange(commandArg);
+      if (parsed.ok) {
+        const res = await startRangeJob(parsed.range, 'all');
+        if (res.started || 'queued' in res) {
+          await replyHtml(`🎯 <b>LeetCode Question Range Started:</b> #${parsed.range.from}–#${parsed.range.to}`);
+          await res.done;
+        } else if (!res.started && 'reason' in res) {
+          await reply(`⚠️ Could not start question range: ${res.reason}`);
+        }
+      } else {
+        await replyHtml(`⚠️ Could not parse question range for queued command: ${escapeHtml(parsed.error)}`);
+      }
+      return;
+    }
+    case '/submitnextsolution':
+    case '/submit_next_solution': {
+      const res = await handleCodeforcesSubmitNext();
+      if (res?.done) await res.done;
+      return;
+    }
+    case '/ccnextsubmit':
+    case '/cc_next_submit':
+    case '/ccnext':
+    case '/cc_next':
+    case '/ccsubmit':
+    case '/cc_submit': {
+      const res = await handleCodeChefTrigger({ forceNext: true, count: 1 });
+      if (res?.done) await res.done;
+      return;
+    }
+    case '/codechef': {
+      const res = await handleCodeChefTrigger({ forceNext: false });
+      if (res?.done) await res.done;
+      return;
+    }
+    case '/triggersubmission':
+    case '/trigger_submission': {
+      const res = await handleTriggerSubmission();
+      if (res?.done) await res.done;
+      return;
+    }
+    case '/claimcoins':
+    case '/claim_coins':
+    case '/claimoffer':
+    case '/claimreward': {
+      await handleCoinClaimCommand();
+      return;
+    }
+    default: {
+      await handleMessage({
+        message_id: 0,
+        chat: { id: config.telegram.chatId },
+        text: item.rawText,
+      });
+      return;
+    }
+  }
 }
 
 /** Pending /renew <label> target — consumed by the next cookie payload. */
