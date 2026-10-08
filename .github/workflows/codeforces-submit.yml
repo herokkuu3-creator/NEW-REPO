@@ -72,6 +72,9 @@ jobs:
               if (body.removedProxies && Array.isArray(body.removedProxies)) {
                 fs.appendFileSync(process.env.GITHUB_OUTPUT, `removed_proxies=${JSON.stringify(body.removedProxies)}\n`);
               }
+              if (body.proxy && typeof body.proxy === 'string') {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, `preferred_proxy=${body.proxy}\n`);
+              }
             }
           }).catch(error => { console.error(error.message); process.exitCode = 1; });
           NODE
@@ -112,6 +115,7 @@ jobs:
           CODEFORCES_NETWORK_MODE: ${{ steps.lookup.outputs.network_mode }}
           FALLBACK_CODEFORCES_PROXY: ${{ secrets.CODEFORCES_RESIDENTIAL_PROXY }}
           REMOVED_PROXIES: ${{ steps.lookup.outputs.removed_proxies }}
+          PREFERRED_PROXY: ${{ steps.lookup.outputs.preferred_proxy }}
         run: |
           if [ "$CODEFORCES_NETWORK_MODE" = "tailscale" ] && [ "$TAILSCALE_STEP_OUTCOME" = "success" ] && [ -n "$TAILSCALE_EXIT_NODE" ] && sudo tailscale set --exit-node="$TAILSCALE_EXIT_NODE" && timeout 30 curl --fail --silent --show-error --output /dev/null https://www.cloudflare.com/cdn-cgi/trace; then
             echo 'CODEFORCES_PROXY=' >> "$GITHUB_ENV"
@@ -128,4 +132,5 @@ jobs:
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
         env:
           CODEFORCES_JOB_ID: ${{ inputs.job_id || steps.lookup.outputs.job_id }}
+          STRICT_PROXY: 'true'
         run: xvfb-run -a node --expose-gc dist/src/codeforces/actionRunner.js

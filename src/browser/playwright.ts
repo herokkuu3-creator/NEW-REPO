@@ -8,6 +8,7 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { loadStorageStateFromDb, saveStorageStateToDb } from '../database/models';
 import { StorageStateShape } from './cookiePayload';
+import { applyStealthScripts, getRandomDesktopViewport } from './stealth';
 
 /**
  * Browser lifecycle management.
@@ -55,6 +56,7 @@ function attachLogCapture(page: Page, sink: string[]): void {
  */
 export function buildLaunchArgs(): string[] {
   const args = [
+    '--disable-blink-features=AutomationControlled',
     '--disable-dev-shm-usage', // small /dev/shm in containers
     '--no-sandbox', // required in most container environments
     '--disable-gpu',
@@ -242,10 +244,11 @@ export async function launchFirefoxWithStorageStateObject(
         cookies: state.cookies,
         origins: state.origins,
       },
-      viewport: { width: 900, height: 600 },
+      viewport: getRandomDesktopViewport(),
       locale: 'en-US',
-      serviceWorkers: 'block',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
     });
+    await applyStealthScripts(context);
 
     // Omit decorative assets while preserving CSS and verification resources.
     await context.route('**/*', async (route) => {

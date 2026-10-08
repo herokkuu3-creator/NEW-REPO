@@ -27,6 +27,7 @@ import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource } from './browserForm';
 import { parseProxyList } from './proxyRotator';
+import { STEALTH_CHROMIUM_ARGS, applyStealthScripts, getRandomDesktopViewport } from '../browser/stealth';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
 const PORT = Number(process.env.PORT ?? 10000);
@@ -229,28 +230,17 @@ async function launchFirefox(
   if (networkMode !== 'tailscale' && configuredProxy && !proxy) {
     throw new Error('CODEFORCES_PROXY must be a http(s), socks4, or socks5 endpoint');
   }
+  const isCloudRunner = process.env.GITHUB_ACTIONS === 'true' || process.env.CI === 'true' || process.env.STRICT_PROXY === 'true';
+  if (networkMode !== 'tailscale' && !proxy && isCloudRunner) {
+    throw new Error('Residential proxy is strictly required on cloud runners to prevent Cloudflare datacenter IP detection');
+  }
   try {
     const active = (browser = await (BROWSER_ENGINE === 'chromium' ? chromium : firefox).launch({
       headless: HEADLESS,
       ...(proxy ? { proxy } : {}),
       ...(BROWSER_ENGINE === 'chromium' ? {
-        args: [
-          '--no-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--no-first-run',
-          '--disable-component-update',
-          '--safebrowsing-disable-auto-update',
-          '--disable-sync',
-          '--disable-default-apps',
-          '--no-default-browser-check',
-          '--disable-background-networking',
-          '--disable-domain-reliability',
-          '--disable-client-side-phishing-detection',
-          '--metrics-recording-only',
-          '--no-pings',
-          '--disable-features=Translate,OptimizationHints,MediaRouter',
-        ],
+        args: STEALTH_CHROMIUM_ARGS,
+        ignoreDefaultArgs: ['--enable-automation'],
       } : {
         firefoxUserPrefs: {
           'browser.cache.disk.enable': false,
@@ -270,16 +260,20 @@ async function launchFirefox(
         },
       }),
     }));
+    const viewport = getRandomDesktopViewport();
     const context = await active.newContext({
       storageState: { cookies: state.cookies, origins: state.origins ?? [] } as Parameters<
         BrowserContext['storageState']
       > extends never
         ? never
         : never,
-      viewport: { width: 900, height: 600 },
+      viewport,
       locale: 'en-US',
-      serviceWorkers: 'block',
+      userAgent: BROWSER_ENGINE === 'chromium'
+        ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
     });
+    await applyStealthScripts(context);
     if (process.env.CODEFORCES_BLOCK_ASSETS !== 'false') {
       await context.route('**/*', async (route) => {
         const type = route.request().resourceType();

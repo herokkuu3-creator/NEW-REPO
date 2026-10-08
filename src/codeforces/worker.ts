@@ -81,7 +81,18 @@ export interface CodeforcesRangeJobInfo {
 let activeCodeforcesRangeAbortController: AbortController | null = null;
 let activeCodeforcesRangeJob: CodeforcesRangeJobInfo | null = null;
 
-export const CODEFORCES_RANGE_GAP_MS = 30000; // 30-second pacing between batch questions to mimic human behavior
+export const CODEFORCES_RANGE_GAP_MS = 30000; // 30-second fallback base pacing
+
+/**
+ * Returns a randomized pacing delay (in milliseconds) with jitter to mimic human behavior
+ * and break rigid automation timing signatures.
+ */
+export function getCodeforcesPacingDelayMs(): number {
+  const baseMs = Number(process.env.CODEFORCES_PACING_BASE_MS ?? 42000);
+  const jitterMs = Number(process.env.CODEFORCES_PACING_JITTER_MS ?? 24000);
+  const delta = (Math.random() - 0.5) * jitterMs;
+  return Math.max(25000, Math.round(baseMs + delta));
+}
 
 export function cancelCodeforcesRun(): boolean {
   if (!runInProgress) return false;
@@ -282,6 +293,10 @@ export async function executeCodeforcesRun(
     for (const [accIndex, account] of accounts.entries()) {
       if (signal.aborted) break;
 
+      let consecutiveFailuresOnSameProblem = 0;
+      let lastAttemptedProblemKey: string | null = null;
+      let consecutiveCloudflareBlocks = 0;
+
       for (let step = 0; step < batchCount; step++) {
         if (signal.aborted) break;
 
@@ -347,6 +362,65 @@ export async function executeCodeforcesRun(
         }
 
         if (outcome.kind === 'solved') {
+          consecutiveFailuresOnSameProblem = 0;
+          consecutiveCloudflareBlocks = 0;
+          lastAttemptedProblemKey = null;
+        } else {
+          const problemKey = outcome.problem ?? null;
+          if (problemKey && problemKey === lastAttemptedProblemKey) {
+            consecutiveFailuresOnSameProblem++;
+          } else {
+            consecutiveFailuresOnSameProblem = 1;
+            lastAttemptedProblemKey = problemKey;
+          }
+
+          const isBlocked = /cloudflare|challenge|403|did not clear/i.test(outcome.error ?? '');
+          if (isBlocked) {
+            consecutiveCloudflareBlocks++;
+            logger.warn({ account: account.label, consecutiveCloudflareBlocks }, 'Cloudflare verification challenge encountered on submit form');
+            if (consecutiveCloudflareBlocks >= 3) {
+              logger.error({ account: account.label }, 'Multiple consecutive Cloudflare blocks detected; stopping batch run to protect account');
+              await options.onAccountProgress?.({
+                phase: 'failed',
+                label: account.label,
+                username: account.username,
+                problem: outcome.problem,
+                error: 'Multiple consecutive Cloudflare blocks encountered. Paused batch to protect account trust score.',
+                index: progressIndex,
+                total: progressTotal,
+                accIndex,
+                accTotal: accounts.length,
+                stepIndex: step + 1,
+                stepTotal: batchCount,
+              });
+              break;
+            }
+          } else {
+            consecutiveCloudflareBlocks = 0;
+          }
+
+          if (consecutiveFailuresOnSameProblem >= 2) {
+            logger.warn({ account: account.label, problem: outcome.problem }, 'Problem failed twice consecutively; advancing queue to skip locked problem');
+            const progress = await getCodeforcesProgress(account.id);
+            const currentEntry = resolveCurrentEntry(source.queue, progress.nextKey, progress.lastCompletedKey);
+            if (currentEntry) {
+              const queueIndex = source.queue.findIndex((e) => e.key === currentEntry.key);
+              if (queueIndex >= 0 && queueIndex + 1 < source.queue.length) {
+                const nextEntry = source.queue[queueIndex + 1]!;
+                await completeCurrentProblem(account.id, {
+                  completedKey: currentEntry.key,
+                  nextKey: nextEntry.key,
+                  submissionId: null,
+                  verdict: 'SKIPPED_AFTER_FAILURES',
+                });
+                logger.info({ skipped: currentEntry.key, next: nextEntry.key }, 'Advanced queue past failing problem');
+              }
+            }
+            consecutiveFailuresOnSameProblem = 0;
+          }
+        }
+
+        if (outcome.kind === 'solved') {
           await options.onAccountProgress?.({
             phase: 'completed',
             label: account.label,
@@ -407,9 +481,10 @@ export async function executeCodeforcesRun(
 
         // Pacing delay between batch steps for this account
         if (step < batchCount - 1 && !signal.aborted) {
+          const pacingGapMs = getCodeforcesPacingDelayMs();
           if (activeCodeforcesRangeJob) {
             activeCodeforcesRangeJob.state = 'waiting';
-            activeCodeforcesRangeJob.waitEndsAt = Date.now() + CODEFORCES_RANGE_GAP_MS;
+            activeCodeforcesRangeJob.waitEndsAt = Date.now() + pacingGapMs;
           }
           await options.onAccountProgress?.({
             phase: 'waiting',
@@ -421,9 +496,9 @@ export async function executeCodeforcesRun(
             accTotal: accounts.length,
             stepIndex: step + 1,
             stepTotal: batchCount,
-            waitSeconds: Math.round(CODEFORCES_RANGE_GAP_MS / 1000),
+            waitSeconds: Math.round(pacingGapMs / 1000),
           });
-          await sleepWithAbort(CODEFORCES_RANGE_GAP_MS, signal);
+          await sleepWithAbort(pacingGapMs, signal);
           if (activeCodeforcesRangeJob) {
             activeCodeforcesRangeJob.state = 'running';
             activeCodeforcesRangeJob.waitEndsAt = undefined;

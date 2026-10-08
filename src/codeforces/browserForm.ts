@@ -1,4 +1,5 @@
 import type { Page, Request, Response } from 'playwright';
+import { simulateHumanMouseMove } from '../browser/stealth';
 
 export interface VerificationFlags {
   turnstile: boolean;
@@ -53,6 +54,16 @@ export function blockCodeforcesResource(url: string, type: string): boolean {
 
 /** Preserve Codeforces' editor teardown and submit handlers instead of replacing window.editor. */
 export async function fillSource(page: Page, code: string): Promise<void> {
+  const sourceBox = page.locator('textarea[name="source"]').first();
+  if ((await sourceBox.count().catch(() => 0)) > 0) {
+    await sourceBox.scrollIntoViewIfNeeded().catch(() => {});
+    await sourceBox.focus().catch(() => {});
+    const bb = await sourceBox.boundingBox().catch(() => null);
+    if (bb) {
+      await simulateHumanMouseMove(page, bb.x + 20, bb.y + 20, 4).catch(() => {});
+    }
+  }
+
   await page.evaluate((content) => {
     const toggle = document.getElementById('toggleEditorCheckbox') as HTMLInputElement | null;
     // Keep the plain textarea active. Some Codeforces pages preserve an Ace
@@ -146,6 +157,24 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
         }
       }).catch(() => 'page-error');
     }
+    if (Date.now() - startedAt >= 2_000) {
+      try {
+        const frameLoc = form.locator('iframe[src*="challenges.cloudflare.com"]').first();
+        if ((await frameLoc.count().catch(() => 0)) > 0) {
+          const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
+          const cb = frame.locator('input[type="checkbox"], #challenge-stage, .ctp-checkbox-label, #cf-stage, .mark').first();
+          if (await cb.isVisible().catch(() => false)) {
+            const box = await cb.boundingBox().catch(() => null);
+            if (box) {
+              await simulateHumanMouseMove(page, box.x + box.width / 2, box.y + box.height / 2, 4).catch(() => {});
+              await cb.click({ timeout: 1500 }).catch(() => {});
+            }
+          }
+        }
+      } catch {
+        // Frame not interactive or detached
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
   }
   if (await hasToken()) return { turnstile: true, interactive: false };
@@ -235,6 +264,21 @@ export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{
     );
   }
 
+  // Natural human dwell time and mouse trajectory before clicking submit
+  const isShortTimeout = timeoutMs < 2000;
+  if (!isShortTimeout) {
+    const dwellMs = process.env.NODE_ENV === 'test' ? 80 : 1500 + Math.floor(Math.random() * 1500);
+    await new Promise((r) => setTimeout(r, Math.min(dwellMs, Math.max(0, timeoutMs - 5000))));
+    try {
+      const box = await control.boundingBox().catch(() => null);
+      if (box) {
+        await simulateHumanMouseMove(page, box.x + box.width / 2, box.y + box.height / 2, 6);
+        await control.hover().catch(() => {});
+        await new Promise((r) => setTimeout(r, 100 + Math.floor(Math.random() * 150)));
+      }
+    } catch {}
+  }
+
   let posted: Request | undefined;
   let response: Response | undefined;
   let finalResponse: Response | undefined;
@@ -275,8 +319,12 @@ export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{
     }
   };
   try {
-    // force skips layout checks under memory pressure, but never enables a disabled control.
-    await control.click({ force: true, noWaitAfter: true, timeout: Math.min(timeoutMs, 15_000) });
+    try {
+      await control.click({ timeout: Math.min(timeoutMs, 5_000), noWaitAfter: true });
+    } catch {
+      // force skips layout checks under memory pressure, but never enables a disabled control.
+      await control.click({ force: true, noWaitAfter: true, timeout: Math.min(timeoutMs, 15_000) });
+    }
     clicked = true;
     while (Date.now() < deadline) {
       if (failure) break;
