@@ -34,8 +34,13 @@ export function blockCodeforcesResource(url: string, type: string): boolean {
   const host = parsed.hostname.toLowerCase();
   const path = parsed.pathname.toLowerCase();
 
-  // Never block Cloudflare's challenge page, iframe, or token requests.
-  if (host === 'challenges.cloudflare.com' || host.endsWith('.challenges.cloudflare.com') || path.startsWith('/cdn-cgi/')) {
+  // Never block Cloudflare's challenge page, iframe, token requests, or Turnstile JS.
+  // Turnstile's entropy scripts can be served from any *.cloudflare.com subdomain.
+  if (
+    host === 'challenges.cloudflare.com' || host.endsWith('.challenges.cloudflare.com') ||
+    host === 'cloudflare.com' || host.endsWith('.cloudflare.com') ||
+    path.startsWith('/cdn-cgi/')
+  ) {
     return false;
   }
 
@@ -100,8 +105,21 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
       if (!formEl) return '';
       const ttInput = formEl.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
       const cfInput = formEl.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
-      const api = (window as unknown as { turnstile?: { getResponse?: () => string } }).turnstile;
-      const apiToken = typeof api?.getResponse === 'function' ? (api.getResponse() || '') : '';
+      const api = (window as unknown as { turnstile?: {
+        getResponse?: (widgetId?: string) => string;
+        getAllChallengeData?: () => unknown[];
+      } }).turnstile;
+
+      // Try getting by widget ID if stored
+      const widgetEl = formEl.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
+      const storedId = widgetEl?.dataset.widgetId;
+      let apiToken = '';
+      if (typeof api?.getResponse === 'function') {
+        try { apiToken = storedId ? (api.getResponse(storedId) || '') : (api.getResponse() || ''); } catch {}
+        // If no token yet, try without ID too
+        if (!apiToken && storedId) { try { apiToken = api.getResponse() || ''; } catch {} }
+      }
+
       const token = (ttInput?.value || cfInput?.value || apiToken || '').trim();
       if (!token) return '';
 
@@ -132,7 +150,6 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
       }
 
       // If data-callback is present on the widget, invoke it to update site's state
-      const widgetEl = formEl.querySelector('.cf-turnstile[data-callback]');
       const callbackName = widgetEl?.getAttribute('data-callback');
       if (callbackName) {
         const fn = callbackName.split('.').reduce<unknown>((val, key) =>
@@ -152,7 +169,11 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
   let renderAttempt = 'not-needed';
   let renderChecked = false;
   let executeAttempt = 'not-needed';
-  let executeChecked = false;
+  // Track the number of execute() retries; for invisible Turnstile we retry up to 4 times
+  let executeCount = 0;
+  const MAX_EXECUTE_RETRIES = 4;
+  // Track next time to retry execute
+  let nextExecuteAt = startedAt + 5_000;
 
   const hasToken = async () => {
     const directVal = (await field.first().inputValue({ timeout: 250 }).catch(() => '')).trim();
@@ -175,25 +196,30 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
       renderChecked = true;
       // Codeforces sometimes leaves the container unrendered even though api.js
       // loaded. Ask the real Turnstile API to render it once; never fabricate a token.
+      // Store the widgetId so we can call getResponse(id) later.
       renderAttempt = await form.evaluate((element) => {
-        const widget = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
+        const widgetEl = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
         const api = (window as unknown as { turnstile?: {
-          render?: (container: HTMLElement, options: { sitekey: string; callback: (token: string) => void }) => string;
-          execute?: (container: HTMLElement) => void;
+          render?: (container: HTMLElement, options: { sitekey: string; callback: (token: string) => void; 'error-callback'?: () => void }) => string;
+          execute?: (container: HTMLElement | string) => void;
         } }).turnstile;
-        if (!widget || !api?.render || widget.querySelector('iframe')) return 'not-needed';
-        const sitekey = widget.dataset.sitekey;
+        if (!widgetEl || !api?.render) return 'not-needed';
+        // Only skip render if the iframe is ALREADY fully rendered (not just present in widget shadow DOM)
+        const pageIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+        if (pageIframe) return 'not-needed'; // Visible checkbox mode — handled by click logic
+        const sitekey = widgetEl.dataset.sitekey;
         if (!sitekey) return 'no-sitekey';
         try {
-          api.render(widget, {
+          const widgetId = api.render(widgetEl, {
             sitekey,
             callback: (token) => {
-              const callbackName = widget.getAttribute('data-callback');
+              const callbackName = widgetEl.getAttribute('data-callback');
               if (callbackName) {
                 const fn = callbackName.split('.').reduce<unknown>((value, key) =>
                   value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
                 if (typeof fn === 'function') (fn as (value: string) => void)(token);
               }
+              // Store token in both hidden inputs immediately via the callback
               const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
               if (input && !input.value) {
                 input.value = token;
@@ -207,27 +233,48 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
                 cfInput.dispatchEvent(new Event('change', { bubbles: true }));
               }
             },
+            'error-callback': () => { /* Cloudflare rejected — execute() retry loop will handle */ },
           });
-          return 'rendered';
+          // Store the widgetId on the element so syncTokens() can use getResponse(id)
+          if (widgetId && widgetEl) widgetEl.dataset.widgetId = String(widgetId);
+          return `rendered:${widgetId ?? 'no-id'}`;
         } catch {
           return 'render-error';
         }
       }).catch(() => 'page-error');
     }
-    if (!executeChecked && Date.now() - startedAt >= 5_000) {
-      executeChecked = true;
-      executeAttempt = await form.evaluate((element) => {
-        const widget = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
-        const api = (window as unknown as { turnstile?: { execute?: (container: HTMLElement) => void } }).turnstile;
-        if (!widget || !api?.execute) return 'unavailable';
+
+    // Invisible/managed Turnstile: call execute() repeatedly with exponential back-off.
+    // On each retry we increase the wait so Cloudflare has more time to score entropy.
+    if (executeCount < MAX_EXECUTE_RETRIES && Date.now() >= nextExecuteAt) {
+      executeCount += 1;
+      const attempt = await form.evaluate((element) => {
+        const widgetEl = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
+        const api = (window as unknown as { turnstile?: {
+          execute?: (container: HTMLElement | string) => void;
+          getResponse?: (id?: string) => string;
+        } }).turnstile;
+        if (!widgetEl || !api?.execute) return 'unavailable';
+        // If execute-mode is not explicitly set, the widget is invisible/managed.
+        // Call execute() which triggers Cloudflare's background challenge.
+        const storedId = widgetEl.dataset.widgetId;
         try {
-          api.execute(widget);
+          if (storedId) {
+            api.execute(storedId);
+          } else {
+            api.execute(widgetEl);
+          }
           return 'executed';
         } catch {
           return 'execute-error';
         }
       }).catch(() => 'page-error');
+      executeAttempt = attempt;
+      // Exponential back-off: 5s, 8s, 12s, 17s between retries
+      const backoffMs = [5_000, 8_000, 12_000, 17_000][executeCount - 1] ?? 17_000;
+      nextExecuteAt = Date.now() + backoffMs;
     }
+
     if (Date.now() - startedAt >= 1_500) {
       try {
         const frameLoc = page.locator('iframe[src*="challenges.cloudflare.com"]').first();
@@ -314,14 +361,16 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
     sitekeyInForm: !!document.querySelector('form:has(textarea[name="source"]) .cf-turnstile[data-sitekey]'),
     execution: document.querySelector('form:has(textarea[name="source"]) .cf-turnstile')?.getAttribute('data-execution') ?? null,
     responseInputPresent: !!document.querySelector('form:has(textarea[name="source"]) input[name="cf-turnstile-response"]'),
+    widgetId: (document.querySelector('form:has(textarea[name="source"]) .cf-turnstile') as HTMLElement | null)?.dataset.widgetId ?? null,
   }));
   throw new BrowserFormError(
-    `Codeforces Turnstile did not issue a token within ${timeoutMs}ms (${JSON.stringify({ ...diagnostics, renderAttempt, executeAttempt })}). ` +
+    `Codeforces Turnstile did not issue a token within ${timeoutMs}ms (${JSON.stringify({ ...diagnostics, renderAttempt, executeAttempt, executeCount })}). ` +
     'No submission was sent. Complete verification in a supported browser or use an accessible submitter connection.',
     'blocked',
     { turnstile: false, interactive: diagnostics.iframePresent },
   );
 }
+
 
 /** One native click, with evidence from the actual POST. Never retry an ambiguous POST. */
 export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{ clicked: boolean; status: number | null }> {

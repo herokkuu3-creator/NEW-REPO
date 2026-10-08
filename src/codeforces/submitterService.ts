@@ -36,8 +36,8 @@ const HEADLESS = process.env.HEADLESS !== 'false';
 const BROWSER_ENGINE = process.env.CODEFORCES_BROWSER === 'chromium' ? 'chromium' : 'firefox';
 const BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const NAV_TIMEOUT_MS = Number(process.env.CODEFORCES_NAV_TIMEOUT_MS ?? 60_000);
-const TURNSTILE_WAIT_MS = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 20_000);
-const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 20_000);
+const TURNSTILE_WAIT_MS = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 35_000);
+const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 25_000);
 const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 300);
 // Outbound proxy for Firefox, e.g. socks5://127.0.0.1:40000 (the local WARP
 // tunnel started by scripts/start-submitter.sh). Empty = direct connection.
@@ -244,6 +244,7 @@ async function launchFirefox(
         ignoreDefaultArgs: ['--enable-automation'],
       } : {
         firefoxUserPrefs: {
+          // Memory / process / session — keep footprint tiny
           'browser.cache.disk.enable': false,
           'browser.cache.memory.enable': false,
           'browser.cache.offline.enable': false,
@@ -258,6 +259,29 @@ async function launchFirefox(
           'dom.ipc.processCount': 1,
           'dom.ipc.processPrelaunch.enabled': false,
           'dom.ipc.keepProcessesAlive.web': 0,
+          // Stealth: disable automation/testing flags that Cloudflare detects
+          'marionette.enabled': false,
+          'remote.enabled': false,
+          'browser.tabs.remote.autostart': false,
+          // Enable features a real browser has (so Cloudflare entropy checks pass)
+          'dom.webdriver.enabled': false,
+          'general.useragent.override': '',
+          // Let canvas and WebGL work normally (not software-render-only)
+          'webgl.disabled': false,
+          'webgl.force-enabled': true,
+          'gfx.offscreencanvas.enabled': true,
+          // Timezone consistency with Windows user
+          'privacy.resistFingerprinting': false,
+          'privacy.resistFingerprinting.block_mozAddonManager': false,
+          // Allow real storage access (Cloudflare reads localStorage signals)
+          'browser.storageManager.enabled': true,
+          'dom.storage.enabled': true,
+          // Language/locale consistency
+          'intl.accept_languages': 'en-US, en',
+          'intl.locale.requested': 'en-US',
+          // Workers and service workers (Turnstile uses workers for entropy)
+          'dom.serviceWorkers.enabled': true,
+          'dom.workers.enabled': true,
         },
       }),
     }));
@@ -377,6 +401,57 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Prom
 
   }
   return false;
+}
+
+/**
+ * Navigate to the Codeforces homepage before going directly to the submit page.
+ * Cloudflare evaluates browser entropy over time; a fresh browser that jumps
+ * straight to the submit page triggers invisible Turnstile checks that fail
+ * because there is no prior session signal. This warm-up visit plants cookies,
+ * lets Turnstile's JS accumulate timing and mouse-based entropy, and makes the
+ * subsequent submit navigation look like normal browsing behaviour.
+ */
+async function warmUpWithHomepage(page: Page): Promise<void> {
+  try {
+    log({}, 'warming up browser with Codeforces homepage visit');
+    const resp = await page.goto('https://codeforces.com', {
+      waitUntil: 'domcontentloaded',
+      timeout: Math.min(NAV_TIMEOUT_MS, 30_000),
+    });
+    const status = resp?.status() ?? 0;
+    if (status === 403 || status === 503) {
+      // Cloudflare blocked even the homepage — wait and continue, the submit
+      // page will handle the challenge with its own waitOutChallenge logic.
+      log({ status }, 'homepage returned Cloudflare challenge during warm-up; skipping interactions');
+      return;
+    }
+    // Random scroll and mouse moves to accumulate entropy signals for Turnstile
+    const viewport = page.viewportSize() ?? { width: 1366, height: 768 };
+    // Simulate reading — scroll down gradually
+    const scrollSteps = 3 + Math.floor(Math.random() * 3);
+    for (let i = 1; i <= scrollSteps; i++) {
+      const scrollY = Math.floor((viewport.height * i * 0.6) / scrollSteps);
+      await page.evaluate((y) => window.scrollTo({ top: y, behavior: 'smooth' }), scrollY).catch(() => {});
+      await sleep(300 + Math.floor(Math.random() * 400));
+    }
+    // Move mouse around naturally
+    const { simulateHumanMouseMove } = await import('../browser/stealth');
+    const points = [
+      { x: 200 + Math.floor(Math.random() * 400), y: 100 + Math.floor(Math.random() * 200) },
+      { x: 600 + Math.floor(Math.random() * 300), y: 300 + Math.floor(Math.random() * 200) },
+      { x: 300 + Math.floor(Math.random() * 200), y: 400 + Math.floor(Math.random() * 150) },
+    ];
+    for (const pt of points) {
+      await simulateHumanMouseMove(page, pt.x, pt.y, 5).catch(() => {});
+      await sleep(200 + Math.floor(Math.random() * 300));
+    }
+    // Brief pause to let any Turnstile workers finish their entropy measurement
+    await sleep(800 + Math.floor(Math.random() * 600));
+    log({}, 'homepage warm-up complete');
+  } catch {
+    // Non-fatal: if homepage fails we still try the submit page directly
+    log({}, 'homepage warm-up failed; proceeding to submit page directly');
+  }
 }
 
 async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> {
@@ -572,6 +647,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
     void session.browser.close().catch(() => undefined);
   }, Math.max(1, deadline - Date.now()));
   try {
+    await warmUpWithHomepage(session.page);
     await openSubmitForm(session.page, request.entry);
     const ts = await fillSubmitForm(session.page, request.entry, request.code);
     flags.turnstile = ts.turnstile;
