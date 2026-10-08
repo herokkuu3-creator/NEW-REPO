@@ -242,6 +242,7 @@ function normalizeOutcome(body: Partial<PostedResult>, submittedAt: number, tran
     submittedAt,
     transport,
     safeToRetry: body.safeToRetry === true || (body.clicked === false && body.ok === false && (body.kind === 'blocked' || body.kind === 'submission-error')),
+    updatedCookies: Array.isArray(body.updatedCookies) ? body.updatedCookies : undefined,
   };
 }
 

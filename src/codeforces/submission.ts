@@ -49,7 +49,8 @@ export interface SelectOption {
 
 const CHALLENGE_RE = /just a moment|checking your browser|verify you are human|cf-chl|enable javascript and cookies/i;
 const SIGNED_OUT_RE = /you are not logged in|please login|please sign in|not logged in|register for practice/i;
-const REJECTION_RE = /you have submitted exactly the same code before|source code is too long|submission failed|invalid csrf|you are not allowed to submit|no such problem|problem not found|not a participant/i;
+const REJECTION_RE =
+  /you have submitted exactly the same code before|source code is too long|submission failed|invalid csrf|you are not allowed to submit|no such problem|problem not found|not a participant|captcha|turnstile|verification|verify you are human|solve the challenge|security check/i;
 const PENDING_VERDICTS = new Set(['TESTING', 'QUEUE', 'QUEUED', undefined, null]);
 const VERIFICATION_WINDOW_MS = 150_000;
 const VERIFICATION_POLL_MS = 2_500;
@@ -73,6 +74,8 @@ export interface BrowserPostOutcome {
   clicked: boolean;
   /** Whether Turnstile rendered an interactive widget instead of solving itself. */
   interactive: boolean;
+  /** Fresh cookies from the browser session for session continuity across submissions. */
+  updatedCookies?: unknown[];
 }
 
 /**
@@ -288,7 +291,10 @@ function finishPost(
     return { ok: false, kind: 'submission-error', error: `the submit form left codeforces.com (${finalUrl})`, status, finalUrl, ...flags };
   }
   if (!isSubmissionHistory(finalUrl)) {
-    return { ok: false, kind: 'submission-error', error: 'Codeforces did not redirect to submission history after the POST; acceptance is uncertain and the POST was not retried.', status, finalUrl, ...flags };
+    const errorMsg = REJECTION_RE.test(body)
+      ? `Codeforces rejected submission: ${compactBodyError(body)}`
+      : 'Codeforces did not redirect to submission history after the POST; acceptance is uncertain and the POST was not retried.';
+    return { ok: false, kind: 'submission-error', error: errorMsg, status, finalUrl, ...flags };
   }
   return { ok: true, status, finalUrl, ...flags };
 }
@@ -530,7 +536,9 @@ export async function pollForVerdict(
 
 function compactBodyError(body: string): string {
   const lines = body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const useful = lines.find((line) => /error|invalid|csrf|too long|failed|same code|not allowed|participant/i.test(line));
+  const useful = lines.find((line) =>
+    /error|invalid|csrf|too long|failed|same code|not allowed|participant|captcha|turnstile|verification|human|robot/i.test(line)
+  );
   return useful?.slice(0, 500) ?? 'Codeforces rejected the submission form';
 }
 

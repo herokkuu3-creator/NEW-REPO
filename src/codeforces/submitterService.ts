@@ -56,7 +56,7 @@ let syncedProxies: string[] = [];
 const CHALLENGE_RE = /just a moment|checking your browser|verify you are human|cf-chl|enable javascript and cookies/i;
 const SIGNED_OUT_RE = /you are not logged in|please login|please sign in|not logged in|register for practice/i;
 const REJECTION_RE =
-  /you have submitted exactly the same code before|source code is too long|submission failed|invalid csrf|you are not allowed to submit|no such problem|problem not found|not a participant/i;
+  /you have submitted exactly the same code before|source code is too long|submission failed|invalid csrf|you are not allowed to submit|no such problem|problem not found|not a participant|captcha|turnstile|verification|verify you are human|solve the challenge|security check/i;
 
 interface SubmitterEntry {
   contestId: number;
@@ -87,6 +87,7 @@ interface SubmitResponse {
   clicked: boolean;
   turnstile: boolean;
   interactive: boolean;
+  updatedCookies?: unknown[];
 }
 
 let busy = false;
@@ -261,8 +262,16 @@ async function launchFirefox(
       }),
     }));
     const viewport = getRandomDesktopViewport();
+    // When connecting via a proxy, strip stale Cloudflare clearance cookies issued for a different IP
+    // so Cloudflare evaluates the session cleanly through the proxy IP rather than flagging a cryptographic IP mismatch
+    const sanitizedCookies = ((state.cookies ?? []) as Array<{ name?: string }>).filter((c) => {
+      if (proxy && (c?.name === 'cf_clearance' || c?.name === '__cf_bm')) {
+        return false;
+      }
+      return true;
+    });
     const context = await active.newContext({
-      storageState: { cookies: state.cookies, origins: state.origins ?? [] } as Parameters<
+      storageState: { cookies: sanitizedCookies, origins: state.origins ?? [] } as Parameters<
         BrowserContext['storageState']
       > extends never
         ? never
@@ -272,6 +281,16 @@ async function launchFirefox(
       userAgent: BROWSER_ENGINE === 'chromium'
         ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
         : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+      extraHTTPHeaders: BROWSER_ENGINE === 'chromium' ? {
+        'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'accept-language': 'en-US,en;q=0.9',
+        'upgrade-insecure-requests': '1',
+      } : {
+        'accept-language': 'en-US,en;q=0.9',
+        'upgrade-insecure-requests': '1',
+      },
     });
     await applyStealthScripts(context);
     if (process.env.CODEFORCES_BLOCK_ASSETS !== 'false') {
@@ -514,7 +533,9 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
 
 function compactBodyError(body: string): string {
   const lines = body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const useful = lines.find((line) => /error|invalid|csrf|too long|failed|same code|not allowed|participant/i.test(line));
+  const useful = lines.find((line) =>
+    /error|invalid|csrf|too long|failed|same code|not allowed|participant|captcha|turnstile|verification|human|robot/i.test(line)
+  );
   return useful?.slice(0, 500) ?? 'Codeforces rejected the submission form';
 }
 
@@ -632,10 +653,26 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
         ...flags,
       };
     }
+    const latestCookies = await session.page.context().cookies().catch(() => []) as unknown[];
     if (!isSubmissionHistory(finalUrl)) {
-      return { ok: false, kind: 'submission-error', error: 'Codeforces did not redirect to submission history after the POST; acceptance is uncertain and the POST was not retried.', status: click.status, finalUrl, clicked: true, ...flags };
+      const pageInfo = await session.page.evaluate(() => {
+        const errorEl = document.querySelector('.error, .alert, .field-error, span[class*="error"], div[class*="error"], .notice');
+        const hasTurnstile = !!document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
+        return {
+          errorText: errorEl?.textContent?.trim() || '',
+          hasTurnstile,
+        };
+      }).catch(() => ({ errorText: '', hasTurnstile: false }));
+
+      const rejectionError = pageInfo.errorText || (REJECTION_RE.test(body) ? compactBodyError(body) : '');
+      const errorMsg = rejectionError
+        ? `Codeforces rejected submission: ${rejectionError}`
+        : pageInfo.hasTurnstile
+          ? 'Codeforces required Cloudflare Turnstile challenge on submission; acceptance was prevented.'
+          : 'Codeforces did not redirect to submission history after the POST; acceptance is uncertain and the POST was not retried.';
+      return { ok: false, kind: pageInfo.hasTurnstile ? 'blocked' : 'submission-error', error: errorMsg, status: click.status, finalUrl, clicked: true, updatedCookies: latestCookies, ...flags };
     }
-    return { ok: true, status: click.status, finalUrl, clicked: true, ...flags };
+    return { ok: true, status: click.status, finalUrl, clicked: true, updatedCookies: latestCookies, ...flags };
   } catch (err) {
     if (expired) throw new BrowserFormError('Browser attempt timed out and was closed.', clickStarted ? 'submission-error' : 'blocked', flags, clickStarted);
     if (err instanceof BrowserFormError) {
@@ -752,7 +789,7 @@ export const server = http.createServer((req, res) => {
       let raw = '';
       req.on('data', (chunk: Buffer) => {
         raw += chunk.toString('utf8');
-        if (raw.length > 8192) req.destroy();
+        if (raw.length > 65536) req.destroy();
       });
       req.on('end', () => {
         try {

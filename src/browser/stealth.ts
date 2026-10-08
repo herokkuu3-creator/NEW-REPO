@@ -68,8 +68,30 @@ export async function applyStealthScripts(context: BrowserContext): Promise<void
             PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
             RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
           },
-          loadTimes: () => ({}),
-          csi: () => ({}),
+          loadTimes: () => {
+            const now = Date.now() / 1000;
+            return {
+              requestTime: now - 0.45,
+              startLoadTime: now - 0.4,
+              commitLoadTime: now - 0.25,
+              finishDocumentLoadTime: now - 0.1,
+              firstPaintTime: now - 0.08,
+              finishLoadTime: now,
+              wasFetchedViaSpdy: true,
+              wasNpnNegotiated: true,
+              npnNegotiatedProtocol: 'h2',
+              navigationType: 'Other',
+            };
+          },
+          csi: () => {
+            const now = Date.now();
+            return {
+              onloadT: now,
+              pageT: 450,
+              startE: now - 450,
+              tran: 15,
+            };
+          },
         };
       }
     } catch {}
@@ -109,7 +131,37 @@ export async function applyStealthScripts(context: BrowserContext): Promise<void
       }
     } catch {}
 
-    // 6. WebGL vendor masking (avoid SwiftShader / llvmpipe software rendering identifiers)
+    // 6. Platform and User-Agent Data consistency (prevent Linux runner leaking Windows UA mismatch)
+    try {
+      Object.defineProperty(navigator, 'platform', {
+        get: () => 'Win32',
+        configurable: true,
+      });
+      const nav = navigator as any;
+      if (nav.userAgentData) {
+        Object.defineProperty(nav.userAgentData, 'platform', {
+          get: () => 'Windows',
+          configurable: true,
+        });
+        const origGetHEV = nav.userAgentData.getHighEntropyValues;
+        if (typeof origGetHEV === 'function') {
+          nav.userAgentData.getHighEntropyValues = async function (hints: string[]) {
+            const res = await origGetHEV.call(this, hints);
+            return {
+              ...res,
+              platform: 'Windows',
+              platformVersion: '15.0.0',
+              architecture: 'x86',
+              bitness: '64',
+              model: '',
+              mobile: false,
+            };
+          };
+        }
+      }
+    } catch {}
+
+    // 7. WebGL and WebGL2 vendor masking (avoid SwiftShader / llvmpipe software rendering identifiers)
     try {
       const getParameter = WebGLRenderingContext.prototype.getParameter;
       WebGLRenderingContext.prototype.getParameter = function (parameter: number) {
@@ -119,6 +171,50 @@ export async function applyStealthScripts(context: BrowserContext): Promise<void
         if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
         return getParameter.call(this, parameter);
       };
+      Object.defineProperty(WebGLRenderingContext.prototype.getParameter, 'toString', {
+        value: () => 'function getParameter() { [native code] }',
+      });
+      if (typeof WebGL2RenderingContext !== 'undefined') {
+        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function (parameter: number) {
+          if (parameter === 37445) return 'Google Inc. (Intel)';
+          if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+          return getParameter2.call(this, parameter);
+        };
+        Object.defineProperty(WebGL2RenderingContext.prototype.getParameter, 'toString', {
+          value: () => 'function getParameter() { [native code] }',
+        });
+      }
+    } catch {}
+
+    // 8. Realistic hardware concurrency, device memory, and display metrics
+    try {
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
+      Object.defineProperty(screen, 'availWidth', { get: () => screen.width, configurable: true });
+      Object.defineProperty(screen, 'availHeight', { get: () => screen.height, configurable: true });
+      if (window.outerWidth === 0) {
+        Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth, configurable: true });
+      }
+      if (window.outerHeight === 0) {
+        Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight, configurable: true });
+      }
+      Object.defineProperty(window, 'devicePixelRatio', { get: () => 1, configurable: true });
+    } catch {}
+
+    // 9. Media devices mock (real desktop browsers have microphones/speakers)
+    try {
+      if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
+        const origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+        navigator.mediaDevices.enumerateDevices = async () => {
+          const devs = await origEnum().catch(() => []);
+          if (devs && devs.length > 0) return devs;
+          return [
+            { deviceId: 'default', kind: 'audioinput', label: 'Default - Microphone (Realtek(R) Audio)', groupId: 'group1' },
+            { deviceId: 'default', kind: 'audiooutput', label: 'Default - Speakers (Realtek(R) Audio)', groupId: 'group1' },
+          ] as any;
+        };
+      }
     } catch {}
   }).catch(() => undefined);
 }

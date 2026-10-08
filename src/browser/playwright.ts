@@ -239,14 +239,24 @@ export async function launchFirefoxWithStorageStateObject(
         'dom.ipc.keepProcessesAlive.web': 0,
       },
     }));
+    const sanitizedCookies = (state.cookies ?? []).filter((c) => {
+      if (proxy && (c.name === 'cf_clearance' || c.name === '__cf_bm')) {
+        return false;
+      }
+      return true;
+    });
     const context = await activeBrowser.newContext({
       storageState: {
-        cookies: state.cookies,
+        cookies: sanitizedCookies,
         origins: state.origins,
       },
       viewport: getRandomDesktopViewport(),
       locale: 'en-US',
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+      extraHTTPHeaders: {
+        'accept-language': 'en-US,en;q=0.9',
+        'upgrade-insecure-requests': '1',
+      },
     });
     await applyStealthScripts(context);
 

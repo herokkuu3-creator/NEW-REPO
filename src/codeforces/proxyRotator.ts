@@ -155,6 +155,7 @@ export interface ProxyTestResult {
   ok: boolean;
   latencyMs: number;
   ip?: string;
+  country?: string;
   error?: string;
 }
 
@@ -292,16 +293,22 @@ async function testHttpProxyNative(
             tlsTunnel.setTimeout(timeoutMs);
 
             let traceBody = '';
+            const parseTraceResult = () => {
+              const ipMatch = traceBody.match(/^ip=([^\r\n]+)/m);
+              const locMatch = traceBody.match(/^loc=([^\r\n]+)/m);
+              return {
+                ok: true,
+                latencyMs: Date.now() - start,
+                ip: ipMatch ? ipMatch[1]?.trim() : undefined,
+                country: locMatch ? locMatch[1]?.trim() : undefined,
+              };
+            };
+
             tlsTunnel.on('data', (data) => {
               traceBody += data.toString('utf8');
-              if (traceBody.includes('ip=')) {
+              if (traceBody.includes('ip=') && traceBody.includes('loc=')) {
                 cleanup();
-                const ipMatch = traceBody.match(/^ip=([^\r\n]+)/m);
-                finish({
-                  ok: true,
-                  latencyMs: Date.now() - start,
-                  ip: ipMatch ? ipMatch[1]?.trim() : undefined,
-                });
+                finish(parseTraceResult());
               }
             });
 
@@ -312,22 +319,12 @@ async function testHttpProxyNative(
 
             tlsTunnel.on('close', () => {
               cleanup();
-              const ipMatch = traceBody.match(/^ip=([^\r\n]+)/m);
-              finish({
-                ok: true,
-                latencyMs: Date.now() - start,
-                ip: ipMatch ? ipMatch[1]?.trim() : undefined,
-              });
+              finish(parseTraceResult());
             });
 
             tlsTunnel.on('end', () => {
               cleanup();
-              const ipMatch = traceBody.match(/^ip=([^\r\n]+)/m);
-              finish({
-                ok: true,
-                latencyMs: Date.now() - start,
-                ip: ipMatch ? ipMatch[1]?.trim() : undefined,
-              });
+              finish(parseTraceResult());
             });
           } catch {
             cleanup();
@@ -372,10 +369,12 @@ async function testProxyWithCurlFallback(
     const latencyMs = Date.now() - start;
     if (stdout && stdout.includes('ip=')) {
       const ipMatch = stdout.match(/^ip=(.+)$/m);
+      const locMatch = stdout.match(/^loc=(.+)$/m);
       return {
         ok: true,
         latencyMs,
         ip: ipMatch ? ipMatch[1]?.trim() : undefined,
+        country: locMatch ? locMatch[1]?.trim() : undefined,
       };
     }
     return {
@@ -437,10 +436,11 @@ export async function testProxyWithCurl(
 
 export interface SelectProxyOptions {
   stateDir?: string;
-  tester?: (proxyUrl: string) => Promise<boolean>;
+  tester?: (proxyUrl: string) => Promise<boolean | ProxyTestResult>;
   log?: (msg: string) => void;
   removedHashes?: string[] | Set<string>;
   preferredProxy?: string;
+  preferredCountry?: string;
 }
 
 /**
@@ -543,11 +543,19 @@ export async function selectWorkingProxy(
     }
 
     log(`Testing proxy [${i + 1}/${proxies.length}] ${masked} (~150B trace check)...`);
-    const ok = await tester(candidate);
+    const checkRes = await tester(candidate);
+    const ok = typeof checkRes === 'boolean' ? checkRes : checkRes.ok;
+    const countryTag = (typeof checkRes === 'object' && checkRes?.country) ? ` (Country: ${checkRes.country})` : '';
     if (ok) {
-      log(`Proxy [${i + 1}/${proxies.length}] ${masked} is alive and verified!`);
-      selected = { proxy: candidate, index: i };
-      break;
+      log(`Proxy [${i + 1}/${proxies.length}] ${masked} is alive and verified!${countryTag}`);
+      const country = (typeof checkRes === 'object' && checkRes?.country) ? checkRes.country.toUpperCase() : undefined;
+      if (!selected) {
+        selected = { proxy: candidate, index: i };
+      }
+      if (!options.preferredCountry || country === options.preferredCountry.toUpperCase()) {
+        selected = { proxy: candidate, index: i };
+        break;
+      }
     } else {
       log(`Proxy [${i + 1}/${proxies.length}] ${masked} failed health check (expired or unreachable). Marking dead.`);
       deadSet.add(hash);
@@ -562,9 +570,11 @@ export async function selectWorkingProxy(
       const hash = proxyHash(candidate);
       const masked = maskProxyUrl(candidate);
       log(`Retrying dead proxy [${i + 1}/${proxies.length}] ${masked} as last resort...`);
-      const ok = await tester(candidate);
+      const checkRes = await tester(candidate);
+      const ok = typeof checkRes === 'boolean' ? checkRes : checkRes.ok;
+      const countryTag = (typeof checkRes === 'object' && checkRes?.country) ? ` (Country: ${checkRes.country})` : '';
       if (ok) {
-        log(`Proxy [${i + 1}/${proxies.length}] ${masked} recovered and verified!`);
+        log(`Proxy [${i + 1}/${proxies.length}] ${masked} recovered and verified!${countryTag}`);
         deadSet.delete(hash);
         selected = { proxy: candidate, index: i };
         break;
@@ -615,9 +625,10 @@ export async function runCli(): Promise<void> {
   }
 
   const preferredProxy = (process.env.PREFERRED_PROXY || process.env.CODEFORCES_PREFERRED_PROXY || '').trim() || undefined;
+  const preferredCountry = (process.env.PREFERRED_COUNTRY || process.env.CODEFORCES_PROXY_COUNTRY || 'IN').trim().toUpperCase() || undefined;
 
   try {
-    const result = await selectWorkingProxy(raw, { removedHashes, preferredProxy });
+    const result = await selectWorkingProxy(raw, { removedHashes, preferredProxy, preferredCountry });
     process.stdout.write(`Selected working proxy: ${result.masked} (index ${result.index + 1} of ${result.total})\n`);
 
     const envFile = process.env.GITHUB_ENV;

@@ -87,20 +87,85 @@ export async function fillSource(page: Page, code: string): Promise<void> {
 export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promise<VerificationFlags> {
   const form = page.locator('form:has(textarea[name="source"])').first();
   const field = form.locator('input[name="turnstileToken"]');
-  if (await field.count() === 0) return { turnstile: false, interactive: false };
+  const cfField = form.locator('input[name="cf-turnstile-response"]');
+  const widget = page.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
 
-  // Codeforces leaves an empty hidden turnstileToken input on some accounts even
-  // when the form has no Turnstile challenge. The widget itself, rather than the
-  // hidden input, tells us whether verification is required.
-  const widget = form.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
-  const noWidgetGraceMs = Math.min(1_500, timeoutMs);
+  if (await field.count() === 0 && await cfField.count() === 0 && await widget.count() === 0) {
+    return { turnstile: false, interactive: false };
+  }
+
+  const syncTokens = async (): Promise<string> => {
+    return page.evaluate(() => {
+      const formEl = document.querySelector('form:has(textarea[name="source"])');
+      if (!formEl) return '';
+      const ttInput = formEl.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
+      const cfInput = formEl.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+      const api = (window as unknown as { turnstile?: { getResponse?: () => string } }).turnstile;
+      const apiToken = typeof api?.getResponse === 'function' ? (api.getResponse() || '') : '';
+      const token = (ttInput?.value || cfInput?.value || apiToken || '').trim();
+      if (!token) return '';
+
+      // Sync both fields so server receives token regardless of which parameter name it validates
+      if (ttInput && !ttInput.value) {
+        ttInput.value = token;
+        ttInput.dispatchEvent(new Event('input', { bubbles: true }));
+        ttInput.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      if (cfInput && !cfInput.value) {
+        cfInput.value = token;
+        cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+        cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      if (!ttInput) {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'turnstileToken';
+        input.value = token;
+        formEl.appendChild(input);
+      }
+      if (!cfInput) {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'cf-turnstile-response';
+        input.value = token;
+        formEl.appendChild(input);
+      }
+
+      // If data-callback is present on the widget, invoke it to update site's state
+      const widgetEl = formEl.querySelector('.cf-turnstile[data-callback]');
+      const callbackName = widgetEl?.getAttribute('data-callback');
+      if (callbackName) {
+        const fn = callbackName.split('.').reduce<unknown>((val, key) =>
+          val && typeof val === 'object' ? (val as Record<string, unknown>)[key] : undefined, window);
+        if (typeof fn === 'function') {
+          try { (fn as (t: string) => void)(token); } catch {}
+        }
+      }
+
+      return token;
+    }).catch(() => '');
+  };
+
+  const noWidgetGraceMs = Math.min(timeoutMs < 2000 ? 500 : 4_000, timeoutMs);
   const deadline = Date.now() + timeoutMs;
   const startedAt = Date.now();
   let renderAttempt = 'not-needed';
   let renderChecked = false;
   let executeAttempt = 'not-needed';
   let executeChecked = false;
-  const hasToken = async () => !!(await field.first().inputValue({ timeout: 1_000 }).catch(() => '')).trim();
+
+  const hasToken = async () => {
+    const directVal = (await field.first().inputValue({ timeout: 250 }).catch(() => '')).trim();
+    if (directVal) return true;
+    const directCf = (await cfField.first().inputValue({ timeout: 250 }).catch(() => '')).trim();
+    if (directCf) {
+      await syncTokens();
+      return true;
+    }
+    const synced = await syncTokens();
+    return !!synced;
+  };
+
   while (Date.now() < deadline) {
     if (await hasToken()) return { turnstile: true, interactive: false };
     if (Date.now() - startedAt >= noWidgetGraceMs && await widget.count() === 0) {
@@ -135,6 +200,12 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
                 input.dispatchEvent(new Event('input', { bubbles: true }));
                 input.dispatchEvent(new Event('change', { bubbles: true }));
               }
+              const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+              if (cfInput && !cfInput.value) {
+                cfInput.value = token;
+                cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+                cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+              }
             },
           });
           return 'rendered';
@@ -157,17 +228,22 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
         }
       }).catch(() => 'page-error');
     }
-    if (Date.now() - startedAt >= 2_000) {
+    if (Date.now() - startedAt >= 1_500) {
       try {
-        const frameLoc = form.locator('iframe[src*="challenges.cloudflare.com"]').first();
+        const frameLoc = page.locator('iframe[src*="challenges.cloudflare.com"]').first();
         if ((await frameLoc.count().catch(() => 0)) > 0) {
           const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
           const cb = frame.locator('input[type="checkbox"], #challenge-stage, .ctp-checkbox-label, #cf-stage, .mark').first();
           if (await cb.isVisible().catch(() => false)) {
+            const frameBox = await frameLoc.boundingBox().catch(() => null);
             const box = await cb.boundingBox().catch(() => null);
             if (box) {
-              await simulateHumanMouseMove(page, box.x + box.width / 2, box.y + box.height / 2, 4).catch(() => {});
-              await cb.click({ timeout: 1500 }).catch(() => {});
+              const targetX = frameBox ? frameBox.x + box.x + box.width / 2 : box.x + box.width / 2;
+              const targetY = frameBox ? frameBox.y + box.y + box.height / 2 : box.y + box.height / 2;
+              await simulateHumanMouseMove(page, targetX, targetY, 6).catch(() => {});
+              await cb.hover().catch(() => {});
+              await new Promise((r) => setTimeout(r, 100 + Math.floor(Math.random() * 200)));
+              await cb.click({ timeout: 2000 }).catch(() => {});
             }
           }
         }
@@ -183,18 +259,18 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
   // Retain the optional solver contract, but never submit any form from here.
   const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
   if (solverUrl) {
-    const widget = await page.evaluate(() => {
+    const widgetInfo = await page.evaluate(() => {
       const element = document.querySelector('.cf-turnstile[data-sitekey]');
       const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
       const sitekey = element?.getAttribute('data-sitekey') ?? /["']?sitekey["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
       return { sitekey, callback: element?.getAttribute('data-callback') ?? null };
     });
-    if (widget.sitekey) {
+    if (widgetInfo.sitekey) {
       try {
         const response = await fetch(`${solverUrl.replace(/\/+$/, '')}/solve`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ siteurl: page.url(), sitekey: widget.sitekey }),
+          body: JSON.stringify({ siteurl: page.url(), sitekey: widgetInfo.sitekey }),
           signal: AbortSignal.timeout(timeoutMs),
         });
         if (response.ok) {
@@ -202,17 +278,25 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
           if (typeof data.token === 'string' && data.token.trim()) {
             await form.evaluate((element, { token, callback }) => {
               const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
-              if (!input) throw new Error('Turnstile input disappeared');
-              input.value = token;
-              input.dispatchEvent(new Event('input', { bubbles: true }));
-              input.dispatchEvent(new Event('change', { bubbles: true }));
+              if (input) {
+                input.value = token;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+              const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+              if (cfInput) {
+                cfInput.value = token;
+                cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+                cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+              }
               // Named callbacks update the site's own enabled/verified state.
               if (callback) {
                 const fn = callback.split('.').reduce<unknown>((value, key) =>
                   value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
                 if (typeof fn === 'function') fn(token);
               }
-            }, { token: data.token, callback: widget.callback });
+            }, { token: data.token, callback: widgetInfo.callback });
+            await syncTokens();
             if (await hasToken()) return { turnstile: true, interactive: false };
           }
         }
@@ -263,6 +347,21 @@ export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{
       'blocked',
     );
   }
+
+  // Ensure Turnstile tokens are fully synchronized to both hidden inputs before clicking
+  await page.evaluate(() => {
+    const formEl = document.querySelector('form:has(textarea[name="source"])');
+    if (!formEl) return;
+    const tt = (formEl.querySelector('input[name="turnstileToken"]') as HTMLInputElement)?.value;
+    const cf = (formEl.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement)?.value;
+    const tok = (tt || cf || '').trim();
+    if (tok) {
+      const ttInput = formEl.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
+      if (ttInput && !ttInput.value) ttInput.value = tok;
+      const cfInput = formEl.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+      if (cfInput && !cfInput.value) cfInput.value = tok;
+    }
+  }).catch(() => {});
 
   // Natural human dwell time and mouse trajectory before clicking submit
   const isShortTimeout = timeoutMs < 2000;

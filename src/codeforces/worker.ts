@@ -876,6 +876,16 @@ async function submitViaBrowser(
     ? await submitViaRemoteSubmitter(state, label, user, entry, code, networkMode, { deadline, onProgress })
     : await postViaLocalBrowser(state, label, entry, code, deadline, networkMode);
 
+  if (posted?.updatedCookies && Array.isArray(posted.updatedCookies) && posted.updatedCookies.length > 0) {
+    const existing = new Map(((state.cookies as any[]) ?? []).map((c: any) => [c.name, c]));
+    for (const c of posted.updatedCookies as Array<{ name: string; value: string }>) {
+      if (c && typeof c.name === 'string') {
+        existing.set(c.name, c);
+      }
+    }
+    state.cookies = Array.from(existing.values());
+  }
+
   if (!posted) {
     return {
       ok: false,

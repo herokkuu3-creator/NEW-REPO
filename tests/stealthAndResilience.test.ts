@@ -48,12 +48,22 @@ describe('Stealth and Anti-Detection Module', () => {
       await page.setContent('<html><body><h1>Test</h1></body></html>');
 
       const evaluation = await page.evaluate(() => {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl');
+        const gl2 = canvas.getContext('webgl2');
+        const dbgRender = gl?.getExtension('WEBGL_debug_renderer_info');
         return {
           webdriver: (navigator as any).webdriver,
           hasChrome: !!(window as any).chrome,
           chromeRuntime: typeof (window as any).chrome?.runtime,
           languages: navigator.languages,
           pluginsLength: navigator.plugins.length,
+          platform: navigator.platform,
+          hardwareConcurrency: navigator.hardwareConcurrency,
+          deviceMemory: (navigator as any).deviceMemory,
+          webglRenderer: dbgRender ? gl?.getParameter(dbgRender.UNMASKED_RENDERER_WEBGL) : null,
+          webgl2Renderer: dbgRender ? gl2?.getParameter(dbgRender.UNMASKED_RENDERER_WEBGL) : null,
+          devicePixelRatio: window.devicePixelRatio,
         };
       });
 
@@ -62,6 +72,11 @@ describe('Stealth and Anti-Detection Module', () => {
       expect(evaluation.chromeRuntime).toBe('object');
       expect(evaluation.languages).toContain('en-US');
       expect(evaluation.pluginsLength).toBeGreaterThan(0);
+      expect(evaluation.platform).toBe('Win32');
+      expect(evaluation.hardwareConcurrency).toBe(8);
+      expect(evaluation.deviceMemory).toBe(8);
+      expect(evaluation.webglRenderer).toContain('ANGLE');
+      expect(evaluation.devicePixelRatio).toBe(1);
 
       // Verify mouse simulation
       await expect(simulateHumanMouseMove(page, 300, 200, 4)).resolves.toBeUndefined();
