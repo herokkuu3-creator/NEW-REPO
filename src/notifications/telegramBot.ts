@@ -1764,23 +1764,51 @@ export interface ProxyUiDeps {
 
 export const defaultProxyUiDeps: ProxyUiDeps = {
   send: async (text, buttons) => {
-    return await tgApi<{ message_id: number }>('sendMessage', {
-      chat_id: config.telegram.chatId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
-    });
+    try {
+      return await tgApi<{ message_id: number }>('sendMessage', {
+        chat_id: config.telegram.chatId,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+      });
+    } catch (err) {
+      if (errText(err).includes("can't parse entities")) {
+        const plain = text.replace(/<[^>]+>/g, '');
+        return await tgApi<{ message_id: number }>('sendMessage', {
+          chat_id: config.telegram.chatId,
+          text: plain,
+          disable_web_page_preview: true,
+          ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+        });
+      }
+      throw err;
+    }
   },
   edit: async (chatId, messageId, text, buttons) => {
-    await tgApi('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      reply_markup: { inline_keyboard: buttons ?? [] },
-    });
+    try {
+      await tgApi('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: buttons ?? [] },
+      });
+    } catch (err) {
+      if (errText(err).includes("can't parse entities")) {
+        const plain = text.replace(/<[^>]+>/g, '');
+        await tgApi('editMessageText', {
+          chat_id: chatId,
+          message_id: messageId,
+          text: plain,
+          disable_web_page_preview: true,
+          reply_markup: { inline_keyboard: buttons ?? [] },
+        });
+        return;
+      }
+      throw err;
+    }
   },
   answer: async (callbackId, text) => {
     await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text, show_alert: true } : {}) });
@@ -1944,7 +1972,7 @@ export async function handleUseProxyCommand(arg?: string, deps: ProxyUiDeps = de
       return;
     }
 
-    await deps.send(`❌ Proxy "${escapeHtml(trimmed)}" not found. Send /useproxy to see all proxies or /useproxy <number> to select by number.`);
+    await deps.send(`❌ Proxy "${escapeHtml(trimmed)}" not found. Send /useproxy to see all proxies or /useproxy &lt;number&gt; to select by number.`);
     return;
   }
 
@@ -1956,7 +1984,7 @@ export async function handleUseProxyCommand(arg?: string, deps: ProxyUiDeps = de
       '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
       '⚠️ <b>No proxies found in active pool.</b>',
       '',
-      'Add proxies first with /addproxy <url> or /setproxies <urls>.',
+      'Add proxies first with /addproxy &lt;url&gt; or /setproxies &lt;urls&gt;.',
     ].join('\n'));
     return;
   }
@@ -2023,7 +2051,7 @@ export async function handleUseProxyCommand(arg?: string, deps: ProxyUiDeps = de
     lines.push('⚙️ <b>Active Mode:</b> Automatic pool rotation (picks first live proxy from start)');
   }
   lines.push('');
-  lines.push('💡 <i>Tap a button below or send /useproxy <number> to set preferred proxy. Send /useproxy auto to reset to automatic rotation.</i>');
+  lines.push('💡 <i>Tap a button below or send /useproxy &lt;number&gt; to set preferred proxy. Send /useproxy auto to reset to automatic rotation.</i>');
 
   buttons.push([
     { text: '🔄 Reset to Auto Fallback', callback_data: 'pxuse:auto' },
@@ -2035,12 +2063,16 @@ export async function handleUseProxyCommand(arg?: string, deps: ProxyUiDeps = de
     try {
       await deps.edit(config.telegram.chatId, messageId, lines.join('\n'), buttons);
       return;
-    } catch {
-      // Fall through to send
+    } catch (err) {
+      logger.warn({ err: errText(err) }, 'Failed to edit message in handleUseProxyCommand, falling back to send');
     }
   }
 
-  await deps.send(lines.join('\n'), buttons);
+  await deps.send(lines.join('\n'), buttons).catch(async (err) => {
+    logger.error({ err: errText(err) }, 'Failed to send proxy buttons in handleUseProxyCommand');
+    const plainLines = lines.map((l) => l.replace(/<[^>]+>/g, ''));
+    await deps.send(plainLines.join('\n'), buttons).catch(() => undefined);
+  });
 }
 
 export async function handleRemoveProxyCommand(arg?: string, deps: ProxyUiDeps = defaultProxyUiDeps): Promise<void> {

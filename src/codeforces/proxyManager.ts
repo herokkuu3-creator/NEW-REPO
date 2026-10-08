@@ -258,13 +258,21 @@ export async function testAllProxiesOneByOne(
   timeoutSeconds = 5,
 ): Promise<ProxyCheckStatus[]> {
   const list = await getAllConfiguredProxies(envSource);
-  const results: ProxyCheckStatus[] = new Array(list.length);
+  const results: ProxyCheckStatus[] = list.map((p) => ({
+    proxy: p,
+    result: { ok: false, latencyMs: 0, error: 'Check timeout' },
+  }));
 
   let completed = 0;
-  await Promise.all(
+  const runner = Promise.all(
     list.map(async (p, i) => {
       try {
-        const result = await testProxyDetailed(p.url, timeoutSeconds);
+        const timeoutPromise = new Promise<ProxyTestResult>((resolve) => {
+          setTimeout(() => {
+            resolve({ ok: false, latencyMs: timeoutSeconds * 1000, error: `Timed out after ${timeoutSeconds}s` });
+          }, (timeoutSeconds + 1) * 1000);
+        });
+        const result = await Promise.race([testProxyDetailed(p.url, timeoutSeconds), timeoutPromise]);
         const status: ProxyCheckStatus = { proxy: p, result };
         results[i] = status;
         completed++;
@@ -289,6 +297,11 @@ export async function testAllProxiesOneByOne(
     }),
   );
 
+  const overallTimeout = new Promise<void>((resolve) => {
+    setTimeout(resolve, Math.max(10_000, (timeoutSeconds + 3) * 1000));
+  });
+
+  await Promise.race([runner, overallTimeout]);
   return results;
 }
 

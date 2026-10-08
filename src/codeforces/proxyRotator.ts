@@ -236,6 +236,18 @@ async function testHttpProxyNative(
       finish({ ok: false, latencyMs: Date.now() - start, error: err.message });
     });
 
+    socket.on('close', () => {
+      cleanup();
+      finish({ ok: false, latencyMs: Date.now() - start, error: 'Socket closed' });
+    });
+
+    socket.on('timeout', () => {
+      cleanup();
+      finish({ ok: false, latencyMs: Date.now() - start, error: `Socket timed out after ${timeoutSeconds}s` });
+    });
+
+    socket.setTimeout(timeoutMs);
+
     const onConnected = () => {
       const connectReq =
         `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
@@ -264,6 +276,8 @@ async function testHttpProxyNative(
           const latencyMs = Date.now() - start;
           socket.removeAllListeners('data');
           socket.removeAllListeners('error');
+          socket.removeAllListeners('close');
+          socket.removeAllListeners('timeout');
 
           // Tunnel is established! Try quick TLS query to get outbound IP
           try {
@@ -275,6 +289,7 @@ async function testHttpProxyNative(
               tlsTunnel.write(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${targetHost}\r\nUser-Agent: curl/8.4.0\r\nConnection: close\r\n\r\n`);
             });
             activeTlsTunnel = tlsTunnel;
+            tlsTunnel.setTimeout(timeoutMs);
 
             let traceBody = '';
             tlsTunnel.on('data', (data) => {
@@ -293,6 +308,16 @@ async function testHttpProxyNative(
             tlsTunnel.on('error', () => {
               cleanup();
               finish({ ok: true, latencyMs });
+            });
+
+            tlsTunnel.on('close', () => {
+              cleanup();
+              const ipMatch = traceBody.match(/^ip=([^\r\n]+)/m);
+              finish({
+                ok: true,
+                latencyMs: Date.now() - start,
+                ip: ipMatch ? ipMatch[1]?.trim() : undefined,
+              });
             });
 
             tlsTunnel.on('end', () => {
@@ -343,7 +368,7 @@ async function testProxyWithCurlFallback(
       '-x',
       proxyUrl,
       endpoint,
-    ]);
+    ], { timeout: (timeoutSeconds + 1) * 1000 });
     const latencyMs = Date.now() - start;
     if (stdout && stdout.includes('ip=')) {
       const ipMatch = stdout.match(/^ip=(.+)$/m);
