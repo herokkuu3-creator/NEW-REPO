@@ -132,6 +132,25 @@ export function proxyHash(proxyUrl: string): string {
   return crypto.createHash('sha256').update(proxyUrl.trim()).digest('hex').slice(0, 16);
 }
 
+/**
+ * Converts a proxy URL or configured string into Playwright's proxy shape.
+ * Keeps credentials separate from server and decodes URL encoding.
+ */
+export function toPlaywrightProxy(raw: string): { server: string; username?: string; password?: string } | undefined {
+  if (!raw) return undefined;
+  const first = parseProxyList(raw)[0] ?? raw.trim();
+  try {
+    const endpoint = new URL(first);
+    if (!['http:', 'https:', 'socks4:', 'socks5:', 'socks5h:'].includes(endpoint.protocol) || !endpoint.hostname) return undefined;
+    const server = `${endpoint.protocol}//${endpoint.host}`;
+    const username = endpoint.username ? decodeURIComponent(endpoint.username) : undefined;
+    const password = endpoint.password ? decodeURIComponent(endpoint.password) : undefined;
+    return { server, ...(username ? { username } : {}), ...(password ? { password } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
 export interface ProxyTestResult {
   ok: boolean;
   latencyMs: number;
@@ -197,15 +216,20 @@ async function testHttpProxyNative(
       });
     }
 
-    const timer = setTimeout(() => {
-      try { socket.destroy(); } catch {}
-      finish({ ok: false, latencyMs: Date.now() - start, error: `Connection timed out after ${timeoutSeconds}s` });
-    }, timeoutMs);
-
+    let activeTlsTunnel: tls.TLSSocket | null = null;
     const cleanup = () => {
       clearTimeout(timer);
+      if (activeTlsTunnel) {
+        try { activeTlsTunnel.destroy(); } catch {}
+        activeTlsTunnel = null;
+      }
       try { socket.destroy(); } catch {}
     };
+
+    const timer = setTimeout(() => {
+      cleanup();
+      finish({ ok: false, latencyMs: Date.now() - start, error: `Connection timed out after ${timeoutSeconds}s` });
+    }, timeoutMs);
 
     socket.on('error', (err) => {
       cleanup();
@@ -250,13 +274,13 @@ async function testHttpProxyNative(
             }, () => {
               tlsTunnel.write(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${targetHost}\r\nUser-Agent: curl/8.4.0\r\nConnection: close\r\n\r\n`);
             });
+            activeTlsTunnel = tlsTunnel;
 
             let traceBody = '';
             tlsTunnel.on('data', (data) => {
               traceBody += data.toString('utf8');
               if (traceBody.includes('ip=')) {
                 cleanup();
-                try { tlsTunnel.destroy(); } catch {}
                 const ipMatch = traceBody.match(/^ip=([^\r\n]+)/m);
                 finish({
                   ok: true,
@@ -304,45 +328,46 @@ async function testHttpProxyNative(
 
 async function testProxyWithCurlFallback(
   proxyUrl: string,
-  timeoutSeconds = 8,
+  timeoutSeconds = 5,
 ): Promise<ProxyTestResult> {
   const start = Date.now();
-  const testEndpoints = [
-    'https://challenges.cloudflare.com/cdn-cgi/trace',
-    'https://www.cloudflare.com/cdn-cgi/trace',
-  ];
+  const endpoint = 'https://challenges.cloudflare.com/cdn-cgi/trace';
 
-  let lastError = 'Failed to connect';
-  for (const endpoint of testEndpoints) {
-    try {
-      const { stdout } = await execFileAsync('curl', [
-        '-s',
-        '-S',
-        '--fail',
-        '--max-time',
-        String(timeoutSeconds),
-        '-x',
-        proxyUrl,
-        endpoint,
-      ]);
-      const latencyMs = Date.now() - start;
-      if (stdout && stdout.includes('ip=')) {
-        const ipMatch = stdout.match(/^ip=(.+)$/m);
-        return {
-          ok: true,
-          latencyMs,
-          ip: ipMatch ? ipMatch[1]?.trim() : undefined,
-        };
-      }
-    } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
+  try {
+    const { stdout } = await execFileAsync('curl', [
+      '-s',
+      '-S',
+      '--fail',
+      '--max-time',
+      String(timeoutSeconds),
+      '-x',
+      proxyUrl,
+      endpoint,
+    ]);
+    const latencyMs = Date.now() - start;
+    if (stdout && stdout.includes('ip=')) {
+      const ipMatch = stdout.match(/^ip=(.+)$/m);
+      return {
+        ok: true,
+        latencyMs,
+        ip: ipMatch ? ipMatch[1]?.trim() : undefined,
+      };
     }
+    return {
+      ok: false,
+      latencyMs,
+      error: 'Unexpected trace response',
+    };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      latencyMs: Date.now() - start,
+      error: msg.includes('timed out') || msg.includes('Operation timed out')
+        ? `Timed out after ${timeoutSeconds}s`
+        : msg.slice(0, 100),
+    };
   }
-  return {
-    ok: false,
-    latencyMs: Date.now() - start,
-    error: lastError,
-  };
 }
 
 /**
@@ -352,7 +377,7 @@ async function testProxyWithCurlFallback(
  */
 export async function testProxyDetailed(
   proxyUrl: string,
-  timeoutSeconds = 8,
+  timeoutSeconds = 5,
 ): Promise<ProxyTestResult> {
   let u: URL;
   try {
@@ -364,12 +389,9 @@ export async function testProxyDetailed(
   if (u.protocol === 'http:' || u.protocol === 'https:') {
     try {
       const nativeRes = await testHttpProxyNative(proxyUrl, timeoutSeconds);
-      if (nativeRes.ok) return nativeRes;
-      if (nativeRes.error && /Proxy (?:407|403|402|50\d)/i.test(nativeRes.error)) {
-        return nativeRes;
-      }
+      return nativeRes;
     } catch {
-      // Fall through to curl fallback
+      // Fall through to curl fallback only if native code throws an unexpected exception
     }
   }
 

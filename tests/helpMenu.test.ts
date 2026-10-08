@@ -12,6 +12,9 @@ describe('HELP_TEXT command clickable formatting', () => {
     expect(HELP_TEXT).toContain('├ /questionrangesubmission — Range solver');
     expect(HELP_TEXT).toContain('├ /useproxy — Select &amp; switch active Codeforces proxy');
     expect(HELP_TEXT).toContain('├ /removeproxy — Blacklist &amp; remove dead proxy in DB');
+    expect(HELP_TEXT).toContain('├ /setproxies — Save &amp; verify multiple proxies in DB');
+    expect(HELP_TEXT).toContain('├ /addproxy — Add proxy to active pool');
+    expect(HELP_TEXT).toContain('├ /renew — Session renewal guide &amp; instructions');
 
     // Ensure commands are not wrapped in <code>/cmd</code> which causes Telegram to only copy to clipboard on click
     expect(HELP_TEXT).not.toContain('<code>/cfrange</code>');
@@ -19,6 +22,9 @@ describe('HELP_TEXT command clickable formatting', () => {
     expect(HELP_TEXT).not.toContain('<code>/questionrangesubmission</code>');
     expect(HELP_TEXT).not.toContain('<code>/useproxy</code>');
     expect(HELP_TEXT).not.toContain('<code>/removeproxy</code>');
+    expect(HELP_TEXT).not.toContain('<code>/setproxies</code>');
+    expect(HELP_TEXT).not.toContain('<code>/addproxy</code>');
+    expect(HELP_TEXT).not.toContain('<code>/renew</code>');
   });
 
   it('contains pro tip guiding users to tap commands directly', () => {

@@ -8,6 +8,7 @@ import {
   readCodeChefDailyState,
   writeCodeChefDailyState,
   CODECHEF_DAILY_RETRY_LIMIT,
+  todayInTimezone,
 } from '../src/codechef/worker';
 import * as storage from '../src/codechef/storage';
 import { submitDirectlyViaCodeChefApi, submitToCodeChef } from '../src/codechef/api';
@@ -204,13 +205,15 @@ describe('CodeChef daily scheduler and retries', () => {
   });
 
   it('runAutomaticCodeChefDaily stops when retry limit is reached', async () => {
-    vi.mocked(getSystemState).mockResolvedValue(JSON.stringify({ date: '2026-10-07', retryCount: CODECHEF_DAILY_RETRY_LIMIT }));
+    const today = todayInTimezone();
+    vi.mocked(getSystemState).mockResolvedValue(JSON.stringify({ date: today, retryCount: CODECHEF_DAILY_RETRY_LIMIT }));
     await runAutomaticCodeChefDaily(true, 8, 15, 'Asia/Kolkata');
     expect(submitDirectlyViaCodeChefApi).not.toHaveBeenCalled();
   });
 
   it('runAutomaticCodeChefDaily ensures accounts are seeded and triggers run with forceDailyAttempt=true', async () => {
-    vi.mocked(getSystemState).mockResolvedValue(JSON.stringify({ date: '2026-10-07', retryCount: 0 }));
+    const today = todayInTimezone();
+    vi.mocked(getSystemState).mockResolvedValue(JSON.stringify({ date: today, retryCount: 0 }));
     vi.mocked(storage.listCodeChefAccounts).mockResolvedValue([
       { id: 'acc1', label: 'tester', username: 'tester', lastSubmissionDate: null, storageState: JSON.stringify({ cookies: [{ name: 'session' }], origins: [] }) },
     ] as never);

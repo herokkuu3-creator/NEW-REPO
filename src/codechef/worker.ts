@@ -97,7 +97,7 @@ export function formatCodeChefRangeStatus(info: CodeChefRangeJobInfo, now = Date
     info.currentProblem ? `📝 <b>Current Problem:</b> <code>${escape(info.currentProblem)}</code>` : '',
     `⏱️ <b>Elapsed Time:</b> ${elapsedStr}`,
     '<code>━━━━━━━━━━━━━━━━━━━━</code>',
-    '<i>Send <code>/cccancelrange</code> to stop this batch job.</i>',
+    '<i>Send /cccancelrange to stop this batch job.</i>',
   ].filter(Boolean).join('\n');
 }
 
@@ -161,7 +161,7 @@ export interface CodeChefRunOptions {
   onAccountOutcome?: (outcome: CodeChefOutcome, index: number, total: number) => Promise<void> | void;
 }
 
-function todayInTimezone(): string {
+export function todayInTimezone(): string {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: config.schedule.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
   const get = (type: string) => parts.find(part => part.type === type)?.value ?? '';
   return `${get('year')}-${get('month')}-${get('day')}`;

@@ -1,4 +1,5 @@
 import { blockCodeforcesResource } from '../codeforces/browserForm';
+import { toPlaywrightProxy } from '../codeforces/proxyRotator';
 import { chromium, firefox, Browser, BrowserContext, Page } from 'playwright';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -210,11 +211,14 @@ export async function launchWithStorageStateObject(
 export async function launchFirefoxWithStorageStateObject(
   state: StorageStateShape,
   label: string,
+  proxyUrl?: string,
 ): Promise<BrowserSession | null> {
   let browser: Browser | null = null;
+  const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
   try {
     const activeBrowser = (browser = await firefox.launch({
       headless: config.browser.headless,
+      ...(proxy ? { proxy } : {}),
       firefoxUserPrefs: {
         // Keep Firefox to the smallest practical footprint for a single submit tab.
         'browser.cache.disk.enable': false,

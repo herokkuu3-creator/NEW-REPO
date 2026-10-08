@@ -2,6 +2,7 @@ import { deleteSystemState, getSystemState, setSystemState, SystemKeys } from '.
 import { logger } from '../logger';
 import {
   parseProxyList,
+  normalizeSingleProxy,
   maskProxyUrl,
   proxyHash,
   testProxyDetailed,
@@ -182,7 +183,8 @@ export async function getAllConfiguredProxies(envSource?: string): Promise<Manag
 
 export function extractProxyDetails(proxyUrl: string): { host: string; username: string } {
   try {
-    const u = new URL(proxyUrl);
+    const normalized = normalizeSingleProxy(proxyUrl) ?? proxyUrl.trim();
+    const u = new URL(normalized);
     const host = u.host || u.hostname || 'unknown';
     const username = u.username ? decodeURIComponent(u.username) : 'none';
     return { host, username };
@@ -205,10 +207,13 @@ export async function setPreferredProxy(
   envSource?: string,
 ): Promise<ManagedProxy | null> {
   const all = await getAllConfiguredProxies(envSource);
+  const norm = normalizeSingleProxy(proxyUrlOrHash);
   const target = all.find(
     (p) =>
       p.url === proxyUrlOrHash ||
+      (norm !== null && p.url === norm) ||
       p.hash === proxyUrlOrHash.toLowerCase() ||
+      (norm !== null && p.hash === proxyHash(norm)) ||
       String(p.index) === proxyUrlOrHash.trim() ||
       p.masked === proxyUrlOrHash,
   );
@@ -250,20 +255,39 @@ export async function removeProxyByIndex(index: number, envSource?: string): Pro
 export async function testAllProxiesOneByOne(
   onProgress?: (progress: ProxyCheckStatus, index: number, total: number) => Promise<void> | void,
   envSource?: string,
+  timeoutSeconds = 5,
 ): Promise<ProxyCheckStatus[]> {
   const list = await getAllConfiguredProxies(envSource);
-  const results: ProxyCheckStatus[] = [];
+  const results: ProxyCheckStatus[] = new Array(list.length);
 
-  for (let i = 0; i < list.length; i++) {
-    const p = list[i]!;
-    // Even if removed, we test it so the user can see if it's currently working or dead
-    const result = await testProxyDetailed(p.url, 8);
-    const status: ProxyCheckStatus = { proxy: p, result };
-    results.push(status);
-    if (onProgress) {
-      await onProgress(status, i + 1, list.length);
-    }
-  }
+  let completed = 0;
+  await Promise.all(
+    list.map(async (p, i) => {
+      try {
+        const result = await testProxyDetailed(p.url, timeoutSeconds);
+        const status: ProxyCheckStatus = { proxy: p, result };
+        results[i] = status;
+        completed++;
+        if (onProgress) {
+          await onProgress(status, completed, list.length);
+        }
+      } catch (err) {
+        const status: ProxyCheckStatus = {
+          proxy: p,
+          result: {
+            ok: false,
+            latencyMs: 0,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        };
+        results[i] = status;
+        completed++;
+        if (onProgress) {
+          await onProgress(status, completed, list.length);
+        }
+      }
+    }),
+  );
 
   return results;
 }
@@ -332,6 +356,10 @@ export async function resolveActiveProxy(
 
   // Fallback / default: Walk available proxies in pool order starting from index 0
   for (const candidate of available) {
+    if (fallbackOccurred && preferredUrlOrHash && (candidate.url === preferredUrlOrHash || candidate.hash === preferredUrlOrHash || candidate.masked === preferredUrlOrHash)) {
+      log(`Proxy [${candidate.index}/${all.length}] ${candidate.masked} already failed preferred proxy check. Skipping.`);
+      continue;
+    }
     log(`Testing proxy [${candidate.index}/${all.length}] ${candidate.masked}...`);
     const ok = await tester(candidate.url).catch(() => false);
     if (ok) {

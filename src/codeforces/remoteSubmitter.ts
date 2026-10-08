@@ -20,7 +20,10 @@ export async function notifyProxyInUse(networkMode: CodeforcesNetworkMode = 'pro
     return null;
   });
   if (activeProxy) {
-    const msg = `🌐 Proxy in use: <b>${escapeHtml(activeProxy.host)}</b> (user: <code>${escapeHtml(activeProxy.username)}</code>)`;
+    const fallbackNotice = activeProxy.fallbackOccurred
+      ? '\n⚠️ <i>(Preferred proxy was unreachable; fell back to pool rotation)</i>'
+      : '';
+    const msg = `🌐 Proxy in use: <b>${escapeHtml(activeProxy.host)}</b> (user: <code>${escapeHtml(activeProxy.username)}</code>)${fallbackNotice}`;
     await sendTelegramMessage(msg, { parseMode: 'HTML' }).catch(() => undefined);
   }
   return activeProxy;

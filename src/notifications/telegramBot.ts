@@ -49,9 +49,11 @@ import {
   testAllProxiesOneByOne,
   fetchRemoteSyncedProxies,
   getPreferredProxy,
+  setPreferredProxy,
   setPreferredProxyByIndex,
   clearPreferredProxy,
   extractProxyDetails,
+  type ProxyCheckStatus,
 } from '../codeforces/proxyManager';
 import { testProxyDetailed, type ProxyTestResult } from '../codeforces/proxyRotator';
 import {
@@ -171,8 +173,8 @@ export const HELP_TEXT = [
   '<b>🌐 𝗣𝗥𝗢𝗫𝗬 &amp; 𝗡𝗘𝗧𝗪𝗢𝗥𝗞</b>',
   '├ /useproxy — Select &amp; switch active Codeforces proxy',
   '├ /testproxy — Test each proxy one-by-one &amp; show live health',
-  '├ /setproxies <i>&lt;urls&gt;</i> — Save &amp; verify multiple proxies in DB',
-  '├ /addproxy <i>&lt;url&gt;</i> — Add proxy to active pool',
+  '├ /setproxies — Save &amp; verify multiple proxies in DB',
+  '├ /addproxy — Add proxy to active pool',
   '├ /removeproxy — Blacklist &amp; remove dead proxy in DB',
   '├ /restoreproxies — Reset blacklist &amp; restore all proxies',
   '├ /syncproxies — Sync proxies from GitHub Actions runner',
@@ -187,8 +189,7 @@ export const HELP_TEXT = [
   '└ /ccaccounts — View CodeChef accounts &amp; queue progress',
   '',
   '<b>🍪 𝗦𝗘𝗦𝗦𝗜𝗢𝗡 𝗠𝗔𝗡𝗔𝗚𝗘𝗠𝗘𝗡𝗧</b>',
-  '├ /renew — Session renewal guide &amp; instructions',
-  '├ /renew <i>&lt;label&gt;</i> — Tag next uploaded JSON with label',
+  '├ /renew — Session renewal guide &amp; instructions (supports label)',
   '├ /removesession — Remove a single account session',
   '└ /removeallsessions — Purge all stored accounts',
   '',
@@ -1756,14 +1757,14 @@ async function handleCodeforcesNetworkButton(
 }
 
 export interface ProxyUiDeps {
-  send: (text: string, buttons?: InlineButton[][]) => Promise<void>;
+  send: (text: string, buttons?: InlineButton[][]) => Promise<any>;
   edit: (chatId: number | string, messageId: number, text: string, buttons?: InlineButton[][]) => Promise<void>;
   answer: (callbackId: string, text?: string) => Promise<void>;
 }
 
 export const defaultProxyUiDeps: ProxyUiDeps = {
   send: async (text, buttons) => {
-    await tgApi('sendMessage', {
+    return await tgApi<{ message_id: number }>('sendMessage', {
       chat_id: config.telegram.chatId,
       text,
       parse_mode: 'HTML',
@@ -1808,14 +1809,23 @@ export async function handleTestProxyCommand(deps: ProxyUiDeps = defaultProxyUiD
     return;
   }
 
-  await deps.send([
+  const sent = (await deps.send([
     '<b>🌐 CODEFORCES PROXY HEALTH CHECK</b>',
     '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-    `🔎 Testing ${all.length} configured proxy(ies) one-by-one (~150B trace check)...`,
-    '<i>Please wait...</i>',
-  ].join('\n'));
+    `🔎 Testing ${all.length} configured proxy(ies) (~150B trace check)...`,
+    '<i>Please wait a few seconds...</i>',
+  ].join('\n'))) as { message_id?: number } | void;
 
-  const results = await testAllProxiesOneByOne();
+  let results: ProxyCheckStatus[];
+  try {
+    results = await testAllProxiesOneByOne();
+  } catch (err) {
+    logger.warn({ err: errText(err) }, 'testAllProxiesOneByOne failed in handleTestProxyCommand');
+    results = all.map((p) => ({
+      proxy: p,
+      result: { ok: false, latencyMs: 0, error: 'Check failed' },
+    }));
+  }
 
   let workingCount = 0;
   let failedCount = 0;
@@ -1854,6 +1864,16 @@ export async function handleTestProxyCommand(deps: ProxyUiDeps = defaultProxyUiD
     { text: '✅ Done', callback_data: 'pxdone' },
   ]);
 
+  const messageId = sent && typeof sent === 'object' && 'message_id' in sent ? sent.message_id : undefined;
+  if (messageId) {
+    try {
+      await deps.edit(config.telegram.chatId, messageId, lines.join('\n'), buttons);
+      return;
+    } catch {
+      // Fall through to send
+    }
+  }
+
   await deps.send(lines.join('\n'), buttons);
 }
 
@@ -1871,32 +1891,60 @@ export async function handleUseProxyCommand(arg?: string, deps: ProxyUiDeps = de
     return;
   }
 
-  // Direct selection by number e.g. "/useproxy 2" or "/useproxy #2"
-  const index = Number.parseInt(trimmed.replace(/^#/, ''), 10);
-  if (Number.isFinite(index) && index > 0) {
-    const res = await setPreferredProxyByIndex(index);
-    if (!res.ok || !res.proxy) {
-      await deps.send(`❌ Proxy #${index} not found. Available proxies can be viewed with /useproxy or /testproxy.`);
+  // Direct selection by number or proxy identifier
+  if (trimmed) {
+    const index = Number.parseInt(trimmed.replace(/^#/, ''), 10);
+    if (Number.isFinite(index) && index > 0) {
+      const res = await setPreferredProxyByIndex(index);
+      if (!res.ok || !res.proxy) {
+        await deps.send(`❌ Proxy #${index} not found. Available proxies can be viewed with /useproxy or /testproxy.`);
+        return;
+      }
+
+      const check: ProxyTestResult = await testProxyDetailed(res.proxy.url, 8).catch(() => ({ ok: false, latencyMs: 0, error: 'Check error' } as ProxyTestResult));
+      const details = extractProxyDetails(res.proxy.url);
+      const statusIcon = check.ok ? '🟢 <b>Live</b>' : '🔴 <b>Down/Unreachable</b>';
+      const latencyText = check.ok
+        ? ` (${check.latencyMs}ms${check.ip ? ` · IP: ${check.ip}` : ''})`
+        : (check.error ? ` (${escapeHtml(check.error)})` : '');
+
+      await deps.send([
+        `✅ <b>Preferred Proxy Selected: #${index}</b>`,
+        '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+        `🌐 <b>Host:</b> <code>${escapeHtml(details.host)}</code>`,
+        `👤 <b>User:</b> <code>${escapeHtml(details.username)}</code>`,
+        `🔒 <b>Proxy:</b> <code>${escapeHtml(res.proxy.masked)}</code>`,
+        `⚡ <b>Current Status:</b> ${statusIcon}${latencyText}`,
+        '',
+        '<i>This proxy will be tested and used first for Codeforces submissions. If it goes down, the system will automatically fall back to testing the pool from the beginning.</i>',
+      ].join('\n'));
       return;
     }
 
-    const check: ProxyTestResult = await testProxyDetailed(res.proxy.url, 8).catch(() => ({ ok: false, latencyMs: 0, error: 'Check error' } as ProxyTestResult));
-    const details = extractProxyDetails(res.proxy.url);
-    const statusIcon = check.ok ? '🟢 <b>Live</b>' : '🔴 <b>Down/Unreachable</b>';
-    const latencyText = check.ok
-      ? ` (${check.latencyMs}ms${check.ip ? ` · IP: ${check.ip}` : ''})`
-      : (check.error ? ` (${escapeHtml(check.error)})` : '');
+    // Try selecting by URL, masked string, or hash
+    const res = await setPreferredProxy(trimmed);
+    if (res) {
+      const check: ProxyTestResult = await testProxyDetailed(res.url, 8).catch(() => ({ ok: false, latencyMs: 0, error: 'Check error' } as ProxyTestResult));
+      const details = extractProxyDetails(res.url);
+      const statusIcon = check.ok ? '🟢 <b>Live</b>' : '🔴 <b>Down/Unreachable</b>';
+      const latencyText = check.ok
+        ? ` (${check.latencyMs}ms${check.ip ? ` · IP: ${check.ip}` : ''})`
+        : (check.error ? ` (${escapeHtml(check.error)})` : '');
 
-    await deps.send([
-      `✅ <b>Preferred Proxy Selected: #${index}</b>`,
-      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-      `🌐 <b>Host:</b> <code>${escapeHtml(details.host)}</code>`,
-      `👤 <b>User:</b> <code>${escapeHtml(details.username)}</code>`,
-      `🔒 <b>Proxy:</b> <code>${escapeHtml(res.proxy.masked)}</code>`,
-      `⚡ <b>Current Status:</b> ${statusIcon}${latencyText}`,
-      '',
-      '<i>This proxy will be tested and used first for Codeforces submissions. If it goes down, the system will automatically fall back to testing the pool from the beginning.</i>',
-    ].join('\n'));
+      await deps.send([
+        `✅ <b>Preferred Proxy Selected: #${res.index}</b>`,
+        '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+        `🌐 <b>Host:</b> <code>${escapeHtml(details.host)}</code>`,
+        `👤 <b>User:</b> <code>${escapeHtml(details.username)}</code>`,
+        `🔒 <b>Proxy:</b> <code>${escapeHtml(res.masked)}</code>`,
+        `⚡ <b>Current Status:</b> ${statusIcon}${latencyText}`,
+        '',
+        '<i>This proxy will be tested and used first for Codeforces submissions. If it goes down, the system will automatically fall back to testing the pool from the beginning.</i>',
+      ].join('\n'));
+      return;
+    }
+
+    await deps.send(`❌ Proxy "${escapeHtml(trimmed)}" not found. Send /useproxy to see all proxies or /useproxy <number> to select by number.`);
     return;
   }
 
@@ -1913,14 +1961,23 @@ export async function handleUseProxyCommand(arg?: string, deps: ProxyUiDeps = de
     return;
   }
 
-  await deps.send([
+  const sent = (await deps.send([
     '<b>🌐 CODEFORCES PROXY SELECTION</b>',
     '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
     `🔎 Testing ${all.length} configured proxy(ies) to check live status...`,
-    '<i>Please wait...</i>',
-  ].join('\n'));
+    '<i>Please wait a few seconds...</i>',
+  ].join('\n'))) as { message_id?: number } | void;
 
-  const results = await testAllProxiesOneByOne();
+  let results: ProxyCheckStatus[];
+  try {
+    results = await testAllProxiesOneByOne();
+  } catch (err) {
+    logger.warn({ err: errText(err) }, 'testAllProxiesOneByOne failed in handleUseProxyCommand');
+    results = all.map((p) => ({
+      proxy: p,
+      result: { ok: false, latencyMs: 0, error: 'Check failed' },
+    }));
+  }
   const currentPreferred = await getPreferredProxy();
 
   const lines = [
@@ -1973,6 +2030,16 @@ export async function handleUseProxyCommand(arg?: string, deps: ProxyUiDeps = de
     { text: '✅ Done', callback_data: 'pxdone' },
   ]);
 
+  const messageId = sent && typeof sent === 'object' && 'message_id' in sent ? sent.message_id : undefined;
+  if (messageId) {
+    try {
+      await deps.edit(config.telegram.chatId, messageId, lines.join('\n'), buttons);
+      return;
+    } catch {
+      // Fall through to send
+    }
+  }
+
   await deps.send(lines.join('\n'), buttons);
 }
 
@@ -2019,7 +2086,7 @@ export async function handleRemoveProxyCommand(arg?: string, deps: ProxyUiDeps =
     '✅ <b>Saved to database blacklist.</b>',
     'This proxy will <b>NOT</b> be used for any future submissions, even if it remains in GitHub Action secrets.',
     '',
-    '💡 <i>To re-enable all proxies, use <code>/restoreproxies</code>.</i>',
+    '💡 <i>To re-enable all proxies, use /restoreproxies.</i>',
   ].join('\n'));
 }
 
@@ -2032,7 +2099,7 @@ export async function handleAddProxyCommand(arg?: string, deps: ProxyUiDeps = de
       'Please specify one or more proxy URLs (comma, space, or newline separated):',
       '👉 <code>/setproxies http://user:pass@host1:port, http://user:pass@host2:port</code>',
       '',
-      '<i>Or send <code>/syncproxies</code> to sync from GitHub Secrets.</i>',
+      '<i>Or send /syncproxies to sync from GitHub Secrets.</i>',
     ].join('\n'));
     return;
   }
@@ -2073,7 +2140,7 @@ export async function handleSyncProxiesCommand(deps: ProxyUiDeps = defaultProxyU
       const { dispatchAction } = await import('../codeforces/actionBroker');
       const testJobId = randomUUID();
       await dispatchAction(runnerRepo, dispatchToken, testJobId);
-      await deps.send('⏳ GitHub Actions sync dispatched! Please wait ~20-30 seconds, then run <code>/testproxy</code>.');
+      await deps.send('⏳ GitHub Actions sync dispatched! Please wait ~20-30 seconds, then run /testproxy.');
       return;
     } catch {
       // fallback below
@@ -2424,7 +2491,7 @@ export async function handleCodeforcesRangeButton(
   const state = cfRangeSelections.get(key);
   if (!state) {
     await deps.answer(callbackId, 'This batch picker expired');
-    await deps.edit(chatId, messageId, '⌛ This batch picker expired. Send <code>/cfrange</code> again.');
+    await deps.edit(chatId, messageId, '⌛ This batch picker expired. Send /cfrange again.');
     return;
   }
 

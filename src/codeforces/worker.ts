@@ -133,7 +133,7 @@ export function formatCodeforcesRangeStatus(info: CodeforcesRangeJobInfo, now = 
     info.currentProblem ? `📝 <b>Current Problem:</b> <code>${escape(info.currentProblem)}</code>` : '',
     `⏱️ <b>Elapsed Time:</b> ${elapsedStr}`,
     '<code>━━━━━━━━━━━━━━━━━━━━</code>',
-    '<i>Send <code>/cfcancelrange</code> to stop this batch job.</i>',
+    '<i>Send /cfcancelrange to stop this batch job.</i>',
   ].filter(Boolean).join('\n');
 }
 
@@ -890,9 +890,9 @@ async function postViaLocalBrowser(
   deadline = Date.now() + CODEFORCES_ATTEMPT_MS,
   networkMode: CodeforcesNetworkMode = 'proxy',
 ): Promise<LocalPostOutcome | null> {
-  if (networkMode !== 'tailscale') {
-    await notifyProxyInUse(networkMode).catch(() => null);
-  }
+  const activeProxy = networkMode !== 'tailscale'
+    ? await notifyProxyInUse(networkMode).catch(() => null)
+    : null;
   releaseHeap();
   await new Promise<void>((resolve) => setTimeout(resolve, 100));
   const available = availableMemoryMb();
@@ -914,7 +914,7 @@ async function postViaLocalBrowser(
     };
   }
 
-  const session = await launchFirefoxWithStorageStateObject(state, label);
+  const session = await launchFirefoxWithStorageStateObject(state, label, activeProxy?.url);
   if (!session) {
     return {
       ok: false,

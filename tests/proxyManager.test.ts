@@ -15,7 +15,7 @@ import {
   extractProxyDetails,
   resolveActiveProxy,
 } from '../src/codeforces/proxyManager';
-import { selectWorkingProxy, proxyHash } from '../src/codeforces/proxyRotator';
+import { selectWorkingProxy, proxyHash, toPlaywrightProxy } from '../src/codeforces/proxyRotator';
 import {
   handleTestProxyCommand,
   handleUseProxyCommand,
@@ -183,6 +183,30 @@ describe('proxyManager', () => {
     const p2 = extractProxyDetails('http://1.2.3.4:8080');
     expect(p2.host).toBe('1.2.3.4:8080');
     expect(p2.username).toBe('none');
+
+    const p3 = extractProxyDetails('gate.brightdata.com:33335:user789:pass999');
+    expect(p3.host).toBe('gate.brightdata.com:33335');
+    expect(p3.username).toBe('user789');
+
+    const p4 = extractProxyDetails('userabc:passdef@gate.brightdata.com:33335');
+    expect(p4.host).toBe('gate.brightdata.com:33335');
+    expect(p4.username).toBe('userabc');
+  });
+
+  it('toPlaywrightProxy converts proxy string to Playwright proxy format', () => {
+    const res = toPlaywrightProxy('http://myuser:mypass@myhost.com:8080');
+    expect(res).toEqual({
+      server: 'http://myhost.com:8080',
+      username: 'myuser',
+      password: 'mypass',
+    });
+
+    const direct = toPlaywrightProxy('http://myhost.com:8080');
+    expect(direct).toEqual({
+      server: 'http://myhost.com:8080',
+    });
+
+    expect(toPlaywrightProxy('')).toBeUndefined();
   });
 
   it('gets, sets, and clears preferred proxy', async () => {
@@ -260,6 +284,32 @@ describe('proxyManager', () => {
     expect(active?.fromPreferred).toBe(false);
     expect(active?.fallbackOccurred).toBe(false);
     expect(tested).toEqual(['http://u1:p1@dead1.com:8080', 'http://u2:p2@live2.com:8080']);
+  });
+
+  it('resolveActiveProxy skips redundant testing of dead preferred proxy during fallback', async () => {
+    const env = 'http://u1:p1@first-dead.com:8080, http://u2:p2@second-preferred-dead.com:8080, http://u3:p3@third-live.com:8080';
+    await setPreferredProxyByIndex(2, env);
+
+    const tested: string[] = [];
+    const active = await resolveActiveProxy({
+      envSource: env,
+      tester: async (url) => {
+        tested.push(url);
+        return url.includes('third-live');
+      },
+    });
+
+    expect(active).not.toBeNull();
+    expect(active?.url).toBe('http://u3:p3@third-live.com:8080');
+    expect(active?.fromPreferred).toBe(false);
+    expect(active?.fallbackOccurred).toBe(true);
+
+    // Tested sequence: preferred proxy (#2) first -> then pool from start (#1) -> then #3 (skipping #2!)
+    expect(tested).toEqual([
+      'http://u2:p2@second-preferred-dead.com:8080',
+      'http://u1:p1@first-dead.com:8080',
+      'http://u3:p3@third-live.com:8080',
+    ]);
   });
 });
 
@@ -490,6 +540,100 @@ describe('telegram proxy commands', () => {
     const result = await notifyProxyInUse('tailscale');
     expect(result).toBeNull();
     expect(sendTelegramMessage).not.toHaveBeenCalled();
+  });
+
+  it('handles /useproxy with invalid string without running proxy checks', async () => {
+    const sent: string[] = [];
+    const deps: ProxyUiDeps = {
+      send: vi.fn(async (text) => {
+        sent.push(text);
+      }),
+      edit: vi.fn(),
+      answer: vi.fn(),
+    };
+
+    await handleUseProxyCommand('not_a_valid_proxy', deps);
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toContain('not found');
+  });
+
+  it('handles /useproxy <url> to set preferred proxy directly by url', async () => {
+    process.env.CODEFORCES_RESIDENTIAL_PROXY = 'http://u1:p1@p1.com:8080, http://u2:p2@p2.com:8080';
+    const sent: string[] = [];
+    const deps: ProxyUiDeps = {
+      send: vi.fn(async (text) => {
+        sent.push(text);
+      }),
+      edit: vi.fn(),
+      answer: vi.fn(),
+    };
+
+    await handleUseProxyCommand('http://u2:p2@p2.com:8080', deps);
+    expect(sent[0]).toContain('Preferred Proxy Selected: #2');
+    expect(await getPreferredProxy()).toBe('http://u2:p2@p2.com:8080');
+  });
+
+  it('handleUseProxyCommand edits pending message in place when message_id is returned', async () => {
+    process.env.CODEFORCES_RESIDENTIAL_PROXY = 'http://u1:p1@good.com:8080';
+    const sent: string[] = [];
+    const edited: { chatId: any; messageId: number; text: string; buttons?: any[] }[] = [];
+    const deps: ProxyUiDeps = {
+      send: vi.fn(async (text) => {
+        sent.push(text);
+        return { message_id: 12345 };
+      }),
+      edit: vi.fn(async (chatId, messageId, text, buttons) => {
+        edited.push({ chatId, messageId, text, buttons });
+      }),
+      answer: vi.fn(),
+    };
+
+    await handleUseProxyCommand('', deps);
+    expect(sent.length).toBe(1); // Only initial "Please wait..." sent
+    expect(sent[0]).toContain('Please wait');
+    expect(edited.length).toBe(1); // Initial message edited into selection menu!
+    expect(edited[0]?.messageId).toBe(12345);
+    expect(edited[0]?.text).toContain('CODEFORCES PROXY SELECTION');
+    expect(edited[0]?.buttons?.length).toBeGreaterThan(0);
+  });
+
+  it('handleTestProxyCommand edits pending message in place when message_id is returned', async () => {
+    process.env.CODEFORCES_RESIDENTIAL_PROXY = 'http://u1:p1@good.com:8080';
+    const sent: string[] = [];
+    const edited: { chatId: any; messageId: number; text: string; buttons?: any[] }[] = [];
+    const deps: ProxyUiDeps = {
+      send: vi.fn(async (text) => {
+        sent.push(text);
+        return { message_id: 67890 };
+      }),
+      edit: vi.fn(async (chatId, messageId, text, buttons) => {
+        edited.push({ chatId, messageId, text, buttons });
+      }),
+      answer: vi.fn(),
+    };
+
+    await handleTestProxyCommand(deps);
+    expect(sent.length).toBe(1); // Initial notice
+    expect(edited.length).toBe(1); // Edited with results
+    expect(edited[0]?.messageId).toBe(67890);
+    expect(edited[0]?.text).toContain('CODEFORCES PROXY HEALTH CHECK');
+  });
+
+  it('notifyProxyInUse includes fallback notice when preferred proxy was down', async () => {
+    process.env.CODEFORCES_RESIDENTIAL_PROXY = 'http://u1:p1@live.com:8080, http://u2:p2@dead.com:8080';
+    await setPreferredProxyByIndex(2); // Set dead proxy #2 as preferred
+    vi.mocked(sendTelegramMessage).mockClear();
+
+    const result = await notifyProxyInUse('proxy');
+    expect(result).not.toBeNull();
+    expect(result?.fallbackOccurred).toBe(true);
+    expect(result?.host).toBe('live.com:8080');
+
+    expect(sendTelegramMessage).toHaveBeenCalledTimes(1);
+    const msg = vi.mocked(sendTelegramMessage).mock.calls[0]?.[0];
+    expect(msg).toContain('Proxy in use:');
+    expect(msg).toContain('live.com:8080');
+    expect(msg).toContain('Preferred proxy was unreachable; fell back to pool rotation');
   });
 
   describe('extractTelegramCommand', () => {
