@@ -292,4 +292,28 @@ describe('Codeforces native browser submission', () => {
     await simulateHumanClick(page, 125, 125, { moveSteps: 5, dwellMs: 10, holdMs: 10 });
     expect(clicked).toBe(true);
   });
+
+  it('allows Codeforces CDN assets on codeforces.net domains', () => {
+    expect(blockCodeforcesResource('https://assets.codeforces.net/css/submit.css', 'stylesheet')).toBe(false);
+    expect(blockCodeforcesResource('https://sta.codeforces.net/scripts/codeforces.js', 'script')).toBe(false);
+    expect(blockCodeforcesResource('https://st.codeforces.net/ace/ace.js', 'script')).toBe(false);
+  });
+
+  it('handles Capzy Turnstile solutions with alternative field names and safely handles default ports', async () => {
+    const fetchStub = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ errorId: 0, taskId: 'test-turnstile-task-2' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ errorId: 0, status: 'ready', solution: { cf_turnstile_response: 'capzy-alt-token', 'cf-turnstile-response': 'capzy-alt-token' } }),
+      });
+    vi.stubGlobal('fetch', fetchStub);
+
+    const result = await solveTurnstileWithCapzy('https://codeforces.com', 'sitekey-xyz', 'http://proxy.example.com', undefined, 5_000);
+    expect(result?.token).toBe('capzy-alt-token');
+    const firstCallBody = JSON.parse(fetchStub.mock.calls[0][1].body);
+    expect(firstCallBody.task.proxyPort).toBe(80);
+  });
 });

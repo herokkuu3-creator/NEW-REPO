@@ -59,8 +59,10 @@ export function blockCodeforcesResource(url: string, type: string): boolean {
 
   // The submit form is self-contained on Codeforces. Third-party analytics,
   // ads, and telemetry are not needed to render, verify, or POST the form.
-  const isCodeforcesHost = host === 'codeforces.com' || host.endsWith('.codeforces.com') ||
-    host === 'codeforces.org' || host.endsWith('.codeforces.org');
+  const isCodeforcesHost =
+    host === 'codeforces.com' || host.endsWith('.codeforces.com') ||
+    host === 'codeforces.org' || host.endsWith('.codeforces.org') ||
+    host === 'codeforces.net' || host.endsWith('.codeforces.net');
   if (!isCodeforcesHost) return true;
 
   // MathJax can download several megabytes but is only used to typeset problem
@@ -128,7 +130,7 @@ export async function solveTurnstileWithCapzy(
     'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
   const ua = userAgent || DEFAULT_DESKTOP_USER_AGENT;
 
-  const runCapzyTask = async (task: Record<string, unknown>): Promise<SolverResult | null> => {
+  const runCapzyTask = async (task: Record<string, unknown>, taskTimeoutMs = timeoutMs): Promise<SolverResult | null> => {
     try {
       const init = await fetch('https://api.capzy.ai/createTask', {
         method: 'POST',
@@ -142,7 +144,7 @@ export async function solveTurnstileWithCapzy(
         return null;
       }
 
-      const deadline = Date.now() + timeoutMs;
+      const deadline = Date.now() + taskTimeoutMs;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 2000));
         const poll = await fetch('https://api.capzy.ai/getTaskResult', {
@@ -156,13 +158,15 @@ export async function solveTurnstileWithCapzy(
           status?: string;
           solution?: {
             token?: string;
+            turnstileToken?: string;
             cookies?: Record<string, string>;
           };
         };
-        if (res?.status === 'ready' && res?.solution?.token) {
+        const token = res?.solution?.token || res?.solution?.turnstileToken || (res?.solution as Record<string, unknown> | undefined)?.['cf-turnstile-response'];
+        if (res?.status === 'ready' && token && typeof token === 'string') {
           return {
-            token: res.solution.token,
-            cookies: res.solution.cookies,
+            token,
+            cookies: res.solution?.cookies,
           };
         }
         if (res?.errorId && res.errorId !== 0) {
@@ -181,15 +185,16 @@ export async function solveTurnstileWithCapzy(
   try {
     if (proxy) {
       const parsed = new URL(proxy);
+      const parsedPort = parseInt(parsed.port, 10);
       proxyTask = {
         type: 'AntiTurnstileTask',
         websiteURL,
         websiteKey: sitekey,
         proxyType: parsed.protocol.replace(':', '') || 'http',
         proxyAddress: parsed.hostname,
-        proxyPort: parseInt(parsed.port, 10),
-        proxyLogin: decodeURIComponent(parsed.username || ''),
-        proxyPassword: decodeURIComponent(parsed.password || ''),
+        proxyPort: !isNaN(parsedPort) && parsedPort > 0 ? parsedPort : (parsed.protocol === 'https:' ? 443 : 80),
+        ...(parsed.username ? { proxyLogin: decodeURIComponent(parsed.username) } : {}),
+        ...(parsed.password ? { proxyPassword: decodeURIComponent(parsed.password) } : {}),
         userAgent: ua,
         ...(action ? { action } : {}),
         ...(cdata ? { cdata } : {}),
@@ -201,7 +206,8 @@ export async function solveTurnstileWithCapzy(
   }
 
   if (proxyTask) {
-    const res = await runCapzyTask(proxyTask);
+    const attempt1Timeout = Math.min(16_000, Math.max(5_000, Math.floor(timeoutMs * 0.45)));
+    const res = await runCapzyTask(proxyTask, attempt1Timeout);
     if (res?.token) return res;
   }
 
@@ -215,7 +221,7 @@ export async function solveTurnstileWithCapzy(
     ...(cdata ? { cdata } : {}),
     ...(action || cdata ? { metadata: { ...(action ? { action } : {}), ...(cdata ? { cdata } : {}) } } : {}),
   };
-  return runCapzyTask(proxylessTask);
+  return runCapzyTask(proxylessTask, timeoutMs);
 }
 
 export async function solveCloudflareWithCapzy(
@@ -242,6 +248,7 @@ export async function solveCloudflareWithCapzy(
 
   try {
     const parsed = new URL(proxy);
+    const parsedPort = parseInt(parsed.port, 10);
     const init = await fetch('https://api.capzy.ai/createTask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -252,9 +259,9 @@ export async function solveCloudflareWithCapzy(
           websiteURL,
           proxyType: parsed.protocol.replace(':', '') || 'http',
           proxyAddress: parsed.hostname,
-          proxyPort: parseInt(parsed.port, 10),
-          proxyLogin: decodeURIComponent(parsed.username || ''),
-          proxyPassword: decodeURIComponent(parsed.password || ''),
+          proxyPort: !isNaN(parsedPort) && parsedPort > 0 ? parsedPort : (parsed.protocol === 'https:' ? 443 : 80),
+          ...(parsed.username ? { proxyLogin: decodeURIComponent(parsed.username) } : {}),
+          ...(parsed.password ? { proxyPassword: decodeURIComponent(parsed.password) } : {}),
           userAgent: ua,
         },
       }),
@@ -277,13 +284,15 @@ export async function solveCloudflareWithCapzy(
         status?: string;
         solution?: {
           token?: string;
+          turnstileToken?: string;
           cookies?: Record<string, string>;
         };
       };
-      if (res?.status === 'ready' && res?.solution) {
+      const token = res?.solution?.token || res?.solution?.turnstileToken || (res?.solution as Record<string, unknown> | undefined)?.['cf-turnstile-response'];
+      if (res?.status === 'ready' && (token || res?.solution?.cookies)) {
         return {
-          token: res.solution.token,
-          cookies: res.solution.cookies,
+          token: typeof token === 'string' ? token : undefined,
+          cookies: res.solution?.cookies,
         };
       }
       if (res?.errorId && res.errorId !== 0) {
@@ -325,22 +334,45 @@ async function injectTurnstileToken(form: ReturnType<Page['locator']>, token: st
       element.appendChild(input);
     }
 
-    if (callback) {
-      const fn = callback.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
-      if (typeof fn === 'function') fn(token);
+    // Sync any document-level inputs outside the form
+    const docCfInputs = document.querySelectorAll('input[name="cf-turnstile-response"], input[name="turnstileToken"]');
+    docCfInputs.forEach((i) => {
+      const inp = i as HTMLInputElement;
+      if (!inp.value) inp.value = token;
+    });
+
+    // Patch window.turnstile.getResponse and isExpired so form submit handlers pass
+    const win = window as any;
+    if (win.turnstile) {
+      win.turnstile.getResponse = () => token;
+      win.turnstile.isExpired = () => false;
     }
 
-    const widgetEl = element.querySelector('.cf-turnstile[data-callback]') as HTMLElement | null;
+    // Trigger intercepted render callback
+    if (typeof win.__turnstileCallback === 'function') {
+      try { win.__turnstileCallback(token); } catch {}
+    }
+
+    // Trigger named callback
+    if (callback) {
+      const fn = callback.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
+      if (typeof fn === 'function') (fn as (t: string) => void)(token);
+    }
+
+    // Trigger widget data-callback attribute
+    const widgetEl = document.querySelector('.cf-turnstile[data-callback], [data-callback]') as HTMLElement | null;
     const widgetCb = widgetEl?.getAttribute('data-callback');
     if (widgetCb && widgetCb !== callback) {
       const fn = widgetCb.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
       if (typeof fn === 'function') (fn as (t: string) => void)(token);
     }
 
-    const submitBtn = element.querySelector('input[type="submit"], button[type="submit"], button:not([type])') as HTMLButtonElement | HTMLInputElement | null;
-    if (submitBtn && submitBtn.disabled) {
-      submitBtn.disabled = false;
-    }
+    // Re-enable submit buttons on form and page
+    const submitBtns = document.querySelectorAll('input[type="submit"], button[type="submit"], button:not([type])');
+    submitBtns.forEach((btn) => {
+      (btn as HTMLButtonElement).disabled = false;
+      btn.removeAttribute('disabled');
+    });
   }, { token, callback: callbackName }).catch(() => {});
 }
 
@@ -402,12 +434,31 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
 
   // 4. Turnstile is actively required or blocking the submit button
   const widgetInfo = await page.evaluate(() => {
-    const element = document.querySelector('.cf-turnstile[data-sitekey]');
+    const win = window as any;
+    const element = document.querySelector('.cf-turnstile[data-sitekey], [data-sitekey]');
     const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
-    const sitekey = element?.getAttribute('data-sitekey') ?? /["']?sitekey["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
-    const action = element?.getAttribute('data-action') ?? /["']?action["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
-    const cdata = element?.getAttribute('data-cdata') ?? /["']?cdata["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
-    return { sitekey, action, cdata, callback: element?.getAttribute('data-callback') ?? null };
+    let sitekey = (typeof win.__turnstileSitekey === 'string' && win.__turnstileSitekey ? win.__turnstileSitekey : null) ??
+      element?.getAttribute('data-sitekey') ??
+      /["']?sitekey["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1] ?? null;
+    let action = (typeof win.__turnstileAction === 'string' && win.__turnstileAction ? win.__turnstileAction : null) ??
+      element?.getAttribute('data-action') ??
+      /["']?action["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1] ?? null;
+    let cdata = (typeof win.__turnstileCdata === 'string' && win.__turnstileCdata ? win.__turnstileCdata : null) ??
+      element?.getAttribute('data-cdata') ??
+      /["']?cdata["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1] ?? null;
+    let callback = (typeof win.__turnstileCallback === 'string' && win.__turnstileCallback ? win.__turnstileCallback : null) ??
+      element?.getAttribute('data-callback') ?? null;
+
+    if (!sitekey) {
+      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]') as HTMLIFrameElement | null;
+      if (iframe?.src) {
+        try {
+          const u = new URL(iframe.src);
+          sitekey = u.searchParams.get('sitekey') || u.searchParams.get('key') || /\/([0-9a-zA-Z_-]{20,})\//.exec(u.pathname)?.[1] || null;
+        } catch {}
+      }
+    }
+    return { sitekey, action, cdata, callback };
   }).catch(() => ({ sitekey: null, action: null, cdata: null, callback: null }));
 
   const solverPromise = (async () => {

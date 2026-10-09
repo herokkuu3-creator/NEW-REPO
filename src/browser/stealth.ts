@@ -47,22 +47,29 @@ export async function applyStealthScripts(
 ): Promise<void> {
   await context.addInitScript(
     ({ engine }: { engine: 'chromium' | 'firefox' }) => {
-      // 1. Mask navigator.webdriver on both navigator and Navigator.prototype
+      // 1. Mask navigator.webdriver on both navigator and Navigator.prototype with native getter signature
       try {
-        const proto = Object.getPrototypeOf(navigator);
-        if (proto && 'webdriver' in proto) {
+        if (Object.prototype.hasOwnProperty.call(navigator, 'webdriver')) {
+          delete (navigator as unknown as Record<string, unknown>).webdriver;
+        }
+        const proto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+        const getter = function webdriver() { return undefined; };
+        try {
+          Object.defineProperty(getter, 'name', { value: 'get webdriver', configurable: true });
+          Object.defineProperty(getter, 'toString', { value: () => 'function get webdriver() { [native code] }', configurable: true });
+        } catch {}
+        if (proto) {
           Object.defineProperty(proto, 'webdriver', {
-            get: () => undefined,
+            get: getter,
             configurable: true,
             enumerable: true,
           });
         }
         Object.defineProperty(navigator, 'webdriver', {
-          get: () => undefined,
+          get: getter,
           configurable: true,
           enumerable: true,
         });
-        delete (navigator as unknown as Record<string, unknown>).webdriver;
       } catch {}
 
       // 2. Mock chrome runtime object (Chromium only — real Firefox does NOT have window.chrome)
@@ -246,6 +253,46 @@ export async function applyStealthScripts(
           };
         }
       } catch {}
+
+      // 10. Strip automation & CDP leakage flags from global scope
+      try {
+        const win = window as any;
+        ['cdc_adoQpoasnfa76pfcZLmcfl_Array', 'cdc_adoQpoasnfa76pfcZLmcfl_Promise', 'cdc_adoQpoasnfa76pfcZLmcfl_Symbol', '__nightmare', 'callPhantom', '_phantom'].forEach((prop) => {
+          try { delete win[prop]; } catch {}
+        });
+      } catch {}
+
+      // 11. Intercept window.turnstile explicitly and implicitly to harvest widget parameters and callbacks
+      try {
+        const win = window as any;
+        let _turnstileInstance = win.turnstile;
+        const wrapTurnstile = (t: any) => {
+          if (!t || typeof t.render !== 'function' || t._isStealthWrapped) return t;
+          const origRender = t.render;
+          t.render = function (container: any, params: any) {
+            try {
+              if (params) {
+                win.__turnstileSitekey = params.sitekey || win.__turnstileSitekey;
+                win.__turnstileCallback = params.callback || win.__turnstileCallback;
+                win.__turnstileAction = params.action || win.__turnstileAction;
+                win.__turnstileCdata = params.cdata || win.__turnstileCdata;
+              }
+            } catch {}
+            return origRender.apply(this, arguments);
+          };
+          t._isStealthWrapped = true;
+          return t;
+        };
+        if (_turnstileInstance) {
+          wrapTurnstile(_turnstileInstance);
+        }
+        Object.defineProperty(win, 'turnstile', {
+          get() { return _turnstileInstance; },
+          set(val) { _turnstileInstance = wrapTurnstile(val); },
+          configurable: true,
+          enumerable: true,
+        });
+      } catch {}
     },
     { engine },
   ).catch(() => undefined);
@@ -378,15 +425,54 @@ export async function interactWithTurnstileCheckbox(page: Page): Promise<boolean
     const box = await iframeLocator.boundingBox().catch(() => null);
     if (!box || box.width <= 0 || box.height <= 0) return false;
 
-    // Turnstile widget checkbox is located on the left side of the widget:
-    // Approximately 28-38px from the left, vertically centered.
-    const targetX = Math.round(box.x + Math.min(36, box.width * 0.12) + (Math.random() - 0.5) * 6);
-    const targetY = Math.round(box.y + box.height / 2 + (Math.random() - 0.5) * 6);
+    // 1. Try to obtain exact checkbox coordinates inside the frame
+    let targetX: number | undefined;
+    let targetY: number | undefined;
+
+    if (typeof page.frameLocator === 'function') {
+      try {
+        const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+        const cb = frame.locator('input[type="checkbox"], .ctp-checkbox-container, .mark').first();
+        if ((await cb.count().catch(() => 0)) > 0) {
+          const cbBox = await cb.boundingBox().catch(() => null);
+          if (cbBox && cbBox.width > 0 && cbBox.height > 0) {
+            targetX = Math.round(cbBox.x + cbBox.width / 2 + (Math.random() - 0.5) * 4);
+            targetY = Math.round(cbBox.y + cbBox.height / 2 + (Math.random() - 0.5) * 4);
+          }
+        }
+      } catch {}
+    }
+
+    // 2. If internal bounding box unavailable, compute from widget geometry
+    if (targetX === undefined || targetY === undefined) {
+      if (box.width < 200) {
+        // Compact Turnstile layout (150x140)
+        targetX = Math.round(box.x + box.width / 2 + (Math.random() - 0.5) * 6);
+        targetY = Math.round(box.y + 35 + (Math.random() - 0.5) * 6);
+      } else {
+        // Standard Turnstile layout (300x65 or responsive)
+        // Checkbox is centered at ~28px from left edge and vertically centered
+        targetX = Math.round(box.x + 28 + (Math.random() - 0.5) * 4);
+        targetY = Math.round(box.y + box.height / 2 + (Math.random() - 0.5) * 4);
+      }
+    }
 
     await simulateHumanClick(page, targetX, targetY, {
-      dwellMs: 100 + Math.random() * 100,
-      holdMs: 70 + Math.random() * 50,
+      dwellMs: 100 + Math.random() * 80,
+      holdMs: 65 + Math.random() * 45,
     });
+
+    // 3. Resilient backup click inside frame locator if available
+    if (typeof page.frameLocator === 'function') {
+      try {
+        const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+        const cb = frame.locator('input[type="checkbox"], .ctp-checkbox-container, .mark').first();
+        if ((await cb.count().catch(() => 0)) > 0 && (await cb.isVisible().catch(() => false))) {
+          await cb.click({ timeout: 1500 }).catch(() => {});
+        }
+      } catch {}
+    }
+
     return true;
   } catch {
     return false;

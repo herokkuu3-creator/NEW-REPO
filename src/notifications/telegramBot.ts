@@ -999,11 +999,15 @@ export async function handleCodeChefTrigger(
 
   if (send) {
     await send('👨‍🍳 CodeChef: checking configured accounts and submitting the next pending source.');
-    const done = runner('manual', {
-      forceDailyAttempt: true,
-      batchCount: options.count ?? 1,
-      accountIds: options.accountIds,
-    }).then(async (report) => {
+    const runnerArgs: ['manual', Parameters<typeof runner>[1]?] =
+      Object.keys(options).length > 0
+        ? ['manual', {
+            forceDailyAttempt: true,
+            batchCount: options.count ?? 1,
+            accountIds: options.accountIds,
+          }]
+        : ['manual'];
+    const done = runner(...runnerArgs).then(async (report) => {
       if (!report) await send!('Another CodeChef run started; this command did not create a second run.');
     }).catch(async (err) => {
       await send!(`CodeChef could not start: ${err instanceof Error ? err.message : String(err)}`);
@@ -1291,6 +1295,10 @@ export function buildCodeChefRangeCountPicker(): { text: string; buttons: Inline
 export async function handleCodeChefRangePrompt(
   deps: CodeChefUiDeps = defaultCodeChefUiDeps,
 ): Promise<void> {
+  if (deps.inProgress()) {
+    await deps.send('🚧 A CodeChef run is already in progress — wait for its report, then try again.');
+    return;
+  }
   const accounts = await deps.listAccounts();
   if (accounts.length === 0) {
     await deps.send('📭 No active CodeChef accounts configured.');
@@ -2587,6 +2595,10 @@ export function buildCodeforcesRangeCountPicker(): { text: string; buttons: Inli
 export async function handleCodeforcesRangePrompt(
   deps: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
 ): Promise<void> {
+  if (deps.inProgress()) {
+    await deps.send('🚧 A Codeforces run is already in progress — wait for its report, then try again.');
+    return;
+  }
   const accounts = await deps.listAccounts();
   if (accounts.length === 0) {
     await deps.send('📭 No active Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
