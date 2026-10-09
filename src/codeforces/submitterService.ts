@@ -354,24 +354,29 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
 
 async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
+  let clickAttemptedAt = 0;
   while (Date.now() < deadline) {
     await sleep(1_000);
     const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
     if (isCodeforces) return true;
     
     // Attempt to click the Turnstile checkbox if it is visible
-    try {
+    if (Date.now() > clickAttemptedAt + 5_000) {
+      try {
       const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
       const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
       if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
+        clickAttemptedAt = Date.now();
         await checkbox.click({ timeout: 500 }).catch(() => {});
       } else {
         const body = frameLocator.locator('body').first();
         if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
+          clickAttemptedAt = Date.now();
           await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
         }
       }
     } catch {}
+    }
   }
   return false;
 }

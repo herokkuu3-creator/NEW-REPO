@@ -307,11 +307,12 @@ function finishPost(
  */
 function challengeWaitMs(): number {
   const configured = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS);
-  return Number.isFinite(configured) && configured >= 0 ? configured : 8_000;
+  return Number.isFinite(configured) && configured >= 0 ? configured : 25_000;
 }
 
 async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs()): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
+  let clickAttemptedAt = 0;
   while (Date.now() < deadline) {
     await sleep(1_000);
     const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
@@ -321,18 +322,22 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs()): Prom
     }
     
     // Attempt to click the Turnstile checkbox if it is visible
-    try {
+    if (Date.now() > clickAttemptedAt + 5_000) {
+      try {
       const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
       const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
       if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
+        clickAttemptedAt = Date.now();
         await checkbox.click({ timeout: 500 }).catch(() => {});
       } else {
         const body = frameLocator.locator('body').first();
         if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
+          clickAttemptedAt = Date.now();
           await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
         }
       }
     } catch {}
+    }
   }
   logger.warn({ timeoutMs, url: page.url() }, 'Codeforces challenge did not clear in the browser');
   return false;
