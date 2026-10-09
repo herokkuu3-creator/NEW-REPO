@@ -319,6 +319,20 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs()): Prom
       logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser');
       return true;
     }
+    
+    // Attempt to click the Turnstile checkbox if it is visible
+    try {
+      const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+      const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
+      if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
+        await checkbox.click({ timeout: 500 }).catch(() => {});
+      } else {
+        const body = frameLocator.locator('body').first();
+        if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
+          await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
+        }
+      }
+    } catch {}
   }
   logger.warn({ timeoutMs, url: page.url() }, 'Codeforces challenge did not clear in the browser');
   return false;

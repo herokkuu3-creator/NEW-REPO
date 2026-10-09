@@ -359,7 +359,19 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Prom
     const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
     if (isCodeforces) return true;
     
-
+    // Attempt to click the Turnstile checkbox if it is visible
+    try {
+      const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+      const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
+      if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
+        await checkbox.click({ timeout: 500 }).catch(() => {});
+      } else {
+        const body = frameLocator.locator('body').first();
+        if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
+          await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
+        }
+      }
+    } catch {}
   }
   return false;
 }

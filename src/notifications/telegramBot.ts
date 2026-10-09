@@ -436,12 +436,15 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       await reply('✖️ Command queuing cancelled.');
       return;
     }
-    const handled = await handleQueueCommandInput(text);
-    if (handled) {
-      pendingQueuePrompt = false;
-      pendingPromptType = null;
+    const isInteractiveCommand = /^\/(?:cfrange|cf_range|cfbatch|cf_batch|ccrange|cc_range|ccbatch|cc_batch|questionrangesubmission|question_range_submission|rangesubmission)\b/.test(text.toLowerCase());
+    if (!isInteractiveCommand) {
+      const handled = await handleQueueCommandInput(text);
+      if (handled) {
+        pendingQueuePrompt = false;
+        pendingPromptType = null;
+      }
+      return;
     }
-    return;
   }
 
   if (text.startsWith('/')) {

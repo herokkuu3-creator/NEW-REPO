@@ -264,6 +264,20 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
       nextExecuteAt = Date.now() + backoffMs;
     }
 
+    try {
+      // Attempt to click the Turnstile checkbox if it is visible
+      const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+      const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
+      if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
+        await checkbox.click({ timeout: 500 }).catch(() => {});
+      } else {
+        const body = frameLocator.locator('body').first();
+        if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
+          await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
+        }
+      }
+    } catch {}
+
     await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
   }
   if (await hasToken()) return { turnstile: true, interactive: false };
