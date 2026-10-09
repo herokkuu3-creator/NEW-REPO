@@ -312,22 +312,68 @@ function challengeWaitMs(): number {
 }
 
 async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxyUrl?: string): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
+  if (timeoutMs === 0) return false;
+  const effectiveTimeout = Math.max(timeoutMs, 45_000);
+  const deadline = Date.now() + effectiveTimeout;
   let clickAttemptedAt = 0;
 
-  // Run Capzy solver in background to clear 403 challenge
-  void solveCloudflareWithCapzy(page.url(), proxyUrl, timeoutMs).then(async (sol) => {
-    if (sol?.cookies) {
-      const cookieList = Object.entries(sol.cookies).map(([name, value]) => ({
-        name,
-        value,
-        domain: '.codeforces.com',
-        path: '/',
-      }));
-      await page.context().addCookies(cookieList).catch(() => {});
-      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+  if (proxyUrl) {
+    const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
+    logger.info({ proxyUrl, userAgent }, 'waitOutChallenge: solving Cloudflare challenge via Capzy');
+    const capzyPromise = solveCloudflareWithCapzy(page.url() || 'https://codeforces.com', proxyUrl, userAgent, 35_000)
+      .then(async (sol) => {
+        if (!sol?.cookies || Object.keys(sol.cookies).length === 0) return false;
+        const cookieList = Object.entries(sol.cookies).map(([name, value]) => ({
+          name, value: String(value), domain: '.codeforces.com', path: '/',
+        }));
+        await page.context().addCookies(cookieList).catch(() => {});
+        logger.info({ cookies: Object.keys(sol.cookies) }, 'waitOutChallenge: injected Capzy cookies, reloading page');
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => {});
+        return true;
+      })
+      .catch(() => false);
+
+    while (Date.now() < deadline) {
+      const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
+      if (isCodeforces) {
+        logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser');
+        return true;
+      }
+
+      const capzyState = await Promise.race([
+        capzyPromise.then(v => ({ done: true, ok: v })),
+        new Promise(r => setTimeout(r, 1000)).then(() => ({ done: false, ok: false }))
+      ]);
+
+      if (capzyState.done && capzyState.ok) {
+        await sleep(1_500);
+        const settledCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
+        if (settledCodeforces) {
+          logger.info({ url: page.url() }, 'Codeforces challenge cleared after Capzy reload');
+          return true;
+        }
+      }
+
+      if (Date.now() > clickAttemptedAt + 5_000) {
+        try {
+          const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+          const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
+          if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
+            clickAttemptedAt = Date.now();
+            await checkbox.click({ timeout: 500 }).catch(() => {});
+          } else {
+            const body = frameLocator.locator('body').first();
+            if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
+              clickAttemptedAt = Date.now();
+              await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
+            }
+          }
+        } catch {}
+      }
     }
-  }).catch(() => {});
+    logger.warn({ timeoutMs: effectiveTimeout, url: page.url() }, 'Codeforces challenge did not clear in the browser');
+    return false;
+  }
 
   while (Date.now() < deadline) {
     await sleep(1_000);
@@ -335,24 +381,6 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
     if (isCodeforces) {
       logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser');
       return true;
-    }
-    
-    // Attempt to click the Turnstile checkbox if it is visible
-    if (Date.now() > clickAttemptedAt + 5_000) {
-      try {
-      const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-      const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
-      if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
-        clickAttemptedAt = Date.now();
-        await checkbox.click({ timeout: 500 }).catch(() => {});
-      } else {
-        const body = frameLocator.locator('body').first();
-        if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
-          clickAttemptedAt = Date.now();
-          await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
-        }
-      }
-    } catch {}
     }
   }
   logger.warn({ timeoutMs, url: page.url() }, 'Codeforces challenge did not clear in the browser');

@@ -86,6 +86,7 @@ export interface SolverResult {
 export async function solveCloudflareWithCapzy(
   websiteURL: string,
   proxyUrl?: string,
+  userAgent?: string,
   timeoutMs = 35_000,
 ): Promise<SolverResult | null> {
   const apiKey =
@@ -111,6 +112,7 @@ export async function solveCloudflareWithCapzy(
           proxyPort: parseInt(parsed.port, 10),
           proxyLogin: decodeURIComponent(parsed.username),
           proxyPassword: decodeURIComponent(parsed.password),
+          ...(userAgent ? { userAgent } : {}),
         },
       }),
       signal: AbortSignal.timeout(10_000),
@@ -227,7 +229,8 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     }
 
     // 2. Capzy AntiCloudflareTask
-    const capzySol = await solveCloudflareWithCapzy(page.url(), proxyUrl, timeoutMs);
+    const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
+    const capzySol = await solveCloudflareWithCapzy(page.url(), proxyUrl, userAgent, timeoutMs);
     if (capzySol?.cookies) {
       const cookieList = Object.entries(capzySol.cookies).map(([name, value]) => ({
         name,
