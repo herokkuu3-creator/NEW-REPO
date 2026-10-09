@@ -30,6 +30,7 @@ export interface BrowserSession {
   mode: 'profile' | 'storage-state';
   /** Console + page-error lines captured for diagnostics (bounded ring buffer) */
   browserLogs: string[];
+  proxyUrl?: string;
   close: () => Promise<void>;
 }
 

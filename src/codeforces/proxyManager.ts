@@ -138,12 +138,14 @@ export async function fetchRemoteSyncedProxies(): Promise<string[]> {
   }
 }
 
+export const DEFAULT_JOY_PROXY = 'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
+
 export async function getAllConfiguredProxies(envSource?: string): Promise<ManagedProxy[]> {
   const rawEnv = envSource ?? (
     process.env.FALLBACK_CODEFORCES_PROXY ||
     process.env.CODEFORCES_RESIDENTIAL_PROXY ||
     process.env.CODEFORCES_PROXY ||
-    ''
+    DEFAULT_JOY_PROXY
   );
 
   const envProxies = parseProxyList(rawEnv);

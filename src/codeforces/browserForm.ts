@@ -78,7 +78,80 @@ export async function fillSource(page: Page, code: string): Promise<void> {
   }, code);
 }
 
-export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promise<VerificationFlags> {
+export interface SolverResult {
+  token?: string;
+  cookies?: Record<string, string>;
+}
+
+export async function solveCloudflareWithCapzy(
+  websiteURL: string,
+  proxyUrl?: string,
+  timeoutMs = 35_000,
+): Promise<SolverResult | null> {
+  const apiKey =
+    process.env.CAPZY_API_KEY?.trim() ||
+    'capzy_9dc57a569ec4a6b2453b7d2869e85320ece4cddfc9a36d2f';
+  const proxy =
+    proxyUrl ||
+    process.env.CODEFORCES_PROXY?.trim() ||
+    'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
+
+  try {
+    const parsed = new URL(proxy);
+    const init = await fetch('https://api.capzy.ai/createTask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clientKey: apiKey,
+        task: {
+          type: 'AntiCloudflareTask',
+          websiteURL,
+          proxyType: 'http',
+          proxyAddress: parsed.hostname,
+          proxyPort: parseInt(parsed.port, 10),
+          proxyLogin: decodeURIComponent(parsed.username),
+          proxyPassword: decodeURIComponent(parsed.password),
+        },
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const data = (await init.json()) as { errorId?: number; taskId?: string };
+    if (!data?.taskId) return null;
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const poll = await fetch('https://api.capzy.ai/getTaskResult', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientKey: apiKey, taskId: data.taskId }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const res = (await poll.json()) as {
+        errorId?: number;
+        status?: string;
+        solution?: {
+          token?: string;
+          cookies?: Record<string, string>;
+        };
+      };
+      if (res?.status === 'ready' && res?.solution) {
+        return {
+          token: res.solution.token,
+          cookies: res.solution.cookies,
+        };
+      }
+      if (res?.errorId && res.errorId !== 0) {
+        break;
+      }
+    }
+  } catch {
+    // Graceful fallback
+  }
+  return null;
+}
+
+export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUrl?: string): Promise<VerificationFlags> {
   const form = page.locator('form:has(textarea[name="source"])').first();
   const field = form.locator('input[name="turnstileToken"]');
   const cfField = form.locator('input[name="cf-turnstile-response"]');
@@ -117,10 +190,10 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
 
   if (await hasToken()) return { turnstile: true, interactive: false };
 
-  const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
-  let solverPromise: Promise<void> | null = null;
-  if (solverUrl) {
-    solverPromise = (async () => {
+  const solverPromise = (async () => {
+    const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
+    if (solverUrl) {
+      // 1. Generic solver URL has explicit priority when configured
       const widgetInfo = await page.evaluate(() => {
         const element = document.querySelector('.cf-turnstile[data-sitekey]');
         const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
@@ -150,8 +223,30 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
           }
         } catch {}
       }
-    })();
-  }
+      return;
+    }
+
+    // 2. Capzy AntiCloudflareTask
+    const capzySol = await solveCloudflareWithCapzy(page.url(), proxyUrl, timeoutMs);
+    if (capzySol?.cookies) {
+      const cookieList = Object.entries(capzySol.cookies).map(([name, value]) => ({
+        name,
+        value,
+        domain: '.codeforces.com',
+        path: '/',
+      }));
+      await page.context().addCookies(cookieList).catch(() => {});
+    }
+    if (capzySol?.token) {
+      await form.evaluate((element, { token }) => {
+        const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
+        if (input) { input.value = token; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); }
+        const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+        if (cfInput) { cfInput.value = token; cfInput.dispatchEvent(new Event('input', { bubbles: true })); cfInput.dispatchEvent(new Event('change', { bubbles: true })); }
+      }, { token: capzySol.token });
+      return;
+    }
+  })();
 
   const deadline = Date.now() + timeoutMs;
   const startedAt = Date.now();
@@ -211,12 +306,11 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number): Promis
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
   }
+  if (solverPromise) await solverPromise.catch(() => {});
   if (await hasToken()) {
-    if (solverPromise) await solverPromise.catch(() => {});
     return { turnstile: true, interactive: false };
   }
   if (await widget.count() === 0) {
-    if (solverPromise) await solverPromise.catch(() => {});
     return { turnstile: false, interactive: false };
   }
   const diagnostics = await page.evaluate(() => ({

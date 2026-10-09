@@ -1,5 +1,5 @@
 import type { Page, Response } from 'playwright';
-import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory } from './browserForm';
+import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, solveCloudflareWithCapzy } from './browserForm';
 import type { BrowserSession } from '../browser/playwright';
 import { logger } from '../logger';
 import { fetchUserStatus, fetchContestStatus, CodeforcesSubmission } from './api';
@@ -221,9 +221,10 @@ export async function postSubmitForm(
   });
 
   const verificationFlags = { turnstile: false, interactive: false };
+  const proxyUrl = (session as unknown as { proxyUrl?: string }).proxyUrl;
   try {
     await openSubmitForm(page, source);
-    const ts = await fillSubmitForm(page, source, code);
+    const ts = await fillSubmitForm(page, source, code, proxyUrl);
     Object.assign(verificationFlags, ts);
     const click = await clickSubmitForm(page);
     const flags = { turnstile: ts.turnstile, clicked: click.clicked, interactive: ts.interactive };
@@ -238,7 +239,7 @@ export async function postSubmitForm(
 
     const body = await readBody(page);
     if (click.status === 403 || click.status === 503 || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(page.url()) || /__cf_chl/i.test(page.url())) {
-      const cleared = await waitOutChallenge(page);
+      const cleared = await waitOutChallenge(page, undefined, proxyUrl);
       const settled = await readBody(page);
       const settledUrl = page.url();
       if (!cleared || CHALLENGE_RE.test(settled) || CHALLENGE_RE.test(settledUrl) || /__cf_chl/i.test(settledUrl)) {
@@ -310,9 +311,24 @@ function challengeWaitMs(): number {
   return Number.isFinite(configured) && configured >= 0 ? configured : 25_000;
 }
 
-async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs()): Promise<boolean> {
+async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxyUrl?: string): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   let clickAttemptedAt = 0;
+
+  // Run Capzy solver in background to clear 403 challenge
+  void solveCloudflareWithCapzy(page.url(), proxyUrl, timeoutMs).then(async (sol) => {
+    if (sol?.cookies) {
+      const cookieList = Object.entries(sol.cookies).map(([name, value]) => ({
+        name,
+        value,
+        domain: '.codeforces.com',
+        path: '/',
+      }));
+      await page.context().addCookies(cookieList).catch(() => {});
+      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    }
+  }).catch(() => {});
+
   while (Date.now() < deadline) {
     await sleep(1_000);
     const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
@@ -406,7 +422,7 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
   throw new CodeforcesSubmissionError(message);
 }
 
-async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string): Promise<{ turnstile: boolean; interactive: boolean }> {
+async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string, proxyUrl?: string): Promise<{ turnstile: boolean; interactive: boolean }> {
   const settled = await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).then(() => true).catch(() => false);
   if (!settled) {
     const body = await readBody(page);
@@ -481,7 +497,7 @@ async function fillSubmitForm(page: Page, source: SourceIndexEntry, code: string
     throw new CodeforcesSubmissionError(`Codeforces ${csrfName} is empty — the submit page was not served correctly`);
   }
 
-  return ensureFormTurnstile(page, TURNSTILE_WAIT_MS);
+  return ensureFormTurnstile(page, TURNSTILE_WAIT_MS, proxyUrl);
 }
 
 async function readFields(page: Page): Promise<SubmitField[]> {
