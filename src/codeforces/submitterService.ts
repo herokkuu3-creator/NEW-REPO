@@ -25,7 +25,7 @@
 import http from 'node:http';
 import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
-import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource } from './browserForm';
+import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy } from './browserForm';
 import { parseProxyList } from './proxyRotator';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
@@ -352,9 +352,22 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
   return names.length > 0 ? names.join(', ') : '(no named fields)';
 }
 
-async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Promise<boolean> {
+async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxyUrl?: string): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   let clickAttemptedAt = 0;
+  // Fire Capzy in background to solve the Cloudflare challenge via proxy
+  if (proxyUrl) {
+    void solveCloudflareWithCapzy('https://codeforces.com', proxyUrl).then(async (result) => {
+      if (!result) return;
+      try {
+        const context = page.context();
+        const cookiesToSet = Object.entries(result.cookies ?? {}).map(([name, value]) => ({
+          name, value: String(value), domain: '.codeforces.com', path: '/',
+        }));
+        if (cookiesToSet.length > 0) await context.addCookies(cookiesToSet).catch(() => undefined);
+      } catch { /* best effort */ }
+    }).catch(() => undefined);
+  }
   while (Date.now() < deadline) {
     await sleep(1_000);
     const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
@@ -445,7 +458,7 @@ async function setSelectValue(page: Page, name: string, value: string): Promise<
   await page.locator(`select[name="${name}"]`).first().selectOption(value, { force: true, timeout: 20_000 });
 }
 
-async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): Promise<{ turnstile: boolean; interactive: boolean }> {
+async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string, proxyUrl?: string): Promise<{ turnstile: boolean; interactive: boolean }> {
   log({}, 'waiting for form to settle');
   const settled = await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).then(() => true).catch(() => false);
   if (!settled) {
@@ -526,7 +539,7 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string): 
   if (!token) throw new Error(`Codeforces ${csrfName} is empty — the submit page was not served correctly`);
 
   log({}, 'checking turnstile');
-  return ensureFormTurnstile(page, TURNSTILE_WAIT_MS);
+  return ensureFormTurnstile(page, TURNSTILE_WAIT_MS, proxyUrl);
 }
 
 function compactBodyError(body: string): string {
@@ -571,7 +584,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
   }, Math.max(1, deadline - Date.now()));
   try {
     await openSubmitForm(session.page, request.entry);
-    const ts = await fillSubmitForm(session.page, request.entry, request.code);
+    const ts = await fillSubmitForm(session.page, request.entry, request.code, request.proxy);
     flags.turnstile = ts.turnstile;
     flags.interactive = ts.interactive;
 
@@ -598,7 +611,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
     let body = await readBody(session.page);
     let finalUrl = session.page.url();
     if (click.status === 403 || click.status === 503 || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl) || /__cf_chl/i.test(finalUrl)) {
-      const cleared = await waitOutChallenge(session.page);
+      const cleared = await waitOutChallenge(session.page, undefined, request.proxy);
       body = await readBody(session.page);
       finalUrl = session.page.url();
       if (!cleared || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
