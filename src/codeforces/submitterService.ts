@@ -242,6 +242,7 @@ async function launchFirefox(
         // Keep the browser's native identity and automation defaults. Only
         // suppress browser-owned background downloads to conserve proxy data.
         args: [
+          '--disable-blink-features=AutomationControlled',
           '--no-sandbox', '--disable-dev-shm-usage', '--no-first-run',
           '--disable-component-update', '--safebrowsing-disable-auto-update',
           '--disable-sync', '--disable-default-apps', '--no-default-browser-check',
@@ -277,6 +278,14 @@ async function launchFirefox(
       viewport: { width: 900, height: 600 },
       locale: 'en-US',
       serviceWorkers: 'block',
+    });
+    await context.addInitScript(() => {
+      try {
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+          configurable: true,
+        });
+      } catch {}
     });
     if (process.env.CODEFORCES_BLOCK_ASSETS !== 'false') {
       await context.route('**/*', async (route) => {
@@ -354,21 +363,15 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
 
 async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxyUrl?: string): Promise<boolean> {
   if (timeoutMs === 0) return false;
-  const effectiveTimeout = Math.max(timeoutMs, 45_000);
-  const deadline = Date.now() + effectiveTimeout;
+  const deadline = Date.now() + Math.max(timeoutMs, 45_000);
   let clickAttemptedAt = 0;
 
   if (proxyUrl) {
-    const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-    log({ proxyUrl, userAgent }, 'waitOutChallenge: firing Capzy solver with matching userAgent');
-    const capzyPromise = solveCloudflareWithCapzy(page.url() || 'https://codeforces.com', proxyUrl, userAgent, 35_000)
-      .then(async (result) => {
-        if (!result?.cookies || Object.keys(result.cookies).length === 0) {
-          log({}, 'waitOutChallenge: Capzy returned no cookies');
-          return false;
-        }
-        log({ cookies: Object.keys(result.cookies) }, 'waitOutChallenge: Capzy solved successfully, injecting cookies');
-        const context = page.context();
+    try {
+      const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
+      log({ proxyUrl, userAgent }, 'waitOutChallenge: requesting Capzy solve');
+      const result = await solveCloudflareWithCapzy(page.url() || 'https://codeforces.com', proxyUrl, userAgent, 30_000);
+      if (result?.cookies && Object.keys(result.cookies).length > 0) {
         const cookiesToSet = Object.entries(result.cookies)
           .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
           .map(([name, value]) => ({
@@ -376,61 +379,41 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
           }));
         if (cookiesToSet.length > 0) {
           log({ count: cookiesToSet.length, names: cookiesToSet.map(c => c.name) }, 'waitOutChallenge: injecting Capzy Cloudflare cookies');
-          await context.addCookies(cookiesToSet).catch(() => undefined);
-        }
-        log({}, 'waitOutChallenge: cookies injected, reloading page to clear challenge');
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => undefined);
-        return true;
-      })
-      .catch((err) => {
-        logError({ err: errorMessage(err) }, 'waitOutChallenge: Capzy solve failed');
-        return false;
-      });
-
-    // Run parallel polling while Capzy solves
-    while (Date.now() < deadline) {
-      const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
-      if (isCodeforces) return true;
-
-      // Check if Capzy solved and reloaded
-      const capzyState = await Promise.race([
-        capzyPromise.then(v => ({ done: true, ok: v })),
-        new Promise(r => setTimeout(r, 1000)).then(() => ({ done: false, ok: false }))
-      ]);
-
-      if (capzyState.done && capzyState.ok) {
-        await sleep(1_500);
-        const settledCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
-        if (settledCodeforces) {
-          log({}, 'waitOutChallenge: Codeforces body visible after Capzy reload!');
-          return true;
-        }
-      }
-
-      if (Date.now() > clickAttemptedAt + 5_000) {
-        try {
-          const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-          const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
-          if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
-            clickAttemptedAt = Date.now();
-            await checkbox.click({ timeout: 500 }).catch(() => {});
-          } else {
-            const body = frameLocator.locator('body').first();
-            if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
-              clickAttemptedAt = Date.now();
-              await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
-            }
+          await page.context().addCookies(cookiesToSet).catch(() => undefined);
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
+          await sleep(2_000);
+          if ((await page.locator('#body').count().catch(() => 0)) > 0) {
+            log({}, 'waitOutChallenge: Codeforces body visible after Capzy reload!');
+            return true;
           }
-        } catch {}
+        }
       }
+    } catch (err) {
+      logError({ err: errorMessage(err) }, 'waitOutChallenge: Capzy attempt failed');
     }
-    return false;
   }
 
   while (Date.now() < deadline) {
     await sleep(1_000);
     const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
     if (isCodeforces) return true;
+
+    if (Date.now() > clickAttemptedAt + 5_000) {
+      try {
+        const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+        const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
+        if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
+          clickAttemptedAt = Date.now();
+          await checkbox.click({ timeout: 500 }).catch(() => {});
+        } else {
+          const body = frameLocator.locator('body').first();
+          if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
+            clickAttemptedAt = Date.now();
+            await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
+          }
+        }
+      } catch {}
+    }
   }
   return false;
 }
