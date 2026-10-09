@@ -23,7 +23,7 @@ import type { HttpSubmitResult } from './httpSubmit';
 import { captureBefore, pollForVerdict, postSubmitForm, type BrowserPostOutcome } from './submission';
 import { isRemoteSubmitterConfigured, notifyProxyInUse, submitViaRemoteSubmitter } from './remoteSubmitter';
 import { shouldRetryWithOriginal, stripCppComments } from './codeSanitizer';
-import { runSubmissionAttempts, readBeforeDeadline, CODEFORCES_ATTEMPT_MS } from './attempts';
+import { runSubmissionAttempts, readBeforeDeadline, CODEFORCES_ATTEMPT_MS, isCodeforcesVerificationRequired } from './attempts';
 import { launchFirefoxWithStorageStateObject } from '../browser/playwright';
 import { logMemory, memoryReading, MemoryWatch, releaseHeap } from '../memory';
 import {
@@ -293,10 +293,6 @@ export async function executeCodeforcesRun(
     for (const [accIndex, account] of accounts.entries()) {
       if (signal.aborted) break;
 
-      let consecutiveFailuresOnSameProblem = 0;
-      let lastAttemptedProblemKey: string | null = null;
-      let consecutiveCloudflareBlocks = 0;
-
       for (let step = 0; step < batchCount; step++) {
         if (signal.aborted) break;
 
@@ -362,65 +358,6 @@ export async function executeCodeforcesRun(
         }
 
         if (outcome.kind === 'solved') {
-          consecutiveFailuresOnSameProblem = 0;
-          consecutiveCloudflareBlocks = 0;
-          lastAttemptedProblemKey = null;
-        } else {
-          const problemKey = outcome.problem ?? null;
-          if (problemKey && problemKey === lastAttemptedProblemKey) {
-            consecutiveFailuresOnSameProblem++;
-          } else {
-            consecutiveFailuresOnSameProblem = 1;
-            lastAttemptedProblemKey = problemKey;
-          }
-
-          const isBlocked = /cloudflare|challenge|403|did not clear/i.test(outcome.error ?? '');
-          if (isBlocked) {
-            consecutiveCloudflareBlocks++;
-            logger.warn({ account: account.label, consecutiveCloudflareBlocks }, 'Cloudflare verification challenge encountered on submit form');
-            if (consecutiveCloudflareBlocks >= 3) {
-              logger.error({ account: account.label }, 'Multiple consecutive Cloudflare blocks detected; stopping batch run to protect account');
-              await options.onAccountProgress?.({
-                phase: 'failed',
-                label: account.label,
-                username: account.username,
-                problem: outcome.problem,
-                error: 'Multiple consecutive Cloudflare blocks encountered. Paused batch to protect account trust score.',
-                index: progressIndex,
-                total: progressTotal,
-                accIndex,
-                accTotal: accounts.length,
-                stepIndex: step + 1,
-                stepTotal: batchCount,
-              });
-              break;
-            }
-          } else {
-            consecutiveCloudflareBlocks = 0;
-          }
-
-          if (consecutiveFailuresOnSameProblem >= 2) {
-            logger.warn({ account: account.label, problem: outcome.problem }, 'Problem failed twice consecutively; advancing queue to skip locked problem');
-            const progress = await getCodeforcesProgress(account.id);
-            const currentEntry = resolveCurrentEntry(source.queue, progress.nextKey, progress.lastCompletedKey);
-            if (currentEntry) {
-              const queueIndex = source.queue.findIndex((e) => e.key === currentEntry.key);
-              if (queueIndex >= 0 && queueIndex + 1 < source.queue.length) {
-                const nextEntry = source.queue[queueIndex + 1]!;
-                await completeCurrentProblem(account.id, {
-                  completedKey: currentEntry.key,
-                  nextKey: nextEntry.key,
-                  submissionId: null,
-                  verdict: 'SKIPPED_AFTER_FAILURES',
-                });
-                logger.info({ skipped: currentEntry.key, next: nextEntry.key }, 'Advanced queue past failing problem');
-              }
-            }
-            consecutiveFailuresOnSameProblem = 0;
-          }
-        }
-
-        if (outcome.kind === 'solved') {
           await options.onAccountProgress?.({
             phase: 'completed',
             label: account.label,
@@ -455,7 +392,7 @@ export async function executeCodeforcesRun(
             label: account.label,
             username: outcome.username,
             problem: outcome.problem,
-            error: outcome.error ?? 'Failed',
+            error: outcome.note ?? outcome.error ?? 'Failed',
             index: progressIndex,
             total: progressTotal,
             accIndex,
@@ -471,11 +408,13 @@ export async function executeCodeforcesRun(
           );
         }
 
-        // If the queue was exhausted or account auth was completely invalid, break step loop for this account
-        if (outcome.kind === 'skipped' && outcome.error?.includes('exhausted')) {
-          break;
-        }
-        if (outcome.kind === 'failed' && outcome.error?.includes('storageState')) {
+        // A batch step is a new solution, not another retry of a failed form.
+        // Only confirmed terminal verdicts/duplicates can advance the cursor.
+        // Keep the result callback above this break so Telegram and daily state
+        // both receive the last failed account outcome.
+        if (outcome.kind !== 'solved' && !outcome.performed) {
+          logger.warn({ account: account.label, problem: outcome.problem, error: outcome.error },
+            'Codeforces account batch paused; current solution remains pending');
           break;
         }
 
@@ -770,6 +709,10 @@ async function runForAccount(
     await recordAttempt(account.id, { submissionId: result.submissionId ?? null, verdict: verdictCode });
     const duplicateSubmission = isAlreadySubmittedCodeError(result.error);
     const finalVerdict = Boolean(result.submissionId && isTerminalCodeforcesVerdict(result.verdict));
+    const verificationRequired = isCodeforcesVerificationRequired(result.error);
+    if (verificationRequired) {
+      logger.warn({ label, problem: problemLabel(entry), error: result.error }, 'Codeforces requires verification; automatic attempts stopped');
+    }
     if (finalVerdict || duplicateSubmission) {
       const index = source.queue.findIndex((e) => e.key === entry.key);
       await completeCurrentProblem(account.id, {
@@ -799,14 +742,16 @@ async function runForAccount(
       kind: result.kind === 'signed-out' ? 'rejected' : 'failed',
       performed: finalVerdict || duplicateSubmission,
       browserAttempted,
-      note: duplicateSubmission
+      note: verificationRequired
+        ? 'Verification required on Codeforces. This account batch is paused; the current solution remains pending.'
+        : duplicateSubmission
         ? `${note ? `${note} ` : ''}Codeforces already had this exact source; marked it performed and advanced to the next solution.`
         : note,
       problem: problemLabel(entry),
       problemUrl: entry.problemUrl ?? null,
       submissionId: result.submissionId ?? null,
       verdict: result.verdict ?? null,
-      error: result.error,
+      error: verificationRequired ? 'Codeforces requires verification before submission.' : result.error,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

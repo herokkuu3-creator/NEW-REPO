@@ -9,7 +9,21 @@ the restored morning implementation.
 The worker retries the same account and source up to three total attempts if
 the result confirms that no submission was sent. A successful account is not
 repeated while another account retries. Final judge verdicts, duplicate-code
-responses and signed-out sessions do not trigger transport retries.
+responses and signed-out sessions do not trigger transport retries. Turnstile,
+CAPTCHA, Cloudflare challenge and HTTP 403 failures also stop immediately;
+they are not retried through alternate submit URLs or browser jobs.
+
+A batch pauses the affected account after an unconfirmed submission, delivers
+its final outcome to Telegram and continues with the other selected accounts.
+The current source remains pending. It is never marked completed merely
+because two attempts failed. Confirmed terminal judge verdicts and exact-code
+duplicates still advance to the next source.
+
+The Codeforces browser uses its native user agent, Client Hints and automation
+defaults. It does not inject fingerprint overrides, perform simulated browsing
+on the homepage, or click verification controls. Existing native form filling
+and enabled-button checks are retained. Saved cookies are restored as supplied
+instead of unconditionally deleting Cloudflare cookies on every proxy launch.
 
 The broker atomically authorizes the runner immediately before its single
 submit click. A timed-out job can be cancelled before authorization, and its

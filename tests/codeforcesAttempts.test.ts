@@ -31,6 +31,13 @@ describe('bounded Codeforces attempts', () => {
     expect(next).toHaveBeenCalledTimes(2);
   });
 
+  it.each(['Turnstile did not issue a token', 'Please complete the anti-bot verification',
+    'HTTP 403', 'Cloudflare challenge did not clear'])('does not retry site verification: %s', async error => {
+    const submit = vi.fn(async () => ({ ok: false, safeToRetry: true, error }));
+    await runSubmissionAttempts(submit);
+    expect(submit).toHaveBeenCalledOnce();
+  });
+
   it.each([
     { ok: false, safeToRetry: false },
     { ok: false },

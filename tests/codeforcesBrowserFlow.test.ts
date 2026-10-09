@@ -80,7 +80,7 @@ beforeAll(async () => {
   fixtureOrigin = `http://codeforces.com:${(server.address() as AddressInfo).port}`;
   browser = await chromium.launch({ headless: true, args: ['--host-resolver-rules=MAP codeforces.com 127.0.0.1', '--no-proxy-server'] });
 });
-beforeEach(async () => { page = await browser.newPage(); posts = []; });
+beforeEach(async () => { page = await browser.newPage(); page.setDefaultTimeout(5_000); posts = []; });
 afterEach(async () => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); await page.close(); });
 afterAll(async () => {
   await browser?.close();
@@ -194,13 +194,13 @@ describe('Codeforces native browser submission', () => {
     await page.evaluate(() => setTimeout(() => {
       (document.querySelector('#solution input[type=submit]') as HTMLInputElement).disabled = false;
     }, 120));
-    await expect(clickSubmitForm(page, 1_000)).resolves.toMatchObject({ clicked: true, status: 200 });
+    await expect(clickSubmitForm(page, 3_000)).resolves.toMatchObject({ clicked: true, status: 200 });
     expect(posts).toHaveLength(1);
   });
 
   it('reports a prevented submit instead of treating a click as a POST', async () => {
     await fixture({ token: 'verified', prevent: true });
-    await expect(clickSubmitForm(page, 300)).rejects.toMatchObject({ clicked: true, message: expect.stringContaining('did not send a POST') });
+    await expect(clickSubmitForm(page, 1_000)).rejects.toMatchObject({ clicked: true, message: expect.stringContaining('did not send a POST') });
     expect(posts).toHaveLength(0);
   });
 

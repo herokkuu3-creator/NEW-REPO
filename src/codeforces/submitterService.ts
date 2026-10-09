@@ -27,7 +27,6 @@ import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource } from './browserForm';
 import { parseProxyList } from './proxyRotator';
-import { STEALTH_CHROMIUM_ARGS, applyStealthScripts, getRandomDesktopViewport } from '../browser/stealth';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
 const PORT = Number(process.env.PORT ?? 10000);
@@ -240,8 +239,15 @@ async function launchFirefox(
       headless: HEADLESS,
       ...(proxy ? { proxy } : {}),
       ...(BROWSER_ENGINE === 'chromium' ? {
-        args: STEALTH_CHROMIUM_ARGS,
-        ignoreDefaultArgs: ['--enable-automation'],
+        // Keep the browser's native identity and automation defaults. Only
+        // suppress browser-owned background downloads to conserve proxy data.
+        args: [
+          '--no-sandbox', '--disable-dev-shm-usage', '--no-first-run',
+          '--disable-component-update', '--safebrowsing-disable-auto-update',
+          '--disable-sync', '--disable-default-apps', '--no-default-browser-check',
+          '--disable-background-networking', '--disable-domain-reliability',
+          '--metrics-recording-only', '--no-pings',
+        ],
       } : {
         firefoxUserPrefs: {
           // Memory / process / session — keep footprint tiny
@@ -259,64 +265,19 @@ async function launchFirefox(
           'dom.ipc.processCount': 1,
           'dom.ipc.processPrelaunch.enabled': false,
           'dom.ipc.keepProcessesAlive.web': 0,
-          // Stealth: disable automation/testing flags that Cloudflare detects
-          'marionette.enabled': false,
-          'remote.enabled': false,
-          'browser.tabs.remote.autostart': false,
-          // Enable features a real browser has (so Cloudflare entropy checks pass)
-          'dom.webdriver.enabled': false,
-          'general.useragent.override': '',
-          // Let canvas and WebGL work normally (not software-render-only)
-          'webgl.disabled': false,
-          'webgl.force-enabled': true,
-          'gfx.offscreencanvas.enabled': true,
-          // Timezone consistency with Windows user
-          'privacy.resistFingerprinting': false,
-          'privacy.resistFingerprinting.block_mozAddonManager': false,
-          // Allow real storage access (Cloudflare reads localStorage signals)
-          'browser.storageManager.enabled': true,
-          'dom.storage.enabled': true,
-          // Language/locale consistency
-          'intl.accept_languages': 'en-US, en',
-          'intl.locale.requested': 'en-US',
-          // Workers and service workers (Turnstile uses workers for entropy)
-          'dom.serviceWorkers.enabled': true,
-          'dom.workers.enabled': true,
         },
       }),
     }));
-    const viewport = getRandomDesktopViewport();
-    // When connecting via a proxy, strip stale Cloudflare clearance cookies issued for a different IP
-    // so Cloudflare evaluates the session cleanly through the proxy IP rather than flagging a cryptographic IP mismatch
-    const sanitizedCookies = ((state.cookies ?? []) as Array<{ name?: string }>).filter((c) => {
-      if (proxy && (c?.name === 'cf_clearance' || c?.name === '__cf_bm')) {
-        return false;
-      }
-      return true;
-    });
     const context = await active.newContext({
-      storageState: { cookies: sanitizedCookies, origins: state.origins ?? [] } as Parameters<
+      storageState: { cookies: state.cookies ?? [], origins: state.origins ?? [] } as Parameters<
         BrowserContext['storageState']
       > extends never
         ? never
         : never,
-      viewport,
+      viewport: { width: 900, height: 600 },
       locale: 'en-US',
-      userAgent: BROWSER_ENGINE === 'chromium'
-        ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
-      extraHTTPHeaders: BROWSER_ENGINE === 'chromium' ? {
-        'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'accept-language': 'en-US,en;q=0.9',
-        'upgrade-insecure-requests': '1',
-      } : {
-        'accept-language': 'en-US,en;q=0.9',
-        'upgrade-insecure-requests': '1',
-      },
+      serviceWorkers: 'block',
     });
-    await applyStealthScripts(context);
     if (process.env.CODEFORCES_BLOCK_ASSETS !== 'false') {
       await context.route('**/*', async (route) => {
         const type = route.request().resourceType();
@@ -403,61 +364,9 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS): Prom
   return false;
 }
 
-/**
- * Navigate to the Codeforces homepage before going directly to the submit page.
- * Cloudflare evaluates browser entropy over time; a fresh browser that jumps
- * straight to the submit page triggers invisible Turnstile checks that fail
- * because there is no prior session signal. This warm-up visit plants cookies,
- * lets Turnstile's JS accumulate timing and mouse-based entropy, and makes the
- * subsequent submit navigation look like normal browsing behaviour.
- */
-async function warmUpWithHomepage(page: Page): Promise<void> {
-  try {
-    log({}, 'warming up browser with Codeforces homepage visit');
-    const resp = await page.goto('https://codeforces.com', {
-      waitUntil: 'domcontentloaded',
-      timeout: Math.min(NAV_TIMEOUT_MS, 30_000),
-    });
-    const status = resp?.status() ?? 0;
-    if (status === 403 || status === 503) {
-      // Cloudflare blocked even the homepage — wait and continue, the submit
-      // page will handle the challenge with its own waitOutChallenge logic.
-      log({ status }, 'homepage returned Cloudflare challenge during warm-up; skipping interactions');
-      return;
-    }
-    // Random scroll and mouse moves to accumulate entropy signals for Turnstile
-    const viewport = page.viewportSize() ?? { width: 1366, height: 768 };
-    // Simulate reading — scroll down gradually
-    const scrollSteps = 3 + Math.floor(Math.random() * 3);
-    for (let i = 1; i <= scrollSteps; i++) {
-      const scrollY = Math.floor((viewport.height * i * 0.6) / scrollSteps);
-      await page.evaluate((y) => window.scrollTo({ top: y, behavior: 'smooth' }), scrollY).catch(() => {});
-      await sleep(300 + Math.floor(Math.random() * 400));
-    }
-    // Move mouse around naturally
-    const { simulateHumanMouseMove } = await import('../browser/stealth');
-    const points = [
-      { x: 200 + Math.floor(Math.random() * 400), y: 100 + Math.floor(Math.random() * 200) },
-      { x: 600 + Math.floor(Math.random() * 300), y: 300 + Math.floor(Math.random() * 200) },
-      { x: 300 + Math.floor(Math.random() * 200), y: 400 + Math.floor(Math.random() * 150) },
-    ];
-    for (const pt of points) {
-      await simulateHumanMouseMove(page, pt.x, pt.y, 5).catch(() => {});
-      await sleep(200 + Math.floor(Math.random() * 300));
-    }
-    // Brief pause to let any Turnstile workers finish their entropy measurement
-    await sleep(800 + Math.floor(Math.random() * 600));
-    log({}, 'homepage warm-up complete');
-  } catch {
-    // Non-fatal: if homepage fails we still try the submit page directly
-    log({}, 'homepage warm-up failed; proceeding to submit page directly');
-  }
-}
-
-async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> {
+export async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> {
   const paths = candidates(entry);
   const attempts: string[] = [];
-  let blocked = 0;
 
   for (const path of paths) {
     try {
@@ -471,16 +380,12 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
         throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
       }
       if ((status === 403 || status === 503) && !(await waitOutChallenge(page))) {
-        attempts.push(`${path}: HTTP ${status} (Cloudflare challenge)`);
-        blocked += 1;
-        continue;
+        throw new BrowserFormError(`Codeforces verification did not complete (HTTP ${status}). The current solution remains pending.`, 'blocked');
       }
       const body = await readBody(page);
       if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
         if (!(await waitOutChallenge(page))) {
-          attempts.push(`${path}: challenge did not clear`);
-          blocked += 1;
-          continue;
+          throw new BrowserFormError('Codeforces verification did not complete. The current solution remains pending.', 'blocked');
         }
       }
       const fields = await readFields(page);
@@ -490,12 +395,13 @@ async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> 
       }
       attempts.push(`${path}: no submit form (url ${page.url()}; fields: ${summarize(fields)})`);
     } catch (err) {
+      if (err instanceof BrowserFormError) throw err;
       attempts.push(`${path}: ${errorMessage(err)}`);
     }
   }
 
   const message = `Codeforces submit form could not be opened for ${entry.contestId}/${entry.problemIndex} — ${attempts.join(' | ')}`;
-  throw new Error(blocked === paths.length ? `blocked: ${message}` : message);
+  throw new Error(message);
 }
 
 /**
@@ -647,7 +553,6 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
     void session.browser.close().catch(() => undefined);
   }, Math.max(1, deadline - Date.now()));
   try {
-    await warmUpWithHomepage(session.page);
     await openSubmitForm(session.page, request.entry);
     const ts = await fillSubmitForm(session.page, request.entry, request.code);
     flags.turnstile = ts.turnstile;

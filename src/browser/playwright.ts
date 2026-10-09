@@ -8,7 +8,6 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { loadStorageStateFromDb, saveStorageStateToDb } from '../database/models';
 import { StorageStateShape } from './cookiePayload';
-import { applyStealthScripts, getRandomDesktopViewport } from './stealth';
 
 /**
  * Browser lifecycle management.
@@ -203,12 +202,9 @@ export async function launchWithStorageStateObject(
  * Firefox flavour of launchWithStorageStateObject, used by the Codeforces
  * submit path.
  *
- * Codeforces sits behind Cloudflare, which sorts clients by TLS fingerprint:
- * headless Chromium is handed "Just a moment..." there, while Firefox is served
- * normally — including the submit POST, which Cloudflare answers with 302 → "/"
- * for every other kind of client. Firefox also runs the page's own JavaScript,
- * so `_tta`, `ftaa`, `bfaa` and the form action are filled in by Codeforces'
- * own code instead of being guessed. LeetCode stays on Chromium.
+ * Runs the site's native JavaScript and submit handlers in Firefox. Neither
+ * engine guarantees access through Cloudflare; verification requirements are
+ * reported to the caller rather than treated as completed submissions.
  */
 export async function launchFirefoxWithStorageStateObject(
   state: StorageStateShape,
@@ -239,26 +235,15 @@ export async function launchFirefoxWithStorageStateObject(
         'dom.ipc.keepProcessesAlive.web': 0,
       },
     }));
-    const sanitizedCookies = (state.cookies ?? []).filter((c) => {
-      if (proxy && (c.name === 'cf_clearance' || c.name === '__cf_bm')) {
-        return false;
-      }
-      return true;
-    });
     const context = await activeBrowser.newContext({
       storageState: {
-        cookies: sanitizedCookies,
+        cookies: state.cookies,
         origins: state.origins,
       },
-      viewport: getRandomDesktopViewport(),
+      viewport: { width: 900, height: 600 },
       locale: 'en-US',
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
-      extraHTTPHeaders: {
-        'accept-language': 'en-US,en;q=0.9',
-        'upgrade-insecure-requests': '1',
-      },
+      serviceWorkers: 'block',
     });
-    await applyStealthScripts(context);
 
     // Omit decorative assets while preserving CSS and verification resources.
     await context.route('**/*', async (route) => {

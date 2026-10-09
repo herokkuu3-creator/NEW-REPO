@@ -1,4 +1,4 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   post: vi.fn(), poll: vi.fn(), complete: vi.fn(), patch: vi.fn(), outcomes: vi.fn(), progress: vi.fn(),
 }));
@@ -39,7 +39,8 @@ beforeEach(() => {
   mocks.poll.mockResolvedValue({ id: 101, verdict: 'OK' });
   mocks.post.mockReset();
 });
-const blocked = { ok: false, kind: 'blocked', clicked: false, safeToRetry: true, error: 'HTTP 403', submittedAt: 1, transport: 'GitHub browser' };
+afterEach(() => vi.useRealTimers());
+const blocked = { ok: false, kind: 'blocked', clicked: false, safeToRetry: true, error: 'Runner unavailable before opening browser', submittedAt: 1, transport: 'GitHub browser' };
 const posted = { ok: true, clicked: true, submittedAt: 1, transport: 'GitHub browser' };
 
 it('preserves the successful account and retries only the failing account with the same source', async () => {
@@ -60,7 +61,33 @@ it('ends after three failed attempts, reports the final failure and preserves th
   expect(report?.totals).toMatchObject({ solved: 1, failed: 1 });
   expect(mocks.post).toHaveBeenCalledTimes(4);
   expect(mocks.complete).toHaveBeenCalledTimes(1);
-  expect(mocks.outcomes.mock.calls[1][0]).toMatchObject({ label: 'second', kind: 'failed', performed: false, error: 'HTTP 403 (GitHub browser)' });
+  expect(mocks.outcomes.mock.calls[1][0]).toMatchObject({ label: 'second', kind: 'failed', performed: false, error: 'Runner unavailable before opening browser (GitHub browser)' });
+});
+
+it('pauses a challenged account at its first failure without skipping its source or stopping other accounts', async () => {
+  vi.useFakeTimers();
+  mocks.post.mockResolvedValueOnce({ ...blocked, error: 'Codeforces Turnstile did not issue a token within 35000ms' })
+    .mockResolvedValue(posted);
+  const run = runCodeforcesNow('manual', { batchCount: 3, forceDailyAttempt: true, onAccountOutcome: mocks.outcomes });
+  await vi.runAllTimersAsync();
+  const report = await run;
+  expect(mocks.post.mock.calls.map(call => call[1])).toEqual(['first', 'second', 'second', 'second']);
+  expect(mocks.complete.mock.calls.every(([id]) => id === 'a2')).toBe(true);
+  expect(mocks.outcomes.mock.calls[0][0]).toMatchObject({ performed: false, note: expect.stringContaining('batch is paused') });
+  expect(mocks.outcomes).toHaveBeenCalledTimes(4);
+  expect(report?.totals).toMatchObject({ solved: 3, failed: 1 });
+});
+
+it('never marks an unsubmitted source completed after repeated transport failures in a batch', async () => {
+  vi.useFakeTimers();
+  mocks.post.mockResolvedValue(blocked);
+  const run = runCodeforcesNow('manual', { batchCount: 4, forceDailyAttempt: true, onAccountOutcome: mocks.outcomes });
+  await vi.runAllTimersAsync();
+  const report = await run;
+  expect(mocks.post).toHaveBeenCalledTimes(6); // Three bounded transport retries per account, one batch step.
+  expect(mocks.complete).not.toHaveBeenCalled();
+  expect(mocks.outcomes).toHaveBeenCalledTimes(2);
+  expect(report?.totals).toMatchObject({ solved: 0, failed: 2 });
 });
 
 it('reconciles an uncertain POST without dispatching another job', async () => {
