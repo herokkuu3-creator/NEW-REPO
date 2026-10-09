@@ -1,3 +1,4 @@
+import { logger } from '../logger';
 import type { Page, Request, Response } from 'playwright';
 
 export interface VerificationFlags {
@@ -144,6 +145,7 @@ export async function solveCloudflareWithCapzy(
         };
       }
       if (res?.errorId && res.errorId !== 0) {
+        logger.warn({ taskId: data.taskId, errorId: res.errorId, status: res.status, raw: res }, 'Capzy solve reported error');
         break;
       }
     }
@@ -232,13 +234,18 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
     const capzySol = await solveCloudflareWithCapzy(page.url(), proxyUrl, userAgent, timeoutMs);
     if (capzySol?.cookies) {
-      const cookieList = Object.entries(capzySol.cookies).map(([name, value]) => ({
-        name,
-        value,
-        domain: '.codeforces.com',
-        path: '/',
-      }));
-      await page.context().addCookies(cookieList).catch(() => {});
+      const cookieList = Object.entries(capzySol.cookies)
+        .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+        .map(([name, value]) => ({
+          name,
+          value,
+          domain: '.codeforces.com',
+          path: '/',
+        }));
+      if (cookieList.length > 0) {
+        logger.info({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'ensureFormTurnstile: injecting Capzy Cloudflare clearance cookies');
+        await page.context().addCookies(cookieList).catch(() => {});
+      }
     }
     if (capzySol?.token) {
       await form.evaluate((element, { token }) => {

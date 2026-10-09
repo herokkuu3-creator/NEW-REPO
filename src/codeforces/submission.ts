@@ -323,10 +323,15 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
     const capzyPromise = solveCloudflareWithCapzy(page.url() || 'https://codeforces.com', proxyUrl, userAgent, 35_000)
       .then(async (sol) => {
         if (!sol?.cookies || Object.keys(sol.cookies).length === 0) return false;
-        const cookieList = Object.entries(sol.cookies).map(([name, value]) => ({
-          name, value: String(value), domain: '.codeforces.com', path: '/',
-        }));
-        await page.context().addCookies(cookieList).catch(() => {});
+        const cookieList = Object.entries(sol.cookies)
+          .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+          .map(([name, value]) => ({
+            name, value: String(value), domain: '.codeforces.com', path: '/',
+          }));
+        if (cookieList.length > 0) {
+          logger.info({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'waitOutChallenge: injecting Capzy Cloudflare cookies');
+          await page.context().addCookies(cookieList).catch(() => {});
+        }
         logger.info({ cookies: Object.keys(sol.cookies) }, 'waitOutChallenge: injected Capzy cookies, reloading page');
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => {});
         return true;
