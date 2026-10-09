@@ -157,6 +157,7 @@ export interface CodeChefProgressEvent {
 export interface CodeChefRunOptions {
   forceDailyAttempt?: boolean;
   batchCount?: number;
+  accountIds?: readonly string[];
   onProgress?: (event: CodeChefProgressEvent) => Promise<void> | void;
   onAccountOutcome?: (outcome: CodeChefOutcome, index: number, total: number) => Promise<void> | void;
 }
@@ -314,7 +315,10 @@ export async function runCodeChefNow(
   try {
     const report: CodeChefReport = { date: todayInTimezone(), outcomes: [] };
     await ensureCodeChefAccountsSeeded();
-    const accounts = await listCodeChefAccounts(true);
+    const requestedAccountIds = options.accountIds ? new Set(options.accountIds) : null;
+    const accounts = (await listCodeChefAccounts(true)).filter(
+      (account) => !requestedAccountIds || requestedAccountIds.has(account.id)
+    );
     const queue = accounts.length ? await loadCodeChefSourceIndex() : [];
     const batchCount = Math.max(1, options.batchCount ?? 1);
     const forceAttempt = options.forceDailyAttempt ?? (reason === 'manual');

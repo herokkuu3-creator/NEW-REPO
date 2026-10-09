@@ -76,6 +76,7 @@ export async function patchCodeforcesAccount(
     lastSubmissionDate?: string | null;
     lastSubmissionId?: string | null;
     lastVerdict?: string | null;
+    state?: StoredCodeforcesState;
   },
 ): Promise<void> {
   await prisma.codeforcesAccount.update({
@@ -88,6 +89,7 @@ export async function patchCodeforcesAccount(
       ...(patch.lastSubmissionDate !== undefined ? { lastSubmissionDate: patch.lastSubmissionDate } : {}),
       ...(patch.lastSubmissionId !== undefined ? { lastSubmissionId: patch.lastSubmissionId } : {}),
       ...(patch.lastVerdict !== undefined ? { lastVerdict: patch.lastVerdict } : {}),
+      ...(patch.state !== undefined ? { storageState: JSON.stringify(patch.state) } : {}),
     },
   });
 }

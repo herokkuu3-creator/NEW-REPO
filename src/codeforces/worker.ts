@@ -690,7 +690,9 @@ async function runForAccount(
         lastSubmissionDate: today,
         lastSubmissionId: result.submissionId,
         lastVerdict: result.verdict,
+        state: stored.state,
       });
+      account.storageState = JSON.stringify(stored.state);
       return {
         label,
         username,
@@ -735,7 +737,9 @@ async function runForAccount(
       lastSubmissionDate: today,
       lastSubmissionId: result.submissionId ?? null,
       lastVerdict: verdictCode,
+      state: stored.state,
     });
+    account.storageState = JSON.stringify(stored.state);
     return {
       label,
       username,
@@ -761,7 +765,9 @@ async function runForAccount(
       checked: true,
       lastSubmissionDate: today,
       lastVerdict: 'SUBMISSION_ERROR',
+      state: stored.state,
     }).catch(() => undefined);
+    account.storageState = JSON.stringify(stored.state);
     return {
       label,
       username: handle,
