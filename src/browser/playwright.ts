@@ -140,6 +140,7 @@ export async function launchWithStorageState(): Promise<BrowserSession | null> {
       page,
       mode: 'storage-state',
       browserLogs,
+      proxyUrl,
       close: async () => {
         await context.close();
         await browser.close();
