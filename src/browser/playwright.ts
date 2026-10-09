@@ -1,4 +1,4 @@
-import { blockCodeforcesResource } from '../codeforces/browserForm';
+import { blockCodeforcesResource, DEFAULT_DESKTOP_USER_AGENT } from '../codeforces/browserForm';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
 import { chromium, firefox, Browser, BrowserContext, Page } from 'playwright';
 import fs from 'node:fs';
@@ -129,6 +129,7 @@ export async function launchWithStorageState(): Promise<BrowserSession | null> {
     });
     const context = await browser.newContext({
       storageState: statePath,
+      userAgent: DEFAULT_DESKTOP_USER_AGENT,
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
     });
@@ -175,6 +176,7 @@ export async function launchWithStorageStateObject(
         cookies: state.cookies,
         origins: state.origins,
       },
+      userAgent: DEFAULT_DESKTOP_USER_AGENT,
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
     });
@@ -242,6 +244,7 @@ export async function launchFirefoxWithStorageStateObject(
         cookies: state.cookies,
         origins: state.origins,
       },
+      userAgent: DEFAULT_DESKTOP_USER_AGENT,
       viewport: { width: 900, height: 600 },
       locale: 'en-US',
       serviceWorkers: 'block',

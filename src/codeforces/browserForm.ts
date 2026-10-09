@@ -94,6 +94,9 @@ export interface SolverResult {
   cookies?: Record<string, string>;
 }
 
+export const DEFAULT_DESKTOP_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
 export async function solveCloudflareWithCapzy(
   websiteURL: string,
   proxyUrl?: string,
@@ -107,6 +110,7 @@ export async function solveCloudflareWithCapzy(
     proxyUrl ||
     process.env.CODEFORCES_PROXY?.trim() ||
     'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
+  const ua = userAgent || DEFAULT_DESKTOP_USER_AGENT;
 
   try {
     const parsed = new URL(proxy);
@@ -123,7 +127,7 @@ export async function solveCloudflareWithCapzy(
           proxyPort: parseInt(parsed.port, 10),
           proxyLogin: decodeURIComponent(parsed.username),
           proxyPassword: decodeURIComponent(parsed.password),
-          ...(userAgent ? { userAgent } : {}),
+          userAgent: ua,
         },
       }),
       signal: AbortSignal.timeout(10_000),
@@ -167,13 +171,9 @@ export async function solveCloudflareWithCapzy(
 
 export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUrl?: string): Promise<VerificationFlags> {
   const form = page.locator('form:has(textarea[name="source"])').first();
-  const field = form.locator('input[name="turnstileToken"]');
-  const cfField = form.locator('input[name="cf-turnstile-response"]');
-  const widget = page.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
-
-  if (await field.count() === 0 && await cfField.count() === 0 && await widget.count() === 0) {
-    return { turnstile: false, interactive: false };
-  }
+  const cfTurnstileDiv = page.locator('.cf-turnstile');
+  const challengeIframe = page.locator('iframe[src*="challenges.cloudflare.com"]');
+  const control = form.locator('input[type="submit"], button[type="submit"], button:not([type])').first();
 
   const syncTokens = async (): Promise<string> => {
     return page.evaluate(() => {
@@ -202,8 +202,30 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     return tok.length > 5;
   };
 
+  // 1. If token already exists, verification is satisfied immediately
   if (await hasToken()) return { turnstile: true, interactive: false };
 
+  // 2. Grace period check: allow up to 1000ms for delayed native token or Turnstile iframe/disabling.
+  // If no iframe appears, no token is issued, and submit button remains enabled,
+  // Turnstile is inactive/not required (e.g. older/rated accounts).
+  const graceDeadline = Date.now() + Math.min(1_000, timeoutMs);
+  while (Date.now() < graceDeadline) {
+    if (await hasToken()) return { turnstile: true, interactive: false };
+    const hasIframeNow = (await challengeIframe.count().catch(() => 0)) > 0;
+    const isControlEnabled = await control.isEnabled().catch(() => false);
+    if (hasIframeNow || !isControlEnabled) break;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+
+  if (await hasToken()) return { turnstile: true, interactive: false };
+
+  const hasIframeAfterGrace = (await challengeIframe.count().catch(() => 0)) > 0;
+  const isControlEnabledAfterGrace = await control.isEnabled().catch(() => false);
+  if (!hasIframeAfterGrace && isControlEnabledAfterGrace) {
+    return { turnstile: false, interactive: false };
+  }
+
+  // 4. Turnstile is actively required or blocking the submit button
   const solverPromise = (async () => {
     const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
     if (solverUrl) {
@@ -263,7 +285,13 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         if (input) { input.value = token; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); }
         const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
         if (cfInput) { cfInput.value = token; cfInput.dispatchEvent(new Event('input', { bubbles: true })); cfInput.dispatchEvent(new Event('change', { bubbles: true })); }
-      }, { token: capzySol.token });
+        const widgetEl = element.querySelector('.cf-turnstile[data-callback]') as HTMLElement | null;
+        const cbName = widgetEl?.getAttribute('data-callback');
+        if (cbName) {
+          const fn = cbName.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
+          if (typeof fn === 'function') (fn as (t: string) => void)(token);
+        }
+      }, { token: capzySol.token }).catch(() => {});
       return;
     }
   })();
@@ -277,14 +305,13 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   let renderAttempt = '';
   let executeAttempt = '';
   let clickAttemptedAt = 0;
-  const noWidgetGraceMs = 5_000;
 
   while (Date.now() < deadline) {
     if (await hasToken()) {
       if (solverPromise) await solverPromise.catch(() => {});
       return { turnstile: true, interactive: false };
     }
-    if (Date.now() - startedAt >= noWidgetGraceMs && await widget.count() === 0) {
+    if (await control.isEnabled().catch(() => false) && (await challengeIframe.count().catch(() => 0)) === 0) {
       if (solverPromise) await solverPromise.catch(() => {});
       return { turnstile: false, interactive: false };
     }
@@ -320,8 +347,8 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     if (Date.now() > clickAttemptedAt + 5_000) {
       try {
         const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-      const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
-      if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) { clickAttemptedAt = Date.now(); await checkbox.click({ timeout: 500 }).catch(() => {}); } else { const body = frameLocator.locator('body').first(); if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) { clickAttemptedAt = Date.now(); await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {}); } }
+        const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
+        if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) { clickAttemptedAt = Date.now(); await checkbox.click({ timeout: 500 }).catch(() => {}); } else { const body = frameLocator.locator('body').first(); if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) { clickAttemptedAt = Date.now(); await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {}); } }
       } catch {}
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
@@ -330,7 +357,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   if (await hasToken()) {
     return { turnstile: true, interactive: false };
   }
-  if (await widget.count() === 0) {
+  if (await control.isEnabled().catch(() => false) && (await challengeIframe.count().catch(() => 0)) === 0) {
     return { turnstile: false, interactive: false };
   }
   const diagnostics = await page.evaluate(() => ({

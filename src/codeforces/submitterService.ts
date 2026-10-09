@@ -25,7 +25,7 @@
 import http from 'node:http';
 import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
-import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy } from './browserForm';
+import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy, DEFAULT_DESKTOP_USER_AGENT } from './browserForm';
 import { parseProxyList } from './proxyRotator';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
@@ -275,6 +275,7 @@ async function launchFirefox(
       > extends never
         ? never
         : never,
+      userAgent: DEFAULT_DESKTOP_USER_AGENT,
       viewport: { width: 900, height: 600 },
       locale: 'en-US',
       serviceWorkers: 'block',
@@ -382,7 +383,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
           await page.context().addCookies(cookiesToSet).catch(() => undefined);
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
           await sleep(2_000);
-          if ((await page.locator('#body').count().catch(() => 0)) > 0) {
+          if ((await page.locator('#body, #pageContent, form:has(textarea[name="source"])').count().catch(() => 0)) > 0) {
             log({}, 'waitOutChallenge: Codeforces body visible after Capzy reload!');
             return true;
           }
@@ -395,7 +396,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
 
   while (Date.now() < deadline) {
     await sleep(1_000);
-    const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
+    const isCodeforces = (await page.locator('#body, #pageContent, form:has(textarea[name="source"])').count().catch(() => 0)) > 0;
     if (isCodeforces) return true;
 
     if (Date.now() > clickAttemptedAt + 5_000) {

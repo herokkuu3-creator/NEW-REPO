@@ -332,7 +332,7 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
           await page.context().addCookies(cookiesToSet).catch(() => undefined);
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
           await sleep(2_000);
-          if ((await page.locator('#body').count().catch(() => 0)) > 0) {
+          if ((await page.locator('#body, #pageContent, form:has(textarea[name="source"])').count().catch(() => 0)) > 0) {
             logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser after Capzy reload');
             return true;
           }
@@ -345,7 +345,7 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
 
   while (Date.now() < deadline) {
     await sleep(1_000);
-    const isCodeforces = (await page.locator('#body').count().catch(() => 0)) > 0;
+    const isCodeforces = (await page.locator('#body, #pageContent, form:has(textarea[name="source"])').count().catch(() => 0)) > 0;
     if (isCodeforces) {
       logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser');
       return true;
