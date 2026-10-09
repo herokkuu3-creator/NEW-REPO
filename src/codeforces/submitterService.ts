@@ -396,7 +396,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
   return false;
 }
 
-export async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise<void> {
+export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl?: string): Promise<void> {
   const paths = candidates(entry);
   const attempts: string[] = [];
 
@@ -411,12 +411,12 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry): Promise
       if (/\/enter(?:[/?#]|$)/i.test(finalUrl)) {
         throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
       }
-      if ((status === 403 || status === 503) && !(await waitOutChallenge(page))) {
+      if ((status === 403 || status === 503) && !(await waitOutChallenge(page, undefined, proxyUrl))) {
         throw new BrowserFormError(`Codeforces verification did not complete (HTTP ${status}). The current solution remains pending.`, 'blocked');
       }
       const body = await readBody(page);
       if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
-        if (!(await waitOutChallenge(page))) {
+        if (!(await waitOutChallenge(page, undefined, proxyUrl))) {
           throw new BrowserFormError('Codeforces verification did not complete. The current solution remains pending.', 'blocked');
         }
       }
@@ -586,7 +586,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
     void session.browser.close().catch(() => undefined);
   }, Math.max(1, deadline - Date.now()));
   try {
-    await openSubmitForm(session.page, request.entry);
+    await openSubmitForm(session.page, request.entry, request.proxy);
     const ts = await fillSubmitForm(session.page, request.entry, request.code, request.proxy);
     flags.turnstile = ts.turnstile;
     flags.interactive = ts.interactive;

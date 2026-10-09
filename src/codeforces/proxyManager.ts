@@ -324,7 +324,7 @@ export async function resolveActiveProxy(
   } = {},
 ): Promise<ActiveProxyResult | null> {
   const log = options.log ?? ((msg: string) => logger.info({ msg }, 'codeforces proxy resolver'));
-  const tester = options.tester ?? ((url: string) => testProxyDetailed(url, 8).then((r) => r.ok));
+  const tester = options.tester ?? ((url: string) => testProxyDetailed(url, 12).then((r) => r.ok));
 
   const all = await getAllConfiguredProxies(options.envSource);
   const available = all.filter((p) => !p.isRemoved);

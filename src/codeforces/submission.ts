@@ -223,7 +223,7 @@ export async function postSubmitForm(
   const verificationFlags = { turnstile: false, interactive: false };
   const proxyUrl = (session as unknown as { proxyUrl?: string }).proxyUrl;
   try {
-    await openSubmitForm(page, source);
+    await openSubmitForm(page, source, proxyUrl);
     const ts = await fillSubmitForm(page, source, code, proxyUrl);
     Object.assign(verificationFlags, ts);
     const click = await clickSubmitForm(page);
@@ -359,7 +359,7 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
   return false;
 }
 
-export async function openSubmitForm(page: Page, source: SourceIndexEntry): Promise<void> {
+export async function openSubmitForm(page: Page, source: SourceIndexEntry, proxyUrl?: string): Promise<void> {
   const candidates = submitFormCandidates(source);
   if (candidates.length === 0) {
     throw new CodeforcesSubmissionError('source entry has no contestId/problemIndex');
@@ -385,6 +385,13 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
       throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
     }
     if (status === 403 || status === 503) {
+      if (await waitOutChallenge(page, undefined, proxyUrl)) {
+        const settledFields = await readFields(page);
+        if (hasSubmitForm(settledFields)) {
+          logger.info({ path, fields: summarizeFields(settledFields) }, 'Codeforces submit form opened after HTTP 403 challenge cleared');
+          return;
+        }
+      }
       attempts.push(`${path}: HTTP ${status} (Cloudflare challenge)`);
       blocked += 1;
       continue;
@@ -392,7 +399,7 @@ export async function openSubmitForm(page: Page, source: SourceIndexEntry): Prom
 
     const body = await readBody(page);
     if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
-      await waitOutChallenge(page);
+      await waitOutChallenge(page, undefined, proxyUrl);
       const settled = await readBody(page);
       if (CHALLENGE_RE.test(settled) || CHALLENGE_RE.test(page.url())) {
         throw new CodeforcesBlockedError('Codeforces served a browser verification page while opening the submit form');
