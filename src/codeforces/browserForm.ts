@@ -1,4 +1,5 @@
 import type { Page, Request, Response } from 'playwright';
+import { interactWithTurnstileCheckbox, simulateHumanMouseMove } from '../browser/stealth';
 
 
 function log(fields: Record<string, unknown>, msg: string): void {
@@ -94,15 +95,142 @@ export interface SolverResult {
   cookies?: Record<string, string>;
 }
 
-export const DEFAULT_DESKTOP_USER_AGENT =
+export const DEFAULT_DESKTOP_CHROME_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+export const DEFAULT_DESKTOP_FIREFOX_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0';
+
+export const DEFAULT_DESKTOP_USER_AGENT = DEFAULT_DESKTOP_CHROME_USER_AGENT;
+
+export function getDefaultUserAgent(engine: 'chromium' | 'firefox' = 'chromium'): string {
+  return engine === 'firefox' ? DEFAULT_DESKTOP_FIREFOX_USER_AGENT : DEFAULT_DESKTOP_CHROME_USER_AGENT;
+}
+
+export async function solveTurnstileWithCapzy(
+  websiteURL: string,
+  sitekey: string,
+  proxyUrl?: string,
+  userAgent?: string,
+  timeoutMs = 35_000,
+  action?: string,
+  cdata?: string,
+): Promise<SolverResult | null> {
+  // Avoid network calls for synthetic test keys
+  if (sitekey === 'fixture-key' || sitekey === 'test-key') return null;
+
+  const apiKey =
+    process.env.CAPZY_API_KEY?.trim() ||
+    'capzy_9dc57a569ec4a6b2453b7d2869e85320ece4cddfc9a36d2f';
+  const proxy =
+    proxyUrl ||
+    process.env.CODEFORCES_PROXY?.trim() ||
+    'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
+  const ua = userAgent || DEFAULT_DESKTOP_USER_AGENT;
+
+  const runCapzyTask = async (task: Record<string, unknown>): Promise<SolverResult | null> => {
+    try {
+      const init = await fetch('https://api.capzy.ai/createTask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientKey: apiKey, task }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const data = (await init.json()) as { errorId?: number; taskId?: string; errorDescription?: string };
+      if (!data?.taskId || (data.errorId && data.errorId !== 0)) {
+        logWarn({ errorId: data?.errorId, desc: data?.errorDescription, taskType: task.type }, 'Capzy createTask failed');
+        return null;
+      }
+
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const poll = await fetch('https://api.capzy.ai/getTaskResult', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ clientKey: apiKey, taskId: data.taskId }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const res = (await poll.json()) as {
+          errorId?: number;
+          status?: string;
+          solution?: {
+            token?: string;
+            cookies?: Record<string, string>;
+          };
+        };
+        if (res?.status === 'ready' && res?.solution?.token) {
+          return {
+            token: res.solution.token,
+            cookies: res.solution.cookies,
+          };
+        }
+        if (res?.errorId && res.errorId !== 0) {
+          logWarn({ taskId: data.taskId, errorId: res.errorId, status: res.status, raw: res }, 'Capzy getTaskResult reported error');
+          break;
+        }
+      }
+    } catch (err) {
+      logWarn({ err: err instanceof Error ? err.message : String(err) }, 'Capzy task execution threw');
+    }
+    return null;
+  };
+
+  // Attempt 1: AntiTurnstileTask with residential proxy
+  let proxyTask: Record<string, unknown> | null = null;
+  try {
+    if (proxy) {
+      const parsed = new URL(proxy);
+      proxyTask = {
+        type: 'AntiTurnstileTask',
+        websiteURL,
+        websiteKey: sitekey,
+        proxyType: parsed.protocol.replace(':', '') || 'http',
+        proxyAddress: parsed.hostname,
+        proxyPort: parseInt(parsed.port, 10),
+        proxyLogin: decodeURIComponent(parsed.username || ''),
+        proxyPassword: decodeURIComponent(parsed.password || ''),
+        userAgent: ua,
+        ...(action ? { action } : {}),
+        ...(cdata ? { cdata } : {}),
+        ...(action || cdata ? { metadata: { ...(action ? { action } : {}), ...(cdata ? { cdata } : {}) } } : {}),
+      };
+    }
+  } catch {
+    proxyTask = null;
+  }
+
+  if (proxyTask) {
+    const res = await runCapzyTask(proxyTask);
+    if (res?.token) return res;
+  }
+
+  // Attempt 2 (Proxyless fallback): AntiTurnstileTaskProxyLess
+  const proxylessTask: Record<string, unknown> = {
+    type: 'AntiTurnstileTaskProxyLess',
+    websiteURL,
+    websiteKey: sitekey,
+    userAgent: ua,
+    ...(action ? { action } : {}),
+    ...(cdata ? { cdata } : {}),
+    ...(action || cdata ? { metadata: { ...(action ? { action } : {}), ...(cdata ? { cdata } : {}) } } : {}),
+  };
+  return runCapzyTask(proxylessTask);
+}
 
 export async function solveCloudflareWithCapzy(
   websiteURL: string,
   proxyUrl?: string,
   userAgent?: string,
   timeoutMs = 35_000,
+  sitekey?: string,
+  action?: string,
+  cdata?: string,
 ): Promise<SolverResult | null> {
+  if (sitekey) {
+    return solveTurnstileWithCapzy(websiteURL, sitekey, proxyUrl, userAgent, timeoutMs, action, cdata);
+  }
+
   const apiKey =
     process.env.CAPZY_API_KEY?.trim() ||
     'capzy_9dc57a569ec4a6b2453b7d2869e85320ece4cddfc9a36d2f';
@@ -122,11 +250,11 @@ export async function solveCloudflareWithCapzy(
         task: {
           type: 'AntiCloudflareTask',
           websiteURL,
-          proxyType: 'http',
+          proxyType: parsed.protocol.replace(':', '') || 'http',
           proxyAddress: parsed.hostname,
           proxyPort: parseInt(parsed.port, 10),
-          proxyLogin: decodeURIComponent(parsed.username),
-          proxyPassword: decodeURIComponent(parsed.password),
+          proxyLogin: decodeURIComponent(parsed.username || ''),
+          proxyPassword: decodeURIComponent(parsed.password || ''),
           userAgent: ua,
         },
       }),
@@ -167,6 +295,53 @@ export async function solveCloudflareWithCapzy(
     // Graceful fallback
   }
   return null;
+}
+
+async function injectTurnstileToken(form: ReturnType<Page['locator']>, token: string, callbackName?: string | null): Promise<void> {
+  await form.evaluate((element, { token, callback }) => {
+    const ttInput = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
+    if (ttInput) {
+      ttInput.value = token;
+      ttInput.dispatchEvent(new Event('input', { bubbles: true }));
+      ttInput.dispatchEvent(new Event('change', { bubbles: true }));
+    } else {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'turnstileToken';
+      input.value = token;
+      element.appendChild(input);
+    }
+
+    const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+    if (cfInput) {
+      cfInput.value = token;
+      cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+      cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+    } else {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'cf-turnstile-response';
+      input.value = token;
+      element.appendChild(input);
+    }
+
+    if (callback) {
+      const fn = callback.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
+      if (typeof fn === 'function') fn(token);
+    }
+
+    const widgetEl = element.querySelector('.cf-turnstile[data-callback]') as HTMLElement | null;
+    const widgetCb = widgetEl?.getAttribute('data-callback');
+    if (widgetCb && widgetCb !== callback) {
+      const fn = widgetCb.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
+      if (typeof fn === 'function') (fn as (t: string) => void)(token);
+    }
+
+    const submitBtn = element.querySelector('input[type="submit"], button[type="submit"], button:not([type])') as HTMLButtonElement | HTMLInputElement | null;
+    if (submitBtn && submitBtn.disabled) {
+      submitBtn.disabled = false;
+    }
+  }, { token, callback: callbackName }).catch(() => {});
 }
 
 export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUrl?: string): Promise<VerificationFlags> {
@@ -226,43 +401,56 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   }
 
   // 4. Turnstile is actively required or blocking the submit button
+  const widgetInfo = await page.evaluate(() => {
+    const element = document.querySelector('.cf-turnstile[data-sitekey]');
+    const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
+    const sitekey = element?.getAttribute('data-sitekey') ?? /["']?sitekey["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
+    const action = element?.getAttribute('data-action') ?? /["']?action["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
+    const cdata = element?.getAttribute('data-cdata') ?? /["']?cdata["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
+    return { sitekey, action, cdata, callback: element?.getAttribute('data-callback') ?? null };
+  }).catch(() => ({ sitekey: null, action: null, cdata: null, callback: null }));
+
   const solverPromise = (async () => {
     const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
-    if (solverUrl) {
+    if (solverUrl && widgetInfo.sitekey) {
       // 1. Generic solver URL has explicit priority when configured
-      const widgetInfo = await page.evaluate(() => {
-        const element = document.querySelector('.cf-turnstile[data-sitekey]');
-        const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
-        const sitekey = element?.getAttribute('data-sitekey') ?? /["']?sitekey["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
-        const action = element?.getAttribute('data-action') ?? /["']?action["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
-        const cdata = element?.getAttribute('data-cdata') ?? /["']?cdata["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1];
-        return { sitekey, action, cdata, callback: element?.getAttribute('data-callback') ?? null };
-      });
-      if (widgetInfo.sitekey) {
-        try {
-          const response = await fetch(`${solverUrl.replace(/\/+$/, '')}/solve`, {
-            method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ siteurl: page.url(), sitekey: widgetInfo.sitekey, action: widgetInfo.action, cdata: widgetInfo.cdata }),
-            signal: AbortSignal.timeout(timeoutMs),
-          });
-          if (response.ok) {
-            const data = await response.json() as { token?: unknown };
-            if (typeof data.token === 'string' && data.token.trim()) {
-              await form.evaluate((element, { token, callback }) => {
-                const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
-                if (input) { input.value = token; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); }
-                const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
-                if (cfInput) { cfInput.value = token; cfInput.dispatchEvent(new Event('input', { bubbles: true })); cfInput.dispatchEvent(new Event('change', { bubbles: true })); }
-                if (callback) { const fn = callback.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window); if (typeof fn === 'function') fn(token); }
-              }, { token: data.token, callback: widgetInfo.callback });
-            }
+      try {
+        const response = await fetch(`${solverUrl.replace(/\/+$/, '')}/solve`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ siteurl: page.url(), sitekey: widgetInfo.sitekey, action: widgetInfo.action, cdata: widgetInfo.cdata }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (response.ok) {
+          const data = await response.json() as { token?: unknown };
+          if (typeof data.token === 'string' && data.token.trim()) {
+            await injectTurnstileToken(form, data.token.trim(), widgetInfo.callback);
+            return;
           }
-        } catch {}
-      }
+        }
+      } catch {}
       return;
     }
 
-    // 2. Capzy AntiCloudflareTask
+    // 2. Capzy AntiTurnstileTask / AntiTurnstileTaskProxyLess
+    if (widgetInfo.sitekey) {
+      const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
+      const capzySol = await solveTurnstileWithCapzy(
+        page.url(),
+        widgetInfo.sitekey,
+        proxyUrl,
+        userAgent,
+        timeoutMs,
+        widgetInfo.action ?? undefined,
+        widgetInfo.cdata ?? undefined,
+      );
+      if (capzySol?.token) {
+        log({ tokenLength: capzySol.token.length }, 'ensureFormTurnstile: injecting Capzy Turnstile token');
+        await injectTurnstileToken(form, capzySol.token, widgetInfo.callback);
+        return;
+      }
+    }
+
+    // 3. Fallback: Capzy AntiCloudflareTask for clearance cookies
     const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
     const capzySol = await solveCloudflareWithCapzy(page.url(), proxyUrl, userAgent, timeoutMs);
     if (capzySol?.cookies) {
@@ -280,19 +468,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
       }
     }
     if (capzySol?.token) {
-      await form.evaluate((element, { token }) => {
-        const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
-        if (input) { input.value = token; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); }
-        const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
-        if (cfInput) { cfInput.value = token; cfInput.dispatchEvent(new Event('input', { bubbles: true })); cfInput.dispatchEvent(new Event('change', { bubbles: true })); }
-        const widgetEl = element.querySelector('.cf-turnstile[data-callback]') as HTMLElement | null;
-        const cbName = widgetEl?.getAttribute('data-callback');
-        if (cbName) {
-          const fn = cbName.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
-          if (typeof fn === 'function') (fn as (t: string) => void)(token);
-        }
-      }, { token: capzySol.token }).catch(() => {});
-      return;
+      await injectTurnstileToken(form, capzySol.token, widgetInfo.callback);
     }
   })();
 
@@ -344,12 +520,9 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
       const backoffMs = [5_000, 8_000, 12_000, 17_000][executeCount - 1] ?? 17_000;
       nextExecuteAt = Date.now() + backoffMs;
     }
-    if (Date.now() > clickAttemptedAt + 5_000) {
-      try {
-        const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-        const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
-        if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) { clickAttemptedAt = Date.now(); await checkbox.click({ timeout: 500 }).catch(() => {}); } else { const body = frameLocator.locator('body').first(); if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) { clickAttemptedAt = Date.now(); await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {}); } }
-      } catch {}
+    if (Date.now() > clickAttemptedAt + 4_000) {
+      clickAttemptedAt = Date.now();
+      await interactWithTurnstileCheckbox(page).catch(() => {});
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
   }
@@ -459,6 +632,16 @@ export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{
     }
   };
   try {
+    try {
+      const box = await control.boundingBox().catch(() => null);
+      if (box && box.width > 0 && box.height > 0) {
+        const targetX = Math.round(box.x + box.width * (0.35 + Math.random() * 0.3));
+        const targetY = Math.round(box.y + box.height * (0.35 + Math.random() * 0.3));
+        await simulateHumanMouseMove(page, targetX, targetY, 15).catch(() => {});
+        await new Promise((r) => setTimeout(r, 60 + Math.random() * 60));
+      }
+    } catch {}
+
     try {
       await control.click({ timeout: Math.min(timeoutMs, 5_000), noWaitAfter: true });
     } catch {

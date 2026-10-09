@@ -1,5 +1,6 @@
 import type { Page, Response } from 'playwright';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, solveCloudflareWithCapzy } from './browserForm';
+import { interactWithTurnstileCheckbox } from '../browser/stealth';
 import type { BrowserSession } from '../browser/playwright';
 import { logger } from '../logger';
 import { fetchUserStatus, fetchContestStatus, CodeforcesSubmission } from './api';
@@ -312,8 +313,8 @@ function challengeWaitMs(): number {
 }
 
 async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxyUrl?: string): Promise<boolean> {
-  if (timeoutMs === 0) return false;
-  const deadline = Date.now() + Math.max(timeoutMs, 45_000);
+  if (timeoutMs === 0 || typeof page.context !== 'function') return false;
+  const deadline = Date.now() + timeoutMs;
   let clickAttemptedAt = 0;
 
   if (proxyUrl) {
@@ -332,7 +333,12 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
           await page.context().addCookies(cookiesToSet).catch(() => undefined);
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
           await sleep(2_000);
-          if ((await page.locator('#body, #pageContent, form:has(textarea[name="source"])').count().catch(() => 0)) > 0) {
+          let settled = false;
+          try {
+            const loc = page.locator('#body, #pageContent, form:has(textarea[name="source"])');
+            settled = typeof loc?.count === 'function' && ((await loc.count().catch(() => 0)) > 0);
+          } catch {}
+          if (settled) {
             logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser after Capzy reload');
             return true;
           }
@@ -344,29 +350,32 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
   }
 
   while (Date.now() < deadline) {
-    await sleep(1_000);
-    const isCodeforces = (await page.locator('#body, #pageContent, form:has(textarea[name="source"])').count().catch(() => 0)) > 0;
+    let isCodeforces = false;
+    try {
+      const loc = page.locator('#body, #pageContent, form:has(textarea[name="source"])');
+      isCodeforces = typeof loc?.count === 'function' && ((await loc.count().catch(() => 0)) > 0);
+    } catch {}
     if (isCodeforces) {
       logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser');
       return true;
     }
 
-    if (Date.now() > clickAttemptedAt + 5_000) {
+    if (Date.now() > clickAttemptedAt + 4_000) {
+      clickAttemptedAt = Date.now();
       try {
-        const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-        const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
-        if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
-          clickAttemptedAt = Date.now();
-          await checkbox.click({ timeout: 500 }).catch(() => {});
-        } else {
-          const body = frameLocator.locator('body').first();
-          if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
-            clickAttemptedAt = Date.now();
-            await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
+        const handled = await interactWithTurnstileCheckbox(page);
+        if (!handled && typeof page.frameLocator === 'function') {
+          const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+          const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
+          if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
+            await checkbox.click({ timeout: 1500 }).catch(() => {});
           }
         }
       } catch {}
     }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(1_000, Math.max(10, remaining)));
   }
   logger.warn({ timeoutMs, url: page.url() }, 'Codeforces challenge did not clear in the browser');
   return false;

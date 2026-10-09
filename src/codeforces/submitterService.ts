@@ -25,7 +25,8 @@
 import http from 'node:http';
 import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
-import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy, DEFAULT_DESKTOP_USER_AGENT } from './browserForm';
+import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy, getDefaultUserAgent } from './browserForm';
+import { applyStealthScripts, interactWithTurnstileCheckbox } from '../browser/stealth';
 import { parseProxyList } from './proxyRotator';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
 
@@ -275,19 +276,12 @@ async function launchFirefox(
       > extends never
         ? never
         : never,
-      userAgent: DEFAULT_DESKTOP_USER_AGENT,
-      viewport: { width: 900, height: 600 },
+      userAgent: getDefaultUserAgent(BROWSER_ENGINE),
+      viewport: { width: 1366, height: 768 },
       locale: 'en-US',
       serviceWorkers: 'block',
     });
-    await context.addInitScript(() => {
-      try {
-        Object.defineProperty(navigator, 'webdriver', {
-          get: () => undefined,
-          configurable: true,
-        });
-      } catch {}
-    });
+    await applyStealthScripts(context, BROWSER_ENGINE);
     if (process.env.CODEFORCES_BLOCK_ASSETS !== 'false') {
       await context.route('**/*', async (route) => {
         const type = route.request().resourceType();
@@ -363,8 +357,8 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
 }
 
 async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxyUrl?: string): Promise<boolean> {
-  if (timeoutMs === 0) return false;
-  const deadline = Date.now() + Math.max(timeoutMs, 45_000);
+  if (timeoutMs === 0 || typeof page.context !== 'function') return false;
+  const deadline = Date.now() + timeoutMs;
   let clickAttemptedAt = 0;
 
   if (proxyUrl) {
@@ -383,7 +377,12 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
           await page.context().addCookies(cookiesToSet).catch(() => undefined);
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
           await sleep(2_000);
-          if ((await page.locator('#body, #pageContent, form:has(textarea[name="source"])').count().catch(() => 0)) > 0) {
+          let settled = false;
+          try {
+            const loc = page.locator('#body, #pageContent, form:has(textarea[name="source"])');
+            settled = typeof loc?.count === 'function' && ((await loc.count().catch(() => 0)) > 0);
+          } catch {}
+          if (settled) {
             log({}, 'waitOutChallenge: Codeforces body visible after Capzy reload!');
             return true;
           }
@@ -395,26 +394,29 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
   }
 
   while (Date.now() < deadline) {
-    await sleep(1_000);
-    const isCodeforces = (await page.locator('#body, #pageContent, form:has(textarea[name="source"])').count().catch(() => 0)) > 0;
+    let isCodeforces = false;
+    try {
+      const loc = page.locator('#body, #pageContent, form:has(textarea[name="source"])');
+      isCodeforces = typeof loc?.count === 'function' && ((await loc.count().catch(() => 0)) > 0);
+    } catch {}
     if (isCodeforces) return true;
 
-    if (Date.now() > clickAttemptedAt + 5_000) {
+    if (Date.now() > clickAttemptedAt + 4_000) {
+      clickAttemptedAt = Date.now();
       try {
-        const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-        const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
-        if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
-          clickAttemptedAt = Date.now();
-          await checkbox.click({ timeout: 500 }).catch(() => {});
-        } else {
-          const body = frameLocator.locator('body').first();
-          if ((await body.count().catch(() => 0)) > 0 && await body.isVisible().catch(() => false)) {
-            clickAttemptedAt = Date.now();
-            await body.click({ position: { x: 10, y: 10 }, timeout: 500 }).catch(() => {});
+        const handled = await interactWithTurnstileCheckbox(page);
+        if (!handled && typeof page.frameLocator === 'function') {
+          const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+          const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
+          if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
+            await checkbox.click({ timeout: 1500 }).catch(() => {});
           }
         }
       } catch {}
     }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(1_000, Math.max(10, remaining)));
   }
   return false;
 }

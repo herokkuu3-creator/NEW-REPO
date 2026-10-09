@@ -1,4 +1,10 @@
-import { blockCodeforcesResource, DEFAULT_DESKTOP_USER_AGENT } from '../codeforces/browserForm';
+import {
+  blockCodeforcesResource,
+  DEFAULT_DESKTOP_CHROME_USER_AGENT,
+  DEFAULT_DESKTOP_FIREFOX_USER_AGENT,
+  DEFAULT_DESKTOP_USER_AGENT,
+} from '../codeforces/browserForm';
+import { applyStealthScripts } from './stealth';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
 import { chromium, firefox, Browser, BrowserContext, Page } from 'playwright';
 import fs from 'node:fs';
@@ -91,6 +97,7 @@ export async function launchWithPersistentProfile(): Promise<BrowserSession | nu
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
     });
+    await applyStealthScripts(context, 'chromium');
     const browserLogs: string[] = [];
     const page = await openPageWithCapture(context, browserLogs);
     logger.info({ profilePath }, 'launched persistent Chromium profile');
@@ -129,10 +136,11 @@ export async function launchWithStorageState(): Promise<BrowserSession | null> {
     });
     const context = await browser.newContext({
       storageState: statePath,
-      userAgent: DEFAULT_DESKTOP_USER_AGENT,
+      userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
     });
+    await applyStealthScripts(context, 'chromium');
     const browserLogs: string[] = [];
     const page = await openPageWithCapture(context, browserLogs);
     logger.info({ statePath }, 'launched context from storageState');
@@ -176,10 +184,11 @@ export async function launchWithStorageStateObject(
         cookies: state.cookies,
         origins: state.origins,
       },
-      userAgent: DEFAULT_DESKTOP_USER_AGENT,
+      userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
     });
+    await applyStealthScripts(context, 'chromium');
     const browserLogs: string[] = [];
     const page = await openPageWithCapture(context, browserLogs);
     logger.info({ label }, 'launched context from account storageState');
@@ -244,11 +253,12 @@ export async function launchFirefoxWithStorageStateObject(
         cookies: state.cookies,
         origins: state.origins,
       },
-      userAgent: DEFAULT_DESKTOP_USER_AGENT,
-      viewport: { width: 900, height: 600 },
+      userAgent: DEFAULT_DESKTOP_FIREFOX_USER_AGENT,
+      viewport: { width: 1366, height: 768 },
       locale: 'en-US',
       serviceWorkers: 'block',
     });
+    await applyStealthScripts(context, 'firefox');
 
     // Omit decorative assets while preserving CSS and verification resources.
     await context.route('**/*', async (route) => {

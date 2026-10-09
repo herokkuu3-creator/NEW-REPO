@@ -1,6 +1,21 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright';
-import { blockCodeforcesResource, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory } from '../src/codeforces/browserForm';
+import {
+  blockCodeforcesResource,
+  clickSubmitForm,
+  ensureFormTurnstile,
+  fillSource,
+  isSubmissionHistory,
+  getDefaultUserAgent,
+  solveTurnstileWithCapzy,
+  DEFAULT_DESKTOP_CHROME_USER_AGENT,
+  DEFAULT_DESKTOP_FIREFOX_USER_AGENT,
+} from '../src/codeforces/browserForm';
+import {
+  simulateHumanMouseMove,
+  simulateHumanClick,
+  interactWithTurnstileCheckbox,
+} from '../src/browser/stealth';
 import { postSubmitForm } from '../src/codeforces/submission';
 import type { BrowserSession } from '../src/browser/playwright';
 import type { SourceIndexEntry } from '../src/codeforces/sourceRepo';
@@ -235,5 +250,46 @@ describe('Codeforces native browser submission', () => {
     expect(isSubmissionHistory('https://codeforces.com/problemset/status?my=on')).toBe(true);
     expect(isSubmissionHistory('https://codeforces.com/')).toBe(false);
     expect(isSubmissionHistory('https://codeforces.com.evil.example/contest/1/my')).toBe(false);
+  });
+
+  it('selects browser-engine-matched user agents to prevent TLS fingerprint mismatch', () => {
+    expect(getDefaultUserAgent('firefox')).toBe(DEFAULT_DESKTOP_FIREFOX_USER_AGENT);
+    expect(getDefaultUserAgent('firefox')).toContain('Firefox/');
+    expect(getDefaultUserAgent('chromium')).toBe(DEFAULT_DESKTOP_CHROME_USER_AGENT);
+    expect(getDefaultUserAgent('chromium')).toContain('Chrome/');
+  });
+
+  it('skips external Capzy calls on fixture keys and supports Capzy Turnstile solving', async () => {
+    expect(await solveTurnstileWithCapzy('https://codeforces.com', 'fixture-key')).toBeNull();
+
+    const fetchStub = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ errorId: 0, taskId: 'test-turnstile-task' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ errorId: 0, status: 'ready', solution: { token: 'capzy-turnstile-token' } }),
+      });
+    vi.stubGlobal('fetch', fetchStub);
+
+    const result = await solveTurnstileWithCapzy('https://codeforces.com', 'real-sitekey-123', undefined, undefined, 5_000);
+    expect(result).toEqual({ token: 'capzy-turnstile-token', cookies: undefined });
+    expect(fetchStub).toHaveBeenCalled();
+    const firstCallBody = JSON.parse(fetchStub.mock.calls[0][1].body);
+    expect(firstCallBody.task.websiteKey).toBe('real-sitekey-123');
+  });
+
+  it('simulates human mouse movements with cubic bezier easing and clicks target elements', async () => {
+    await page.setContent('<div id="btn" style="position:absolute;left:100px;top:100px;width:50px;height:50px;">Click me</div>');
+    let clicked = false;
+    await page.exposeFunction('onDivClicked', () => { clicked = true; });
+    await page.evaluate(() => {
+      document.getElementById('btn')!.addEventListener('click', () => (window as any).onDivClicked());
+    });
+
+    await simulateHumanMouseMove(page, 125, 125, 5);
+    await simulateHumanClick(page, 125, 125, { moveSteps: 5, dwellMs: 10, holdMs: 10 });
+    expect(clicked).toBe(true);
   });
 });

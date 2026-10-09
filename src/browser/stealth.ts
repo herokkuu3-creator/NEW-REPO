@@ -39,218 +39,356 @@ export function getRandomDesktopViewport(): { width: number; height: number } {
 
 /**
  * Injects scripts before any page scripts execute to mask automation indicators.
+ * Respects browser engine (Firefox vs Chromium) to prevent conflicting fingerprints.
  */
-export async function applyStealthScripts(context: BrowserContext): Promise<void> {
-  await context.addInitScript(() => {
-    // 1. Mask navigator.webdriver
-    try {
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => undefined,
-        configurable: true,
-      });
-    } catch {}
+export async function applyStealthScripts(
+  context: BrowserContext,
+  engine: 'chromium' | 'firefox' = 'chromium',
+): Promise<void> {
+  await context.addInitScript(
+    ({ engine }: { engine: 'chromium' | 'firefox' }) => {
+      // 1. Mask navigator.webdriver on both navigator and Navigator.prototype
+      try {
+        const proto = Object.getPrototypeOf(navigator);
+        if (proto && 'webdriver' in proto) {
+          Object.defineProperty(proto, 'webdriver', {
+            get: () => undefined,
+            configurable: true,
+            enumerable: true,
+          });
+        }
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+          configurable: true,
+          enumerable: true,
+        });
+        delete (navigator as unknown as Record<string, unknown>).webdriver;
+      } catch {}
 
-    // 2. Mock chrome runtime object
-    try {
-      const win = window as any;
-      if (!win.chrome) {
-        win.chrome = {
-          app: {
-            isInstalled: false,
-            InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
-            RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
-          },
-          runtime: {
-            OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
-            OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
-            PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-            PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-            PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
-            RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
-          },
-          loadTimes: () => {
-            const now = Date.now() / 1000;
-            return {
-              requestTime: now - 0.45,
-              startLoadTime: now - 0.4,
-              commitLoadTime: now - 0.25,
-              finishDocumentLoadTime: now - 0.1,
-              firstPaintTime: now - 0.08,
-              finishLoadTime: now,
-              wasFetchedViaSpdy: true,
-              wasNpnNegotiated: true,
-              npnNegotiatedProtocol: 'h2',
-              navigationType: 'Other',
+      // 2. Mock chrome runtime object (Chromium only — real Firefox does NOT have window.chrome)
+      if (engine === 'chromium') {
+        try {
+          const win = window as unknown as Record<string, unknown>;
+          if (!win.chrome) {
+            win.chrome = {
+              app: {
+                isInstalled: false,
+                InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+              },
+              runtime: {
+                OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+                OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+                PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+                RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
+              },
+              loadTimes: () => {
+                const now = Date.now() / 1000;
+                return {
+                  requestTime: now - 0.45,
+                  startLoadTime: now - 0.4,
+                  commitLoadTime: now - 0.25,
+                  finishDocumentLoadTime: now - 0.1,
+                  firstPaintTime: now - 0.08,
+                  finishLoadTime: now,
+                  wasFetchedViaSpdy: true,
+                  wasNpnNegotiated: true,
+                  npnNegotiatedProtocol: 'h2',
+                  navigationType: 'Other',
+                };
+              },
+              csi: () => {
+                const now = Date.now();
+                return {
+                  onloadT: now,
+                  pageT: 450,
+                  startE: now - 450,
+                  tran: 15,
+                };
+              },
             };
-          },
-          csi: () => {
-            const now = Date.now();
-            return {
-              onloadT: now,
-              pageT: 450,
-              startE: now - 450,
-              tran: 15,
-            };
-          },
-        };
+          }
+        } catch {}
       }
-    } catch {}
 
-    // 3. Realistic navigator.languages
-    try {
-      Object.defineProperty(navigator, 'languages', {
-        get: () => ['en-US', 'en'],
-        configurable: true,
-      });
-    } catch {}
-
-    // 4. Realistic navigator.plugins
-    try {
-      if (!navigator.plugins || navigator.plugins.length === 0) {
-        Object.defineProperty(navigator, 'plugins', {
-          get: () => [
-            { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-          ],
+      // 3. Realistic navigator.languages
+      try {
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['en-US', 'en'],
           configurable: true,
         });
-      }
-    } catch {}
+      } catch {}
 
-    // 5. Normal permissions query
-    try {
-      if (navigator.permissions && navigator.permissions.query) {
-        const originalQuery = navigator.permissions.query;
-        navigator.permissions.query = (parameters: any) =>
-          parameters && parameters.name === 'notifications'
-            ? Promise.resolve({ state: Notification.permission === 'granted' ? 'granted' : 'default' } as any)
-            : originalQuery.call(navigator.permissions, parameters);
+      // 4. Realistic navigator.plugins (Chromium only)
+      if (engine === 'chromium') {
+        try {
+          if (!navigator.plugins || navigator.plugins.length === 0) {
+            Object.defineProperty(navigator, 'plugins', {
+              get: () => [
+                { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+              ],
+              configurable: true,
+            });
+          }
+        } catch {}
       }
-    } catch {}
 
-    // 6. Platform and User-Agent Data consistency (prevent Linux runner leaking Windows UA mismatch)
-    try {
-      Object.defineProperty(navigator, 'platform', {
-        get: () => 'Win32',
-        configurable: true,
-      });
-      const nav = navigator as any;
-      if (nav.userAgentData) {
-        Object.defineProperty(nav.userAgentData, 'platform', {
-          get: () => 'Windows',
-          configurable: true,
-        });
-        const origGetHEV = nav.userAgentData.getHighEntropyValues;
-        if (typeof origGetHEV === 'function') {
-          nav.userAgentData.getHighEntropyValues = async function (hints: string[]) {
-            const res = await origGetHEV.call(this, hints);
-            return {
-              ...res,
-              platform: 'Windows',
-              platformVersion: '15.0.0',
-              architecture: 'x86',
-              bitness: '64',
-              model: '',
-              mobile: false,
-            };
+      // 5. Normal permissions query
+      try {
+        if (navigator.permissions && navigator.permissions.query) {
+          const originalQuery = navigator.permissions.query;
+          navigator.permissions.query = (parameters: unknown) => {
+            const p = parameters as { name?: string } | undefined;
+            if (p && p.name === 'notifications') {
+              const perm = typeof Notification !== 'undefined' ? Notification.permission : 'default';
+              return Promise.resolve({ state: perm === 'granted' ? 'granted' : 'default' } as PermissionStatus);
+            }
+            return originalQuery.call(navigator.permissions, parameters as PermissionDescriptor);
           };
         }
-      }
-    } catch {}
+      } catch {}
 
-    // 7. WebGL and WebGL2 vendor masking (avoid SwiftShader / llvmpipe software rendering identifiers)
-    try {
-      const getParameter = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function (parameter: number) {
-        // UNMASKED_VENDOR_WEBGL
-        if (parameter === 37445) return 'Google Inc. (Intel)';
-        // UNMASKED_RENDERER_WEBGL
-        if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-        return getParameter.call(this, parameter);
-      };
-      Object.defineProperty(WebGLRenderingContext.prototype.getParameter, 'toString', {
-        value: () => 'function getParameter() { [native code] }',
-      });
-      if (typeof WebGL2RenderingContext !== 'undefined') {
-        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-        WebGL2RenderingContext.prototype.getParameter = function (parameter: number) {
-          if (parameter === 37445) return 'Google Inc. (Intel)';
-          if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-          return getParameter2.call(this, parameter);
-        };
-        Object.defineProperty(WebGL2RenderingContext.prototype.getParameter, 'toString', {
-          value: () => 'function getParameter() { [native code] }',
+      // 6. Platform and User-Agent Data consistency
+      try {
+        Object.defineProperty(navigator, 'platform', {
+          get: () => 'Win32',
+          configurable: true,
         });
-      }
-    } catch {}
+        if (engine === 'chromium') {
+          const nav = navigator as unknown as {
+            userAgentData?: {
+              platform?: string;
+              getHighEntropyValues?: (hints: string[]) => Promise<Record<string, unknown>>;
+            };
+          };
+          if (nav.userAgentData) {
+            Object.defineProperty(nav.userAgentData, 'platform', {
+              get: () => 'Windows',
+              configurable: true,
+            });
+            const origGetHEV = nav.userAgentData.getHighEntropyValues;
+            if (typeof origGetHEV === 'function') {
+              nav.userAgentData.getHighEntropyValues = async function (hints: string[]) {
+                const res = await origGetHEV.call(this, hints);
+                return {
+                  ...res,
+                  platform: 'Windows',
+                  platformVersion: '15.0.0',
+                  architecture: 'x86',
+                  bitness: '64',
+                  model: '',
+                  mobile: false,
+                };
+              };
+            }
+          }
+        }
+      } catch {}
 
-    // 8. Realistic hardware concurrency, device memory, and display metrics
-    try {
-      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
-      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
-      Object.defineProperty(screen, 'availWidth', { get: () => screen.width, configurable: true });
-      Object.defineProperty(screen, 'availHeight', { get: () => screen.height, configurable: true });
-      if (window.outerWidth === 0) {
-        Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth, configurable: true });
-      }
-      if (window.outerHeight === 0) {
-        Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight, configurable: true });
-      }
-      Object.defineProperty(window, 'devicePixelRatio', { get: () => 1, configurable: true });
-    } catch {}
+      // 7. WebGL and WebGL2 vendor masking (avoid SwiftShader / llvmpipe software rendering identifiers)
+      try {
+        if (typeof WebGLRenderingContext !== 'undefined') {
+          const getParameter = WebGLRenderingContext.prototype.getParameter;
+          WebGLRenderingContext.prototype.getParameter = function (parameter: number) {
+            if (parameter === 37445) return 'Google Inc. (Intel)';
+            if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return getParameter.call(this, parameter);
+          };
+          Object.defineProperty(WebGLRenderingContext.prototype.getParameter, 'toString', {
+            value: () => 'function getParameter() { [native code] }',
+          });
+        }
+        if (typeof WebGL2RenderingContext !== 'undefined') {
+          const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+          WebGL2RenderingContext.prototype.getParameter = function (parameter: number) {
+            if (parameter === 37445) return 'Google Inc. (Intel)';
+            if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return getParameter2.call(this, parameter);
+          };
+          Object.defineProperty(WebGL2RenderingContext.prototype.getParameter, 'toString', {
+            value: () => 'function getParameter() { [native code] }',
+          });
+        }
+      } catch {}
 
-    // 9. Media devices mock (real desktop browsers have microphones/speakers)
-    try {
-      if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
-        const origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
-        navigator.mediaDevices.enumerateDevices = async () => {
-          const devs = await origEnum().catch(() => []);
-          if (devs && devs.length > 0) return devs;
-          return [
-            { deviceId: 'default', kind: 'audioinput', label: 'Default - Microphone (Realtek(R) Audio)', groupId: 'group1' },
-            { deviceId: 'default', kind: 'audiooutput', label: 'Default - Speakers (Realtek(R) Audio)', groupId: 'group1' },
-          ] as any;
-        };
-      }
-    } catch {}
-  }).catch(() => undefined);
+      // 8. Realistic hardware concurrency, device memory, and display metrics
+      try {
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
+        Object.defineProperty(screen, 'availWidth', { get: () => screen.width, configurable: true });
+        Object.defineProperty(screen, 'availHeight', { get: () => screen.height, configurable: true });
+        if (window.outerWidth === 0) {
+          Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth, configurable: true });
+        }
+        if (window.outerHeight === 0) {
+          Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight, configurable: true });
+        }
+        Object.defineProperty(window, 'devicePixelRatio', { get: () => 1, configurable: true });
+      } catch {}
+
+      // 9. Media devices mock (real desktop browsers have microphones/speakers)
+      try {
+        if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
+          const origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+          navigator.mediaDevices.enumerateDevices = async () => {
+            const devs = await origEnum().catch(() => []);
+            if (devs && devs.length > 0) return devs;
+            return [
+              { deviceId: 'default', kind: 'audioinput', label: 'Default - Microphone (Realtek(R) Audio)', groupId: 'group1' },
+              { deviceId: 'default', kind: 'audiooutput', label: 'Default - Speakers (Realtek(R) Audio)', groupId: 'group1' },
+            ] as unknown as MediaDeviceInfo[];
+          };
+        }
+      } catch {}
+    },
+    { engine },
+  ).catch(() => undefined);
 }
 
 /**
- * Simulates natural human mouse movement with multi-point interpolation and slight jitter.
+ * Simulates natural human mouse movement using a Cubic Bézier curve
+ * with biomechanical easing and sub-pixel micro-jitter.
  */
 export async function simulateHumanMouseMove(
   page: Page,
   targetX: number,
   targetY: number,
-  steps = 8,
+  steps?: number,
 ): Promise<void> {
   try {
-    const lastPos = (page as any)._lastHumanMousePos ?? { x: 150, y: 150 };
+    const lastPos = (page as unknown as { _lastHumanMousePos?: { x: number; y: number } })._lastHumanMousePos ?? {
+      x: Math.round(150 + Math.random() * 200),
+      y: Math.round(150 + Math.random() * 200),
+    };
     const startX = lastPos.x;
     const startY = lastPos.y;
 
-    for (let i = 1; i <= steps; i++) {
-      const progress = i / steps;
-      // Introduce slight curved trajectory
-      const curve = Math.sin(progress * Math.PI) * 12;
-      const jitterX = (Math.random() - 0.5) * 3;
-      const jitterY = (Math.random() - 0.5) * 3;
+    const dx = targetX - startX;
+    const dy = targetY - startY;
+    const distance = Math.sqrt(dx * dx + dy * dy);
 
-      const currentX = Math.round(startX + (targetX - startX) * progress + jitterX);
-      const currentY = Math.round(startY + (targetY - startY) * progress + curve + jitterY);
+    if (distance < 2) {
+      await page.mouse.move(targetX, targetY).catch(() => {});
+      (page as unknown as { _lastHumanMousePos: { x: number; y: number } })._lastHumanMousePos = { x: targetX, y: targetY };
+      return;
+    }
+
+    const numSteps = steps ?? Math.max(16, Math.min(45, Math.round(distance / 14)));
+
+    // Generate two cubic Bezier control points offset perpendicularly from the chord
+    const angle = Math.atan2(dy, dx);
+    const perpAngle = angle + (Math.random() < 0.5 ? 1 : -1) * (Math.PI / 2);
+    const curveDeviation = Math.min(50, distance * 0.25) * (0.6 + Math.random() * 0.8);
+
+    const cp1x = startX + dx * 0.25 + Math.cos(perpAngle) * curveDeviation * (0.5 + Math.random() * 0.5);
+    const cp1y = startY + dy * 0.25 + Math.sin(perpAngle) * curveDeviation * (0.5 + Math.random() * 0.5);
+
+    const cp2x = startX + dx * 0.75 + Math.cos(perpAngle) * curveDeviation * (0.3 + Math.random() * 0.7);
+    const cp2y = startY + dy * 0.75 + Math.sin(perpAngle) * curveDeviation * (0.3 + Math.random() * 0.7);
+
+    for (let i = 1; i <= numSteps; i++) {
+      const u = i / numSteps;
+      // Smoothstep easing: 3u^2 - 2u^3
+      const t = u * u * (3 - 2 * u);
+
+      const oneMinusT = 1 - t;
+      const b0 = oneMinusT * oneMinusT * oneMinusT;
+      const b1 = 3 * oneMinusT * oneMinusT * t;
+      const b2 = 3 * oneMinusT * t * t;
+      const b3 = t * t * t;
+
+      // Physiological tremor diminishes near target
+      const tremor = (1 - u) * 1.5;
+      const jitterX = (Math.random() - 0.5) * tremor;
+      const jitterY = (Math.random() - 0.5) * tremor;
+
+      const currentX = Math.round(b0 * startX + b1 * cp1x + b2 * cp2x + b3 * targetX + jitterX);
+      const currentY = Math.round(b0 * startY + b1 * cp1y + b2 * cp2y + b3 * targetY + jitterY);
 
       await page.mouse.move(currentX, currentY).catch(() => {});
-      if (steps > 1) {
-        await new Promise((r) => setTimeout(r, 8 + Math.floor(Math.random() * 12)));
+
+      if (numSteps > 1) {
+        const delay = 6 + Math.floor(Math.random() * 10);
+        await new Promise((r) => setTimeout(r, delay));
       }
     }
 
-    (page as any)._lastHumanMousePos = { x: targetX, y: targetY };
+    await page.mouse.move(targetX, targetY).catch(() => {});
+    (page as unknown as { _lastHumanMousePos: { x: number; y: number } })._lastHumanMousePos = { x: targetX, y: targetY };
   } catch {
     // Non-fatal if element or frame detaches
+  }
+}
+
+/**
+ * Executes a human-like click with realistic movement trajectory,
+ * perceptual dwell time, contact hold duration, and post-click settle.
+ */
+export async function simulateHumanClick(
+  page: Page,
+  targetX: number,
+  targetY: number,
+  options: { moveSteps?: number; dwellMs?: number; holdMs?: number } = {},
+): Promise<void> {
+  const dwellMs = options.dwellMs ?? (60 + Math.random() * 80);
+  const holdMs = options.holdMs ?? (60 + Math.random() * 50);
+
+  // 1. Move mouse to target with natural Bezier curve
+  await simulateHumanMouseMove(page, targetX, targetY, options.moveSteps);
+
+  // 2. Pre-click hover dwell time
+  if (dwellMs > 0) {
+    await new Promise((r) => setTimeout(r, dwellMs));
+  }
+
+  // 3. Mouse down
+  await page.mouse.down().catch(() => {});
+
+  // 4. Biological contact hold duration
+  if (holdMs > 0) {
+    await new Promise((r) => setTimeout(r, holdMs));
+  }
+
+  // 5. Mouse up
+  await page.mouse.up().catch(() => {});
+
+  // 6. Post-click settling pause
+  await new Promise((r) => setTimeout(r, 40 + Math.random() * 40));
+}
+
+/**
+ * Detects Cloudflare Turnstile challenge iframes and performs a human-like
+ * cursor approach and click on the verification checkbox.
+ */
+export async function interactWithTurnstileCheckbox(page: Page): Promise<boolean> {
+  try {
+    const iframeLocator = page.locator('iframe[src*="challenges.cloudflare.com"]').first();
+    const count = await iframeLocator.count().catch(() => 0);
+    if (count === 0) return false;
+
+    const isVisible = await iframeLocator.isVisible().catch(() => false);
+    if (!isVisible) return false;
+
+    const box = await iframeLocator.boundingBox().catch(() => null);
+    if (!box || box.width <= 0 || box.height <= 0) return false;
+
+    // Turnstile widget checkbox is located on the left side of the widget:
+    // Approximately 28-38px from the left, vertically centered.
+    const targetX = Math.round(box.x + Math.min(36, box.width * 0.12) + (Math.random() - 0.5) * 6);
+    const targetY = Math.round(box.y + box.height / 2 + (Math.random() - 0.5) * 6);
+
+    await simulateHumanClick(page, targetX, targetY, {
+      dwellMs: 100 + Math.random() * 100,
+      holdMs: 70 + Math.random() * 50,
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
