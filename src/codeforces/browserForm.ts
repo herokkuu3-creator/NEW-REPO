@@ -1,5 +1,15 @@
-import { logger } from '../logger';
 import type { Page, Request, Response } from 'playwright';
+
+
+function log(fields: Record<string, unknown>, msg: string): void {
+  const time = new Date().toISOString();
+  process.stdout.write(`${JSON.stringify({ level: 30, time, service: 'browser-form', ...fields, msg })}\n`);
+}
+
+function logWarn(fields: Record<string, unknown>, msg: string): void {
+  const time = new Date().toISOString();
+  process.stdout.write(`${JSON.stringify({ level: 40, time, service: 'browser-form', ...fields, msg })}\n`);
+}
 
 export interface VerificationFlags {
   turnstile: boolean;
@@ -145,7 +155,7 @@ export async function solveCloudflareWithCapzy(
         };
       }
       if (res?.errorId && res.errorId !== 0) {
-        logger.warn({ taskId: data.taskId, errorId: res.errorId, status: res.status, raw: res }, 'Capzy solve reported error');
+        logWarn({ taskId: data.taskId, errorId: res.errorId, status: res.status, raw: res }, 'Capzy solve reported error');
         break;
       }
     }
@@ -243,7 +253,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
           path: '/',
         }));
       if (cookieList.length > 0) {
-        logger.info({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'ensureFormTurnstile: injecting Capzy Cloudflare clearance cookies');
+        log({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'ensureFormTurnstile: injecting Capzy Cloudflare clearance cookies');
         await page.context().addCookies(cookieList).catch(() => {});
       }
     }
