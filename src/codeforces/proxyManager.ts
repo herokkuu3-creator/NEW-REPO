@@ -319,12 +319,23 @@ export interface ActiveProxyResult {
 export async function resolveActiveProxy(
   options: {
     envSource?: string;
-    tester?: (proxyUrl: string) => Promise<boolean>;
+    tester?: (proxyUrl: string) => Promise<boolean | ProxyTestResult>;
     log?: (msg: string) => void;
   } = {},
 ): Promise<ActiveProxyResult | null> {
   const log = options.log ?? ((msg: string) => logger.info({ msg }, 'codeforces proxy resolver'));
-  const tester = options.tester ?? ((url: string) => testProxyDetailed(url, 12).then((r) => r.ok));
+  const runTest = async (url: string): Promise<ProxyTestResult> => {
+    if (options.tester) {
+      try {
+        const res = await options.tester(url);
+        if (typeof res === 'boolean') return { ok: res, latencyMs: 0, error: res ? undefined : 'tester returned false' };
+        return res;
+      } catch (err) {
+        return { ok: false, latencyMs: 0, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+    return testProxyDetailed(url, 12).catch((err) => ({ ok: false, latencyMs: 0, error: err instanceof Error ? err.message : String(err) }));
+  };
 
   const all = await getAllConfiguredProxies(options.envSource);
   const available = all.filter((p) => !p.isRemoved);
@@ -342,8 +353,8 @@ export async function resolveActiveProxy(
     );
     if (preferredCandidate) {
       log(`Testing preferred proxy #${preferredCandidate.index} (${preferredCandidate.masked})...`);
-      const ok = await tester(preferredCandidate.url).catch(() => false);
-      if (ok) {
+      const testRes = await runTest(preferredCandidate.url);
+      if (testRes.ok) {
         log(`Preferred proxy #${preferredCandidate.index} (${preferredCandidate.masked}) is live! Selected.`);
         const details = extractProxyDetails(preferredCandidate.url);
         return {
@@ -356,7 +367,7 @@ export async function resolveActiveProxy(
         };
       }
       logger.warn(
-        { proxy: preferredCandidate.masked, index: preferredCandidate.index },
+        { proxy: preferredCandidate.masked, index: preferredCandidate.index, error: testRes.error },
         'Preferred Codeforces proxy failed health check. Falling back to pool rotation from beginning.',
       );
       fallbackOccurred = true;
@@ -376,8 +387,8 @@ export async function resolveActiveProxy(
       continue;
     }
     log(`Testing proxy [${candidate.index}/${all.length}] ${candidate.masked}...`);
-    const ok = await tester(candidate.url).catch(() => false);
-    if (ok) {
+    const testRes = await runTest(candidate.url);
+    if (testRes.ok) {
       log(`Proxy [${candidate.index}/${all.length}] ${candidate.masked} is live! Selected.`);
       const details = extractProxyDetails(candidate.url);
       return {
@@ -389,7 +400,7 @@ export async function resolveActiveProxy(
         fallbackOccurred,
       };
     }
-    logger.warn({ proxy: candidate.masked, index: candidate.index }, 'Proxy failed health check, testing next.');
+    logger.warn({ proxy: candidate.masked, index: candidate.index, error: testRes.error }, 'Proxy failed health check, testing next.');
   }
 
   return null;
