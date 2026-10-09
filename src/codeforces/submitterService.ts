@@ -357,8 +357,10 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
   let clickAttemptedAt = 0;
   // Fire Capzy in background to solve the Cloudflare challenge via proxy
   if (proxyUrl) {
+    log({ proxyUrl }, 'waitOutChallenge: firing Capzy background solver');
     void solveCloudflareWithCapzy('https://codeforces.com', proxyUrl).then(async (result) => {
-      if (!result) return;
+      if (!result) { log({}, 'waitOutChallenge: Capzy returned no result'); return; }
+      log({ cookies: Object.keys(result.cookies ?? {}) }, 'waitOutChallenge: Capzy solved successfully, injecting cookies');
       try {
         const context = page.context();
         const cookiesToSet = Object.entries(result.cookies ?? {}).map(([name, value]) => ({
@@ -459,6 +461,7 @@ async function setSelectValue(page: Page, name: string, value: string): Promise<
 }
 
 async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string, proxyUrl?: string): Promise<{ turnstile: boolean; interactive: boolean }> {
+  log({ proxyUrl }, 'fillSubmitForm: starting form fill with proxyUrl');
   log({}, 'waiting for form to settle');
   const settled = await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).then(() => true).catch(() => false);
   if (!settled) {
