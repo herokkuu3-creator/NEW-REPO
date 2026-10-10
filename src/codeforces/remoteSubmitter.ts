@@ -8,6 +8,7 @@ import type { CodeforcesNetworkMode } from './worker';
 import { CODEFORCES_ATTEMPT_MS } from './attempts';
 import { getRemovedProxyHashes, resolveActiveProxy, type ActiveProxyResult } from './proxyManager';
 import { sendTelegramMessage } from '../notifications/telegram';
+import { getCapzyApiKeys, getActiveCapzyKeyIndex, setActiveCapzyKeyIndex } from './capzyKeyManager';
 
 function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -165,6 +166,8 @@ export async function submitViaRemoteSubmitter(
     removedProxies: await getRemovedProxyHashes().catch(() => []),
     attemptDeadline: deadline,
     requiresPostAuthorization: true,
+    capzyApiKeys: await getCapzyApiKeys().catch(() => []),
+    capzyActiveKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
   };
 
   const submittedAt = Math.floor(Date.now() / 1000);
@@ -209,6 +212,10 @@ export async function submitViaRemoteSubmitter(
       ...failed(`the isolated submitter answered HTTP ${response.status} with a body that was not JSON`, false),
       submittedAt,
     };
+  }
+
+  if (body && typeof (body as any).activeCapzyKeyIndex === 'number') {
+    await setActiveCapzyKeyIndex((body as any).activeCapzyKeyIndex).catch(() => {});
   }
 
   const outcome = normalizeOutcome(body, submittedAt, response.status === 202 ? 'GitHub browser' : 'isolated browser');

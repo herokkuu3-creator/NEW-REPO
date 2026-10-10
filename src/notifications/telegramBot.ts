@@ -57,6 +57,16 @@ import {
 } from '../codeforces/proxyManager';
 import { testProxyDetailed, type ProxyTestResult } from '../codeforces/proxyRotator';
 import {
+  saveCapzyApiKeys,
+  getCapzyApiKeys,
+  getActiveCapzyKeyIndex,
+  checkCapzyKeyBalance,
+  maskApiKey,
+  isLikelyCapzyKey,
+  type KeyBalanceResult,
+} from '../codeforces/capzyKeyManager';
+
+import {
   isRunInProgress,
   runSubmissionNow,
   triggerRun,
@@ -133,10 +143,11 @@ interface TgUpdate {
 
 export type InlineButton = { text: string; callback_data: string };
 
-export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | null;
+export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | 'capzy' | null;
 let pendingPromptType: PendingPromptType = null;
 let pendingRangePrompt = false;
 let pendingQueuePrompt = false;
+let pendingCapzyPrompt = false;
 
 export function getPendingPromptType(): PendingPromptType {
   return pendingPromptType;
@@ -146,6 +157,22 @@ export function setPendingPromptType(val: PendingPromptType): void {
   pendingPromptType = val;
   pendingRangePrompt = val === 'leetcode';
   pendingQueuePrompt = val === 'queue';
+  pendingCapzyPrompt = val === 'capzy';
+}
+
+export function isPendingCapzyPrompt(): boolean {
+  return pendingCapzyPrompt;
+}
+
+export function setPendingCapzyPrompt(val: boolean): void {
+  pendingCapzyPrompt = val;
+  if (val) {
+    pendingPromptType = 'capzy';
+    pendingRangePrompt = false;
+    pendingQueuePrompt = false;
+  } else if (pendingPromptType === 'capzy') {
+    pendingPromptType = null;
+  }
 }
 
 export function isPendingQueuePrompt(): boolean {
@@ -157,6 +184,7 @@ export function setPendingQueuePrompt(val: boolean): void {
   if (val) {
     pendingPromptType = 'queue';
     pendingRangePrompt = false;
+    pendingCapzyPrompt = false;
   } else if (pendingPromptType === 'queue') {
     pendingPromptType = null;
   }
@@ -200,6 +228,10 @@ export const HELP_TEXT = [
   '├ /restoreproxies — Reset blacklist &amp; restore all proxies',
   '├ /syncproxies — Sync proxies from GitHub Actions runner',
   '└ /cfnetwork — Switch network mode (Proxy / Tailscale)',
+  '',
+  '<b>🧩 𝗖𝗔𝗣𝗧𝗖𝗛𝗔 𝗦𝗢𝗟𝗩𝗘𝗥</b>',
+  '├ /capsolver — Configure Capzy/CapSolver API keys (multi-key rotation)',
+  '└ /capsolverstatus — Check current solver API keys &amp; balances',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ /codechef — Run daily CodeChef submission',
@@ -447,6 +479,18 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     }
   }
 
+  // Handle active Capzy / CapSolver key prompt
+  if (pendingCapzyPrompt) {
+    if (text === '/cancel' || lowerText === 'cancel') {
+      pendingCapzyPrompt = false;
+      pendingPromptType = null;
+      await reply('✖️ CapSolver key setup cancelled.');
+      return;
+    }
+    await handleCapSolverCommand(text);
+    return;
+  }
+
   if (text.startsWith('/')) {
     const { command: cmd, arg: commandArg } = extractTelegramCommand(text);
     switch (cmd) {
@@ -625,6 +669,23 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/restoreproxy':
         await handleRestoreProxiesCommand();
         return;
+      case '/capsolver':
+      case '/capsolverkey':
+      case '/capsolverkeys':
+      case '/capzy':
+      case '/capzykey':
+      case '/capzykeys':
+      case '/solverkey':
+      case '/solverkeys':
+      case '/setsolver':
+      case '/setcapsolver':
+        await handleCapSolverCommand(commandArg);
+        return;
+      case '/capsolverstatus':
+      case '/capzystatus':
+      case '/solverstatus':
+        await replyHtml(await formatCapzyStatusMessage());
+        return;
       case '/cfaccounts':
       case '/cf_accounts':
         await replyHtml(await codeforcesAccountsText());
@@ -722,6 +783,11 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         pendingRenewalLabel = undefined;
         pendingRangePrompt = false;
         pendingPromptType = null;
+        if (pendingCapzyPrompt) {
+          pendingCapzyPrompt = false;
+          await reply('✖️ CapSolver key setup cancelled.');
+          return;
+        }
         if (pendingQueuePrompt) {
           pendingQueuePrompt = false;
           await reply('✖️ Command queuing cancelled.');
@@ -742,7 +808,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /startqueue, /queuestatus, /clearqueue, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /capsolver, /capsolverstatus, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /startqueue, /queuestatus, /clearqueue, /cancel, /help');
         return;
     }
   }
@@ -771,6 +837,12 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       await handleQuestionRangeCommand(text);
       return;
     }
+  }
+
+  // Non-command message: check if it's pasted Capzy / CapSolver API key(s)
+  if (!msg.document && isLikelyCapzyKey(text)) {
+    await handleCapSolverCommand(text);
+    return;
   }
 
   // Non-command message: check if it's pasted proxy list first
@@ -2412,6 +2484,114 @@ export async function handleProxyButton(
     );
     return;
   }
+}
+
+export async function formatCapzyStatusMessage(): Promise<string> {
+  const keys = await getCapzyApiKeys();
+  if (keys.length === 0) {
+    return [
+      '🧩 <b>CapSolver / Capzy Configuration</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+      '⚠️ <i>No CapSolver/Capzy API keys configured in database.</i>',
+      '',
+      'To configure API key(s), run:',
+      '<code>/capsolver &lt;key1, key2, ...&gt;</code>',
+      'or send <code>/capsolver</code> and enter your keys.',
+    ].join('\n');
+  }
+
+  const activeIdx = await getActiveCapzyKeyIndex();
+  const lines: string[] = [
+    '🧩 <b>CapSolver / Capzy Configuration</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    `Total configured keys: <b>${keys.length}</b>`,
+    `Active key: <b>#${activeIdx + 1} (${escapeHtml(maskApiKey(keys[activeIdx] ?? ''))})</b>`,
+    '',
+    '<b>API Key Status & Balances:</b>',
+  ];
+
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i]!;
+    const masked = maskApiKey(key);
+    const isActive = i === activeIdx;
+    const bal = await checkCapzyKeyBalance(key);
+    const tag = isActive ? ' <b>[ACTIVE]</b>' : (i < activeIdx ? ' <i>(exhausted/prior)</i>' : '');
+    if (bal.ok && bal.balance > 0) {
+      lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ✅ $${bal.balance.toFixed(4)}${tag}`);
+    } else {
+      const errDesc = bal.error || (bal.balance <= 0 ? 'zero balance' : 'error');
+      lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ❌ ${escapeHtml(errDesc)}${tag}`);
+    }
+  }
+
+  lines.push('');
+  lines.push('💡 <i>Automatic key rotation: if the active key runs out of funds or errors, the bot automatically switches to the next working key and keeps track of it.</i>');
+  return lines.join('\n');
+}
+
+export async function handleCapSolverCommand(commandArg?: string): Promise<void> {
+  const arg = (commandArg ?? '').trim();
+  if (arg) {
+    pendingCapzyPrompt = false;
+    pendingPromptType = null;
+    await reply('⏳ Verifying and saving CapSolver/Capzy API keys...');
+    const saveResult = await saveCapzyApiKeys(arg);
+    if (!saveResult.ok || saveResult.keys.length === 0) {
+      await replyHtml(`❌ <b>Failed to save API keys:</b> ${escapeHtml(saveResult.error ?? 'Invalid input')}`);
+      return;
+    }
+
+    const activeIdx = await getActiveCapzyKeyIndex();
+    const lines: string[] = [
+      '🧩 <b>CapSolver / Capzy API Keys Saved</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+      `Saved <b>${saveResult.keys.length}</b> key(s) to database.`,
+      `Active key: <b>#${activeIdx + 1} (${escapeHtml(maskApiKey(saveResult.keys[activeIdx] ?? ''))})</b>`,
+      '',
+      '<b>Validation Results:</b>',
+    ];
+
+    for (let i = 0; i < saveResult.keys.length; i++) {
+      const key = saveResult.keys[i]!;
+      const masked = maskApiKey(key);
+      const bal = saveResult.balances[i];
+      const isActive = i === activeIdx;
+      const tag = isActive ? ' <b>[ACTIVE]</b>' : '';
+      if (bal && bal.ok && bal.balance > 0) {
+        lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ✅ $${bal.balance.toFixed(4)}${tag}`);
+      } else {
+        const errDesc = bal?.error || 'Zero balance / invalid';
+        lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ⚠️ ${escapeHtml(errDesc)}${tag}`);
+      }
+    }
+
+    lines.push('');
+    lines.push('🔄 <i>Automatic rotation is active: if a key runs out of funds or errors, solving immediately continues with the next key and persists the active state.</i>');
+    await replyHtml(lines.join('\n'));
+    return;
+  }
+
+  // If no argument provided: prompt user
+  pendingCapzyPrompt = true;
+  pendingPromptType = 'capzy';
+  pendingRangePrompt = false;
+  pendingQueuePrompt = false;
+
+  const currentStatus = await formatCapzyStatusMessage();
+  const promptMsg = [
+    currentStatus,
+    '',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    '🔑 <b>Enter New API Key(s)</b>',
+    '',
+    'Please send your API key(s) in your next message.',
+    'You can enter a single key or comma-separated multiple keys:',
+    '<code>capzy_xxx..., capzy_yyy...</code>',
+    '',
+    'Send /cancel to abort.',
+  ].join('\n');
+
+  await replyHtml(promptMsg);
 }
 
 /** One account per button, followed by the explicit all-accounts choice. */

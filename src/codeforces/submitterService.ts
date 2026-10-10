@@ -26,6 +26,7 @@ import http from 'node:http';
 import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy, getDefaultUserAgent } from './browserForm';
+import { initCapzyKeys, getActiveCapzyKeyIndex } from './capzyKeyManager';
 import { applyStealthScripts, interactWithTurnstileCheckbox } from '../browser/stealth';
 import { parseProxyList } from './proxyRotator';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
@@ -76,6 +77,8 @@ interface SubmitRequest {
   state: { cookies: unknown[]; origins?: unknown[] };
   networkMode?: 'proxy' | 'tailscale';
   proxy?: string;
+  capzyApiKeys?: string[];
+  capzyActiveKeyIndex?: number;
 }
 
 interface SubmitResponse {
@@ -88,6 +91,7 @@ interface SubmitResponse {
   turnstile: boolean;
   interactive: boolean;
   updatedCookies?: unknown[];
+  activeCapzyKeyIndex?: number;
 }
 
 let busy = false;
@@ -379,7 +383,7 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
   return names.length > 0 ? names.join(', ') : '(no named fields)';
 }
 
-async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxyUrl?: string): Promise<boolean> {
+async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxyUrl?: string, overrideKeys?: string[]): Promise<boolean> {
   if (timeoutMs === 0 || typeof page.context !== 'function') return false;
   const deadline = Date.now() + timeoutMs;
   let clickAttemptedAt = 0;
@@ -390,7 +394,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
     void (async () => {
       try {
         const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-        const result = await solveCloudflareWithCapzy(page.url() || 'https://codeforces.com', proxyUrl, userAgent, Math.min(10_000, timeoutMs));
+        const result = await solveCloudflareWithCapzy(page.url() || 'https://codeforces.com', proxyUrl, userAgent, Math.min(10_000, timeoutMs), undefined, undefined, undefined, overrideKeys);
         if (result?.cookies && Object.keys(result.cookies).length > 0) {
           const cookiesToSet = Object.entries(result.cookies)
             .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
@@ -453,7 +457,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
   return false;
 }
 
-export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl?: string): Promise<void> {
+export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl?: string, overrideKeys?: string[]): Promise<void> {
   const paths = candidates(entry);
   const attempts: string[] = [];
 
@@ -469,7 +473,7 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
         throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
       }
       if (status === 403 || status === 503) {
-        const cleared = await waitOutChallenge(page, undefined, proxyUrl);
+        const cleared = await waitOutChallenge(page, undefined, proxyUrl, overrideKeys);
         if (cleared) {
           const fields = await readFields(page);
           if (hasSubmitForm(fields)) {
@@ -494,7 +498,7 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
       }
       const body = await readBody(page);
       if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
-        const cleared = await waitOutChallenge(page, undefined, proxyUrl);
+        const cleared = await waitOutChallenge(page, undefined, proxyUrl, overrideKeys);
         if (cleared) {
           const fields = await readFields(page);
           if (hasSubmitForm(fields)) {
@@ -557,7 +561,7 @@ async function setSelectValue(page: Page, name: string, value: string): Promise<
   await page.locator(`select[name="${name}"]`).first().selectOption(value, { force: true, timeout: 20_000 });
 }
 
-async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string, proxyUrl?: string): Promise<{ turnstile: boolean; interactive: boolean }> {
+async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string, proxyUrl?: string, overrideKeys?: string[]): Promise<{ turnstile: boolean; interactive: boolean }> {
   log({ proxyUrl }, 'fillSubmitForm: starting form fill with proxyUrl');
   log({}, 'waiting for form to settle');
   const settled = await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).then(() => true).catch(() => false);
@@ -639,7 +643,7 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string, p
   if (!token) throw new Error(`Codeforces ${csrfName} is empty — the submit page was not served correctly`);
 
   log({}, 'checking turnstile');
-  return ensureFormTurnstile(page, TURNSTILE_WAIT_MS, proxyUrl);
+  return ensureFormTurnstile(page, TURNSTILE_WAIT_MS, proxyUrl, overrideKeys);
 }
 
 function compactBodyError(body: string): string {
@@ -655,6 +659,10 @@ function isAlreadySubmittedCodeError(error: string | null | undefined): boolean 
 }
 
 export async function submit(request: SubmitRequest, authorizePost?: () => Promise<boolean>): Promise<SubmitResponse> {
+  if (request.capzyApiKeys && request.capzyApiKeys.length > 0) {
+    initCapzyKeys(request.capzyApiKeys, request.capzyActiveKeyIndex);
+  }
+
   // Leave one minute for result delivery and browserless judge polling.
   const deadline = Math.min(Date.now() + 7 * 60_000,
     typeof request.attemptDeadline === 'number' ? request.attemptDeadline - 60_000 : Infinity);
@@ -672,6 +680,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
       clicked: false,
       turnstile: false,
       interactive: false,
+      activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
     };
   }
 
@@ -687,8 +696,8 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
     void session.browser.close().catch(() => undefined);
   }, Math.max(1, deadline - Date.now()));
   try {
-    await openSubmitForm(session.page, request.entry, request.proxy);
-    const ts = await fillSubmitForm(session.page, request.entry, request.code, request.proxy);
+    await openSubmitForm(session.page, request.entry, request.proxy, request.capzyApiKeys);
+    const ts = await fillSubmitForm(session.page, request.entry, request.code, request.proxy, request.capzyApiKeys);
     flags.turnstile = ts.turnstile;
     flags.interactive = ts.interactive;
 
@@ -707,6 +716,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
         status: click.status,
         finalUrl: session.page.url(),
         clicked: false,
+        activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
         ...flags,
       };
     }
@@ -715,7 +725,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
     let body = await readBody(session.page);
     let finalUrl = session.page.url();
     if (click.status === 403 || click.status === 503 || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl) || /__cf_chl/i.test(finalUrl)) {
-      const cleared = await waitOutChallenge(session.page, undefined, request.proxy);
+      const cleared = await waitOutChallenge(session.page, undefined, request.proxy, request.capzyApiKeys);
       body = await readBody(session.page);
       finalUrl = session.page.url();
       if (!cleared || CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
@@ -812,9 +822,9 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
           ? 'Codeforces required Cloudflare Turnstile challenge on submission; acceptance was prevented.'
           : 'Codeforces did not redirect to submission history after the POST; acceptance is uncertain and the POST was not retried.';
       const kind = (rejectionError || isDuplicate) ? 'submission-error' : (pageInfo.hasTurnstile ? 'blocked' : 'submission-error');
-      return { ok: false, kind, error: errorMsg, status: click.status, finalUrl, clicked: true, updatedCookies: latestCookies, ...flags };
+      return { ok: false, kind, error: errorMsg, status: click.status, finalUrl, clicked: true, updatedCookies: latestCookies, activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0), ...flags };
     }
-    return { ok: true, status: click.status, finalUrl, clicked: true, updatedCookies: latestCookies, ...flags };
+    return { ok: true, status: click.status, finalUrl, clicked: true, updatedCookies: latestCookies, activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0), ...flags };
   } catch (err) {
     if (expired) throw new BrowserFormError('Browser attempt timed out and was closed.', clickStarted ? 'submission-error' : 'blocked', flags, clickStarted);
     if (err instanceof BrowserFormError) {

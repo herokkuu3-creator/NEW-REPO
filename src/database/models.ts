@@ -98,6 +98,8 @@ export const SystemKeys = {
   codeforcesRemovedProxies: 'codeforcesRemovedProxies', // JSON string[] of blacklisted proxy hashes or URLs
   codeforcesCustomProxies: 'codeforcesCustomProxies', // JSON string[] of user-added proxy URLs
   codeforcesPreferredProxy: 'codeforcesPreferredProxy', // string (proxy URL or hash/identifier)
+  capzyApiKeys: 'capzyApiKeys', // JSON string[] of Capzy / CapSolver API keys
+  capzyActiveKeyIndex: 'capzyActiveKeyIndex', // string of active key index ('0', '1', ...)
 } as const;
 
 /**
