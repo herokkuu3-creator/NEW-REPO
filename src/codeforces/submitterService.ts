@@ -382,36 +382,29 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
   const deadline = Date.now() + timeoutMs;
   let clickAttemptedAt = 0;
 
+  let capzyRunning = false;
   if (proxyUrl) {
-    try {
-      const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-      log({ proxyUrl, userAgent }, 'waitOutChallenge: requesting Capzy solve');
-      const result = await solveCloudflareWithCapzy(page.url() || 'https://codeforces.com', proxyUrl, userAgent, 30_000);
-      if (result?.cookies && Object.keys(result.cookies).length > 0) {
-        const cookiesToSet = Object.entries(result.cookies)
-          .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
-          .map(([name, value]) => ({
-            name, value: String(value), domain: '.codeforces.com', path: '/',
-          }));
-        if (cookiesToSet.length > 0) {
-          log({ count: cookiesToSet.length, names: cookiesToSet.map(c => c.name) }, 'waitOutChallenge: injecting Capzy Cloudflare cookies');
-          await page.context().addCookies(cookiesToSet).catch(() => undefined);
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
-          await sleep(2_000);
-          let settled = false;
-          try {
-            const loc = page.locator('#body, #pageContent, form:has(textarea[name="source"])');
-            settled = typeof loc?.count === 'function' && ((await loc.count().catch(() => 0)) > 0);
-          } catch {}
-          if (settled) {
-            log({}, 'waitOutChallenge: Codeforces body visible after Capzy reload!');
-            return true;
+    capzyRunning = true;
+    void (async () => {
+      try {
+        const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
+        const result = await solveCloudflareWithCapzy(page.url() || 'https://codeforces.com', proxyUrl, userAgent, Math.min(10_000, timeoutMs));
+        if (result?.cookies && Object.keys(result.cookies).length > 0) {
+          const cookiesToSet = Object.entries(result.cookies)
+            .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+            .map(([name, value]) => ({
+              name, value: String(value), domain: '.codeforces.com', path: '/',
+            }));
+          if (cookiesToSet.length > 0) {
+            log({ count: cookiesToSet.length }, 'waitOutChallenge: injecting Capzy Cloudflare cookies');
+            await page.context().addCookies(cookiesToSet).catch(() => undefined);
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => undefined);
           }
         }
+      } catch {} finally {
+        capzyRunning = false;
       }
-    } catch (err) {
-      logError({ err: errorMessage(err) }, 'waitOutChallenge: Capzy attempt failed');
-    }
+    })();
   }
 
   while (Date.now() < deadline) {
@@ -422,7 +415,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
     } catch {}
     if (isCodeforces) return true;
 
-    if (Date.now() > clickAttemptedAt + 4_000) {
+    if (Date.now() > clickAttemptedAt + 2_500) {
       clickAttemptedAt = Date.now();
       try {
         const handled = await interactWithTurnstileCheckbox(page);
@@ -437,7 +430,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
-    await sleep(Math.min(1_000, Math.max(10, remaining)));
+    await sleep(Math.min(500, Math.max(10, remaining)));
   }
   return false;
 }
@@ -457,14 +450,28 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
       if (/\/enter(?:[/?#]|$)/i.test(finalUrl)) {
         throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
       }
-      if ((status === 403 || status === 503) && !(await waitOutChallenge(page, undefined, proxyUrl))) {
-        throw new BrowserFormError(`Codeforces verification did not complete (HTTP ${status}). The current solution remains pending.`, 'blocked');
+      if (status === 403 || status === 503) {
+        if (await waitOutChallenge(page, undefined, proxyUrl)) {
+          const fields = await readFields(page);
+          if (hasSubmitForm(fields)) {
+            log({ path, fields: summarize(fields) }, 'Codeforces submit form opened after HTTP 403 challenge cleared');
+            return;
+          }
+        }
+        attempts.push(`${path}: HTTP ${status} (Cloudflare challenge)`);
+        continue;
       }
       const body = await readBody(page);
       if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
-        if (!(await waitOutChallenge(page, undefined, proxyUrl))) {
-          throw new BrowserFormError('Codeforces verification did not complete. The current solution remains pending.', 'blocked');
+        if (await waitOutChallenge(page, undefined, proxyUrl)) {
+          const fields = await readFields(page);
+          if (hasSubmitForm(fields)) {
+            log({ path, fields: summarize(fields) }, 'Codeforces submit form opened after challenge cleared');
+            return;
+          }
         }
+        attempts.push(`${path}: Cloudflare challenge did not clear`);
+        continue;
       }
       const fields = await readFields(page);
       if (hasSubmitForm(fields)) {
@@ -479,7 +486,7 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
   }
 
   const message = `Codeforces submit form could not be opened for ${entry.contestId}/${entry.problemIndex} — ${attempts.join(' | ')}`;
-  throw new Error(message);
+  throw new BrowserFormError(message, 'blocked');
 }
 
 /**
