@@ -97,14 +97,35 @@ let busy = false;
 // so both services' output reads consistently in the Render log view.
 // ---------------------------------------------------------------------------
 
+const LOG_BUFFER_SIZE = 1000;
+export const logRingBuffer: Array<{ level: number; time: string; service: string; msg: string; [key: string]: unknown }> = [];
+
+function appendLog(entry: { level: number; time: string; service: string; msg: string; [key: string]: unknown }): void {
+  logRingBuffer.push(entry);
+  if (logRingBuffer.length > LOG_BUFFER_SIZE) {
+    logRingBuffer.shift();
+  }
+}
+
 function log(fields: Record<string, unknown>, msg: string): void {
   const time = new Date().toISOString();
-  process.stdout.write(`${JSON.stringify({ level: 30, time, service: 'codeforces-submit-browser', ...fields, msg })}\n`);
+  const entry = { level: 30, time, service: 'codeforces-submit-browser', ...fields, msg };
+  appendLog(entry);
+  process.stdout.write(`${JSON.stringify(entry)}\n`);
+}
+
+function logWarn(fields: Record<string, unknown>, msg: string): void {
+  const time = new Date().toISOString();
+  const entry = { level: 40, time, service: 'codeforces-submit-browser', ...fields, msg };
+  appendLog(entry);
+  process.stdout.write(`${JSON.stringify(entry)}\n`);
 }
 
 function logError(fields: Record<string, unknown>, msg: string): void {
   const time = new Date().toISOString();
-  process.stdout.write(`${JSON.stringify({ level: 50, time, service: 'codeforces-submit-browser', ...fields, msg })}\n`);
+  const entry = { level: 50, time, service: 'codeforces-submit-browser', ...fields, msg };
+  appendLog(entry);
+  process.stdout.write(`${JSON.stringify(entry)}\n`);
 }
 
 function errorMessage(err: unknown): string {
@@ -578,6 +599,10 @@ function compactBodyError(body: string): string {
   return useful?.slice(0, 500) ?? 'Codeforces rejected the submission form';
 }
 
+function isAlreadySubmittedCodeError(error: string | null | undefined): boolean {
+  return /exactly the same code|same code before|already submitted/i.test(error ?? '');
+}
+
 export async function submit(request: SubmitRequest, authorizePost?: () => Promise<boolean>): Promise<SubmitResponse> {
   // Leave one minute for result delivery and browserless judge polling.
   const deadline = Math.min(Date.now() + 7 * 60_000,
@@ -695,21 +720,48 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
     const latestCookies = await session.page.context().cookies().catch(() => []) as unknown[];
     if (!isSubmissionHistory(finalUrl)) {
       const pageInfo = await session.page.evaluate(() => {
-        const errorEl = document.querySelector('.error, .alert, .field-error, span[class*="error"], div[class*="error"], .notice');
-        const hasTurnstile = !!document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
+        const errorSelectors = [
+          '.error',
+          '.alert',
+          '.alert-error',
+          '.field-error',
+          '.error__desc',
+          'span.for__source',
+          'span.for__programTypeId',
+          'span.for__submittedProblemIndex',
+          'span[class*="error"]',
+          'div[class*="error"]',
+          'p[class*="error"]',
+          '.notice',
+        ];
+        const errorEls = Array.from(document.querySelectorAll(errorSelectors.join(', ')));
+        const errorText = errorEls
+          .map((el) => (el as HTMLElement).innerText || el.textContent || '')
+          .map((t) => t.trim())
+          .filter((t) => t.length > 0 && !/^\s*$/.test(t))
+          .join('; ');
+
+        // An active Turnstile challenge must have an actual Cloudflare challenge iframe,
+        // NOT merely the empty template container <div class="cf-turnstile">.
+        const challengeIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+        const hasActiveTurnstile = !!challengeIframe;
+
         return {
-          errorText: errorEl?.textContent?.trim() || '',
-          hasTurnstile,
+          errorText,
+          hasTurnstile: hasActiveTurnstile,
         };
       }).catch(() => ({ errorText: '', hasTurnstile: false }));
 
-      const rejectionError = pageInfo.errorText || (REJECTION_RE.test(body) ? compactBodyError(body) : '');
+      const visibleBody = await readBody(session.page);
+      const rejectionError = pageInfo.errorText || (REJECTION_RE.test(visibleBody) ? compactBodyError(visibleBody) : '');
+      const isDuplicate = isAlreadySubmittedCodeError(rejectionError || visibleBody);
       const errorMsg = rejectionError
-        ? `Codeforces rejected submission: ${rejectionError}`
+        ? (isDuplicate ? rejectionError : `Codeforces rejected submission: ${rejectionError}`)
         : pageInfo.hasTurnstile
           ? 'Codeforces required Cloudflare Turnstile challenge on submission; acceptance was prevented.'
           : 'Codeforces did not redirect to submission history after the POST; acceptance is uncertain and the POST was not retried.';
-      return { ok: false, kind: pageInfo.hasTurnstile ? 'blocked' : 'submission-error', error: errorMsg, status: click.status, finalUrl, clicked: true, updatedCookies: latestCookies, ...flags };
+      const kind = (rejectionError || isDuplicate) ? 'submission-error' : (pageInfo.hasTurnstile ? 'blocked' : 'submission-error');
+      return { ok: false, kind, error: errorMsg, status: click.status, finalUrl, clicked: true, updatedCookies: latestCookies, ...flags };
     }
     return { ok: true, status: click.status, finalUrl, clicked: true, updatedCookies: latestCookies, ...flags };
   } catch (err) {
@@ -779,6 +831,33 @@ export const server = http.createServer((req, res) => {
     } else {
       res.end(body);
     }
+    return;
+  }
+
+  if (req.method === 'GET' && (url === '/logs' || url.startsWith('/logs?'))) {
+    const query = new URL(url, 'http://localhost').searchParams;
+    const limit = Math.min(1000, Math.max(1, parseInt(query.get('limit') || '200', 10)));
+    let entries = logRingBuffer.slice(-limit);
+    const lvl = query.get('level');
+    if (lvl) {
+      const minLevel = parseInt(lvl, 10);
+      if (!isNaN(minLevel)) {
+        entries = entries.filter((e) => typeof e.level === 'number' && e.level >= minLevel);
+      }
+    }
+    if (query.get('format') === 'text') {
+      res.writeHead(200, {
+        'content-type': 'text/plain; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(
+        entries
+          .map((e) => `[${e.time}] [${e.level === 50 ? 'ERROR' : e.level === 40 ? 'WARN' : 'INFO'}] ${e.msg} ${JSON.stringify(e)}`)
+          .join('\n'),
+      );
+      return;
+    }
+    json(res, 200, { ok: true, count: entries.length, logs: entries });
     return;
   }
 

@@ -412,15 +412,14 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   // 1. If token already exists, verification is satisfied immediately
   if (await hasToken()) return { turnstile: true, interactive: false };
 
-  // 2. Grace period check: allow up to 1000ms for delayed native token or Turnstile iframe/disabling.
+  // 2. Grace period check: allow up to 1000ms for delayed native token or Turnstile iframe appearance.
   // If no iframe appears, no token is issued, and submit button remains enabled,
   // Turnstile is inactive/not required (e.g. older/rated accounts).
   const graceDeadline = Date.now() + Math.min(1_000, timeoutMs);
   while (Date.now() < graceDeadline) {
     if (await hasToken()) return { turnstile: true, interactive: false };
     const hasIframeNow = (await challengeIframe.count().catch(() => 0)) > 0;
-    const isControlEnabled = await control.isEnabled().catch(() => false);
-    if (hasIframeNow || !isControlEnabled) break;
+    if (hasIframeNow) break;
     await new Promise((r) => setTimeout(r, 20));
   }
 
@@ -739,6 +738,7 @@ export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{
 export function isSubmissionHistory(url: string): boolean {
   try {
     const parsed = new URL(url);
-    return parsed.hostname === 'codeforces.com' && /^\/(?:contest\/\d+\/my|gym\/\d+\/my|problemset\/status)\/?$/.test(parsed.pathname);
+    if (parsed.hostname !== 'codeforces.com') return false;
+    return /^\/(?:contest\/\d+\/(?:my|status|submission\/\d+)|gym\/\d+\/(?:my|status)|problemset\/(?:status|submission\/\d+\/\d+)|submissions(?:\/[a-zA-Z0-9_.-]+)?)\/?$/.test(parsed.pathname);
   } catch { return false; }
 }

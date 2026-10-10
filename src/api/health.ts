@@ -3,7 +3,7 @@ import path from 'node:path';
 import Fastify, { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config';
-import { logger } from '../logger';
+import { logger, logRingBuffer } from '../logger';
 import { AccountStatus } from '@prisma/client';
 import {
   getAllSystemState,
@@ -468,6 +468,25 @@ export async function startHealthServer(
     }
     const raw = await getSystemState(SystemKeys.lastReport);
     return { report: safeJson(raw) };
+  });
+
+  app.get('/logs', async (req, reply) => {
+    const query = req.query as { limit?: string; format?: string; level?: string };
+    const limit = Math.min(1000, Math.max(1, parseInt(query?.limit || '200', 10)));
+    let entries = logRingBuffer.slice(-limit);
+    if (query?.level) {
+      const minLevel = parseInt(query.level, 10);
+      if (!isNaN(minLevel)) {
+        entries = entries.filter((e) => typeof e.level === 'number' && e.level >= minLevel);
+      }
+    }
+    if (query?.format === 'text') {
+      reply.header('content-type', 'text/plain; charset=utf-8');
+      return entries
+        .map((e) => `[${e.time ?? ''}] [${e.level ?? ''}] ${e.msg ?? ''} ${JSON.stringify(e)}`)
+        .join('\n');
+    }
+    return { ok: true, count: entries.length, logs: entries };
   });
 
   const port = config.api.port;
