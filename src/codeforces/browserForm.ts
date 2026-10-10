@@ -378,7 +378,6 @@ async function injectTurnstileToken(form: ReturnType<Page['locator']>, token: st
 
 export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUrl?: string): Promise<VerificationFlags> {
   const form = page.locator('form:has(textarea[name="source"])').first();
-  const cfTurnstileDiv = page.locator('.cf-turnstile');
   const challengeIframe = page.locator('iframe[src*="challenges.cloudflare.com"]');
   const control = form.locator('input[type="submit"], button[type="submit"], button:not([type])').first();
 
@@ -412,115 +411,145 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   // 1. If token already exists, verification is satisfied immediately
   if (await hasToken()) return { turnstile: true, interactive: false };
 
-  // 2. Grace period check: allow up to 1000ms for delayed native token or Turnstile iframe appearance.
-  // If no iframe appears, no token is issued, and submit button remains enabled,
-  // Turnstile is inactive/not required (e.g. older/rated accounts).
+  // 2. Check if a Turnstile widget or sitekey is present on the page
+  const checkWidgetPresent = async (): Promise<boolean> => {
+    return page.evaluate(() => {
+      const win = window as any;
+      const el = document.querySelector('.cf-turnstile, [data-sitekey]');
+      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+      const script = document.querySelector('script[src*="turnstile"]');
+      const sitekey = win.__turnstileSitekey || el?.getAttribute('data-sitekey') || (el as HTMLElement | null)?.dataset?.sitekey;
+      return !!(el || iframe || script || win.turnstile || sitekey);
+    }).catch(() => false);
+  };
+
   const graceDeadline = Date.now() + Math.min(1_000, timeoutMs);
   while (Date.now() < graceDeadline) {
     if (await hasToken()) return { turnstile: true, interactive: false };
-    const hasIframeNow = (await challengeIframe.count().catch(() => 0)) > 0;
-    if (hasIframeNow) break;
+    if (await checkWidgetPresent()) break;
     await new Promise((r) => setTimeout(r, 20));
   }
 
   if (await hasToken()) return { turnstile: true, interactive: false };
 
-  const hasIframeAfterGrace = (await challengeIframe.count().catch(() => 0)) > 0;
-  const isControlEnabledAfterGrace = await control.isEnabled().catch(() => false);
-  if (!hasIframeAfterGrace && isControlEnabledAfterGrace) {
+  const isWidgetPresent = await checkWidgetPresent();
+  const isControlEnabled = await control.isEnabled().catch(() => false);
+  if (!isWidgetPresent && isControlEnabled) {
     return { turnstile: false, interactive: false };
   }
 
-  // 4. Turnstile is actively required or blocking the submit button
-  const widgetInfo = await page.evaluate(() => {
-    const win = window as any;
-    const element = document.querySelector('.cf-turnstile[data-sitekey], [data-sitekey]');
-    const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
-    let sitekey = (typeof win.__turnstileSitekey === 'string' && win.__turnstileSitekey ? win.__turnstileSitekey : null) ??
-      element?.getAttribute('data-sitekey') ??
-      /["']?sitekey["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1] ?? null;
-    let action = (typeof win.__turnstileAction === 'string' && win.__turnstileAction ? win.__turnstileAction : null) ??
-      element?.getAttribute('data-action') ??
-      /["']?action["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1] ?? null;
-    let cdata = (typeof win.__turnstileCdata === 'string' && win.__turnstileCdata ? win.__turnstileCdata : null) ??
-      element?.getAttribute('data-cdata') ??
-      /["']?cdata["']?\s*:\s*["']([^"']+)["']/.exec(inline)?.[1] ?? null;
-    let callback = (typeof win.__turnstileCallback === 'string' && win.__turnstileCallback ? win.__turnstileCallback : null) ??
-      element?.getAttribute('data-callback') ?? null;
+  // 3. A Turnstile widget IS present. Extract sitekey and launch background solver.
+  const extractWidgetInfo = async () => {
+    return page.evaluate(() => {
+      const win = window as any;
+      const element = document.querySelector('.cf-turnstile[data-sitekey], [data-sitekey], .cf-turnstile');
+      const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
+      const fullHtml = document.body ? document.body.innerHTML : '';
+      let sitekey = (typeof win.__turnstileSitekey === 'string' && win.__turnstileSitekey ? win.__turnstileSitekey : null) ??
+        element?.getAttribute('data-sitekey') ??
+        element?.getAttribute('data-key') ??
+        (element as HTMLElement | null)?.dataset?.sitekey ??
+        /["']?sitekey["']?\s*[:=]\s*["']([^"']+)["']/i.exec(inline)?.[1] ??
+        /["']?sitekey["']?\s*[:=]\s*["']([^"']+)["']/i.exec(fullHtml)?.[1] ??
+        /(0x4[a-zA-Z0-9_-]{18,})/i.exec(inline)?.[1] ??
+        /(0x4[a-zA-Z0-9_-]{18,})/i.exec(fullHtml)?.[1] ?? null;
+      let action = (typeof win.__turnstileAction === 'string' && win.__turnstileAction ? win.__turnstileAction : null) ??
+        element?.getAttribute('data-action') ??
+        /["']?action["']?\s*[:=]\s*["']([^"']+)["']/i.exec(inline)?.[1] ?? null;
+      let cdata = (typeof win.__turnstileCdata === 'string' && win.__turnstileCdata ? win.__turnstileCdata : null) ??
+        element?.getAttribute('data-cdata') ??
+        /["']?cdata["']?\s*[:=]\s*["']([^"']+)["']/i.exec(inline)?.[1] ?? null;
+      let callback = (typeof win.__turnstileCallback === 'string' && win.__turnstileCallback ? win.__turnstileCallback : null) ??
+        element?.getAttribute('data-callback') ?? null;
 
-    if (!sitekey) {
-      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]') as HTMLIFrameElement | null;
-      if (iframe?.src) {
-        try {
-          const u = new URL(iframe.src);
-          sitekey = u.searchParams.get('sitekey') || u.searchParams.get('key') || /\/([0-9a-zA-Z_-]{20,})\//.exec(u.pathname)?.[1] || null;
-        } catch {}
-      }
-    }
-    return { sitekey, action, cdata, callback };
-  }).catch(() => ({ sitekey: null, action: null, cdata: null, callback: null }));
-
-  const solverPromise = (async () => {
-    const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
-    if (solverUrl && widgetInfo.sitekey) {
-      // 1. Generic solver URL has explicit priority when configured
-      try {
-        const response = await fetch(`${solverUrl.replace(/\/+$/, '')}/solve`, {
-          method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ siteurl: page.url(), sitekey: widgetInfo.sitekey, action: widgetInfo.action, cdata: widgetInfo.cdata }),
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-        if (response.ok) {
-          const data = await response.json() as { token?: unknown };
-          if (typeof data.token === 'string' && data.token.trim()) {
-            await injectTurnstileToken(form, data.token.trim(), widgetInfo.callback);
-            return;
+      if (!sitekey) {
+        const iframes = Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]')) as HTMLIFrameElement[];
+        for (const iframe of iframes) {
+          if (iframe?.src) {
+            try {
+              const u = new URL(iframe.src);
+              sitekey = u.searchParams.get('sitekey') || u.searchParams.get('key') || /\/([0-9a-zA-Z_-]{20,})\//.exec(u.pathname)?.[1] || /(0x4[a-zA-Z0-9_-]{18,})/i.exec(iframe.src)?.[1] || null;
+              if (sitekey) break;
+            } catch {}
           }
         }
-      } catch {}
-      return;
-    }
+      }
+      return { sitekey, action, cdata, callback };
+    }).catch(() => ({ sitekey: null, action: null, cdata: null, callback: null }));
+  };
 
-    // 2. Capzy AntiTurnstileTask / AntiTurnstileTaskProxyLess
-    if (widgetInfo.sitekey) {
+  let solverStarted = false;
+  let solverPromise: Promise<void> | null = null;
+  const awaitSolver = async () => {
+    if (solverPromise) await solverPromise.catch(() => {});
+  };
+
+  const triggerSolver = (info: { sitekey: string | null; action: string | null; cdata: string | null; callback: string | null }) => {
+    if (solverStarted || !info.sitekey) return;
+    solverStarted = true;
+    solverPromise = (async () => {
+      const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
+      if (solverUrl && info.sitekey) {
+        try {
+          const response = await fetch(`${solverUrl.replace(/\/+$/, '')}/solve`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ siteurl: page.url(), sitekey: info.sitekey, action: info.action, cdata: info.cdata }),
+            signal: AbortSignal.timeout(timeoutMs),
+          });
+          if (response.ok) {
+            const data = await response.json() as { token?: unknown };
+            if (typeof data.token === 'string' && data.token.trim()) {
+              await injectTurnstileToken(form, data.token.trim(), info.callback);
+              return;
+            }
+          }
+        } catch {}
+      }
+
+      if (info.sitekey) {
+        const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
+        const capzySol = await solveTurnstileWithCapzy(
+          page.url(),
+          info.sitekey,
+          proxyUrl,
+          userAgent,
+          timeoutMs,
+          info.action ?? undefined,
+          info.cdata ?? undefined,
+        );
+        if (capzySol?.token) {
+          log({ tokenLength: capzySol.token.length }, 'ensureFormTurnstile: injecting Capzy Turnstile token');
+          await injectTurnstileToken(form, capzySol.token, info.callback);
+          return;
+        }
+      }
+
       const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-      const capzySol = await solveTurnstileWithCapzy(
-        page.url(),
-        widgetInfo.sitekey,
-        proxyUrl,
-        userAgent,
-        timeoutMs,
-        widgetInfo.action ?? undefined,
-        widgetInfo.cdata ?? undefined,
-      );
+      const capzySol = await solveCloudflareWithCapzy(page.url(), proxyUrl, userAgent, timeoutMs);
+      if (capzySol?.cookies) {
+        const cookieList = Object.entries(capzySol.cookies)
+          .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+          .map(([name, value]) => ({
+            name,
+            value,
+            domain: '.codeforces.com',
+            path: '/',
+          }));
+        if (cookieList.length > 0) {
+          log({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'ensureFormTurnstile: injecting Capzy Cloudflare clearance cookies');
+          await page.context().addCookies(cookieList).catch(() => {});
+        }
+      }
       if (capzySol?.token) {
-        log({ tokenLength: capzySol.token.length }, 'ensureFormTurnstile: injecting Capzy Turnstile token');
-        await injectTurnstileToken(form, capzySol.token, widgetInfo.callback);
-        return;
+        await injectTurnstileToken(form, capzySol.token, info.callback);
       }
-    }
+    })();
+  };
 
-    // 3. Fallback: Capzy AntiCloudflareTask for clearance cookies
-    const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-    const capzySol = await solveCloudflareWithCapzy(page.url(), proxyUrl, userAgent, timeoutMs);
-    if (capzySol?.cookies) {
-      const cookieList = Object.entries(capzySol.cookies)
-        .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
-        .map(([name, value]) => ({
-          name,
-          value,
-          domain: '.codeforces.com',
-          path: '/',
-        }));
-      if (cookieList.length > 0) {
-        log({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'ensureFormTurnstile: injecting Capzy Cloudflare clearance cookies');
-        await page.context().addCookies(cookieList).catch(() => {});
-      }
-    }
-    if (capzySol?.token) {
-      await injectTurnstileToken(form, capzySol.token, widgetInfo.callback);
-    }
-  })();
+  let widgetInfo = await extractWidgetInfo();
+  if (widgetInfo.sitekey) {
+    triggerSolver(widgetInfo);
+  }
 
   const deadline = Date.now() + timeoutMs;
   const startedAt = Date.now();
@@ -534,13 +563,17 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
 
   while (Date.now() < deadline) {
     if (await hasToken()) {
-      if (solverPromise) await solverPromise.catch(() => {});
+      await awaitSolver();
       return { turnstile: true, interactive: false };
     }
-    if (await control.isEnabled().catch(() => false) && (await challengeIframe.count().catch(() => 0)) === 0) {
-      if (solverPromise) await solverPromise.catch(() => {});
-      return { turnstile: false, interactive: false };
+
+    if (!solverStarted) {
+      widgetInfo = await extractWidgetInfo();
+      if (widgetInfo.sitekey) {
+        triggerSolver(widgetInfo);
+      }
     }
+
     if (!renderChecked && Date.now() - startedAt >= 2_000) {
       renderChecked = true;
       renderAttempt = await form.evaluate((element) => {
@@ -558,6 +591,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         } catch { return 'render-error'; }
       }).catch(() => 'page-error');
     }
+
     if (executeCount < MAX_EXECUTE_RETRIES && Date.now() >= nextExecuteAt) {
       executeCount += 1;
       executeAttempt = await form.evaluate((element) => {
@@ -570,19 +604,20 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
       const backoffMs = [5_000, 8_000, 12_000, 17_000][executeCount - 1] ?? 17_000;
       nextExecuteAt = Date.now() + backoffMs;
     }
-    if (Date.now() > clickAttemptedAt + 4_000) {
+
+    if (Date.now() > clickAttemptedAt + 3_000) {
       clickAttemptedAt = Date.now();
       await interactWithTurnstileCheckbox(page).catch(() => {});
     }
+
     await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
   }
-  if (solverPromise) await solverPromise.catch(() => {});
+
+  await awaitSolver();
   if (await hasToken()) {
     return { turnstile: true, interactive: false };
   }
-  if (await control.isEnabled().catch(() => false) && (await challengeIframe.count().catch(() => 0)) === 0) {
-    return { turnstile: false, interactive: false };
-  }
+
   const diagnostics = await page.evaluate(() => ({
     apiLoaded: typeof (window as unknown as { turnstile?: unknown }).turnstile !== 'undefined',
     iframePresent: !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
