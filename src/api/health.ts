@@ -46,6 +46,7 @@ export interface ApiHooks {
   isRunInProgress: () => boolean;
   /** Runs the submission for every account and resolves with the report (null = run already in progress). */
   runSubmission: () => Promise<RunReport | null>;
+  triggerCodeforcesRun?: (reason: string) => Promise<{ started: boolean; message: string }>;
 }
 
 /** Shape of a Playwright storageState file — validated, never logged. */
@@ -238,6 +239,17 @@ export async function startHealthServer(
     }
     runNowBodySchema.parse(req.body ?? {});
     const result = await hooks.triggerRun('admin-api');
+    return reply.code(result.started ? 202 : 409).send(result);
+  });
+
+  app.post('/admin/codeforces-run', async (req, reply) => {
+    if (!requireAdmin(req.headers.authorization)) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    if (!hooks.triggerCodeforcesRun) {
+      return reply.code(501).send({ error: 'Codeforces trigger not supported' });
+    }
+    const result = await hooks.triggerCodeforcesRun('admin-api');
     return reply.code(result.started ? 202 : 409).send(result);
   });
 

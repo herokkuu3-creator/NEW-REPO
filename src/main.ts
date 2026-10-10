@@ -10,7 +10,7 @@ import {
 } from './scheduler/dailyWorker';
 import { startHealthServer } from './api/health';
 import { startTelegramBot } from './notifications/telegramBot';
-import { startCodeforcesScheduler } from './codeforces/worker';
+import { startCodeforcesScheduler, triggerCodeforcesRun } from './codeforces/worker';
 import { startCodeChefScheduler } from './codechef/worker';
 
 /**
@@ -48,6 +48,7 @@ async function main(): Promise<void> {
     triggerRun,
     isRunInProgress,
     runSubmission: () => runSubmissionNow(TRIGGER_SUBMISSION_REASON),
+    triggerCodeforcesRun,
   });
   const stopScheduler = startScheduler();
   const stopTelegramBot = startTelegramBot();

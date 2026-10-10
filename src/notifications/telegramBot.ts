@@ -522,6 +522,12 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cancel_cc_range':
         await handleCancelCodeChefRange();
         return;
+      case '/codeforces':
+      case '/cf':
+      case '/cfnext':
+      case '/cf_next':
+      case '/cfsubmit':
+      case '/cf_submit':
       case '/submitnextsolution':
       case '/submit_next_solution':
         await handleCodeforcesSubmitNext();
