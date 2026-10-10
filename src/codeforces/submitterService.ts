@@ -458,8 +458,7 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
             return;
           }
         }
-        attempts.push(`${path}: HTTP ${status} (Cloudflare challenge)`);
-        continue;
+        throw new BrowserFormError(`Codeforces verification did not complete (HTTP ${status}). The current solution remains pending.`, 'blocked');
       }
       const body = await readBody(page);
       if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
@@ -470,8 +469,7 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
             return;
           }
         }
-        attempts.push(`${path}: Cloudflare challenge did not clear`);
-        continue;
+        throw new BrowserFormError('Codeforces verification did not complete. The current solution remains pending.', 'blocked');
       }
       const fields = await readFields(page);
       if (hasSubmitForm(fields)) {

@@ -411,19 +411,21 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   // 1. If token already exists, verification is satisfied immediately
   if (await hasToken()) return { turnstile: true, interactive: false };
 
-  // 2. Check if a Turnstile widget or sitekey is present on the page
+  // 2. Check if a Turnstile widget, Cloudflare script, or sitekey is present on the page
   const checkWidgetPresent = async (): Promise<boolean> => {
     return page.evaluate(() => {
       const win = window as any;
-      const el = document.querySelector('.cf-turnstile, [data-sitekey]');
-      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-      const script = document.querySelector('script[src*="turnstile"]');
-      const sitekey = win.__turnstileSitekey || el?.getAttribute('data-sitekey') || (el as HTMLElement | null)?.dataset?.sitekey;
-      return !!(el || iframe || script || win.turnstile || sitekey);
+      const el = document.querySelector('.cf-turnstile, [data-sitekey], [data-key]');
+      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="cloudflare.com"], iframe[title*="Turnstile"], iframe[title*="Cloudflare"]');
+      const script = document.querySelector('script[src*="turnstile"], script[src*="challenge-platform"]');
+      const link = document.querySelector('link[href*="challenges.cloudflare.com"]');
+      const sitekey = win.__turnstileSitekey || el?.getAttribute('data-sitekey') || el?.getAttribute('data-key') || (el as HTMLElement | null)?.dataset?.sitekey;
+      const cfParams = win.__CF$cv$params;
+      return !!(el || iframe || script || link || win.turnstile || cfParams || sitekey);
     }).catch(() => false);
   };
 
-  const graceDeadline = Date.now() + Math.min(1_000, timeoutMs);
+  const graceDeadline = Date.now() + Math.min(3_000, timeoutMs);
   while (Date.now() < graceDeadline) {
     if (await hasToken()) return { turnstile: true, interactive: false };
     if (await checkWidgetPresent()) break;
@@ -442,28 +444,34 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   const extractWidgetInfo = async () => {
     return page.evaluate(() => {
       const win = window as any;
-      const element = document.querySelector('.cf-turnstile[data-sitekey], [data-sitekey], .cf-turnstile');
+      const elements = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey], [data-key]'));
       const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
       const fullHtml = document.body ? document.body.innerHTML : '';
-      let sitekey = (typeof win.__turnstileSitekey === 'string' && win.__turnstileSitekey ? win.__turnstileSitekey : null) ??
-        element?.getAttribute('data-sitekey') ??
-        element?.getAttribute('data-key') ??
-        (element as HTMLElement | null)?.dataset?.sitekey ??
-        /["']?sitekey["']?\s*[:=]\s*["']([^"']+)["']/i.exec(inline)?.[1] ??
-        /["']?sitekey["']?\s*[:=]\s*["']([^"']+)["']/i.exec(fullHtml)?.[1] ??
-        /(0x4[a-zA-Z0-9_-]{18,})/i.exec(inline)?.[1] ??
-        /(0x4[a-zA-Z0-9_-]{18,})/i.exec(fullHtml)?.[1] ?? null;
-      let action = (typeof win.__turnstileAction === 'string' && win.__turnstileAction ? win.__turnstileAction : null) ??
-        element?.getAttribute('data-action') ??
-        /["']?action["']?\s*[:=]\s*["']([^"']+)["']/i.exec(inline)?.[1] ?? null;
-      let cdata = (typeof win.__turnstileCdata === 'string' && win.__turnstileCdata ? win.__turnstileCdata : null) ??
-        element?.getAttribute('data-cdata') ??
-        /["']?cdata["']?\s*[:=]\s*["']([^"']+)["']/i.exec(inline)?.[1] ?? null;
-      let callback = (typeof win.__turnstileCallback === 'string' && win.__turnstileCallback ? win.__turnstileCallback : null) ??
-        element?.getAttribute('data-callback') ?? null;
+      let sitekey: string | null = (typeof win.__turnstileSitekey === 'string' && win.__turnstileSitekey ? win.__turnstileSitekey : null);
+      let action: string | null = (typeof win.__turnstileAction === 'string' && win.__turnstileAction ? win.__turnstileAction : null);
+      let cdata: string | null = (typeof win.__turnstileCdata === 'string' && win.__turnstileCdata ? win.__turnstileCdata : null);
+      let callback: string | null = (typeof win.__turnstileCallback === 'string' && win.__turnstileCallback ? win.__turnstileCallback : null);
+
+      for (const el of elements) {
+        if (!sitekey) {
+          sitekey = el.getAttribute('data-sitekey') || el.getAttribute('data-key') || (el as HTMLElement).dataset?.sitekey || null;
+        }
+        if (!action) action = el.getAttribute('data-action') || null;
+        if (!cdata) cdata = el.getAttribute('data-cdata') || null;
+        if (!callback) callback = el.getAttribute('data-callback') || null;
+      }
 
       if (!sitekey) {
-        const iframes = Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]')) as HTMLIFrameElement[];
+        sitekey = /["']?sitekey["']?\s*[:=]\s*["']([^"']+)["']/i.exec(inline)?.[1] ??
+          /["']?sitekey["']?\s*[:=]\s*["']([^"']+)["']/i.exec(fullHtml)?.[1] ??
+          /(0x4[a-zA-Z0-9_-]{18,})/i.exec(inline)?.[1] ??
+          /(0x4[a-zA-Z0-9_-]{18,})/i.exec(fullHtml)?.[1] ?? null;
+      }
+      if (!action) action = /["']?action["']?\s*[:=]\s*["']([^"']+)["']/i.exec(inline)?.[1] ?? null;
+      if (!cdata) cdata = /["']?cdata["']?\s*[:=]\s*["']([^"']+)["']/i.exec(inline)?.[1] ?? null;
+
+      if (!sitekey) {
+        const iframes = Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="cloudflare.com"]')) as HTMLIFrameElement[];
         for (const iframe of iframes) {
           if (iframe?.src) {
             try {
@@ -485,7 +493,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   };
 
   const triggerSolver = (info: { sitekey: string | null; action: string | null; cdata: string | null; callback: string | null }) => {
-    if (solverStarted || !info.sitekey) return;
+    if (solverStarted) return;
     solverStarted = true;
     solverPromise = (async () => {
       const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
@@ -525,7 +533,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
       }
 
       const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-      const capzySol = await solveCloudflareWithCapzy(page.url(), proxyUrl, userAgent, timeoutMs);
+      const capzySol = await solveCloudflareWithCapzy(page.url(), proxyUrl, userAgent, timeoutMs, info.sitekey ?? undefined, info.action ?? undefined, info.cdata ?? undefined);
       if (capzySol?.cookies) {
         const cookieList = Object.entries(capzySol.cookies)
           .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
@@ -541,6 +549,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         }
       }
       if (capzySol?.token) {
+        log({ tokenLength: capzySol.token.length }, 'ensureFormTurnstile: injecting Capzy Cloudflare token');
         await injectTurnstileToken(form, capzySol.token, info.callback);
       }
     })();
@@ -569,7 +578,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
 
     if (!solverStarted) {
       widgetInfo = await extractWidgetInfo();
-      if (widgetInfo.sitekey) {
+      if (widgetInfo.sitekey || Date.now() - startedAt >= 2_000) {
         triggerSolver(widgetInfo);
       }
     }
@@ -668,12 +677,28 @@ export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{
     if (!formEl) return;
     const tt = (formEl.querySelector('input[name="turnstileToken"]') as HTMLInputElement)?.value;
     const cf = (formEl.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement)?.value;
-    const tok = (tt || cf || '').trim();
+    const api = (window as any).turnstile;
+    let apiTok = '';
+    try { apiTok = typeof api?.getResponse === 'function' ? api.getResponse() : ''; } catch {}
+    const tok = (tt || cf || apiTok || '').trim();
     if (tok) {
-      const ttInput = formEl.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
-      if (ttInput && !ttInput.value) ttInput.value = tok;
-      const cfInput = formEl.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
-      if (cfInput && !cfInput.value) cfInput.value = tok;
+      let ttInput = formEl.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
+      if (!ttInput) {
+        ttInput = document.createElement('input');
+        ttInput.type = 'hidden';
+        ttInput.name = 'turnstileToken';
+        formEl.appendChild(ttInput);
+      }
+      ttInput.value = tok;
+
+      let cfInput = formEl.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+      if (!cfInput) {
+        cfInput = document.createElement('input');
+        cfInput.type = 'hidden';
+        cfInput.name = 'cf-turnstile-response';
+        formEl.appendChild(cfInput);
+      }
+      cfInput.value = tok;
     }
   }).catch(() => {});
 
