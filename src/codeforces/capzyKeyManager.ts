@@ -1,5 +1,33 @@
-import { logger } from '../logger';
-import { getSystemState, setSystemState, SystemKeys } from '../database/models';
+const CAPZY_API_KEYS_KEY = 'capzyApiKeys';
+const CAPZY_ACTIVE_KEY_INDEX_KEY = 'capzyActiveKeyIndex';
+
+async function safeGetSystemState(key: string): Promise<string | null> {
+  if (!process.env.DATABASE_URL) return null;
+  try {
+    const { getSystemState } = await import('../database/models');
+    return await getSystemState(key);
+  } catch {
+    return null;
+  }
+}
+
+async function safeSetSystemState(key: string, value: string): Promise<void> {
+  if (!process.env.DATABASE_URL) return;
+  try {
+    const { setSystemState } = await import('../database/models');
+    await setSystemState(key, value);
+  } catch {}
+}
+
+function logInfo(fields: Record<string, unknown>, msg: string): void {
+  const entry = { level: 30, time: new Date().toISOString(), service: 'capzy-key-manager', ...fields, msg };
+  process.stdout.write(`${JSON.stringify(entry)}\n`);
+}
+
+function logWarn(fields: Record<string, unknown>, msg: string): void {
+  const entry = { level: 40, time: new Date().toISOString(), service: 'capzy-key-manager', ...fields, msg };
+  process.stdout.write(`${JSON.stringify(entry)}\n`);
+}
 
 export interface KeyBalanceResult {
   key: string;
@@ -151,7 +179,7 @@ export async function getCapzyApiKeys(): Promise<string[]> {
 
   if (!process.env.VITEST && process.env.NODE_ENV !== 'test') {
     try {
-      const rawDb = await getSystemState(SystemKeys.capzyApiKeys);
+      const rawDb = await safeGetSystemState(CAPZY_API_KEYS_KEY);
       if (rawDb) {
         try {
           const parsed = JSON.parse(rawDb);
@@ -204,7 +232,7 @@ export async function setActiveCapzyKeyIndex(index: number): Promise<void> {
   inMemoryActiveIndex = Math.max(0, index);
   if (!process.env.VITEST && process.env.NODE_ENV !== 'test') {
     try {
-      await setSystemState(SystemKeys.capzyActiveKeyIndex, String(inMemoryActiveIndex));
+      await safeSetSystemState(CAPZY_ACTIVE_KEY_INDEX_KEY, String(inMemoryActiveIndex));
     } catch {}
   }
 }
@@ -212,7 +240,7 @@ export async function setActiveCapzyKeyIndex(index: number): Promise<void> {
 export async function getActiveCapzyKeyIndex(): Promise<number> {
   if (!process.env.VITEST && process.env.NODE_ENV !== 'test') {
     try {
-      const raw = await getSystemState(SystemKeys.capzyActiveKeyIndex);
+      const raw = await safeGetSystemState(CAPZY_ACTIVE_KEY_INDEX_KEY);
       if (raw !== null && raw !== undefined) {
         const idx = parseInt(raw, 10);
         if (!isNaN(idx) && idx >= 0) {
@@ -247,14 +275,14 @@ export async function saveCapzyApiKeys(
 
   if (!process.env.VITEST && process.env.NODE_ENV !== 'test') {
     try {
-      await setSystemState(SystemKeys.capzyApiKeys, JSON.stringify(keys));
-      await setSystemState(SystemKeys.capzyActiveKeyIndex, String(activeIdx));
+      await safeSetSystemState(CAPZY_API_KEYS_KEY, JSON.stringify(keys));
+      await safeSetSystemState(CAPZY_ACTIVE_KEY_INDEX_KEY, String(activeIdx));
     } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Failed to persist Capzy keys to database');
+      logWarn({ err: err instanceof Error ? err.message : String(err) }, 'Failed to persist Capzy keys to database');
     }
   }
 
-  logger.info(
+  logInfo(
     { count: keys.length, activeIdx, activeKey: maskApiKey(keys[activeIdx] ?? '') },
     'Saved Capzy API keys and updated active index',
   );
@@ -281,13 +309,13 @@ export async function rotateToNextCapzyKey(
   inMemoryActiveIndex = nextIndex;
   if (!process.env.VITEST && process.env.NODE_ENV !== 'test') {
     try {
-      await setSystemState(SystemKeys.capzyActiveKeyIndex, String(nextIndex));
+      await safeSetSystemState(CAPZY_ACTIVE_KEY_INDEX_KEY, String(nextIndex));
     } catch {}
   }
 
   const newKey = nextIndex < keys.length ? keys[nextIndex] : null;
 
-  logger.warn(
+  logWarn(
     {
       failedKey: failedKey ? maskApiKey(failedKey) : undefined,
       reason,
