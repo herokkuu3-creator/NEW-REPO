@@ -180,15 +180,23 @@ export async function solveTurnstileWithCapzy(
     return null;
   };
 
-  // Attempt 1: AntiTurnstileTask with residential proxy
+  let targetUrl = websiteURL;
+  try {
+    const parsed = new URL(websiteURL);
+    targetUrl = parsed.origin;
+  } catch {}
+
+  const isRefusingProxy = !!proxy && (proxy.includes('joyproxy.com') || proxy.includes('busyip.com'));
+
+  // Attempt 1: AntiTurnstileTask with residential proxy (skipped for proxies that refuse solver connections)
   let proxyTask: Record<string, unknown> | null = null;
   try {
-    if (proxy) {
+    if (proxy && !isRefusingProxy) {
       const parsed = new URL(proxy);
       const parsedPort = parseInt(parsed.port, 10);
       proxyTask = {
         type: 'AntiTurnstileTask',
-        websiteURL,
+        websiteURL: targetUrl,
         websiteKey: sitekey,
         proxyType: parsed.protocol.replace(':', '') || 'http',
         proxyAddress: parsed.hostname,
@@ -211,10 +219,10 @@ export async function solveTurnstileWithCapzy(
     if (res?.token) return res;
   }
 
-  // Attempt 2 (Proxyless fallback): AntiTurnstileTaskProxyLess
+  // Attempt 2: AntiTurnstileTaskProxyLess (uses Capzy cloud infrastructure)
   const proxylessTask: Record<string, unknown> = {
     type: 'AntiTurnstileTaskProxyLess',
-    websiteURL,
+    websiteURL: targetUrl,
     websiteKey: sitekey,
     userAgent: ua,
     ...(action ? { action } : {}),
@@ -565,7 +573,8 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   let executeCount = 0;
   let nextExecuteAt = startedAt + 5_000;
   const MAX_EXECUTE_RETRIES = 4;
-  let renderChecked = false;
+  let apiScriptInjected = false;
+  let widgetRendered = false;
   let renderAttempt = '';
   let executeAttempt = '';
   let clickAttemptedAt = 0;
@@ -583,22 +592,49 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
       }
     }
 
-    if (!renderChecked && Date.now() - startedAt >= 2_000) {
-      renderChecked = true;
-      renderAttempt = await form.evaluate((element) => {
+    if (!apiScriptInjected && Date.now() - startedAt >= 1_000) {
+      apiScriptInjected = true;
+      const hasApi = await page.evaluate(() => typeof (window as any).turnstile !== 'undefined').catch(() => false);
+      if (!hasApi) {
+        await page.addScriptTag({ url: 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit' }).catch(() => {});
+      }
+    }
+
+    if (!widgetRendered && Date.now() - startedAt >= 1_500) {
+      const renderRes = await form.evaluate((element) => {
         const widgetEl = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
-        const api = (window as unknown as { turnstile?: { render?: (container: HTMLElement, options: { sitekey: string; callback: (token: string) => void; 'error-callback'?: () => void }) => string; execute?: (container: HTMLElement | string) => void; } }).turnstile;
-        if (!widgetEl || !api?.render) return 'not-needed';
+        const api = (window as unknown as { turnstile?: { render?: (container: HTMLElement, options: Record<string, unknown>) => string; execute?: (container: HTMLElement | string) => void; } }).turnstile;
+        if (!widgetEl || !api?.render) return null;
         const pageIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-        if (pageIframe) return 'not-needed';
+        if (pageIframe) return 'iframe-exists';
         const sitekey = widgetEl.dataset.sitekey;
         if (!sitekey) return 'no-sitekey';
         try {
-          const widgetId = api.render(widgetEl, { sitekey, callback: (token) => { const callbackName = widgetEl.getAttribute('data-callback'); if (callbackName) { const fn = callbackName.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window); if (typeof fn === 'function') (fn as (value: string) => void)(token); } const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null; if (input && !input.value) { input.value = token; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); } const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null; if (cfInput && !cfInput.value) { cfInput.value = token; cfInput.dispatchEvent(new Event('input', { bubbles: true })); cfInput.dispatchEvent(new Event('change', { bubbles: true })); } }, 'error-callback': () => {} });
+          const widgetId = api.render(widgetEl, {
+            sitekey,
+            callback: (token: string) => {
+              const callbackName = widgetEl.getAttribute('data-callback');
+              if (callbackName) {
+                const fn = callbackName.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
+                if (typeof fn === 'function') (fn as (value: string) => void)(token);
+              }
+              const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
+              if (input && !input.value) { input.value = token; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); }
+              const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+              if (cfInput && !cfInput.value) { cfInput.value = token; cfInput.dispatchEvent(new Event('input', { bubbles: true })); cfInput.dispatchEvent(new Event('change', { bubbles: true })); }
+            },
+            'error-callback': () => {},
+          });
           if (widgetId && widgetEl) widgetEl.dataset.widgetId = String(widgetId);
           return `rendered:${widgetId ?? 'no-id'}`;
         } catch { return 'render-error'; }
       }).catch(() => 'page-error');
+      if (renderRes) {
+        renderAttempt = renderRes;
+        if (renderRes !== 'render-error' && renderRes !== 'page-error') {
+          widgetRendered = true;
+        }
+      }
     }
 
     if (executeCount < MAX_EXECUTE_RETRIES && Date.now() >= nextExecuteAt) {

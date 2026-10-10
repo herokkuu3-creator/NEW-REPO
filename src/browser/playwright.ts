@@ -256,7 +256,7 @@ export async function launchFirefoxWithStorageStateObject(
       userAgent: DEFAULT_DESKTOP_FIREFOX_USER_AGENT,
       viewport: { width: 1366, height: 768 },
       locale: 'en-US',
-      serviceWorkers: 'block',
+      serviceWorkers: 'allow',
     });
     await applyStealthScripts(context, 'firefox');
 
