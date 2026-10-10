@@ -123,7 +123,7 @@ export async function solveTurnstileWithCapzy(
 
   const apiKey =
     process.env.CAPZY_API_KEY?.trim() ||
-    'capzy_9dc57a569ec4a6b2453b7d2869e85320ece4cddfc9a36d2f';
+    'capzy_b1680657df2e72f365f078303446b985a2aa59c49adf5abe';
   const proxy =
     proxyUrl ||
     process.env.CODEFORCES_PROXY?.trim() ||
@@ -247,7 +247,7 @@ export async function solveCloudflareWithCapzy(
 
   const apiKey =
     process.env.CAPZY_API_KEY?.trim() ||
-    'capzy_9dc57a569ec4a6b2453b7d2869e85320ece4cddfc9a36d2f';
+    'capzy_b1680657df2e72f365f078303446b985a2aa59c49adf5abe';
   const proxy =
     proxyUrl ||
     process.env.CODEFORCES_PROXY?.trim() ||
