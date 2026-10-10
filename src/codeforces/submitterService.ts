@@ -257,13 +257,15 @@ async function launchFirefox(
     throw new Error('Residential proxy is strictly required on cloud runners to prevent Cloudflare datacenter IP detection');
   }
   try {
+    const useModernHeadless = BROWSER_ENGINE === 'chromium' && HEADLESS;
     const active = (browser = await (BROWSER_ENGINE === 'chromium' ? chromium : firefox).launch({
-      headless: HEADLESS,
+      headless: useModernHeadless ? false : HEADLESS,
       ...(proxy ? { proxy } : {}),
       ...(BROWSER_ENGINE === 'chromium' ? {
         // Keep the browser's native identity and automation defaults. Only
         // suppress browser-owned background downloads to conserve proxy data.
         args: [
+          ...(useModernHeadless ? ['--headless=new'] : []),
           '--disable-blink-features=AutomationControlled',
           '--no-sandbox', '--disable-dev-shm-usage', '--no-first-run',
           '--disable-component-update', '--safebrowsing-disable-auto-update',
@@ -408,22 +410,38 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
   }
 
   while (Date.now() < deadline) {
-    let isCodeforces = false;
+    // 1. Check cookies for cf_clearance
     try {
-      const loc = page.locator('#body, #pageContent, form:has(textarea[name="source"])');
-      isCodeforces = typeof loc?.count === 'function' && ((await loc.count().catch(() => 0)) > 0);
+      const cookies = await page.context().cookies().catch(() => []);
+      const hasClearance = cookies.some((c) => c.name === 'cf_clearance' && c.value.length > 5);
+      if (hasClearance) {
+        log({}, 'waitOutChallenge: cf_clearance cookie detected');
+        return true;
+      }
     } catch {}
-    if (isCodeforces) return true;
+
+    // 2. Check title and DOM readiness
+    try {
+      const title = await page.title().catch(() => '');
+      const isChallengeTitle = /just a moment|checking your browser|attention required|cloudflare/i.test(title);
+      const isCodeforces = title.toLowerCase().includes('codeforces') && !isChallengeTitle;
+      const loc = page.locator('#header, #body, #pageContent, .main-menu-list, form:has(textarea[name="source"])');
+      const count = await loc.count().catch(() => 0);
+      if (isCodeforces && count > 0) {
+        log({ title, count }, 'waitOutChallenge: Codeforces page content detected');
+        return true;
+      }
+    } catch {}
 
     if (Date.now() > clickAttemptedAt + 2_500) {
       clickAttemptedAt = Date.now();
       try {
         const handled = await interactWithTurnstileCheckbox(page);
         if (!handled && typeof page.frameLocator === 'function') {
-          const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-          const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"]').first();
-          if ((await checkbox.count().catch(() => 0)) > 0 && await checkbox.isVisible().catch(() => false)) {
-            await checkbox.click({ timeout: 1500 }).catch(() => {});
+          const frameLocator = page.frameLocator('iframe[src*="challenges.cloudflare.com"], iframe[src*="challenge-platform"], iframe[title*="Turnstile"], iframe[title*="Cloudflare"]').first();
+          const checkbox = frameLocator.locator('.ctp-checkbox-container, .mark, input[type="checkbox"], #challenge-stage, #cf-stage').first();
+          if ((await checkbox.count().catch(() => 0)) > 0) {
+            await checkbox.click({ force: true, timeout: 1500 }).catch(() => {});
           }
         }
       } catch {}
@@ -451,23 +469,51 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
         throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
       }
       if (status === 403 || status === 503) {
-        if (await waitOutChallenge(page, undefined, proxyUrl)) {
+        const cleared = await waitOutChallenge(page, undefined, proxyUrl);
+        if (cleared) {
           const fields = await readFields(page);
           if (hasSubmitForm(fields)) {
             log({ path, fields: summarize(fields) }, 'Codeforces submit form opened after HTTP 403 challenge cleared');
             return;
           }
+          const retryRes = await page.goto(`https://codeforces.com${path}`, {
+            waitUntil: 'domcontentloaded',
+            timeout: NAV_TIMEOUT_MS,
+          }).catch(() => null);
+          if (retryRes && retryRes.status() < 400) {
+            const retryFields = await readFields(page);
+            if (hasSubmitForm(retryFields)) {
+              log({ path, fields: summarize(retryFields) }, 'Codeforces submit form opened after clearance retry');
+              return;
+            }
+          }
+          attempts.push(`${path}: HTTP ${status} (challenge cleared but submit form missing on ${page.url()})`);
+          continue;
         }
         throw new BrowserFormError(`Codeforces verification did not complete (HTTP ${status}). The current solution remains pending.`, 'blocked');
       }
       const body = await readBody(page);
       if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
-        if (await waitOutChallenge(page, undefined, proxyUrl)) {
+        const cleared = await waitOutChallenge(page, undefined, proxyUrl);
+        if (cleared) {
           const fields = await readFields(page);
           if (hasSubmitForm(fields)) {
             log({ path, fields: summarize(fields) }, 'Codeforces submit form opened after challenge cleared');
             return;
           }
+          const retryRes = await page.goto(`https://codeforces.com${path}`, {
+            waitUntil: 'domcontentloaded',
+            timeout: NAV_TIMEOUT_MS,
+          }).catch(() => null);
+          if (retryRes && retryRes.status() < 400) {
+            const retryFields = await readFields(page);
+            if (hasSubmitForm(retryFields)) {
+              log({ path, fields: summarize(retryFields) }, 'Codeforces submit form opened after clearance retry');
+              return;
+            }
+          }
+          attempts.push(`${path}: challenge cleared but submit form missing on ${page.url()}`);
+          continue;
         }
         throw new BrowserFormError('Codeforces verification did not complete. The current solution remains pending.', 'blocked');
       }

@@ -415,7 +415,7 @@ export async function simulateHumanClick(
  */
 export async function interactWithTurnstileCheckbox(page: Page): Promise<boolean> {
   try {
-    const iframeLocator = page.locator('iframe[src*="challenges.cloudflare.com"]').first();
+    const iframeLocator = page.locator('iframe[src*="challenges.cloudflare.com"], iframe[src*="challenge-platform"], iframe[title*="Turnstile"], iframe[title*="Cloudflare"]').first();
     const count = await iframeLocator.count().catch(() => 0);
     if (count === 0) return false;
 
@@ -431,8 +431,8 @@ export async function interactWithTurnstileCheckbox(page: Page): Promise<boolean
 
     if (typeof page.frameLocator === 'function') {
       try {
-        const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-        const cb = frame.locator('input[type="checkbox"], .ctp-checkbox-container, .mark').first();
+        const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"], iframe[src*="challenge-platform"], iframe[title*="Turnstile"], iframe[title*="Cloudflare"]').first();
+        const cb = frame.locator('input[type="checkbox"], .ctp-checkbox-container, .mark, #challenge-stage, #cf-stage').first();
         if ((await cb.count().catch(() => 0)) > 0) {
           const cbBox = await cb.boundingBox().catch(() => null);
           if (cbBox && cbBox.width > 0 && cbBox.height > 0) {
@@ -465,10 +465,10 @@ export async function interactWithTurnstileCheckbox(page: Page): Promise<boolean
     // 3. Resilient backup click inside frame locator if available
     if (typeof page.frameLocator === 'function') {
       try {
-        const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-        const cb = frame.locator('input[type="checkbox"], .ctp-checkbox-container, .mark').first();
-        if ((await cb.count().catch(() => 0)) > 0 && (await cb.isVisible().catch(() => false))) {
-          await cb.click({ timeout: 1500 }).catch(() => {});
+        const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"], iframe[src*="challenge-platform"], iframe[title*="Turnstile"], iframe[title*="Cloudflare"]').first();
+        const cb = frame.locator('input[type="checkbox"], .ctp-checkbox-container, .mark, #challenge-stage, #cf-stage').first();
+        if ((await cb.count().catch(() => 0)) > 0) {
+          await cb.click({ force: true, timeout: 1500 }).catch(() => {});
         }
       } catch {}
     }

@@ -60,7 +60,7 @@ function attachLogCapture(page: Page, sink: string[]): void {
  * /dev/shm, no sandbox). `--single-process` is available as an escape hatch
  * via CHROMIUM_SINGLE_PROCESS=true but is off by default (stability first).
  */
-export function buildLaunchArgs(): string[] {
+export function buildLaunchArgs(headless = config.browser.headless): string[] {
   const args = [
     '--disable-blink-features=AutomationControlled',
     '--disable-dev-shm-usage', // small /dev/shm in containers
@@ -73,6 +73,9 @@ export function buildLaunchArgs(): string[] {
     '--no-first-run',
     '--js-flags=--max-old-space-size=256', // cap V8 heap for 512MB instances
   ];
+  if (headless) {
+    args.unshift('--headless=new');
+  }
   if (config.browser.chromiumSingleProcess) args.push('--single-process');
   return args;
 }
@@ -91,11 +94,13 @@ export async function launchWithPersistentProfile(): Promise<BrowserSession | nu
     return null;
   }
   try {
+    const isHeadless = config.browser.headless;
     const context = await chromium.launchPersistentContext(profilePath, {
-      headless: config.browser.headless,
-      args: buildLaunchArgs(),
+      headless: isHeadless ? false : false,
+      args: buildLaunchArgs(isHeadless),
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
+      serviceWorkers: 'allow',
     });
     await applyStealthScripts(context, 'chromium');
     const browserLogs: string[] = [];
@@ -130,15 +135,17 @@ export async function launchWithStorageState(): Promise<BrowserSession | null> {
     return null;
   }
   try {
+    const isHeadless = config.browser.headless;
     const browser = await chromium.launch({
-      headless: config.browser.headless,
-      args: buildLaunchArgs(),
+      headless: isHeadless ? false : false,
+      args: buildLaunchArgs(isHeadless),
     });
     const context = await browser.newContext({
       storageState: statePath,
       userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
+      serviceWorkers: 'allow',
     });
     await applyStealthScripts(context, 'chromium');
     const browserLogs: string[] = [];
@@ -175,9 +182,10 @@ export async function launchWithStorageStateObject(
   label: string,
 ): Promise<BrowserSession | null> {
   try {
+    const isHeadless = config.browser.headless;
     const browser = await chromium.launch({
-      headless: config.browser.headless,
-      args: buildLaunchArgs(),
+      headless: isHeadless ? false : false,
+      args: buildLaunchArgs(isHeadless),
     });
     const context = await browser.newContext({
       storageState: {
@@ -187,6 +195,7 @@ export async function launchWithStorageStateObject(
       userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
+      serviceWorkers: 'allow',
     });
     await applyStealthScripts(context, 'chromium');
     const browserLogs: string[] = [];
