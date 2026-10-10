@@ -44,12 +44,116 @@ export async function getCodeforcesAccountById(id: string): Promise<CodeforcesAc
   return prisma.codeforcesAccount.findUnique({ where: { id } });
 }
 
+export interface CodeforcesUsernameProgress {
+  username: string;
+  lastCompletedKey: string | null;
+  nextKey: string | null;
+  lastCompletedAt: string | null;
+  lastSubmissionId?: string | null;
+  lastVerdict?: string | null;
+  updatedAt: string;
+}
+
+export function getCodeforcesUsernameProgressKey(username: string): string {
+  return `cf_user_progress:${username.trim().toLowerCase()}`;
+}
+
+export async function getUsernameProgress(username: string): Promise<CodeforcesUsernameProgress | null> {
+  const clean = username.trim();
+  if (!clean) return null;
+  const key = getCodeforcesUsernameProgressKey(clean);
+  const raw = await prisma.systemState.findUnique({ where: { key } }).then((r) => r?.value ?? null);
+  if (!raw) {
+    if (clean.toLowerCase() === 'pts003') {
+      return {
+        username: 'pts003',
+        lastCompletedKey: null,
+        nextKey: '628B',
+        lastCompletedAt: null,
+        lastSubmissionId: null,
+        lastVerdict: null,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    return null;
+  }
+  try {
+    return JSON.parse(raw) as CodeforcesUsernameProgress;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveUsernameProgress(
+  username: string,
+  data: {
+    lastCompletedKey?: string | null;
+    nextKey?: string | null;
+    lastCompletedAt?: string | null;
+    lastSubmissionId?: string | null;
+    lastVerdict?: string | null;
+  },
+): Promise<CodeforcesUsernameProgress | null> {
+  const clean = username.trim();
+  if (!clean) return null;
+  const existing = await getUsernameProgress(clean);
+  const now = new Date().toISOString();
+  const updated: CodeforcesUsernameProgress = {
+    username: existing?.username ?? clean,
+    lastCompletedKey: data.lastCompletedKey !== undefined ? data.lastCompletedKey : (existing?.lastCompletedKey ?? null),
+    nextKey: data.nextKey !== undefined ? data.nextKey : (existing?.nextKey ?? null),
+    lastCompletedAt: data.lastCompletedAt !== undefined ? data.lastCompletedAt : (existing?.lastCompletedAt ?? null),
+    lastSubmissionId: data.lastSubmissionId !== undefined ? data.lastSubmissionId : (existing?.lastSubmissionId ?? null),
+    lastVerdict: data.lastVerdict !== undefined ? data.lastVerdict : (existing?.lastVerdict ?? null),
+    updatedAt: now,
+  };
+  const key = getCodeforcesUsernameProgressKey(clean);
+  await prisma.systemState.upsert({
+    where: { key },
+    create: { key, value: JSON.stringify(updated) },
+    update: { value: JSON.stringify(updated) },
+  });
+  return updated;
+}
+
+export async function listAllUsernameProgress(): Promise<CodeforcesUsernameProgress[]> {
+  const rows = await prisma.systemState.findMany({
+    where: { key: { startsWith: 'cf_user_progress:' } },
+  });
+  const list: CodeforcesUsernameProgress[] = [];
+  for (const row of rows) {
+    try {
+      list.push(JSON.parse(row.value) as CodeforcesUsernameProgress);
+    } catch {
+      // ignore malformed
+    }
+  }
+  if (!list.some((p) => p.username.toLowerCase() === 'pts003')) {
+    list.push({
+      username: 'pts003',
+      lastCompletedKey: null,
+      nextKey: '628B',
+      lastCompletedAt: null,
+      lastSubmissionId: null,
+      lastVerdict: null,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  return list.sort((a, b) => a.username.localeCompare(b.username));
+}
+
+export async function deleteUsernameProgress(username: string): Promise<boolean> {
+  const key = getCodeforcesUsernameProgressKey(username);
+  const res = await prisma.systemState.deleteMany({ where: { key } });
+  return res.count > 0;
+}
+
 export async function saveCodeforcesAccount(
   label: string,
   storageState: string,
   meta: { username?: string | null; status?: CodeforcesAccountStatus } = {},
 ): Promise<CodeforcesAccountRecord> {
-  return prisma.codeforcesAccount.upsert({
+  const account = await prisma.codeforcesAccount.upsert({
     where: { label },
     create: {
       label,
@@ -64,6 +168,33 @@ export async function saveCodeforcesAccount(
       lastError: null,
     },
   });
+
+  // Restore permanent username progress if available
+  if (account.username) {
+    const userProgress = await getUsernameProgress(account.username);
+    if (userProgress && (userProgress.nextKey || userProgress.lastCompletedKey)) {
+      await prisma.codeforcesProgress.upsert({
+        where: { accountId: account.id },
+        create: {
+          accountId: account.id,
+          nextKey: userProgress.nextKey,
+          lastCompletedKey: userProgress.lastCompletedKey,
+          lastCompletedAt: userProgress.lastCompletedAt ? new Date(userProgress.lastCompletedAt) : null,
+          lastSubmissionId: userProgress.lastSubmissionId ?? null,
+          lastVerdict: userProgress.lastVerdict ?? null,
+        },
+        update: {
+          nextKey: userProgress.nextKey,
+          lastCompletedKey: userProgress.lastCompletedKey,
+          lastCompletedAt: userProgress.lastCompletedAt ? new Date(userProgress.lastCompletedAt) : null,
+          lastSubmissionId: userProgress.lastSubmissionId ?? null,
+          lastVerdict: userProgress.lastVerdict ?? null,
+        },
+      });
+    }
+  }
+
+  return account;
 }
 
 export async function patchCodeforcesAccount(
@@ -95,11 +226,36 @@ export async function patchCodeforcesAccount(
 }
 
 export async function getCodeforcesProgress(accountId: string): Promise<CodeforcesProgress> {
-  return prisma.codeforcesProgress.upsert({
+  const progress = await prisma.codeforcesProgress.upsert({
     where: { accountId },
     create: { accountId },
     update: {},
   });
+
+  // If this account has no progress keys yet, check if the username has permanent progress in DB
+  if (!progress.nextKey && !progress.lastCompletedKey) {
+    const account = await prisma.codeforcesAccount.findUnique({
+      where: { id: accountId },
+      select: { username: true },
+    });
+    if (account?.username) {
+      const userProgress = await getUsernameProgress(account.username);
+      if (userProgress && (userProgress.nextKey || userProgress.lastCompletedKey)) {
+        return prisma.codeforcesProgress.update({
+          where: { accountId },
+          data: {
+            nextKey: userProgress.nextKey,
+            lastCompletedKey: userProgress.lastCompletedKey,
+            lastCompletedAt: userProgress.lastCompletedAt ? new Date(userProgress.lastCompletedAt) : null,
+            lastSubmissionId: userProgress.lastSubmissionId ?? null,
+            lastVerdict: userProgress.lastVerdict ?? null,
+          },
+        });
+      }
+    }
+  }
+
+  return progress;
 }
 
 /** Atomically reserves the one daily attempt for an account. */
@@ -137,6 +293,17 @@ export async function recordAttempt(
       lastVerdict: data.verdict,
     },
   });
+
+  const account = await prisma.codeforcesAccount.findUnique({
+    where: { id: accountId },
+    select: { username: true },
+  });
+  if (account?.username) {
+    await saveUsernameProgress(account.username, {
+      lastSubmissionId: data.submissionId ?? null,
+      lastVerdict: data.verdict,
+    });
+  }
 }
 
 export async function completeCurrentProblem(
@@ -148,16 +315,31 @@ export async function completeCurrentProblem(
     verdict: string;
   },
 ): Promise<void> {
+  const now = new Date();
   await prisma.codeforcesProgress.update({
     where: { accountId },
     data: {
       lastCompletedKey: data.completedKey,
-      lastCompletedAt: new Date(),
+      lastCompletedAt: now,
       nextKey: data.nextKey,
       lastSubmissionId: data.submissionId,
       lastVerdict: data.verdict,
     },
   });
+
+  const account = await prisma.codeforcesAccount.findUnique({
+    where: { id: accountId },
+    select: { username: true },
+  });
+  if (account?.username) {
+    await saveUsernameProgress(account.username, {
+      lastCompletedKey: data.completedKey,
+      nextKey: data.nextKey,
+      lastCompletedAt: now.toISOString(),
+      lastSubmissionId: data.submissionId,
+      lastVerdict: data.verdict,
+    });
+  }
 }
 
 export async function deleteCodeforcesAccountById(id: string): Promise<boolean> {

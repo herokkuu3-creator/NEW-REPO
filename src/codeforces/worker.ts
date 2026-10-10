@@ -1029,13 +1029,28 @@ async function postViaLocalBrowser(
   return { ...posted, submittedAt, transport: 'Firefox transport' };
 }
 
+export function matchQueueEntry(entry: SourceIndexEntry, targetKey: string): boolean {
+  if (entry.key === targetKey || entry.path === targetKey) return true;
+  const target = targetKey.trim().toLowerCase();
+  const contestIndex = `${entry.contestId ?? ''}${entry.problemIndex ?? ''}`.toLowerCase();
+  if (contestIndex && (contestIndex === target || `${entry.contestId}/${entry.problemIndex}`.toLowerCase() === target)) {
+    return true;
+  }
+  const file = (entry.fileName ?? entry.path ?? '').toLowerCase();
+  if (file === target) return true;
+  if (contestIndex && (file.startsWith(`${contestIndex} `) || file.startsWith(`${contestIndex}-`) || file.startsWith(`${contestIndex}.`))) {
+    if (target === contestIndex) return true;
+  }
+  return false;
+}
+
 export function resolveCurrentEntry(queue: SourceIndexEntry[], nextKey: string | null, lastCompletedKey: string | null): SourceIndexEntry | null {
   if (nextKey) {
-    const exact = queue.find((entry) => entry.key === nextKey);
+    const exact = queue.find((entry) => matchQueueEntry(entry, nextKey));
     if (exact) return exact;
   }
   if (lastCompletedKey) {
-    const completedIndex = queue.findIndex((entry) => entry.key === lastCompletedKey);
+    const completedIndex = queue.findIndex((entry) => matchQueueEntry(entry, lastCompletedKey));
     if (completedIndex >= 0) return queue[completedIndex + 1] ?? null;
   }
   return queue[0] ?? null;

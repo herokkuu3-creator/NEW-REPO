@@ -36,7 +36,14 @@ import {
   formatCodeChefRangeStatus,
 } from '../codechef/worker';
 import { listCodeChefAccounts, getCodeChefProgress as getCodeChefAccountProgress } from '../codechef/storage';
-import { deleteCodeforcesAccountById, deleteAllCodeforcesAccounts, getCodeforcesProgress, listCodeforcesAccounts } from '../codeforces/storage';
+import {
+  deleteCodeforcesAccountById,
+  deleteAllCodeforcesAccounts,
+  getCodeforcesProgress,
+  listCodeforcesAccounts,
+  listAllUsernameProgress,
+  saveUsernameProgress,
+} from '../codeforces/storage';
 import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../codeforces/report';
 import { loadRuntimeSourceIndex, SourceIndexEntry } from '../codeforces/sourceRepo';
 import { submitPageUrl } from '../codeforces/handoff';
@@ -217,6 +224,8 @@ export const HELP_TEXT = [
   '├ /cfnetwork — Switch network mode (Proxy / Tailscale)',
   '├ /cfmanualnext — Get next source &amp; mobile submit link',
   '├ /cfaccounts — View Codeforces accounts &amp; verdicts',
+  '├ /cfprogress — View permanent submission progress by username in DB',
+  '├ /cfsetprogress &lt;user&gt; &lt;problem&gt; — Set next problem for username',
   '└ /cf_clear_cookies — Delete Codeforces stored sessions',
   '',
   '<b>🌐 𝗣𝗥𝗢𝗫𝗬 &amp; 𝗡𝗘𝗧𝗪𝗢𝗥𝗞</b>',
@@ -689,6 +698,17 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cfaccounts':
       case '/cf_accounts':
         await replyHtml(await codeforcesAccountsText());
+        return;
+      case '/cfprogress':
+      case '/cf_progress':
+      case '/cfuserprogress':
+      case '/cf_user_progress':
+        await replyHtml(await codeforcesUserProgressText());
+        return;
+      case '/cfsetprogress':
+      case '/cf_set_progress':
+      case '/cfprogressset':
+        await handleCfSetProgress(commandArg);
         return;
       case '/triggersubmission':
       case '/trigger_submission':
@@ -3436,7 +3456,7 @@ export async function handleCallbackQuery(
     const removed = await deleteAllCodeforcesAccounts();
     logger.info({ removed }, 'all Codeforces account sessions removed via Telegram');
     await deps.answer(q.id, `Removed ${removed}`);
-    await deps.edit(chatId, messageId, `🧹 Removed all Codeforces sessions (${removed} account(s)). Send Codeforces cookie .json files to add accounts again.`);
+    await deps.edit(chatId, messageId, `🧹 Removed all Codeforces sessions (${removed} account(s)).\n\n<b>Note:</b> Username submission progress is permanently preserved in the DB. When cookies are re-added, accounts continue from their next question.`);
     return;
   }
 
@@ -3454,7 +3474,7 @@ export async function handleCallbackQuery(
       text = '🤷 That Codeforces account was already removed.';
     } else {
       logger.info({ label: target.label }, 'Codeforces account session removed via Telegram');
-      text = `✅ Removed Codeforces account ${cfAccountName(target)}`;
+      text = `✅ Removed Codeforces account ${cfAccountName(target)} (username submission progress preserved in DB)`;
     }
     const remaining = await listCodeforcesAccounts();
     await deps.answer(q.id, text);
@@ -3724,6 +3744,7 @@ export const VALID_QUEUE_COMMANDS = new Set([
   '/cfrangestatus', '/cf_range_status', '/cfstatusrange', '/cf_status_range',
   '/cfcancelrange', '/cf_cancel_range', '/cfcancel', '/cf_cancel', '/cancelcfrange', '/cancel_cf_range',
   '/cfaccounts', '/cf_accounts',
+  '/cfprogress', '/cf_progress', '/cfsetprogress', '/cf_set_progress',
   '/cfnetwork', '/cf_network', '/cftransport',
   // CodeChef
   '/ccrange', '/cc_range', '/ccbatch', '/cc_batch',
@@ -4212,6 +4233,51 @@ async function codeforcesAccountsText(): Promise<string> {
     if (account.lastError) lines.push(`   └ ⚠️ <i>${escapeHtml(account.lastError.slice(0, 140))}</i>`);
   }
   return lines.join('\n');
+}
+
+async function codeforcesUserProgressText(): Promise<string> {
+  const list = await listAllUsernameProgress();
+  if (list.length === 0) {
+    return '<b>🏆 CODEFORCES USER PROGRESS</b>\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n<i>No username progress saved yet. Progress is saved automatically on each submission.</i>';
+  }
+  const lines = [
+    '<b>🏆 CODEFORCES USER PROGRESS (PERMANENT)</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    '<i>Tracks the last completed and next question for each username. Progress persists permanently in DB across cookie resets.</i>\n',
+  ];
+  for (const item of list) {
+    lines.push(`👤 <b><code>${escapeHtml(item.username)}</code></b>`);
+    if (item.nextKey) lines.push(`   ├ 🎯 Next: <code>${escapeHtml(item.nextKey)}</code>`);
+    if (item.lastCompletedKey) lines.push(`   ├ ✅ Last Completed: <code>${escapeHtml(item.lastCompletedKey)}</code>`);
+    if (item.lastVerdict) lines.push(`   ├ ⚖️ Verdict: <i>${escapeHtml(item.lastVerdict)}</i>`);
+    if (item.lastSubmissionId) lines.push(`   ├ 🆔 Submission: #<code>${escapeHtml(item.lastSubmissionId)}</code>`);
+    if (item.lastCompletedAt) lines.push(`   └ 🕒 Completed: <code>${escapeHtml(item.lastCompletedAt.slice(0, 19).replace('T', ' '))}</code>`);
+    else lines.push(`   └ 🕒 Updated: <code>${escapeHtml(item.updatedAt.slice(0, 19).replace('T', ' '))}</code>`);
+    lines.push('');
+  }
+  lines.push('<i>Use <code>/cfsetprogress &lt;username&gt; &lt;problemKey&gt;</code> to adjust progress manually.</i>');
+  return lines.join('\n');
+}
+
+async function handleCfSetProgress(arg?: string): Promise<void> {
+  const parts = (arg ?? '').trim().split(/\s+/);
+  if (parts.length < 2 || !parts[0] || !parts[1]) {
+    await replyHtml('<b>Usage:</b> <code>/cfsetprogress &lt;username&gt; &lt;nextProblemKey&gt;</code>\n<i>Example: <code>/cfsetprogress pts003 628B</code></i>');
+    return;
+  }
+  const [username, problemKey] = parts;
+  await saveUsernameProgress(username!, { nextKey: problemKey! });
+  const accounts = await listCodeforcesAccounts(true);
+  const matched = accounts.find((a) => (a.username ?? '').toLowerCase() === username!.toLowerCase());
+  if (matched) {
+    const { prisma } = await import('../database/prisma');
+    await prisma.codeforcesProgress.upsert({
+      where: { accountId: matched.id },
+      create: { accountId: matched.id, nextKey: problemKey! },
+      update: { nextKey: problemKey! },
+    });
+  }
+  await replyHtml(`✅ Set next problem for <b><code>${escapeHtml(username!)}</code></b> to <code>${escapeHtml(problemKey!)}</code>.\n<i>Permanent progress saved in DB${matched ? ` and synced to active account <code>${escapeHtml(matched.label)}</code>` : ''}.</i>`);
 }
 
 async function statusText(): Promise<string> {
