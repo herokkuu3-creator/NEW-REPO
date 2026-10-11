@@ -252,9 +252,8 @@ describe('Solver Orchestration & Fallback Engine', () => {
       return { ok: false, status: 500 } as Response;
     }));
 
-    const result = await solveTurnstileOrchestrated({
-      siteurl: 'https://codeforces.com/contest/2275/submit',
-      sitekey: '0x4AAAAAAADnPIDROrmt1Wwj',
+    const result = await solveCloudflareOrchestrated({
+      websiteURL: 'https://codeforces.com/contest/2275/submit',
       timeoutMs: 5_000,
       overrideKeys: ['capzy_valid_key_1234567890abcdef1234567890'],
     });
@@ -264,7 +263,67 @@ describe('Solver Orchestration & Fallback Engine', () => {
     expect(result).not.toBeNull();
     expect(result?.cfClearance).toBe('cleared');
     expect(result?.source).toBe('cpsolver');
-    expect(sentTelegramMessages.some((msg) => msg.includes('Turnstile solved via CPSolver!'))).toBe(true);
+    expect(sentTelegramMessages.some((msg) => msg.includes('Cloudflare Challenge cleared via CPSolver!'))).toBe(true);
     expect(sentTelegramMessages.some((msg) => msg.includes('Falling back to CapSolver'))).toBe(false);
+  });
+
+  it('fails over to CapSolver when CPSolver returns clearance cookies but no token for Turnstile widget', async () => {
+    process.env.CPSOLVER_URL = 'https://cpsolver.test.com';
+    process.env.TELEGRAM_BOT_TOKEN = '123456:test_token';
+    process.env.TELEGRAM_CHAT_ID = '987654321';
+
+    let cpsolverCalls = 0;
+    let capzyCalled = false;
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const urlStr = String(url);
+      if (urlStr.includes('api.telegram.org')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true }) } as Response;
+      }
+
+      // CPSolver returns cfClearance but token is undefined/empty
+      if (urlStr.includes('cpsolver.test.com/solve')) {
+        cpsolverCalls++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            cfClearance: 'cleared',
+            cookies: { cf_clearance: 'xyz' },
+            token: '',
+            durationMs: 3000,
+          }),
+        } as Response;
+      }
+
+      // Capzy fallback provides real token
+      if (urlStr.includes('api.capzy.ai/createTask')) {
+        capzyCalled = true;
+        return { ok: true, status: 200, json: async () => ({ errorId: 0, taskId: 'task_cf_token' }) } as Response;
+      }
+
+      if (urlStr.includes('api.capzy.ai/getTaskResult')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ errorId: 0, status: 'ready', solution: { token: '0.real_turnstile_token_from_capzy' } }),
+        } as Response;
+      }
+
+      return { ok: false, status: 500 } as Response;
+    }));
+
+    const result = await solveTurnstileOrchestrated({
+      siteurl: 'https://codeforces.com/contest/2275/submit',
+      sitekey: '0x4AAAAAAADnPIDROrmt1Wwj',
+      timeoutMs: 5_000,
+      overrideKeys: ['capzy_valid_key_1234567890abcdef1234567890'],
+    });
+
+    expect(capzyCalled).toBe(true);
+    expect(result).not.toBeNull();
+    expect(result?.token).toBe('0.real_turnstile_token_from_capzy');
+    expect(result?.source).toBe('capsolver');
   });
 });

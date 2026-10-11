@@ -219,12 +219,23 @@ export async function solveTurnstileWithCPSolver(params: {
       proxyUsed?: string;
     };
 
-    const hasToken = typeof data.token === 'string' && data.token.trim().length > 0;
+    const hasToken = typeof data.token === 'string' && data.token.trim().length > 10;
     const hasClearance = typeof data.cfClearance === 'string' && data.cfClearance.trim().length > 0;
     const hasCookies = data.cookies && Object.keys(data.cookies).length > 0;
-    const isSuccess = data.ok !== false && (hasToken || hasClearance || hasCookies);
+    const isSuccess = data.ok !== false && (params.sitekey ? hasToken : (hasToken || hasClearance || hasCookies));
 
-    if (isSuccess) {
+    if (isSuccess && hasToken) {
+      return {
+        ok: true,
+        token: data.token,
+        cookies: data.cookies,
+        cfClearance: data.cfClearance,
+        durationMs: data.durationMs ?? durationMs,
+        proxyUsed: data.proxyUsed,
+      };
+    }
+
+    if (isSuccess && !params.sitekey && (hasClearance || hasCookies)) {
       return {
         ok: true,
         token: data.token,
@@ -238,7 +249,7 @@ export async function solveTurnstileWithCPSolver(params: {
     return {
       ok: false,
       durationMs: data.durationMs ?? durationMs,
-      error: data.error || (data.ok ? 'CPSolver returned ok=true without token' : 'CPSolver failed to solve Turnstile'),
+      error: data.error || (data.ok ? 'CPSolver completed without issuing a Turnstile token' : 'CPSolver failed to solve Turnstile'),
       proxyUsed: data.proxyUsed,
     };
   } catch (err) {
@@ -668,7 +679,8 @@ export async function solveTurnstileOrchestrated(params: {
         timeoutMs,
       });
 
-      if (res.ok && (res.token || res.cfClearance || (res.cookies && Object.keys(res.cookies).length > 0))) {
+      const hasValidToken = typeof res.token === 'string' && res.token.trim().length > 10;
+      if (res.ok && hasValidToken) {
         const sec = Math.max(1, Math.round(res.durationMs / 1000));
         const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${res.proxyUsed}</code>` : '';
         const successNotice = `✅ <b>Turnstile solved via CPSolver!</b> <i>(${sec}s, attempt ${attempt}/${maxTries})</i>${proxyInfo}`;
