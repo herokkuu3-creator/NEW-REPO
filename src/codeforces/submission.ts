@@ -1,5 +1,6 @@
 import type { Page, Response } from 'playwright';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, solveCloudflareWithCapzy, solveCloudflareOrchestrated } from './browserForm';
+import { getCPSolverUrl } from './captchaSolver';
 import { interactWithTurnstileCheckbox } from '../browser/stealth';
 import type { BrowserSession } from '../browser/playwright';
 import { logger } from '../logger';
@@ -309,15 +310,16 @@ function finishPost(
  */
 function challengeWaitMs(): number {
   const configured = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS);
-  return Number.isFinite(configured) && configured >= 0 ? configured : 25_000;
+  return Number.isFinite(configured) && configured >= 0 ? configured : 50_000;
 }
 
 async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxyUrl?: string): Promise<boolean> {
   if (timeoutMs === 0 || typeof page.context !== 'function') return false;
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + Math.max(timeoutMs, 45_000);
   let clickAttemptedAt = 0;
 
-  if (proxyUrl) {
+  const solverUrl = getCPSolverUrl();
+  if (proxyUrl || solverUrl) {
     try {
       const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
       logger.info({ proxyUrl, userAgent }, 'waitOutChallenge: requesting orchestrated solve');
@@ -325,7 +327,7 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
         websiteURL: page.url() || 'https://codeforces.com',
         proxyUrl,
         userAgent,
-        timeoutMs: 30_000,
+        timeoutMs: Math.max(35_000, timeoutMs),
       });
       if (result?.cookies && Object.keys(result.cookies).length > 0) {
         const cookiesToSet = Object.entries(result.cookies)

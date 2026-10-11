@@ -27,7 +27,7 @@ import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy, getDefaultUserAgent } from './browserForm';
 import { initCapzyKeys, getActiveCapzyKeyIndex } from './capzyKeyManager';
-import { solveCloudflareOrchestrated, initCPSolverConfig } from './captchaSolver';
+import { solveCloudflareOrchestrated, initCPSolverConfig, getCPSolverUrl } from './captchaSolver';
 import { applyStealthScripts, interactWithTurnstileCheckbox } from '../browser/stealth';
 import { parseProxyList } from './proxyRotator';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
@@ -39,7 +39,7 @@ const BROWSER_ENGINE = process.env.CODEFORCES_BROWSER === 'chromium' ? 'chromium
 const BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const NAV_TIMEOUT_MS = Number(process.env.CODEFORCES_NAV_TIMEOUT_MS ?? 60_000);
 const TURNSTILE_WAIT_MS = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 45_000);
-const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 25_000);
+const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 50_000);
 const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 300);
 // Outbound proxy for Firefox, e.g. socks5://127.0.0.1:40000 (the local WARP
 // tunnel started by scripts/start-submitter.sh). Empty = direct connection.
@@ -389,20 +389,21 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
 
 async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxyUrl?: string, overrideKeys?: string[]): Promise<boolean> {
   if (timeoutMs === 0 || typeof page.context !== 'function') return false;
-  const deadline = Date.now() + timeoutMs;
+  const effectiveTimeout = Math.max(timeoutMs, 45_000);
+  const deadline = Date.now() + effectiveTimeout;
   let clickAttemptedAt = 0;
 
-  let capzyRunning = false;
-  if (proxyUrl) {
-    capzyRunning = true;
-    void (async () => {
+  let solverPromise: Promise<boolean> | null = null;
+  const solverUrl = getCPSolverUrl();
+  if (proxyUrl || solverUrl) {
+    solverPromise = (async () => {
       try {
         const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
         const result = await solveCloudflareOrchestrated({
           websiteURL: page.url() || 'https://codeforces.com',
           proxyUrl,
           userAgent,
-          timeoutMs: Math.min(25_000, timeoutMs),
+          timeoutMs: Math.max(35_000, timeoutMs),
           overrideKeys,
         });
         if (result?.cookies && Object.keys(result.cookies).length > 0) {
@@ -414,11 +415,13 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
           if (cookiesToSet.length > 0) {
             log({ count: cookiesToSet.length, source: result.source }, 'waitOutChallenge: injecting Cloudflare cookies');
             await page.context().addCookies(cookiesToSet).catch(() => undefined);
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => undefined);
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
+            return true;
           }
         }
-      } catch {} finally {
-        capzyRunning = false;
+        return false;
+      } catch {
+        return false;
       }
     })();
   }
@@ -447,7 +450,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
       }
     } catch {}
 
-    if (Date.now() > clickAttemptedAt + 2_500) {
+    if (Date.now() > clickAttemptedAt + 3_500) {
       clickAttemptedAt = Date.now();
       try {
         const handled = await interactWithTurnstileCheckbox(page);
@@ -464,6 +467,19 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
     if (remaining <= 0) break;
     await sleep(Math.min(500, Math.max(10, remaining)));
   }
+
+  // Grace period: if solverPromise is still running, wait up to 15s for clearance
+  if (solverPromise) {
+    const solved = await Promise.race([
+      solverPromise,
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 15_000)),
+    ]);
+    if (solved) {
+      log({}, 'waitOutChallenge: challenge cleared after waiting for solver completion');
+      return true;
+    }
+  }
+
   return false;
 }
 
