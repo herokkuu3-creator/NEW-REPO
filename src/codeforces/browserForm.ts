@@ -306,6 +306,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     solverStarted = true;
     solverPromise = (async () => {
       const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
+      const currentCookies = await page.context().cookies().catch(() => []);
 
       if (info.sitekey) {
         const solution = await solveTurnstileOrchestrated({
@@ -315,6 +316,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
           cdata: info.cdata ?? undefined,
           proxyUrl,
           userAgent,
+          cookies: currentCookies,
           timeoutMs,
           overrideKeys,
         });
@@ -344,6 +346,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
           websiteURL: page.url(),
           proxyUrl,
           userAgent,
+          cookies: currentCookies,
           timeoutMs,
           overrideKeys,
         });

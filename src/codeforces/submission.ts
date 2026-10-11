@@ -335,6 +335,7 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
   if (proxyUrl || solverUrl) {
     try {
       const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
+      const currentCookies = await page.context().cookies().catch(() => []);
       logger.info({ solverUrl, userAgent: userAgent?.slice(0, 80), url: currentUrl }, 'waitOutChallenge: invoking solveCloudflareOrchestrated synchronously');
 
       const solveStart = Date.now();
@@ -342,6 +343,7 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
         websiteURL: currentUrl,
         proxyUrl,
         userAgent,
+        cookies: currentCookies,
         timeoutMs: Math.max(35_000, timeoutMs),
       });
 
@@ -355,23 +357,29 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
         hasClearance: !!result?.cfClearance,
       }, 'waitOutChallenge: solveCloudflareOrchestrated returned');
 
+      const cookiesToSet: Array<{ name: string; value: string; domain: string; path: string }> = [];
       if (result?.cookies && Object.keys(result.cookies).length > 0) {
-        const cookiesToSet = Object.entries(result.cookies)
-          .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
-          .map(([name, value]) => ({
-            name,
-            value: String(value),
-            domain: '.codeforces.com',
-            path: '/',
-          }));
+        for (const [name, value] of Object.entries(result.cookies)) {
+          if (name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf')) {
+            cookiesToSet.push({ name, value: String(value), domain: '.codeforces.com', path: '/' });
+          }
+        }
+      }
+      if (result?.cfClearance && result.cfClearance.length > 5 && result.cfClearance !== 'cleared') {
+        if (!cookiesToSet.some((c) => c.name === 'cf_clearance')) {
+          cookiesToSet.push({ name: 'cf_clearance', value: result.cfClearance, domain: '.codeforces.com', path: '/' });
+        }
+      }
 
+      if (cookiesToSet.length > 0 || Boolean(result)) {
         if (cookiesToSet.length > 0) {
-          logger.info({ count: cookiesToSet.length, names: cookiesToSet.map((c) => c.name), source: result.source }, 'waitOutChallenge: injecting Cloudflare clearance cookies into browser context');
+          logger.info({ count: cookiesToSet.length, names: cookiesToSet.map((c) => c.name), source: result?.source }, 'waitOutChallenge: injecting Cloudflare clearance cookies into browser context');
           await page.context().addCookies(cookiesToSet).catch((err) => {
             logger.warn({ err: String(err) }, 'waitOutChallenge: addCookies threw');
           });
+        }
 
-          await sleep(500);
+        await sleep(500);
 
           logger.info({ url: page.url() }, 'waitOutChallenge: reloading page after cookie injection...');
           const reloadRes = await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch((err) => {
@@ -399,7 +407,6 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
             return true;
           }
         }
-      }
     } catch (solverErr) {
       logger.warn({ err: errorMessage(solverErr) }, 'waitOutChallenge: orchestrated solver threw an error');
     }

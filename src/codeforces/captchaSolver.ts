@@ -165,6 +165,7 @@ export async function solveTurnstileWithCPSolver(params: {
   userAgent?: string;
   timeoutMs?: number;
   mode?: 'harness' | 'navigate';
+  cookies?: Array<{ name: string; value: string; domain?: string; path?: string }> | Record<string, string>;
 }): Promise<{
   ok: boolean;
   token?: string;
@@ -195,6 +196,7 @@ export async function solveTurnstileWithCPSolver(params: {
         timeout,
         mode: params.mode ?? ((params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj' || (params.siteurl ?? '').includes('codeforces.com')) ? 'navigate' : 'harness'),
         userAgent: params.userAgent,
+        cookies: params.cookies,
       }),
       signal: AbortSignal.timeout(timeout + 5_000),
     });
@@ -263,6 +265,7 @@ export async function solveCloudflareWithCPSolver(params: {
   proxy?: string;
   userAgent?: string;
   timeoutMs?: number;
+  cookies?: Array<{ name: string; value: string; domain?: string; path?: string }> | Record<string, string>;
 }): Promise<{
   ok: boolean;
   token?: string;
@@ -290,6 +293,7 @@ export async function solveCloudflareWithCPSolver(params: {
         timeout,
         mode: 'navigate',
         userAgent: params.userAgent,
+        cookies: params.cookies,
       }),
       signal: AbortSignal.timeout(timeout + 5_000),
     });
@@ -639,6 +643,7 @@ export async function solveTurnstileOrchestrated(params: {
   cdata?: string;
   proxyUrl?: string;
   userAgent?: string;
+  cookies?: Array<{ name: string; value: string; domain?: string; path?: string }> | Record<string, string>;
   timeoutMs?: number;
   overrideKeys?: string[];
 }): Promise<SolverResult | null> {
@@ -670,6 +675,7 @@ export async function solveTurnstileOrchestrated(params: {
         cdata: params.cdata,
         proxy: proxyForCPSolver,
         userAgent: params.userAgent,
+        cookies: params.cookies,
         timeoutMs: cpsolverTimeoutMs,
       });
 
@@ -698,7 +704,11 @@ export async function solveTurnstileOrchestrated(params: {
         };
       }
 
+      const errBrief = res.error ? ` (${res.error.slice(0, 100)})` : '';
       logWarn({ attempt, error: res.error, durationMs: Date.now() - attemptStartTime }, 'CPSolver attempt failed');
+      const failNotice = `⚠️ <b>[Attempt ${attempt}/${maxTries} failed]</b><i>${errBrief}</i>`;
+      await sendSolverTelegramNotification(failNotice).catch(() => undefined);
+
       if (attempt < maxTries) {
         await new Promise((r) => setTimeout(r, 2000));
       }
@@ -754,6 +764,7 @@ export async function solveCloudflareOrchestrated(params: {
   websiteURL: string;
   proxyUrl?: string;
   userAgent?: string;
+  cookies?: Array<{ name: string; value: string; domain?: string; path?: string }> | Record<string, string>;
   timeoutMs?: number;
   sitekey?: string;
   action?: string;
@@ -768,6 +779,7 @@ export async function solveCloudflareOrchestrated(params: {
       cdata: params.cdata,
       proxyUrl: params.proxyUrl,
       userAgent: params.userAgent,
+      cookies: params.cookies,
       timeoutMs: params.timeoutMs,
       overrideKeys: params.overrideKeys,
     });
@@ -795,6 +807,7 @@ export async function solveCloudflareOrchestrated(params: {
         siteurl: params.websiteURL,
         proxy: proxyForCPSolver,
         userAgent: params.userAgent,
+        cookies: params.cookies,
         timeoutMs,
       });
 
@@ -813,7 +826,11 @@ export async function solveCloudflareOrchestrated(params: {
         };
       }
 
+      const errBrief = res.error ? ` (${res.error.slice(0, 100)})` : '';
       logWarn({ attempt, error: res.error }, 'CPSolver challenge attempt failed');
+      const failNotice = `⚠️ <b>[Attempt ${attempt}/${maxTries} failed]</b><i>${errBrief}</i>`;
+      await sendSolverTelegramNotification(failNotice).catch(() => undefined);
+
       if (attempt < maxTries) {
         await new Promise((r) => setTimeout(r, 2000));
       }
