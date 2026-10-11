@@ -162,6 +162,7 @@ export async function solveTurnstileWithCPSolver(params: {
   action?: string;
   cdata?: string;
   proxy?: string;
+  userAgent?: string;
   timeoutMs?: number;
   mode?: 'harness' | 'navigate';
 }): Promise<{
@@ -193,6 +194,7 @@ export async function solveTurnstileWithCPSolver(params: {
         proxy: params.proxy,
         timeout,
         mode: params.mode ?? 'harness',
+        userAgent: params.userAgent,
       }),
       signal: AbortSignal.timeout(timeout + 5_000),
     });
@@ -254,6 +256,7 @@ export async function solveTurnstileWithCPSolver(params: {
 export async function solveCloudflareWithCPSolver(params: {
   siteurl: string;
   proxy?: string;
+  userAgent?: string;
   timeoutMs?: number;
 }): Promise<{
   ok: boolean;
@@ -281,6 +284,7 @@ export async function solveCloudflareWithCPSolver(params: {
         proxy: params.proxy,
         timeout,
         mode: 'navigate',
+        userAgent: params.userAgent,
       }),
       signal: AbortSignal.timeout(timeout + 5_000),
     });
@@ -659,6 +663,7 @@ export async function solveTurnstileOrchestrated(params: {
         action: params.action,
         cdata: params.cdata,
         proxy: proxyForCPSolver,
+        userAgent: params.userAgent,
         timeoutMs,
       });
 
@@ -774,6 +779,7 @@ export async function solveCloudflareOrchestrated(params: {
       const res = await solveCloudflareWithCPSolver({
         siteurl: params.websiteURL,
         proxy: proxyForCPSolver,
+        userAgent: params.userAgent,
         timeoutMs,
       });
 

@@ -206,7 +206,9 @@ export async function submitViaRemoteSubmitter(
   }
   if (response.status === 202 && typeof (body as { jobId?: unknown } | null)?.jobId === 'string') {
     const id = (body as { jobId: string }).jobId;
+    logger.info({ id }, 'submitViaRemoteSubmitter: dispatched to runner broker, awaiting job result...');
     body = await waitForActionResult(url, token, id, deadline, options.onProgress);
+    logger.info({ id, result: body }, 'submitViaRemoteSubmitter: received runner result from broker');
     if (!body || 'jobId' in body) {
       return { ...failed(`GitHub browser job ${id} did not return a result; its Codeforces outcome is uncertain`, false), submittedAt };
     }
@@ -234,6 +236,7 @@ export async function submitViaRemoteSubmitter(
       clicked: outcome.clicked,
       turnstile: outcome.turnstile,
       interactive: outcome.interactive,
+      error: outcome.error,
     },
     'isolated Codeforces browser submitter finished',
   );

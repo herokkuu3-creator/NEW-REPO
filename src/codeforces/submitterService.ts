@@ -389,55 +389,110 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
 
 async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxyUrl?: string, overrideKeys?: string[]): Promise<boolean> {
   if (timeoutMs === 0 || typeof page.context !== 'function') return false;
-  const effectiveTimeout = Math.max(timeoutMs, 45_000);
+  const effectiveTimeout = Math.max(timeoutMs, 50_000);
   const deadline = Date.now() + effectiveTimeout;
-  let clickAttemptedAt = 0;
+  const currentUrl = page.url() || 'https://codeforces.com';
+  const initialTitle = await page.title().catch(() => '');
 
-  let solverPromise: Promise<boolean> | null = null;
+  log({ url: currentUrl, title: initialTitle, timeoutMs, effectiveTimeout, hasProxy: !!proxyUrl }, 'waitOutChallenge: starting challenge resolution');
+
+  // Check if challenge is already gone before doing anything
+  const initialIsChallenge = /just a moment|checking your browser|attention required|cloudflare/i.test(initialTitle);
+  if (!initialIsChallenge && initialTitle.toLowerCase().includes('codeforces')) {
+    const loc = page.locator('#header, #body, #pageContent, form:has(textarea[name="source"])');
+    if ((await loc.count().catch(() => 0)) > 0) {
+      log({ title: initialTitle }, 'waitOutChallenge: page already has Codeforces content, no wait needed');
+      return true;
+    }
+  }
+
   const solverUrl = getCPSolverUrl();
   if (proxyUrl || solverUrl) {
-    solverPromise = (async () => {
-      try {
-        const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-        const result = await solveCloudflareOrchestrated({
-          websiteURL: page.url() || 'https://codeforces.com',
-          proxyUrl,
-          userAgent,
-          timeoutMs: Math.max(35_000, timeoutMs),
-          overrideKeys,
-        });
-        if (result?.cookies && Object.keys(result.cookies).length > 0) {
-          const cookiesToSet = Object.entries(result.cookies)
-            .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
-            .map(([name, value]) => ({
-              name, value: String(value), domain: '.codeforces.com', path: '/',
-            }));
-          if (cookiesToSet.length > 0) {
-            log({ count: cookiesToSet.length, source: result.source }, 'waitOutChallenge: injecting Cloudflare cookies');
-            await page.context().addCookies(cookiesToSet).catch(() => undefined);
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
+    try {
+      const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
+      log({ solverUrl, userAgent: userAgent?.slice(0, 80), url: currentUrl }, 'waitOutChallenge: invoking solveCloudflareOrchestrated synchronously');
+
+      const solveStart = Date.now();
+      const result = await solveCloudflareOrchestrated({
+        websiteURL: currentUrl,
+        proxyUrl,
+        userAgent,
+        timeoutMs: Math.max(35_000, timeoutMs),
+        overrideKeys,
+      });
+
+      const solveDuration = Date.now() - solveStart;
+      log({
+        durationMs: solveDuration,
+        ok: !!result,
+        source: result?.source,
+        hasToken: !!result?.token,
+        cookieCount: Object.keys(result?.cookies ?? {}).length,
+        hasClearance: !!result?.cfClearance,
+      }, 'waitOutChallenge: solveCloudflareOrchestrated returned');
+
+      if (result?.cookies && Object.keys(result.cookies).length > 0) {
+        const cookiesToSet = Object.entries(result.cookies)
+          .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+          .map(([name, value]) => ({
+            name,
+            value: String(value),
+            domain: '.codeforces.com',
+            path: '/',
+          }));
+
+        if (cookiesToSet.length > 0) {
+          log({ count: cookiesToSet.length, names: cookiesToSet.map((c) => c.name), source: result.source }, 'waitOutChallenge: injecting Cloudflare clearance cookies into browser context');
+          await page.context().addCookies(cookiesToSet).catch((err) => {
+            logWarn({ err: String(err) }, 'waitOutChallenge: addCookies threw');
+          });
+
+          await sleep(500);
+
+          log({ url: page.url() }, 'waitOutChallenge: reloading page after cookie injection...');
+          const reloadRes = await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch((err) => {
+            logWarn({ err: String(err) }, 'waitOutChallenge: reload threw');
+            return null;
+          });
+
+          await sleep(2000);
+
+          const postTitle = await page.title().catch(() => '');
+          const postUrl = page.url();
+          const isStillChallenge = /just a moment|checking your browser|attention required|cloudflare/i.test(postTitle);
+          const hasContent = await page.locator('#header, #body, #pageContent, form:has(textarea[name="source"])').count().catch(() => 0);
+
+          log({
+            postStatus: reloadRes?.status() ?? null,
+            postTitle,
+            postUrl,
+            isStillChallenge,
+            hasContent,
+          }, 'waitOutChallenge: post-reload verification check');
+
+          if (!isStillChallenge && hasContent > 0) {
+            log({ postTitle, hasContent }, 'waitOutChallenge: challenge successfully cleared after solver cookies injection!');
             return true;
           }
         }
-        return false;
-      } catch {
-        return false;
       }
-    })();
+    } catch (solverErr) {
+      logWarn({ err: errorMessage(solverErr) }, 'waitOutChallenge: orchestrated solver threw an error');
+    }
   }
 
+  // Fallback: check loop until deadline
+  let clickAttemptedAt = 0;
   while (Date.now() < deadline) {
-    // 1. Check cookies for cf_clearance
     try {
       const cookies = await page.context().cookies().catch(() => []);
       const hasClearance = cookies.some((c) => c.name === 'cf_clearance' && c.value.length > 5);
       if (hasClearance) {
-        log({}, 'waitOutChallenge: cf_clearance cookie detected');
+        log({}, 'waitOutChallenge: cf_clearance cookie detected in cookie jar');
         return true;
       }
     } catch {}
 
-    // 2. Check title and DOM readiness
     try {
       const title = await page.title().catch(() => '');
       const isChallengeTitle = /just a moment|checking your browser|attention required|cloudflare/i.test(title);
@@ -468,18 +523,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
     await sleep(Math.min(500, Math.max(10, remaining)));
   }
 
-  // Grace period: if solverPromise is still running, wait up to 15s for clearance
-  if (solverPromise) {
-    const solved = await Promise.race([
-      solverPromise,
-      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 15_000)),
-    ]);
-    if (solved) {
-      log({}, 'waitOutChallenge: challenge cleared after waiting for solver completion');
-      return true;
-    }
-  }
-
+  logWarn({ url: page.url(), title: await page.title().catch(() => '') }, 'waitOutChallenge: challenge did not clear before deadline');
   return false;
 }
 
@@ -489,44 +533,68 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
 
   for (const path of paths) {
     try {
+      log({ path }, 'openSubmitForm: navigating to candidate submit path');
       const response = await page.goto(`https://codeforces.com${path}`, {
         waitUntil: 'domcontentloaded',
         timeout: NAV_TIMEOUT_MS,
       });
       const status = response?.status() ?? 0;
       const finalUrl = page.url();
+      const title = await page.title().catch(() => '');
+      log({ path, status, finalUrl, title }, 'openSubmitForm: initial navigation completed');
+
       if (/\/enter(?:[/?#]|$)/i.test(finalUrl)) {
         throw new Error('Codeforces session is signed out (the submit page redirected to the login page)');
       }
-      if (status === 403 || status === 503) {
+
+      if (status === 403 || status === 503 || CHALLENGE_RE.test(title)) {
+        log({ path, status, title }, 'openSubmitForm: Cloudflare challenge detected (HTTP 403/503 or challenge title)');
         const cleared = await waitOutChallenge(page, undefined, proxyUrl, overrideKeys);
+        log({ path, cleared }, 'openSubmitForm: waitOutChallenge returned');
+
         if (cleared) {
-          const fields = await readFields(page);
+          await sleep(1500);
+          let fields = await readFields(page);
+          log({ path, fieldsCount: fields.length, fields: summarize(fields), url: page.url() }, 'openSubmitForm: checking fields after clearance');
           if (hasSubmitForm(fields)) {
-            log({ path, fields: summarize(fields) }, 'Codeforces submit form opened after HTTP 403 challenge cleared');
+            log({ path, fields: summarize(fields) }, 'Codeforces submit form opened after challenge cleared');
             return;
           }
+
+          log({ path }, 'openSubmitForm: submit form fields not found immediately, navigating with clearance cookies');
           const retryRes = await page.goto(`https://codeforces.com${path}`, {
             waitUntil: 'domcontentloaded',
             timeout: NAV_TIMEOUT_MS,
-          }).catch(() => null);
-          if (retryRes && retryRes.status() < 400) {
-            const retryFields = await readFields(page);
-            if (hasSubmitForm(retryFields)) {
-              log({ path, fields: summarize(retryFields) }, 'Codeforces submit form opened after clearance retry');
-              return;
-            }
+          }).catch((err) => {
+            logWarn({ err: String(err) }, 'openSubmitForm: retry navigation threw');
+            return null;
+          });
+
+          await sleep(1500);
+          fields = await readFields(page);
+          const retryStatus = retryRes?.status() ?? null;
+          const retryTitle = await page.title().catch(() => '');
+          log({ path, retryStatus, retryTitle, fieldsCount: fields.length, fields: summarize(fields), url: page.url() }, 'openSubmitForm: post-retry fields check');
+
+          if (hasSubmitForm(fields)) {
+            log({ path, fields: summarize(fields) }, 'Codeforces submit form opened after clearance retry navigation');
+            return;
           }
-          attempts.push(`${path}: HTTP ${status} (challenge cleared but submit form missing on ${page.url()})`);
+          attempts.push(`${path}: HTTP ${status} (challenge cleared but submit form missing on ${page.url()}, fields: ${summarize(fields)})`);
           continue;
         }
-        throw new BrowserFormError(`Codeforces verification did not complete (HTTP ${status}). The current solution remains pending.`, 'blocked');
+
+        attempts.push(`${path}: HTTP ${status} (Cloudflare challenge could not be cleared)`);
+        continue;
       }
+
       const body = await readBody(page);
       if (CHALLENGE_RE.test(body) || CHALLENGE_RE.test(finalUrl)) {
+        log({ path, bodySnippet: body.slice(0, 100) }, 'openSubmitForm: Challenge text matched in body');
         const cleared = await waitOutChallenge(page, undefined, proxyUrl, overrideKeys);
         if (cleared) {
-          const fields = await readFields(page);
+          await sleep(1500);
+          let fields = await readFields(page);
           if (hasSubmitForm(fields)) {
             log({ path, fields: summarize(fields) }, 'Codeforces submit form opened after challenge cleared');
             return;
@@ -535,24 +603,25 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
             waitUntil: 'domcontentloaded',
             timeout: NAV_TIMEOUT_MS,
           }).catch(() => null);
-          if (retryRes && retryRes.status() < 400) {
-            const retryFields = await readFields(page);
-            if (hasSubmitForm(retryFields)) {
-              log({ path, fields: summarize(retryFields) }, 'Codeforces submit form opened after clearance retry');
-              return;
-            }
+          await sleep(1500);
+          fields = await readFields(page);
+          if (hasSubmitForm(fields)) {
+            log({ path, fields: summarize(fields) }, 'Codeforces submit form opened after clearance retry navigation');
+            return;
           }
           attempts.push(`${path}: challenge cleared but submit form missing on ${page.url()}`);
           continue;
         }
-        throw new BrowserFormError('Codeforces verification did not complete. The current solution remains pending.', 'blocked');
+        attempts.push(`${path}: challenge in body could not be cleared`);
+        continue;
       }
+
       const fields = await readFields(page);
       if (hasSubmitForm(fields)) {
-        log({ path, fields: summarize(fields) }, 'Codeforces submit form opened');
+        log({ path, fields: summarize(fields) }, 'Codeforces submit form opened directly');
         return;
       }
-      attempts.push(`${path}: no submit form (url ${page.url()}; fields: ${summarize(fields)})`);
+      attempts.push(`${path}: no submit form (url ${page.url()}; title "${title}"; fields: ${summarize(fields)})`);
     } catch (err) {
       if (err instanceof BrowserFormError) throw err;
       attempts.push(`${path}: ${errorMessage(err)}`);
@@ -560,6 +629,7 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
   }
 
   const message = `Codeforces submit form could not be opened for ${entry.contestId}/${entry.problemIndex} — ${attempts.join(' | ')}`;
+  logError({ message }, 'openSubmitForm: all candidates exhausted');
   throw new BrowserFormError(message, 'blocked');
 }
 

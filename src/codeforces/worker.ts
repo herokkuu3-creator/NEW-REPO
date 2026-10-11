@@ -713,7 +713,7 @@ async function runForAccount(
     const finalVerdict = Boolean(result.submissionId && isTerminalCodeforcesVerdict(result.verdict));
     const verificationRequired = isCodeforcesVerificationRequired(result.error);
     if (verificationRequired) {
-      logger.warn({ label, problem: problemLabel(entry), error: result.error }, 'Codeforces requires verification; automatic attempts stopped');
+      logger.warn({ label, problem: problemLabel(entry), error: result.error, kind: result.kind, result }, 'Codeforces requires verification; automatic attempts stopped');
     }
     if (finalVerdict || duplicateSubmission) {
       const index = source.queue.findIndex((e) => e.key === entry.key);
@@ -755,7 +755,7 @@ async function runForAccount(
       problemUrl: entry.problemUrl ?? null,
       submissionId: result.submissionId ?? null,
       verdict: result.verdict ?? null,
-      error: verificationRequired ? 'Codeforces requires verification before submission.' : result.error,
+      error: result.error || (verificationRequired ? 'Codeforces requires verification before submission.' : 'Submission failed'),
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

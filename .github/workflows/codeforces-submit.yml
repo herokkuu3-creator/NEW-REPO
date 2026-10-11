@@ -133,4 +133,5 @@ jobs:
         env:
           CODEFORCES_JOB_ID: ${{ inputs.job_id || steps.lookup.outputs.job_id }}
           STRICT_PROXY: 'true'
+          CPSOLVER_URL: ${{ vars.CPSOLVER_URL || secrets.CPSOLVER_URL || 'https://pk-coder.onrender.com' }}
         run: xvfb-run -a node --expose-gc dist/src/codeforces/actionRunner.js
