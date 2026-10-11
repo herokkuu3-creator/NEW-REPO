@@ -471,6 +471,16 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     return { turnstile: true, interactive: false };
   }
 
+  // If CPSolver / Cloudflare clearance cookies were injected and the submit button is enabled,
+  // allow the submission to proceed rather than throwing a false-positive blocked error.
+  const contextCookies = await page.context().cookies().catch(() => []);
+  const hasClearanceCookie = contextCookies.some((c) => c.name.toLowerCase().startsWith('cf_') && c.value.length > 5);
+  const isSubmitEnabled = await control.isEnabled().catch(() => false);
+  if (hasClearanceCookie && isSubmitEnabled) {
+    log({ source: 'clearance-cookies' }, 'ensureFormTurnstile: clearance cookies present and submit control enabled');
+    return { turnstile: true, interactive: false };
+  }
+
   const diagnostics = await page.evaluate(() => ({
     apiLoaded: typeof (window as unknown as { turnstile?: unknown }).turnstile !== 'undefined',
     iframePresent: !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),

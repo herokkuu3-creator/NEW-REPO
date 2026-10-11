@@ -221,21 +221,14 @@ export async function solveTurnstileWithCPSolver(params: {
 
     const hasToken = typeof data.token === 'string' && data.token.trim().length > 10;
     const hasClearance = typeof data.cfClearance === 'string' && data.cfClearance.trim().length > 0;
-    const hasCookies = data.cookies && Object.keys(data.cookies).length > 0;
-    const isSuccess = data.ok !== false && (params.sitekey ? hasToken : (hasToken || hasClearance || hasCookies));
+    const hasCookies = !!(data.cookies && Object.keys(data.cookies).some((k) => k.toLowerCase().startsWith('cf_')));
 
-    if (isSuccess && hasToken) {
-      return {
-        ok: true,
-        token: data.token,
-        cookies: data.cookies,
-        cfClearance: data.cfClearance,
-        durationMs: data.durationMs ?? durationMs,
-        proxyUsed: data.proxyUsed,
-      };
-    }
+    // Codeforces uses a managed Turnstile key; CPSolver runs in navigate mode and returns
+    // cfClearance / cf_ cookies (not a Turnstile token). Accept both token and clearance as success.
+    const isCfKey = params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj' || (params.siteurl ?? '').includes('codeforces.com');
+    const isSuccess = data.ok !== false && (hasToken || (isCfKey ? (hasClearance || hasCookies) : false));
 
-    if (isSuccess && !params.sitekey && (hasClearance || hasCookies)) {
+    if (isSuccess) {
       return {
         ok: true,
         token: data.token,
@@ -249,7 +242,7 @@ export async function solveTurnstileWithCPSolver(params: {
     return {
       ok: false,
       durationMs: data.durationMs ?? durationMs,
-      error: data.error || (data.ok ? 'CPSolver completed without issuing a Turnstile token' : 'CPSolver failed to solve Turnstile'),
+      error: data.error || (data.ok ? 'CPSolver completed without issuing a Turnstile token or clearance' : 'CPSolver failed to solve Turnstile'),
       proxyUsed: data.proxyUsed,
     };
   } catch (err) {
@@ -659,8 +652,8 @@ export async function solveTurnstileOrchestrated(params: {
       solverHost = new URL(solverUrl).host;
     } catch {}
 
-    const maxTries = Math.max(1, parseInt(process.env.CPSOLVER_MAX_TRIES || '1', 10));
-    const cpsolverTimeoutMs = Math.min(timeoutMs, parseInt(process.env.CPSOLVER_TIMEOUT_MS || '15000', 10));
+    const maxTries = Math.max(1, parseInt(process.env.CPSOLVER_MAX_TRIES || '3', 10));
+    const cpsolverTimeoutMs = Math.min(timeoutMs, parseInt(process.env.CPSOLVER_TIMEOUT_MS || '35000', 10));
     log({ solverUrl, maxTries, siteurl: params.siteurl, cpsolverTimeoutMs }, 'Starting Turnstile solve with local CPSolver');
 
     for (let attempt = 1; attempt <= maxTries; attempt++) {
@@ -681,13 +674,21 @@ export async function solveTurnstileOrchestrated(params: {
       });
 
       const hasValidToken = typeof res.token === 'string' && res.token.trim().length > 10;
-      if (res.ok && hasValidToken) {
+      // In navigate mode CPSolver returns cfClearance/cookies when Codeforces clears the challenge
+      // (no Turnstile token — the clearance cookies are injected into the browser context directly).
+      // Accept: a real token OR cfClearance/cf_ cookies (navigate-mode success).
+      const hasClearanceOrCookies = res.ok && (
+        (typeof res.cfClearance === 'string' && res.cfClearance.trim().length > 0) ||
+        (res.cookies && Object.keys(res.cookies).some((k) => k.toLowerCase().startsWith('cf_')))
+      );
+      if (res.ok && (hasValidToken || hasClearanceOrCookies)) {
         const sec = Math.max(1, Math.round(res.durationMs / 1000));
         const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${res.proxyUsed}</code>` : '';
-        const successNotice = `✅ <b>Turnstile solved via CPSolver!</b> <i>(${sec}s, attempt ${attempt}/${maxTries})</i>${proxyInfo}`;
+        const mode = hasValidToken ? 'token' : 'clearance-cookies';
+        const successNotice = `✅ <b>Turnstile solved via CPSolver!</b> <i>(${sec}s, attempt ${attempt}/${maxTries}, mode=${mode})</i>${proxyInfo}`;
         await sendSolverTelegramNotification(successNotice).catch(() => undefined);
 
-        log({ durationMs: res.durationMs, attempt, proxyUsed: res.proxyUsed }, 'CPSolver succeeded');
+        log({ durationMs: res.durationMs, attempt, proxyUsed: res.proxyUsed, mode }, 'CPSolver succeeded');
         return {
           token: res.token,
           cookies: res.cookies,
