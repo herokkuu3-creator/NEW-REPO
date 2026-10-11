@@ -102,7 +102,7 @@ describe('Solver Orchestration & Fallback Engine', () => {
     expect(cpsolverCalls).toBe(1);
 
     // Verify Telegram messages were sent
-    expect(sentTelegramMessages.some((msg) => msg.includes('[Attempt 1/3] Solving Turnstile via CPSolver'))).toBe(true);
+    expect(sentTelegramMessages.some((msg) => msg.includes('Solving Turnstile via CPSolver'))).toBe(true);
     expect(sentTelegramMessages.some((msg) => msg.includes('Turnstile solved via CPSolver'))).toBe(true);
     expect(sentTelegramMessages.some((msg) => msg.includes('CapSolver / Capzy'))).toBe(false);
   });
@@ -111,6 +111,7 @@ describe('Solver Orchestration & Fallback Engine', () => {
     process.env.CPSOLVER_URL = 'https://cpsolver.test.com';
     process.env.TELEGRAM_BOT_TOKEN = '123456:test_token';
     process.env.TELEGRAM_CHAT_ID = '987654321';
+    process.env.CPSOLVER_MAX_TRIES = '3';
 
     let cpsolverAttempts = 0;
     let capzyTaskCreated = false;

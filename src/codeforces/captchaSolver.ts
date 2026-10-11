@@ -659,8 +659,9 @@ export async function solveTurnstileOrchestrated(params: {
       solverHost = new URL(solverUrl).host;
     } catch {}
 
-    const maxTries = 3;
-    log({ solverUrl, maxTries, siteurl: params.siteurl }, 'Starting Turnstile solve with local CPSolver');
+    const maxTries = Math.max(1, parseInt(process.env.CPSOLVER_MAX_TRIES || '1', 10));
+    const cpsolverTimeoutMs = Math.min(timeoutMs, parseInt(process.env.CPSOLVER_TIMEOUT_MS || '15000', 10));
+    log({ solverUrl, maxTries, siteurl: params.siteurl, cpsolverTimeoutMs }, 'Starting Turnstile solve with local CPSolver');
 
     for (let attempt = 1; attempt <= maxTries; attempt++) {
       const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Turnstile via CPSolver (${solverHost})...</b>`;
@@ -676,7 +677,7 @@ export async function solveTurnstileOrchestrated(params: {
         cdata: params.cdata,
         proxy: proxyForCPSolver,
         userAgent: params.userAgent,
-        timeoutMs,
+        timeoutMs: cpsolverTimeoutMs,
       });
 
       const hasValidToken = typeof res.token === 'string' && res.token.trim().length > 10;
