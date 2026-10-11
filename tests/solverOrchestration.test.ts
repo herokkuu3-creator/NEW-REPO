@@ -213,12 +213,13 @@ describe('Solver Orchestration & Fallback Engine', () => {
     expect(health.activeProxy).toBe('http://bi_3:****@gate.busyip.com:18080');
   });
 
-  it('treats CPSolver response without token as failure and retries up to 3 times before fallback', async () => {
+  it('successfully returns CPSolver solution when cfClearance/cookies are resolved without requiring commercial fallback', async () => {
     process.env.CPSOLVER_URL = 'https://cpsolver.test.com';
     process.env.TELEGRAM_BOT_TOKEN = '123456:test_token';
     process.env.TELEGRAM_CHAT_ID = '987654321';
 
     let cpsolverAttempts = 0;
+    let capzyCalled = false;
     vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
       const urlStr = String(url);
       if (urlStr.includes('api.telegram.org')) {
@@ -227,7 +228,7 @@ describe('Solver Orchestration & Fallback Engine', () => {
         return { ok: true, status: 200, json: async () => ({ ok: true }) } as Response;
       }
 
-      // CPSolver returns ok: true, but NO TOKEN (only cfClearance or cleared)
+      // CPSolver returns ok: true with cfClearance and cookies
       if (urlStr.includes('cpsolver.test.com/solve')) {
         cpsolverAttempts++;
         return {
@@ -236,26 +237,16 @@ describe('Solver Orchestration & Fallback Engine', () => {
           json: async () => ({
             ok: true,
             cfClearance: 'cleared',
+            cookies: { JSESSIONID: 'abc', '39ce7': 'xyz' },
             durationMs: 4000,
           }),
         } as Response;
       }
 
-      // Capzy API fallback succeeds
-      if (urlStr.includes('api.capzy.ai/createTask')) {
-        return { ok: true, status: 200, json: async () => ({ errorId: 0, taskId: 'task_def_456' }) } as Response;
-      }
-
-      if (urlStr.includes('api.capzy.ai/getTaskResult')) {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({
-            errorId: 0,
-            status: 'ready',
-            solution: { token: 'capzy_fallback_token_789' },
-          }),
-        } as Response;
+      // Capzy API should never be called
+      if (urlStr.includes('api.capzy.ai')) {
+        capzyCalled = true;
+        return { ok: true, status: 200, json: async () => ({}) } as Response;
       }
 
       return { ok: false, status: 500 } as Response;
@@ -263,18 +254,17 @@ describe('Solver Orchestration & Fallback Engine', () => {
 
     const result = await solveTurnstileOrchestrated({
       siteurl: 'https://codeforces.com/contest/2275/submit',
-      sitekey: '0x4AAAAAAtestkey',
+      sitekey: '0x4AAAAAAADnPIDROrmt1Wwj',
       timeoutMs: 5_000,
       overrideKeys: ['capzy_valid_key_1234567890abcdef1234567890'],
     });
 
-    expect(cpsolverAttempts).toBe(3);
+    expect(cpsolverAttempts).toBe(1);
+    expect(capzyCalled).toBe(false);
     expect(result).not.toBeNull();
-    expect(result?.token).toBe('capzy_fallback_token_789');
-    expect(result?.source).toBe('capsolver');
-
-    // Crucially: never announced "Turnstile solved via CPSolver!" without a token
-    expect(sentTelegramMessages.some((msg) => msg.includes('Turnstile solved via CPSolver!'))).toBe(false);
-    expect(sentTelegramMessages.some((msg) => msg.includes('CPSolver failed after 3 attempts'))).toBe(true);
+    expect(result?.cfClearance).toBe('cleared');
+    expect(result?.source).toBe('cpsolver');
+    expect(sentTelegramMessages.some((msg) => msg.includes('Turnstile solved via CPSolver!'))).toBe(true);
+    expect(sentTelegramMessages.some((msg) => msg.includes('Falling back to CapSolver'))).toBe(false);
   });
 });

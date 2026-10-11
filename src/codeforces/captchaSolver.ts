@@ -220,7 +220,9 @@ export async function solveTurnstileWithCPSolver(params: {
     };
 
     const hasToken = typeof data.token === 'string' && data.token.trim().length > 0;
-    const isSuccess = data.ok !== false && hasToken;
+    const hasClearance = typeof data.cfClearance === 'string' && data.cfClearance.trim().length > 0;
+    const hasCookies = data.cookies && Object.keys(data.cookies).length > 0;
+    const isSuccess = data.ok !== false && (hasToken || hasClearance || hasCookies);
 
     if (isSuccess) {
       return {
@@ -666,7 +668,7 @@ export async function solveTurnstileOrchestrated(params: {
         timeoutMs,
       });
 
-      if (res.ok && res.token) {
+      if (res.ok && (res.token || res.cfClearance || (res.cookies && Object.keys(res.cookies).length > 0))) {
         const sec = Math.max(1, Math.round(res.durationMs / 1000));
         const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${res.proxyUsed}</code>` : '';
         const successNotice = `✅ <b>Turnstile solved via CPSolver!</b> <i>(${sec}s, attempt ${attempt}/${maxTries})</i>${proxyInfo}`;
