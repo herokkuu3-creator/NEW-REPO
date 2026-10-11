@@ -56,11 +56,11 @@ const REJECTION_RE =
 const PENDING_VERDICTS = new Set(['TESTING', 'QUEUE', 'QUEUED', undefined, null]);
 const VERIFICATION_WINDOW_MS = 150_000;
 const VERIFICATION_POLL_MS = 2_500;
-const configuredTurnstileWait = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 8_000);
-const TURNSTILE_WAIT_MS =
-  Number.isFinite(configuredTurnstileWait) && configuredTurnstileWait >= 1_000
-    ? configuredTurnstileWait
-    : 8_000;
+const configuredTurnstileWait = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 60_000);
+const TURNSTILE_WAIT_MS = Math.max(
+  Number.isFinite(configuredTurnstileWait) ? configuredTurnstileWait : 60_000,
+  60_000,
+);
 
 /** Outcome of posting the submit form from the browser, before any polling. */
 export interface BrowserPostOutcome {

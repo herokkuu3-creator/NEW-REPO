@@ -339,37 +339,34 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
             await page.context().addCookies(cookieList).catch(() => {});
           }
         }
-      }
+      } else {
+        const cloudflareSol = await solveCloudflareOrchestrated({
+          websiteURL: page.url(),
+          proxyUrl,
+          userAgent,
+          timeoutMs,
+          overrideKeys,
+        });
 
-      const cloudflareSol = await solveCloudflareOrchestrated({
-        websiteURL: page.url(),
-        proxyUrl,
-        userAgent,
-        timeoutMs,
-        sitekey: info.sitekey ?? undefined,
-        action: info.action ?? undefined,
-        cdata: info.cdata ?? undefined,
-        overrideKeys,
-      });
-
-      if (cloudflareSol?.cookies) {
-        const cookieList = Object.entries(cloudflareSol.cookies)
-          .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
-          .map(([name, value]) => ({
-            name,
-            value,
-            domain: '.codeforces.com',
-            path: '/',
-          }));
-        if (cookieList.length > 0) {
-          log({ count: cookieList.length, names: cookieList.map(c => c.name), source: cloudflareSol.source }, 'ensureFormTurnstile: injecting Cloudflare clearance cookies');
-          await page.context().addCookies(cookieList).catch(() => {});
+        if (cloudflareSol?.cookies) {
+          const cookieList = Object.entries(cloudflareSol.cookies)
+            .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+            .map(([name, value]) => ({
+              name,
+              value,
+              domain: '.codeforces.com',
+              path: '/',
+            }));
+          if (cookieList.length > 0) {
+            log({ count: cookieList.length, names: cookieList.map(c => c.name), source: cloudflareSol.source }, 'ensureFormTurnstile: injecting Cloudflare clearance cookies');
+            await page.context().addCookies(cookieList).catch(() => {});
+          }
         }
-      }
 
-      if (cloudflareSol?.token) {
-        log({ tokenLength: cloudflareSol.token.length, source: cloudflareSol.source }, 'ensureFormTurnstile: injecting Cloudflare token');
-        await injectTurnstileToken(form, cloudflareSol.token, info.callback);
+        if (cloudflareSol?.token) {
+          log({ tokenLength: cloudflareSol.token.length, source: cloudflareSol.source }, 'ensureFormTurnstile: injecting Cloudflare token');
+          await injectTurnstileToken(form, cloudflareSol.token, info.callback);
+        }
       }
     })();
   };

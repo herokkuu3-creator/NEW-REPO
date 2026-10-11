@@ -161,9 +161,9 @@ services:
         value: --max-old-space-size=96
       # Bounded waits: never hold the container open for a long challenge.
       - key: CODEFORCES_TURNSTILE_WAIT_MS
-        value: "20000"
+        value: "60000"
       - key: CODEFORCES_CHALLENGE_WAIT_MS
-        value: "10000"
+        value: "30000"
       - key: CODEFORCES_SUBMITTER_TOKEN
         sync: false
       - key: LOG_LEVEL

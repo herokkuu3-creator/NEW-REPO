@@ -220,10 +220,9 @@ export async function solveTurnstileWithCPSolver(params: {
     };
 
     const hasToken = typeof data.token === 'string' && data.token.trim().length > 0;
-    const hasClearance = typeof data.cfClearance === 'string' && data.cfClearance.trim().length > 0;
-    const isSuccess = data.ok === true || (data.ok !== false && (hasToken || hasClearance));
+    const isSuccess = data.ok !== false && hasToken;
 
-    if (isSuccess && (hasToken || hasClearance)) {
+    if (isSuccess) {
       return {
         ok: true,
         token: data.token,
@@ -237,7 +236,7 @@ export async function solveTurnstileWithCPSolver(params: {
     return {
       ok: false,
       durationMs: data.durationMs ?? durationMs,
-      error: data.error || 'CPSolver returned ok=false without token',
+      error: data.error || (data.ok ? 'CPSolver returned ok=true without token' : 'CPSolver failed to solve Turnstile'),
       proxyUsed: data.proxyUsed,
     };
   } catch (err) {
@@ -667,7 +666,7 @@ export async function solveTurnstileOrchestrated(params: {
         timeoutMs,
       });
 
-      if (res.ok && (res.token || res.cfClearance || (res.cookies && Object.keys(res.cookies).length > 0))) {
+      if (res.ok && res.token) {
         const sec = Math.max(1, Math.round(res.durationMs / 1000));
         const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${res.proxyUsed}</code>` : '';
         const successNotice = `✅ <b>Turnstile solved via CPSolver!</b> <i>(${sec}s, attempt ${attempt}/${maxTries})</i>${proxyInfo}`;
