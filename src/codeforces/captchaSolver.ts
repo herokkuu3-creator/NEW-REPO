@@ -193,7 +193,7 @@ export async function solveTurnstileWithCPSolver(params: {
         cdata: params.cdata,
         proxy: params.proxy,
         timeout,
-        mode: params.mode ?? 'harness',
+        mode: params.mode ?? ((params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj' || (params.siteurl ?? '').includes('codeforces.com')) ? 'navigate' : 'harness'),
         userAgent: params.userAgent,
       }),
       signal: AbortSignal.timeout(timeout + 5_000),
