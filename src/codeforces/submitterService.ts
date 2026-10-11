@@ -27,6 +27,7 @@ import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy, getDefaultUserAgent } from './browserForm';
 import { initCapzyKeys, getActiveCapzyKeyIndex } from './capzyKeyManager';
+import { solveCloudflareOrchestrated, initCPSolverConfig } from './captchaSolver';
 import { applyStealthScripts, interactWithTurnstileCheckbox } from '../browser/stealth';
 import { parseProxyList } from './proxyRotator';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
@@ -79,6 +80,9 @@ interface SubmitRequest {
   proxy?: string;
   capzyApiKeys?: string[];
   capzyActiveKeyIndex?: number;
+  cpsolverUrl?: string;
+  telegramBotToken?: string;
+  telegramChatId?: string;
 }
 
 interface SubmitResponse {
@@ -394,7 +398,13 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
     void (async () => {
       try {
         const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-        const result = await solveCloudflareWithCapzy(page.url() || 'https://codeforces.com', proxyUrl, userAgent, Math.min(10_000, timeoutMs), undefined, undefined, undefined, overrideKeys);
+        const result = await solveCloudflareOrchestrated({
+          websiteURL: page.url() || 'https://codeforces.com',
+          proxyUrl,
+          userAgent,
+          timeoutMs: Math.min(25_000, timeoutMs),
+          overrideKeys,
+        });
         if (result?.cookies && Object.keys(result.cookies).length > 0) {
           const cookiesToSet = Object.entries(result.cookies)
             .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
@@ -402,7 +412,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
               name, value: String(value), domain: '.codeforces.com', path: '/',
             }));
           if (cookiesToSet.length > 0) {
-            log({ count: cookiesToSet.length }, 'waitOutChallenge: injecting Capzy Cloudflare cookies');
+            log({ count: cookiesToSet.length, source: result.source }, 'waitOutChallenge: injecting Cloudflare cookies');
             await page.context().addCookies(cookiesToSet).catch(() => undefined);
             await page.reload({ waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => undefined);
           }
@@ -661,6 +671,13 @@ function isAlreadySubmittedCodeError(error: string | null | undefined): boolean 
 export async function submit(request: SubmitRequest, authorizePost?: () => Promise<boolean>): Promise<SubmitResponse> {
   if (request.capzyApiKeys && request.capzyApiKeys.length > 0) {
     initCapzyKeys(request.capzyApiKeys, request.capzyActiveKeyIndex);
+  }
+  if (request.cpsolverUrl || request.telegramBotToken || request.telegramChatId) {
+    initCPSolverConfig({
+      url: request.cpsolverUrl,
+      telegramBotToken: request.telegramBotToken,
+      telegramChatId: request.telegramChatId,
+    });
   }
 
   // Leave one minute for result delivery and browserless judge polling.

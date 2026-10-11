@@ -42,3 +42,5 @@ local-auth/chrome-capture-profile/
 leetcode-session.json
 
 .proxy_state/
+
+CPSolver/

@@ -72,6 +72,7 @@ import {
   isLikelyCapzyKey,
   type KeyBalanceResult,
 } from '../codeforces/capzyKeyManager';
+import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver';
 
 import {
   isRunInProgress,
@@ -2507,45 +2508,64 @@ export async function handleProxyButton(
 }
 
 export async function formatCapzyStatusMessage(): Promise<string> {
-  const keys = await getCapzyApiKeys();
-  if (keys.length === 0) {
-    return [
-      '🧩 <b>CapSolver / Capzy Configuration</b>',
-      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-      '⚠️ <i>No CapSolver/Capzy API keys configured in database.</i>',
-      '',
-      'To configure API key(s), run:',
-      '<code>/capsolver &lt;key1, key2, ...&gt;</code>',
-      'or send <code>/capsolver</code> and enter your keys.',
-    ].join('\n');
-  }
-
-  const activeIdx = await getActiveCapzyKeyIndex();
   const lines: string[] = [
-    '🧩 <b>CapSolver / Capzy Configuration</b>',
+    '🧩 <b>Cloudflare Turnstile Solver Configuration</b>',
     '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-    `Total configured keys: <b>${keys.length}</b>`,
-    `Active key: <b>#${activeIdx + 1} (${escapeHtml(maskApiKey(keys[activeIdx] ?? ''))})</b>`,
-    '',
-    '<b>API Key Status & Balances:</b>',
   ];
 
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i]!;
-    const masked = maskApiKey(key);
-    const isActive = i === activeIdx;
-    const bal = await checkCapzyKeyBalance(key);
-    const tag = isActive ? ' <b>[ACTIVE]</b>' : (i < activeIdx ? ' <i>(exhausted/prior)</i>' : '');
-    if (bal.ok && bal.balance > 0) {
-      lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ✅ $${bal.balance.toFixed(4)}${tag}`);
+  // 1. Primary Solver: CPSolver (Local/Render)
+  const cpUrl = getCPSolverUrl();
+  if (cpUrl) {
+    const health = await checkCPSolverHealth();
+    if (health.ok) {
+      lines.push('🟢 <b>Primary Solver: CPSolver (Local/Render)</b>');
+      lines.push(`├ URL: <code>${escapeHtml(health.url)}</code>`);
+      lines.push(`├ Status: <b>Online</b> (Uptime: ${health.uptimeSeconds ?? 0}s)`);
+      lines.push(`├ Proxy Pool: <b>${health.totalProxies ?? 0} proxies</b> (Active: #${(health.activeIndex ?? 0) + 1})`);
+      if (health.activeProxy) {
+        lines.push(`└ Active Proxy: <code>${escapeHtml(health.activeProxy)}</code>`);
+      }
     } else {
-      const errDesc = bal.error || (bal.balance <= 0 ? 'zero balance' : 'error');
-      lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ❌ ${escapeHtml(errDesc)}${tag}`);
+      lines.push('🔴 <b>Primary Solver: CPSolver (Local/Render)</b>');
+      lines.push(`├ URL: <code>${escapeHtml(cpUrl)}</code>`);
+      lines.push(`└ Status: <b>Offline/Unreachable</b> (<i>${escapeHtml(health.error ?? 'unknown')}</i>)`);
+    }
+  } else {
+    lines.push('⚪ <b>Primary Solver: CPSolver (Local/Render)</b>');
+    lines.push('└ <i>Not configured. Set CPSOLVER_URL in environment variables to enable.</i>');
+  }
+
+  lines.push('');
+  lines.push('<b>🔄 Fallback Solver: CapSolver / Capzy (Commercial)</b>');
+
+  const keys = await getCapzyApiKeys();
+  if (keys.length === 0) {
+    lines.push('⚠️ <i>No CapSolver/Capzy API keys configured in database.</i>');
+    lines.push('To configure API key(s), run: <code>/capsolver &lt;key1, key2, ...&gt;</code>');
+  } else {
+    const activeIdx = await getActiveCapzyKeyIndex();
+    lines.push(`Total configured keys: <b>${keys.length}</b>`);
+    lines.push(`Active key: <b>#${activeIdx + 1} (${escapeHtml(maskApiKey(keys[activeIdx] ?? ''))})</b>`);
+    lines.push('');
+    lines.push('<b>API Key Balances:</b>');
+
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i]!;
+      const masked = maskApiKey(key);
+      const isActive = i === activeIdx;
+      const bal = await checkCapzyKeyBalance(key);
+      const tag = isActive ? ' <b>[ACTIVE]</b>' : (i < activeIdx ? ' <i>(exhausted/prior)</i>' : '');
+      if (bal.ok && bal.balance > 0) {
+        lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ✅ $${bal.balance.toFixed(4)}${tag}`);
+      } else {
+        const errDesc = bal.error || (bal.balance <= 0 ? 'zero balance' : 'error');
+        lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ❌ ${escapeHtml(errDesc)}${tag}`);
+      }
     }
   }
 
   lines.push('');
-  lines.push('💡 <i>Automatic key rotation: if the active key runs out of funds or errors, the bot automatically switches to the next working key and keeps track of it.</i>');
+  lines.push('💡 <i>Execution flow: Submissions first attempt solving via CPSolver (up to 3 tries with residential proxy failover). If CPSolver fails, it automatically fails over to CapSolver/Capzy.</i>');
   return lines.join('\n');
 }
 

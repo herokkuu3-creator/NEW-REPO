@@ -9,6 +9,7 @@ import { CODEFORCES_ATTEMPT_MS } from './attempts';
 import { getRemovedProxyHashes, resolveActiveProxy, type ActiveProxyResult } from './proxyManager';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { getCapzyApiKeys, getActiveCapzyKeyIndex, setActiveCapzyKeyIndex } from './capzyKeyManager';
+import { getCPSolverUrl } from './captchaSolver';
 
 function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -168,6 +169,9 @@ export async function submitViaRemoteSubmitter(
     requiresPostAuthorization: true,
     capzyApiKeys: await getCapzyApiKeys().catch(() => []),
     capzyActiveKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
+    cpsolverUrl: getCPSolverUrl(),
+    telegramBotToken: process.env.TELEGRAM_BOT_TOKEN?.trim(),
+    telegramChatId: process.env.TELEGRAM_CHAT_ID?.trim(),
   };
 
   const submittedAt = Math.floor(Date.now() / 1000);

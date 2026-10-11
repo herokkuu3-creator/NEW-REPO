@@ -1,0 +1,830 @@
+import {
+  getCandidateCapzyKeys,
+  rotateToNextCapzyKey,
+  isCapzyKeyError,
+  maskApiKey,
+} from './capzyKeyManager';
+
+function log(fields: Record<string, unknown>, msg: string): void {
+  const time = new Date().toISOString();
+  process.stdout.write(`${JSON.stringify({ level: 30, time, service: 'captcha-solver', ...fields, msg })}\n`);
+}
+
+function logWarn(fields: Record<string, unknown>, msg: string): void {
+  const time = new Date().toISOString();
+  process.stdout.write(`${JSON.stringify({ level: 40, time, service: 'captcha-solver', ...fields, msg })}\n`);
+}
+
+export interface SolverResult {
+  token?: string;
+  cookies?: Record<string, string>;
+  cfClearance?: string;
+  source?: 'cpsolver' | 'capsolver';
+  durationMs?: number;
+}
+
+export const DEFAULT_DESKTOP_CHROME_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+export const DEFAULT_DESKTOP_FIREFOX_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0';
+
+export const DEFAULT_DESKTOP_USER_AGENT = DEFAULT_DESKTOP_CHROME_USER_AGENT;
+
+export function getDefaultUserAgent(engine: 'chromium' | 'firefox' = 'chromium'): string {
+  return engine === 'firefox' ? DEFAULT_DESKTOP_FIREFOX_USER_AGENT : DEFAULT_DESKTOP_CHROME_USER_AGENT;
+}
+
+let inMemoryCPSolverUrl = '';
+let inMemoryTelegramBotToken = '';
+let inMemoryTelegramChatId = '';
+
+/**
+ * Configure solver overrides in memory (useful when called from isolated worker or tests).
+ */
+export function initCPSolverConfig(options: {
+  url?: string;
+  telegramBotToken?: string;
+  telegramChatId?: string;
+}): void {
+  if (options.url) inMemoryCPSolverUrl = options.url.trim().replace(/\/+$/, '');
+  if (options.telegramBotToken) inMemoryTelegramBotToken = options.telegramBotToken.trim();
+  if (options.telegramChatId) inMemoryTelegramChatId = options.telegramChatId.trim();
+}
+
+/**
+ * Resolves the configured CPSolver microservice URL.
+ * Checks CPSOLVER_URL, then TURNSTILE_SOLVER_URL, then in-memory configuration.
+ */
+export function getCPSolverUrl(): string {
+  const raw =
+    process.env.CPSOLVER_URL?.trim() ||
+    process.env.TURNSTILE_SOLVER_URL?.trim() ||
+    inMemoryCPSolverUrl;
+  return raw ? raw.replace(/\/+$/, '') : '';
+}
+
+/**
+ * Non-blocking, zero-overhead Telegram notification sender.
+ * Works across both the main backend (with Prisma/config) and the isolated submitter.
+ */
+export async function sendSolverTelegramNotification(text: string): Promise<boolean> {
+  const token =
+    process.env.TELEGRAM_BOT_TOKEN?.trim() ||
+    inMemoryTelegramBotToken;
+  const chatId =
+    process.env.TELEGRAM_CHAT_ID?.trim() ||
+    inMemoryTelegramChatId;
+
+  // 1. Direct Telegram API call (zero dependencies, works in isolated container)
+  if (token && chatId) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  // 2. Fall back to main telegram module if available in main app
+  if (process.env.DATABASE_URL) {
+    try {
+      const { sendTelegramMessage } = await import('../notifications/telegram');
+      return await sendTelegramMessage(text, { parseMode: 'HTML' });
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Query health and proxy status of the CPSolver microservice.
+ */
+export async function checkCPSolverHealth(): Promise<{
+  ok: boolean;
+  url: string;
+  status?: string;
+  uptimeSeconds?: number;
+  totalProxies?: number;
+  activeIndex?: number;
+  activeProxy?: string | null;
+  error?: string;
+}> {
+  const url = getCPSolverUrl();
+  if (!url) return { ok: false, url: '', error: 'CPSolver URL is not configured' };
+
+  try {
+    const res = await fetch(`${url}/health`, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) {
+      return { ok: false, url, error: `HTTP ${res.status}: ${res.statusText}` };
+    }
+    const data = (await res.json()) as any;
+    return {
+      ok: true,
+      url,
+      status: data.status || 'ok',
+      uptimeSeconds: data.uptimeSeconds,
+      totalProxies: data.proxyPool?.total ?? 0,
+      activeIndex: data.proxyPool?.activeIndex ?? 0,
+      activeProxy: data.proxyPool?.activeProxy ?? null,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      url,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Executes a single Turnstile solve request against the CPSolver microservice.
+ */
+export async function solveTurnstileWithCPSolver(params: {
+  siteurl: string;
+  sitekey: string;
+  action?: string;
+  cdata?: string;
+  proxy?: string;
+  timeoutMs?: number;
+  mode?: 'harness' | 'navigate';
+}): Promise<{
+  ok: boolean;
+  token?: string;
+  cookies?: Record<string, string>;
+  cfClearance?: string;
+  durationMs: number;
+  error?: string;
+  proxyUsed?: string;
+}> {
+  const solverUrl = getCPSolverUrl();
+  if (!solverUrl) {
+    return { ok: false, durationMs: 0, error: 'CPSolver URL is not configured' };
+  }
+
+  const startTime = Date.now();
+  const timeout = params.timeoutMs ?? 35_000;
+
+  try {
+    const response = await fetch(`${solverUrl}/solve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        siteurl: params.siteurl,
+        sitekey: params.sitekey,
+        action: params.action,
+        cdata: params.cdata,
+        proxy: params.proxy,
+        timeout,
+        mode: params.mode ?? 'harness',
+      }),
+      signal: AbortSignal.timeout(timeout + 5_000),
+    });
+
+    const durationMs = Date.now() - startTime;
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      return {
+        ok: false,
+        durationMs,
+        error: `CPSolver HTTP ${response.status}: ${errText.slice(0, 200)}`,
+      };
+    }
+
+    const data = (await response.json()) as {
+      ok?: boolean;
+      token?: string;
+      cookies?: Record<string, string>;
+      cfClearance?: string;
+      durationMs?: number;
+      error?: string;
+      proxyUsed?: string;
+    };
+
+    const hasToken = typeof data.token === 'string' && data.token.trim().length > 0;
+    const hasClearance = typeof data.cfClearance === 'string' && data.cfClearance.trim().length > 0;
+    const isSuccess = data.ok === true || (data.ok !== false && (hasToken || hasClearance));
+
+    if (isSuccess && (hasToken || hasClearance)) {
+      return {
+        ok: true,
+        token: data.token,
+        cookies: data.cookies,
+        cfClearance: data.cfClearance,
+        durationMs: data.durationMs ?? durationMs,
+        proxyUsed: data.proxyUsed,
+      };
+    }
+
+    return {
+      ok: false,
+      durationMs: data.durationMs ?? durationMs,
+      error: data.error || 'CPSolver returned ok=false without token',
+      proxyUsed: data.proxyUsed,
+    };
+  } catch (err) {
+    const durationMs = Date.now() - startTime;
+    return {
+      ok: false,
+      durationMs,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Executes a Cloudflare interstitial / clearance solve against the CPSolver microservice.
+ */
+export async function solveCloudflareWithCPSolver(params: {
+  siteurl: string;
+  proxy?: string;
+  timeoutMs?: number;
+}): Promise<{
+  ok: boolean;
+  token?: string;
+  cookies?: Record<string, string>;
+  cfClearance?: string;
+  durationMs: number;
+  error?: string;
+  proxyUsed?: string;
+}> {
+  const solverUrl = getCPSolverUrl();
+  if (!solverUrl) {
+    return { ok: false, durationMs: 0, error: 'CPSolver URL is not configured' };
+  }
+
+  const startTime = Date.now();
+  const timeout = params.timeoutMs ?? 35_000;
+
+  try {
+    const response = await fetch(`${solverUrl}/solve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        siteurl: params.siteurl,
+        proxy: params.proxy,
+        timeout,
+        mode: 'navigate',
+      }),
+      signal: AbortSignal.timeout(timeout + 5_000),
+    });
+
+    const durationMs = Date.now() - startTime;
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      return {
+        ok: false,
+        durationMs,
+        error: `CPSolver HTTP ${response.status}: ${errText.slice(0, 200)}`,
+      };
+    }
+
+    const data = (await response.json()) as {
+      ok?: boolean;
+      token?: string;
+      cookies?: Record<string, string>;
+      cfClearance?: string;
+      durationMs?: number;
+      error?: string;
+      proxyUsed?: string;
+    };
+
+    const hasToken = typeof data.token === 'string' && data.token.trim().length > 0;
+    const hasClearance = typeof data.cfClearance === 'string' && data.cfClearance.trim().length > 0;
+    const hasCookies = !!(data.cookies && Object.keys(data.cookies).length > 0);
+    const isSuccess = data.ok === true || (data.ok !== false && (hasToken || hasClearance || hasCookies));
+
+    if (isSuccess && (hasToken || hasClearance || hasCookies)) {
+      return {
+        ok: true,
+        token: data.token,
+        cookies: data.cookies,
+        cfClearance: data.cfClearance,
+        durationMs: data.durationMs ?? durationMs,
+        proxyUsed: data.proxyUsed,
+      };
+    }
+
+    return {
+      ok: false,
+      durationMs: data.durationMs ?? durationMs,
+      error: data.error || 'CPSolver returned ok=false without clearance',
+      proxyUsed: data.proxyUsed,
+    };
+  } catch (err) {
+    const durationMs = Date.now() - startTime;
+    return {
+      ok: false,
+      durationMs,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Solve Turnstile with Capzy / CapSolver API (commercial fallback).
+ */
+export async function solveTurnstileWithCapzy(
+  websiteURL: string,
+  sitekey: string,
+  proxyUrl?: string,
+  userAgent?: string,
+  timeoutMs = 35_000,
+  action?: string,
+  cdata?: string,
+  overrideKeys?: string[],
+): Promise<SolverResult | null> {
+  // Avoid network calls for synthetic test keys
+  if (sitekey === 'fixture-key' || sitekey === 'test-key') return null;
+
+  const candidateKeys = await getCandidateCapzyKeys(overrideKeys);
+  if (candidateKeys.length === 0) {
+    logWarn({}, 'Capzy solver skipped: no Capzy/CapSolver API keys configured');
+    return null;
+  }
+
+  const proxy =
+    proxyUrl ||
+    process.env.CODEFORCES_PROXY?.trim() ||
+    'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
+  const ua = userAgent || DEFAULT_DESKTOP_CHROME_USER_AGENT;
+
+  let targetUrl = websiteURL;
+  try {
+    const parsed = new URL(websiteURL);
+    targetUrl = parsed.origin;
+  } catch {}
+
+  const isRefusingProxy = !!proxy && (proxy.includes('joyproxy.com') || proxy.includes('busyip.com'));
+
+  // Attempt 1: AntiTurnstileTask with residential proxy
+  let proxyTask: Record<string, unknown> | null = null;
+  try {
+    if (proxy && !isRefusingProxy) {
+      const parsed = new URL(proxy);
+      const parsedPort = parseInt(parsed.port, 10);
+      proxyTask = {
+        type: 'AntiTurnstileTask',
+        websiteURL: targetUrl,
+        websiteKey: sitekey,
+        proxyType: parsed.protocol.replace(':', '') || 'http',
+        proxyAddress: parsed.hostname,
+        proxyPort: !isNaN(parsedPort) && parsedPort > 0 ? parsedPort : (parsed.protocol === 'https:' ? 443 : 80),
+        ...(parsed.username ? { proxyLogin: decodeURIComponent(parsed.username) } : {}),
+        ...(parsed.password ? { proxyPassword: decodeURIComponent(parsed.password) } : {}),
+        userAgent: ua,
+        ...(action ? { action } : {}),
+        ...(cdata ? { cdata } : {}),
+        ...(action || cdata ? { metadata: { ...(action ? { action } : {}), ...(cdata ? { cdata } : {}) } } : {}),
+      };
+    }
+  } catch {
+    proxyTask = null;
+  }
+
+  // Attempt 2: AntiTurnstileTaskProxyLess
+  const proxylessTask: Record<string, unknown> = {
+    type: 'AntiTurnstileTaskProxyLess',
+    websiteURL: targetUrl,
+    websiteKey: sitekey,
+    userAgent: ua,
+    ...(action ? { action } : {}),
+    ...(cdata ? { cdata } : {}),
+    ...(action || cdata ? { metadata: { ...(action ? { action } : {}), ...(cdata ? { cdata } : {}) } } : {}),
+  };
+
+  const runCapzyTask = async (
+    apiKey: string,
+    task: Record<string, unknown>,
+    taskTimeoutMs = timeoutMs,
+  ): Promise<{ result: SolverResult | null; isKeyError: boolean }> => {
+    try {
+      const init = await fetch('https://api.capzy.ai/createTask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientKey: apiKey, task }),
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (!init.ok && (init.status === 401 || init.status === 402 || init.status === 403)) {
+        logWarn({ status: init.status, key: maskApiKey(apiKey) }, 'Capzy createTask returned unauthorized/unfunded HTTP status');
+        return { result: null, isKeyError: true };
+      }
+
+      const data = (await init.json()) as { errorId?: number; errorCode?: string; taskId?: string; errorDescription?: string };
+      if (data?.errorId && data.errorId !== 0) {
+        const keyError = isCapzyKeyError(data.errorId, data.errorCode, data.errorDescription);
+        logWarn({ errorId: data.errorId, desc: data.errorDescription, code: data.errorCode, keyError, key: maskApiKey(apiKey) }, 'Capzy createTask failed');
+        return { result: null, isKeyError: keyError };
+      }
+      if (!data?.taskId) {
+        return { result: null, isKeyError: false };
+      }
+
+      const deadline = Date.now() + taskTimeoutMs;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const poll = await fetch('https://api.capzy.ai/getTaskResult', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ clientKey: apiKey, taskId: data.taskId }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const res = (await poll.json()) as {
+          errorId?: number;
+          errorCode?: string;
+          errorDescription?: string;
+          status?: string;
+          solution?: {
+            token?: string;
+            turnstileToken?: string;
+            cookies?: Record<string, string>;
+          };
+        };
+        const token = res?.solution?.token || res?.solution?.turnstileToken || (res?.solution as Record<string, unknown> | undefined)?.['cf-turnstile-response'];
+        if (res?.status === 'ready' && token && typeof token === 'string') {
+          return {
+            result: {
+              token,
+              cookies: res.solution?.cookies,
+            },
+            isKeyError: false,
+          };
+        }
+        if (res?.errorId && res.errorId !== 0) {
+          const keyError = isCapzyKeyError(res.errorId, res.errorCode, res.errorDescription);
+          logWarn({ taskId: data.taskId, errorId: res.errorId, code: res.errorCode, desc: res.errorDescription, status: res.status, keyError, key: maskApiKey(apiKey) }, 'Capzy getTaskResult reported error');
+          return { result: null, isKeyError: keyError };
+        }
+      }
+    } catch (err) {
+      logWarn({ err: err instanceof Error ? err.message : String(err), key: maskApiKey(apiKey) }, 'Capzy task execution threw');
+    }
+    return { result: null, isKeyError: false };
+  };
+
+  for (const apiKey of candidateKeys) {
+    if (proxyTask) {
+      const attempt1Timeout = Math.min(16_000, Math.max(5_000, Math.floor(timeoutMs * 0.45)));
+      const { result, isKeyError } = await runCapzyTask(apiKey, proxyTask, attempt1Timeout);
+      if (result?.token) return result;
+      if (isKeyError) {
+        await rotateToNextCapzyKey(apiKey, 'Key invalid or zero balance during proxy task', overrideKeys);
+        continue;
+      }
+    }
+
+    const { result, isKeyError } = await runCapzyTask(apiKey, proxylessTask, timeoutMs);
+    if (result?.token) return result;
+    if (isKeyError) {
+      await rotateToNextCapzyKey(apiKey, 'Key invalid or zero balance during proxyless task', overrideKeys);
+      continue;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Solve Cloudflare challenge with Capzy / CapSolver API (commercial fallback).
+ */
+export async function solveCloudflareWithCapzy(
+  websiteURL: string,
+  proxyUrl?: string,
+  userAgent?: string,
+  timeoutMs = 35_000,
+  sitekey?: string,
+  action?: string,
+  cdata?: string,
+  overrideKeys?: string[],
+): Promise<SolverResult | null> {
+  if (sitekey) {
+    return solveTurnstileWithCapzy(websiteURL, sitekey, proxyUrl, userAgent, timeoutMs, action, cdata, overrideKeys);
+  }
+
+  const candidateKeys = await getCandidateCapzyKeys(overrideKeys);
+  if (candidateKeys.length === 0) {
+    logWarn({}, 'Capzy solver skipped: no Capzy/CapSolver API keys configured');
+    return null;
+  }
+
+  const proxy =
+    proxyUrl ||
+    process.env.CODEFORCES_PROXY?.trim() ||
+    'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
+  const ua = userAgent || DEFAULT_DESKTOP_CHROME_USER_AGENT;
+
+  for (const apiKey of candidateKeys) {
+    try {
+      const parsed = new URL(proxy);
+      const parsedPort = parseInt(parsed.port, 10);
+      const init = await fetch('https://api.capzy.ai/createTask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clientKey: apiKey,
+          task: {
+            type: 'AntiCloudflareTask',
+            websiteURL,
+            proxyType: parsed.protocol.replace(':', '') || 'http',
+            proxyAddress: parsed.hostname,
+            proxyPort: !isNaN(parsedPort) && parsedPort > 0 ? parsedPort : (parsed.protocol === 'https:' ? 443 : 80),
+            ...(parsed.username ? { proxyLogin: decodeURIComponent(parsed.username) } : {}),
+            ...(parsed.password ? { proxyPassword: decodeURIComponent(parsed.password) } : {}),
+            userAgent: ua,
+          },
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (!init.ok && (init.status === 401 || init.status === 402 || init.status === 403)) {
+        await rotateToNextCapzyKey(apiKey, `HTTP ${init.status} on createTask`, overrideKeys);
+        continue;
+      }
+
+      const data = (await init.json()) as { errorId?: number; errorCode?: string; errorDescription?: string; taskId?: string };
+      if (data?.errorId && data.errorId !== 0) {
+        if (isCapzyKeyError(data.errorId, data.errorCode, data.errorDescription)) {
+          await rotateToNextCapzyKey(apiKey, data.errorDescription || data.errorCode || 'Key error on createTask', overrideKeys);
+          continue;
+        }
+        return null;
+      }
+      if (!data?.taskId) continue;
+
+      const deadline = Date.now() + timeoutMs;
+      let rotatedDuringPoll = false;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const poll = await fetch('https://api.capzy.ai/getTaskResult', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ clientKey: apiKey, taskId: data.taskId }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const res = (await poll.json()) as {
+          errorId?: number;
+          errorCode?: string;
+          errorDescription?: string;
+          status?: string;
+          solution?: {
+            token?: string;
+            turnstileToken?: string;
+            cookies?: Record<string, string>;
+          };
+        };
+        const token = res?.solution?.token || res?.solution?.turnstileToken || (res?.solution as Record<string, unknown> | undefined)?.['cf-turnstile-response'];
+        if (res?.status === 'ready' && (token || res?.solution?.cookies)) {
+          return {
+            token: typeof token === 'string' ? token : undefined,
+            cookies: res.solution?.cookies,
+          };
+        }
+        if (res?.errorId && res.errorId !== 0) {
+          logWarn({ taskId: data.taskId, errorId: res.errorId, status: res.status, raw: res }, 'Capzy solve reported error');
+          if (isCapzyKeyError(res.errorId, res.errorCode, res.errorDescription)) {
+            await rotateToNextCapzyKey(apiKey, res.errorDescription || res.errorCode || 'Key error during poll', overrideKeys);
+            rotatedDuringPoll = true;
+          }
+          break;
+        }
+      }
+      if (rotatedDuringPoll) continue;
+    } catch (err) {
+      logWarn({ err: err instanceof Error ? err.message : String(err), key: maskApiKey(apiKey) }, 'Capzy solveCloudflare threw');
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Unified Orchestrated Solver for Turnstile widgets.
+ * Flow:
+ * 1. Checks if local CPSolver is configured.
+ * 2. Attempts up to 3 tries on CPSolver, notifying Telegram of each attempt.
+ * 3. If CPSolver succeeds: notifies Telegram and returns result.
+ * 4. If CPSolver fails after 3 tries: notifies Telegram of failover to CapSolver / Capzy.
+ * 5. Proceeds with CapSolver / Capzy multi-key rotation, notifying Telegram.
+ */
+export async function solveTurnstileOrchestrated(params: {
+  siteurl: string;
+  sitekey: string;
+  action?: string;
+  cdata?: string;
+  proxyUrl?: string;
+  userAgent?: string;
+  timeoutMs?: number;
+  overrideKeys?: string[];
+}): Promise<SolverResult | null> {
+  const solverUrl = getCPSolverUrl();
+  const timeoutMs = params.timeoutMs ?? 35_000;
+
+  // Phase 1: Local / Render CPSolver (up to 3 tries)
+  if (solverUrl) {
+    let solverHost = solverUrl;
+    try {
+      solverHost = new URL(solverUrl).host;
+    } catch {}
+
+    const maxTries = 3;
+    log({ solverUrl, maxTries, siteurl: params.siteurl }, 'Starting Turnstile solve with local CPSolver');
+
+    for (let attempt = 1; attempt <= maxTries; attempt++) {
+      const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Turnstile via CPSolver (${solverHost})...</b>`;
+      await sendSolverTelegramNotification(attemptNotice).catch(() => undefined);
+
+      log({ attempt, maxTries }, 'Invoking CPSolver');
+      const attemptStartTime = Date.now();
+      const res = await solveTurnstileWithCPSolver({
+        siteurl: params.siteurl,
+        sitekey: params.sitekey,
+        action: params.action,
+        cdata: params.cdata,
+        proxy: params.proxyUrl,
+        timeoutMs,
+      });
+
+      if (res.ok && res.token) {
+        const sec = Math.max(1, Math.round(res.durationMs / 1000));
+        const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${res.proxyUsed}</code>` : '';
+        const successNotice = `✅ <b>Turnstile solved via CPSolver!</b> <i>(${sec}s, attempt ${attempt}/${maxTries})</i>${proxyInfo}`;
+        await sendSolverTelegramNotification(successNotice).catch(() => undefined);
+
+        log({ durationMs: res.durationMs, attempt, proxyUsed: res.proxyUsed }, 'CPSolver succeeded');
+        return {
+          token: res.token,
+          cookies: res.cookies,
+          cfClearance: res.cfClearance,
+          source: 'cpsolver',
+          durationMs: res.durationMs,
+        };
+      }
+
+      logWarn({ attempt, error: res.error, durationMs: Date.now() - attemptStartTime }, 'CPSolver attempt failed');
+      if (attempt < maxTries) {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+
+    // All 3 tries failed
+    const fallbackNotice = `⚠️ <b>CPSolver failed after ${maxTries} attempts. Falling back to CapSolver / Capzy...</b>`;
+    await sendSolverTelegramNotification(fallbackNotice).catch(() => undefined);
+    logWarn({}, 'CPSolver exhausted 3 tries. Falling back to CapSolver/Capzy');
+  } else {
+    log({}, 'CPSolver URL not configured, proceeding directly with CapSolver / Capzy');
+  }
+
+  // Phase 2: CapSolver / Capzy commercial fallback
+  const capzyNotice = `🧩 <b>Solving Turnstile via CapSolver / Capzy (multi-key rotation)...</b>`;
+  await sendSolverTelegramNotification(capzyNotice).catch(() => undefined);
+
+  const capzySol = await solveTurnstileWithCapzy(
+    params.siteurl,
+    params.sitekey,
+    params.proxyUrl,
+    params.userAgent,
+    timeoutMs,
+    params.action,
+    params.cdata,
+    params.overrideKeys,
+  );
+
+  if (capzySol?.token) {
+    const successNotice = `✅ <b>Turnstile solved via CapSolver / Capzy!</b>`;
+    await sendSolverTelegramNotification(successNotice).catch(() => undefined);
+    return {
+      ...capzySol,
+      source: 'capsolver',
+    };
+  }
+
+  const failNotice = `❌ <b>CapSolver / Capzy also failed to solve Turnstile.</b>`;
+  await sendSolverTelegramNotification(failNotice).catch(() => undefined);
+  return null;
+}
+
+/**
+ * Unified Orchestrated Solver for Cloudflare Interstitial / Clearance challenges.
+ * Flow:
+ * 1. Checks if local CPSolver is configured.
+ * 2. Attempts up to 3 tries on CPSolver in navigate mode.
+ * 3. If CPSolver succeeds: notifies Telegram and returns result.
+ * 4. If CPSolver fails after 3 tries: notifies Telegram of failover to CapSolver / Capzy.
+ * 5. Proceeds with CapSolver / Capzy.
+ */
+export async function solveCloudflareOrchestrated(params: {
+  websiteURL: string;
+  proxyUrl?: string;
+  userAgent?: string;
+  timeoutMs?: number;
+  sitekey?: string;
+  action?: string;
+  cdata?: string;
+  overrideKeys?: string[];
+}): Promise<SolverResult | null> {
+  if (params.sitekey) {
+    return solveTurnstileOrchestrated({
+      siteurl: params.websiteURL,
+      sitekey: params.sitekey,
+      action: params.action,
+      cdata: params.cdata,
+      proxyUrl: params.proxyUrl,
+      userAgent: params.userAgent,
+      timeoutMs: params.timeoutMs,
+      overrideKeys: params.overrideKeys,
+    });
+  }
+
+  const solverUrl = getCPSolverUrl();
+  const timeoutMs = params.timeoutMs ?? 35_000;
+
+  // Phase 1: Local / Render CPSolver (up to 3 tries)
+  if (solverUrl) {
+    let solverHost = solverUrl;
+    try {
+      solverHost = new URL(solverUrl).host;
+    } catch {}
+
+    const maxTries = 3;
+    log({ solverUrl, maxTries, url: params.websiteURL }, 'Starting Cloudflare clearance solve with local CPSolver');
+
+    for (let attempt = 1; attempt <= maxTries; attempt++) {
+      const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Cloudflare Challenge via CPSolver (${solverHost})...</b>`;
+      await sendSolverTelegramNotification(attemptNotice).catch(() => undefined);
+
+      const res = await solveCloudflareWithCPSolver({
+        siteurl: params.websiteURL,
+        proxy: params.proxyUrl,
+        timeoutMs,
+      });
+
+      if (res.ok && (res.token || res.cfClearance || (res.cookies && Object.keys(res.cookies).length > 0))) {
+        const sec = Math.max(1, Math.round(res.durationMs / 1000));
+        const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${res.proxyUsed}</code>` : '';
+        const successNotice = `✅ <b>Cloudflare Challenge cleared via CPSolver!</b> <i>(${sec}s, attempt ${attempt}/${maxTries})</i>${proxyInfo}`;
+        await sendSolverTelegramNotification(successNotice).catch(() => undefined);
+
+        return {
+          token: res.token,
+          cookies: res.cookies,
+          cfClearance: res.cfClearance,
+          source: 'cpsolver',
+          durationMs: res.durationMs,
+        };
+      }
+
+      logWarn({ attempt, error: res.error }, 'CPSolver challenge attempt failed');
+      if (attempt < maxTries) {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+
+    const fallbackNotice = `⚠️ <b>CPSolver failed after ${maxTries} attempts. Falling back to CapSolver / Capzy...</b>`;
+    await sendSolverTelegramNotification(fallbackNotice).catch(() => undefined);
+  }
+
+  // Phase 2: CapSolver / Capzy commercial fallback
+  const capzyNotice = `🧩 <b>Solving Cloudflare Challenge via CapSolver / Capzy...</b>`;
+  await sendSolverTelegramNotification(capzyNotice).catch(() => undefined);
+
+  const capzySol = await solveCloudflareWithCapzy(
+    params.websiteURL,
+    params.proxyUrl,
+    params.userAgent,
+    timeoutMs,
+    params.sitekey,
+    params.action,
+    params.cdata,
+    params.overrideKeys,
+  );
+
+  if (capzySol && (capzySol.token || capzySol.cookies)) {
+    const successNotice = `✅ <b>Cloudflare Challenge cleared via CapSolver / Capzy!</b>`;
+    await sendSolverTelegramNotification(successNotice).catch(() => undefined);
+    return {
+      ...capzySol,
+      source: 'capsolver',
+    };
+  }
+
+  const failNotice = `❌ <b>CapSolver / Capzy also failed to clear Cloudflare Challenge.</b>`;
+  await sendSolverTelegramNotification(failNotice).catch(() => undefined);
+  return null;
+}

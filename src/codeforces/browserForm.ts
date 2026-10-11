@@ -99,293 +99,21 @@ export async function fillSource(page: Page, code: string): Promise<void> {
   }, code);
 }
 
-export interface SolverResult {
-  token?: string;
-  cookies?: Record<string, string>;
-}
-
-export const DEFAULT_DESKTOP_CHROME_USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
-export const DEFAULT_DESKTOP_FIREFOX_USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0';
-
-export const DEFAULT_DESKTOP_USER_AGENT = DEFAULT_DESKTOP_CHROME_USER_AGENT;
-
-export function getDefaultUserAgent(engine: 'chromium' | 'firefox' = 'chromium'): string {
-  return engine === 'firefox' ? DEFAULT_DESKTOP_FIREFOX_USER_AGENT : DEFAULT_DESKTOP_CHROME_USER_AGENT;
-}
-
-export async function solveTurnstileWithCapzy(
-  websiteURL: string,
-  sitekey: string,
-  proxyUrl?: string,
-  userAgent?: string,
-  timeoutMs = 35_000,
-  action?: string,
-  cdata?: string,
-  overrideKeys?: string[],
-): Promise<SolverResult | null> {
-  // Avoid network calls for synthetic test keys
-  if (sitekey === 'fixture-key' || sitekey === 'test-key') return null;
-
-  const candidateKeys = await getCandidateCapzyKeys(overrideKeys);
-  if (candidateKeys.length === 0) {
-    logWarn({}, 'Capzy solver skipped: no Capzy/CapSolver API keys configured');
-    return null;
-  }
-
-  const proxy =
-    proxyUrl ||
-    process.env.CODEFORCES_PROXY?.trim() ||
-    'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
-  const ua = userAgent || DEFAULT_DESKTOP_USER_AGENT;
-
-  let targetUrl = websiteURL;
-  try {
-    const parsed = new URL(websiteURL);
-    targetUrl = parsed.origin;
-  } catch {}
-
-  const isRefusingProxy = !!proxy && (proxy.includes('joyproxy.com') || proxy.includes('busyip.com'));
-
-  // Attempt 1: AntiTurnstileTask with residential proxy (skipped for proxies that refuse solver connections)
-  let proxyTask: Record<string, unknown> | null = null;
-  try {
-    if (proxy && !isRefusingProxy) {
-      const parsed = new URL(proxy);
-      const parsedPort = parseInt(parsed.port, 10);
-      proxyTask = {
-        type: 'AntiTurnstileTask',
-        websiteURL: targetUrl,
-        websiteKey: sitekey,
-        proxyType: parsed.protocol.replace(':', '') || 'http',
-        proxyAddress: parsed.hostname,
-        proxyPort: !isNaN(parsedPort) && parsedPort > 0 ? parsedPort : (parsed.protocol === 'https:' ? 443 : 80),
-        ...(parsed.username ? { proxyLogin: decodeURIComponent(parsed.username) } : {}),
-        ...(parsed.password ? { proxyPassword: decodeURIComponent(parsed.password) } : {}),
-        userAgent: ua,
-        ...(action ? { action } : {}),
-        ...(cdata ? { cdata } : {}),
-        ...(action || cdata ? { metadata: { ...(action ? { action } : {}), ...(cdata ? { cdata } : {}) } } : {}),
-      };
-    }
-  } catch {
-    proxyTask = null;
-  }
-
-  // Attempt 2: AntiTurnstileTaskProxyLess (uses Capzy cloud infrastructure)
-  const proxylessTask: Record<string, unknown> = {
-    type: 'AntiTurnstileTaskProxyLess',
-    websiteURL: targetUrl,
-    websiteKey: sitekey,
-    userAgent: ua,
-    ...(action ? { action } : {}),
-    ...(cdata ? { cdata } : {}),
-    ...(action || cdata ? { metadata: { ...(action ? { action } : {}), ...(cdata ? { cdata } : {}) } } : {}),
-  };
-
-  const runCapzyTask = async (
-    apiKey: string,
-    task: Record<string, unknown>,
-    taskTimeoutMs = timeoutMs,
-  ): Promise<{ result: SolverResult | null; isKeyError: boolean }> => {
-    try {
-      const init = await fetch('https://api.capzy.ai/createTask', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clientKey: apiKey, task }),
-        signal: AbortSignal.timeout(10_000),
-      });
-
-      if (!init.ok && (init.status === 401 || init.status === 402 || init.status === 403)) {
-        logWarn({ status: init.status, key: maskApiKey(apiKey) }, 'Capzy createTask returned unauthorized/unfunded HTTP status');
-        return { result: null, isKeyError: true };
-      }
-
-      const data = (await init.json()) as { errorId?: number; errorCode?: string; taskId?: string; errorDescription?: string };
-      if (data?.errorId && data.errorId !== 0) {
-        const keyError = isCapzyKeyError(data.errorId, data.errorCode, data.errorDescription);
-        logWarn({ errorId: data.errorId, desc: data.errorDescription, code: data.errorCode, keyError, key: maskApiKey(apiKey) }, 'Capzy createTask failed');
-        return { result: null, isKeyError: keyError };
-      }
-      if (!data?.taskId) {
-        return { result: null, isKeyError: false };
-      }
-
-      const deadline = Date.now() + taskTimeoutMs;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2000));
-        const poll = await fetch('https://api.capzy.ai/getTaskResult', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ clientKey: apiKey, taskId: data.taskId }),
-          signal: AbortSignal.timeout(10_000),
-        });
-        const res = (await poll.json()) as {
-          errorId?: number;
-          errorCode?: string;
-          errorDescription?: string;
-          status?: string;
-          solution?: {
-            token?: string;
-            turnstileToken?: string;
-            cookies?: Record<string, string>;
-          };
-        };
-        const token = res?.solution?.token || res?.solution?.turnstileToken || (res?.solution as Record<string, unknown> | undefined)?.['cf-turnstile-response'];
-        if (res?.status === 'ready' && token && typeof token === 'string') {
-          return {
-            result: {
-              token,
-              cookies: res.solution?.cookies,
-            },
-            isKeyError: false,
-          };
-        }
-        if (res?.errorId && res.errorId !== 0) {
-          const keyError = isCapzyKeyError(res.errorId, res.errorCode, res.errorDescription);
-          logWarn({ taskId: data.taskId, errorId: res.errorId, code: res.errorCode, desc: res.errorDescription, status: res.status, keyError, key: maskApiKey(apiKey) }, 'Capzy getTaskResult reported error');
-          return { result: null, isKeyError: keyError };
-        }
-      }
-    } catch (err) {
-      logWarn({ err: err instanceof Error ? err.message : String(err), key: maskApiKey(apiKey) }, 'Capzy task execution threw');
-    }
-    return { result: null, isKeyError: false };
-  };
-
-  for (const apiKey of candidateKeys) {
-    if (proxyTask) {
-      const attempt1Timeout = Math.min(16_000, Math.max(5_000, Math.floor(timeoutMs * 0.45)));
-      const { result, isKeyError } = await runCapzyTask(apiKey, proxyTask, attempt1Timeout);
-      if (result?.token) return result;
-      if (isKeyError) {
-        await rotateToNextCapzyKey(apiKey, 'Key invalid or zero balance during proxy task', overrideKeys);
-        continue;
-      }
-    }
-
-    const { result, isKeyError } = await runCapzyTask(apiKey, proxylessTask, timeoutMs);
-    if (result?.token) return result;
-    if (isKeyError) {
-      await rotateToNextCapzyKey(apiKey, 'Key invalid or zero balance during proxyless task', overrideKeys);
-      continue;
-    }
-  }
-
-  return null;
-}
-
-export async function solveCloudflareWithCapzy(
-  websiteURL: string,
-  proxyUrl?: string,
-  userAgent?: string,
-  timeoutMs = 35_000,
-  sitekey?: string,
-  action?: string,
-  cdata?: string,
-  overrideKeys?: string[],
-): Promise<SolverResult | null> {
-  if (sitekey) {
-    return solveTurnstileWithCapzy(websiteURL, sitekey, proxyUrl, userAgent, timeoutMs, action, cdata, overrideKeys);
-  }
-
-  const candidateKeys = await getCandidateCapzyKeys(overrideKeys);
-  if (candidateKeys.length === 0) {
-    logWarn({}, 'Capzy solver skipped: no Capzy/CapSolver API keys configured');
-    return null;
-  }
-
-  const proxy =
-    proxyUrl ||
-    process.env.CODEFORCES_PROXY?.trim() ||
-    'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
-  const ua = userAgent || DEFAULT_DESKTOP_USER_AGENT;
-
-  for (const apiKey of candidateKeys) {
-    try {
-      const parsed = new URL(proxy);
-      const parsedPort = parseInt(parsed.port, 10);
-      const init = await fetch('https://api.capzy.ai/createTask', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clientKey: apiKey,
-          task: {
-            type: 'AntiCloudflareTask',
-            websiteURL,
-            proxyType: parsed.protocol.replace(':', '') || 'http',
-            proxyAddress: parsed.hostname,
-            proxyPort: !isNaN(parsedPort) && parsedPort > 0 ? parsedPort : (parsed.protocol === 'https:' ? 443 : 80),
-            ...(parsed.username ? { proxyLogin: decodeURIComponent(parsed.username) } : {}),
-            ...(parsed.password ? { proxyPassword: decodeURIComponent(parsed.password) } : {}),
-            userAgent: ua,
-          },
-        }),
-        signal: AbortSignal.timeout(10_000),
-      });
-
-      if (!init.ok && (init.status === 401 || init.status === 402 || init.status === 403)) {
-        await rotateToNextCapzyKey(apiKey, `HTTP ${init.status} on createTask`, overrideKeys);
-        continue;
-      }
-
-      const data = (await init.json()) as { errorId?: number; errorCode?: string; errorDescription?: string; taskId?: string };
-      if (data?.errorId && data.errorId !== 0) {
-        if (isCapzyKeyError(data.errorId, data.errorCode, data.errorDescription)) {
-          await rotateToNextCapzyKey(apiKey, data.errorDescription || data.errorCode || 'Key error on createTask', overrideKeys);
-          continue;
-        }
-        return null;
-      }
-      if (!data?.taskId) continue;
-
-      const deadline = Date.now() + timeoutMs;
-      let rotatedDuringPoll = false;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2000));
-        const poll = await fetch('https://api.capzy.ai/getTaskResult', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ clientKey: apiKey, taskId: data.taskId }),
-          signal: AbortSignal.timeout(10_000),
-        });
-        const res = (await poll.json()) as {
-          errorId?: number;
-          errorCode?: string;
-          errorDescription?: string;
-          status?: string;
-          solution?: {
-            token?: string;
-            turnstileToken?: string;
-            cookies?: Record<string, string>;
-          };
-        };
-        const token = res?.solution?.token || res?.solution?.turnstileToken || (res?.solution as Record<string, unknown> | undefined)?.['cf-turnstile-response'];
-        if (res?.status === 'ready' && (token || res?.solution?.cookies)) {
-          return {
-            token: typeof token === 'string' ? token : undefined,
-            cookies: res.solution?.cookies,
-          };
-        }
-        if (res?.errorId && res.errorId !== 0) {
-          logWarn({ taskId: data.taskId, errorId: res.errorId, status: res.status, raw: res }, 'Capzy solve reported error');
-          if (isCapzyKeyError(res.errorId, res.errorCode, res.errorDescription)) {
-            await rotateToNextCapzyKey(apiKey, res.errorDescription || res.errorCode || 'Key error during poll', overrideKeys);
-            rotatedDuringPoll = true;
-          }
-          break;
-        }
-      }
-      if (rotatedDuringPoll) continue;
-    } catch (err) {
-      logWarn({ err: err instanceof Error ? err.message : String(err), key: maskApiKey(apiKey) }, 'Capzy solveCloudflare threw');
-    }
-  }
-
-  return null;
-}
+export {
+  type SolverResult,
+  DEFAULT_DESKTOP_CHROME_USER_AGENT,
+  DEFAULT_DESKTOP_FIREFOX_USER_AGENT,
+  DEFAULT_DESKTOP_USER_AGENT,
+  getDefaultUserAgent,
+  solveTurnstileWithCapzy,
+  solveCloudflareWithCapzy,
+  solveTurnstileOrchestrated,
+  solveCloudflareOrchestrated,
+} from './captchaSolver';
+import {
+  solveTurnstileOrchestrated,
+  solveCloudflareOrchestrated,
+} from './captchaSolver';
 
 async function injectTurnstileToken(form: ReturnType<Page['locator']>, token: string, callbackName?: string | null): Promise<void> {
   await form.evaluate((element, { token, callback }) => {
@@ -577,47 +305,55 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     if (solverStarted) return;
     solverStarted = true;
     solverPromise = (async () => {
-      const solverUrl = process.env.TURNSTILE_SOLVER_URL?.trim();
-      if (solverUrl && info.sitekey) {
-        try {
-          const response = await fetch(`${solverUrl.replace(/\/+$/, '')}/solve`, {
-            method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ siteurl: page.url(), sitekey: info.sitekey, action: info.action, cdata: info.cdata }),
-            signal: AbortSignal.timeout(timeoutMs),
-          });
-          if (response.ok) {
-            const data = await response.json() as { token?: unknown };
-            if (typeof data.token === 'string' && data.token.trim()) {
-              await injectTurnstileToken(form, data.token.trim(), info.callback);
-              return;
-            }
-          }
-        } catch {}
-      }
+      const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
 
       if (info.sitekey) {
-        const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-        const capzySol = await solveTurnstileWithCapzy(
-          page.url(),
-          info.sitekey,
+        const solution = await solveTurnstileOrchestrated({
+          siteurl: page.url(),
+          sitekey: info.sitekey,
+          action: info.action ?? undefined,
+          cdata: info.cdata ?? undefined,
           proxyUrl,
           userAgent,
           timeoutMs,
-          info.action ?? undefined,
-          info.cdata ?? undefined,
           overrideKeys,
-        );
-        if (capzySol?.token) {
-          log({ tokenLength: capzySol.token.length }, 'ensureFormTurnstile: injecting Capzy Turnstile token');
-          await injectTurnstileToken(form, capzySol.token, info.callback);
+        });
+
+        if (solution?.token) {
+          log({ tokenLength: solution.token.length, source: solution.source }, 'ensureFormTurnstile: injecting Turnstile token');
+          await injectTurnstileToken(form, solution.token, info.callback);
           return;
+        }
+
+        if (solution?.cookies) {
+          const cookieList = Object.entries(solution.cookies)
+            .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+            .map(([name, value]) => ({
+              name,
+              value,
+              domain: '.codeforces.com',
+              path: '/',
+            }));
+          if (cookieList.length > 0) {
+            log({ count: cookieList.length, names: cookieList.map(c => c.name), source: solution.source }, 'ensureFormTurnstile: injecting clearance cookies');
+            await page.context().addCookies(cookieList).catch(() => {});
+          }
         }
       }
 
-      const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-      const capzySol = await solveCloudflareWithCapzy(page.url(), proxyUrl, userAgent, timeoutMs, info.sitekey ?? undefined, info.action ?? undefined, info.cdata ?? undefined, overrideKeys);
-      if (capzySol?.cookies) {
-        const cookieList = Object.entries(capzySol.cookies)
+      const cloudflareSol = await solveCloudflareOrchestrated({
+        websiteURL: page.url(),
+        proxyUrl,
+        userAgent,
+        timeoutMs,
+        sitekey: info.sitekey ?? undefined,
+        action: info.action ?? undefined,
+        cdata: info.cdata ?? undefined,
+        overrideKeys,
+      });
+
+      if (cloudflareSol?.cookies) {
+        const cookieList = Object.entries(cloudflareSol.cookies)
           .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
           .map(([name, value]) => ({
             name,
@@ -626,13 +362,14 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
             path: '/',
           }));
         if (cookieList.length > 0) {
-          log({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'ensureFormTurnstile: injecting Capzy Cloudflare clearance cookies');
+          log({ count: cookieList.length, names: cookieList.map(c => c.name), source: cloudflareSol.source }, 'ensureFormTurnstile: injecting Cloudflare clearance cookies');
           await page.context().addCookies(cookieList).catch(() => {});
         }
       }
-      if (capzySol?.token) {
-        log({ tokenLength: capzySol.token.length }, 'ensureFormTurnstile: injecting Capzy Cloudflare token');
-        await injectTurnstileToken(form, capzySol.token, info.callback);
+
+      if (cloudflareSol?.token) {
+        log({ tokenLength: cloudflareSol.token.length, source: cloudflareSol.source }, 'ensureFormTurnstile: injecting Cloudflare token');
+        await injectTurnstileToken(form, cloudflareSol.token, info.callback);
       }
     })();
   };

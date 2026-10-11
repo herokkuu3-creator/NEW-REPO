@@ -1,5 +1,5 @@
 import type { Page, Response } from 'playwright';
-import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, solveCloudflareWithCapzy } from './browserForm';
+import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, solveCloudflareWithCapzy, solveCloudflareOrchestrated } from './browserForm';
 import { interactWithTurnstileCheckbox } from '../browser/stealth';
 import type { BrowserSession } from '../browser/playwright';
 import { logger } from '../logger';
@@ -320,8 +320,13 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
   if (proxyUrl) {
     try {
       const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
-      logger.info({ proxyUrl, userAgent }, 'waitOutChallenge: requesting Capzy solve');
-      const result = await solveCloudflareWithCapzy(page.url() || 'https://codeforces.com', proxyUrl, userAgent, 30_000);
+      logger.info({ proxyUrl, userAgent }, 'waitOutChallenge: requesting orchestrated solve');
+      const result = await solveCloudflareOrchestrated({
+        websiteURL: page.url() || 'https://codeforces.com',
+        proxyUrl,
+        userAgent,
+        timeoutMs: 30_000,
+      });
       if (result?.cookies && Object.keys(result.cookies).length > 0) {
         const cookiesToSet = Object.entries(result.cookies)
           .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
@@ -329,7 +334,7 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
             name, value: String(value), domain: '.codeforces.com', path: '/',
           }));
         if (cookiesToSet.length > 0) {
-          logger.info({ count: cookiesToSet.length, names: cookiesToSet.map(c => c.name) }, 'waitOutChallenge: injecting Capzy Cloudflare cookies');
+          logger.info({ count: cookiesToSet.length, names: cookiesToSet.map(c => c.name), source: result.source }, 'waitOutChallenge: injecting Cloudflare clearance cookies');
           await page.context().addCookies(cookiesToSet).catch(() => undefined);
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
           await sleep(2_000);
@@ -339,13 +344,13 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
             settled = typeof loc?.count === 'function' && ((await loc.count().catch(() => 0)) > 0);
           } catch {}
           if (settled) {
-            logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser after Capzy reload');
+            logger.info({ url: page.url() }, 'Codeforces challenge cleared in the browser after reload');
             return true;
           }
         }
       }
     } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'waitOutChallenge: Capzy attempt failed');
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'waitOutChallenge: solve attempt failed');
     }
   }
 

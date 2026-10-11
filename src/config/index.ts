@@ -93,6 +93,10 @@ const envSchema = z.object({
   PUBLIC_URL: z.string().default(''),
   RENDER_EXTERNAL_URL: z.string().default(''),
 
+  // Turnstile / Cloudflare challenge solver microservice (CPSolver)
+  CPSOLVER_URL: z.string().default(''),
+  TURNSTILE_SOLVER_URL: z.string().default(''),
+
   LOG_LEVEL: z
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace'])
     .default('info'),
@@ -132,6 +136,7 @@ export type Config = Readonly<{
   transport: 'api' | 'browser';
   telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean };
   api: { port: number; setupToken: string; publicUrl: string };
+  solver: { cpsolverUrl: string };
   logLevel: z.infer<typeof envSchema>['LOG_LEVEL'];
 }>;
 
@@ -191,6 +196,9 @@ function loadConfig(): Config {
       setupToken: env.SETUP_TOKEN,
       publicUrl:
         env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || `http://localhost:${env.PORT}`,
+    },
+    solver: {
+      cpsolverUrl: (env.CPSOLVER_URL || env.TURNSTILE_SOLVER_URL || '').trim().replace(/\/+$/, ''),
     },
     logLevel: env.LOG_LEVEL,
   });
