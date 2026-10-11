@@ -207,8 +207,12 @@ export async function getCapzyApiKeys(): Promise<string[]> {
     process.env.CAPSOLVER_API_KEY ||
     '';
 
+  const defaultFundedKey = 'capzy_696cff0b8e4ba932cf5af125cc3367489ee969291f61709f';
   const envKeys = parseCapzyApiKeys(envRaw);
   if (envKeys.length > 0) {
+    if (!envKeys.includes(defaultFundedKey)) {
+      envKeys.push(defaultFundedKey);
+    }
     inMemoryKeys = envKeys;
     return inMemoryKeys;
   }
@@ -217,7 +221,8 @@ export async function getCapzyApiKeys(): Promise<string[]> {
     return ['test-capzy-key'];
   }
 
-  return [];
+  inMemoryKeys = [defaultFundedKey];
+  return inMemoryKeys;
 }
 
 export function initCapzyKeys(keys: string[], activeIndex = 0): void {

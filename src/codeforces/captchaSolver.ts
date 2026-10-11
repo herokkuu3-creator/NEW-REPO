@@ -657,7 +657,7 @@ export async function solveTurnstileOrchestrated(params: {
       solverHost = new URL(solverUrl).host;
     } catch {}
 
-    const maxTries = Math.max(1, parseInt(process.env.CPSOLVER_MAX_TRIES || '3', 10));
+    const maxTries = Math.max(1, parseInt(process.env.CPSOLVER_MAX_TRIES || '1', 10));
     const cpsolverTimeoutMs = Math.min(timeoutMs, parseInt(process.env.CPSOLVER_TIMEOUT_MS || '65000', 10));
     log({ solverUrl, maxTries, siteurl: params.siteurl, cpsolverTimeoutMs }, 'Starting Turnstile solve with local CPSolver');
 
@@ -679,15 +679,14 @@ export async function solveTurnstileOrchestrated(params: {
         timeoutMs: cpsolverTimeoutMs,
       });
 
+      const isInterstitialKey = params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj';
       const hasValidToken = typeof res.token === 'string' && res.token.trim().length > 10;
-      // In navigate mode CPSolver returns cfClearance/cookies when Codeforces clears the challenge
-      // (no Turnstile token — the clearance cookies are injected into the browser context directly).
-      // Accept: a real token OR cfClearance/cf_ cookies (navigate-mode success).
       const hasClearanceOrCookies = res.ok && (
         (typeof res.cfClearance === 'string' && res.cfClearance.trim().length > 0) ||
         (res.cookies && Object.keys(res.cookies).some((k) => k.toLowerCase().startsWith('cf_')))
       );
-      if (res.ok && (hasValidToken || hasClearanceOrCookies)) {
+
+      if (res.ok && (hasValidToken || (isInterstitialKey && hasClearanceOrCookies))) {
         const sec = Math.max(1, Math.round(res.durationMs / 1000));
         const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${res.proxyUsed}</code>` : '';
         const mode = hasValidToken ? 'token' : 'clearance-cookies';
@@ -704,6 +703,13 @@ export async function solveTurnstileOrchestrated(params: {
         };
       }
 
+      // If CPSolver returned clearance cookies without a Turnstile token, preserve them for downstream
+      if (res.cookies && Object.keys(res.cookies).length > 0) {
+        if (!params.cookies || typeof params.cookies !== 'object') {
+          params.cookies = res.cookies;
+        }
+      }
+
       const errBrief = res.error ? ` (${res.error.slice(0, 100)})` : '';
       logWarn({ attempt, error: res.error, durationMs: Date.now() - attemptStartTime }, 'CPSolver attempt failed');
       const failNotice = `⚠️ <b>[Attempt ${attempt}/${maxTries} failed]</b><i>${errBrief}</i>`;
@@ -714,10 +720,10 @@ export async function solveTurnstileOrchestrated(params: {
       }
     }
 
-    // All 3 tries failed
+    // All tries finished without a widget token — fall back to commercial CapSolver / Capzy
     const fallbackNotice = `⚠️ <b>CPSolver failed after ${maxTries} attempts. Falling back to CapSolver / Capzy...</b>`;
     await sendSolverTelegramNotification(fallbackNotice).catch(() => undefined);
-    logWarn({}, 'CPSolver exhausted 3 tries. Falling back to CapSolver/Capzy');
+    logWarn({}, 'CPSolver exhausted attempts without valid token. Falling back to CapSolver/Capzy');
   } else {
     log({}, 'CPSolver URL not configured, proceeding directly with CapSolver / Capzy');
   }

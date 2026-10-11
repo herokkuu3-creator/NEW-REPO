@@ -345,13 +345,6 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
           await injectTurnstileToken(form, solution.token!, info.callback);
           return;
         }
-
-        if (hasClearance) {
-          log({ source: solution?.source }, 'ensureFormTurnstile: clearance cookies verified, enabling submit control');
-          const tokenVal = solution?.cfClearance || 'cf_clearance_verified';
-          await injectTurnstileToken(form, tokenVal, info.callback);
-          return;
-        }
       } else {
         const cloudflareSol = await solveCloudflareOrchestrated({
           websiteURL: page.url(),
@@ -363,8 +356,6 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         });
 
         const hasCfSolToken = typeof cloudflareSol?.token === 'string' && cloudflareSol.token.trim().length > 10;
-        const hasCfSolClearance = (typeof cloudflareSol?.cfClearance === 'string' && cloudflareSol.cfClearance.trim().length > 0) ||
-          (cloudflareSol?.cookies && Object.keys(cloudflareSol.cookies).some(k => k.toLowerCase().startsWith('cf_')));
 
         if (cloudflareSol?.cookies) {
           const cookieList = Object.entries(cloudflareSol.cookies)
@@ -384,13 +375,6 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         if (hasCfSolToken) {
           log({ tokenLength: cloudflareSol.token!.length, source: cloudflareSol.source }, 'ensureFormTurnstile: injecting Cloudflare token');
           await injectTurnstileToken(form, cloudflareSol.token!, info.callback);
-          return;
-        }
-
-        if (hasCfSolClearance) {
-          log({ source: cloudflareSol?.source }, 'ensureFormTurnstile: Cloudflare clearance verified, enabling submit control');
-          const tokenVal = cloudflareSol?.cfClearance || 'cf_clearance_verified';
-          await injectTurnstileToken(form, tokenVal, info.callback);
           return;
         }
       }
@@ -497,14 +481,14 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     return { turnstile: true, interactive: false };
   }
 
-  // If CPSolver / Cloudflare clearance cookies were injected, enable the submit button
-  // and allow the submission to proceed rather than throwing a false-positive blocked error.
+  // If no Turnstile widget is present on the form, but clearance cookies are present and submit button is enabled,
+  // allow the submission to proceed rather than throwing a false-positive blocked error.
   const contextCookies = await page.context().cookies().catch(() => []);
   const hasClearanceCookie = contextCookies.some((c) => c.name.toLowerCase().startsWith('cf_') && c.value.length > 5);
-  if (hasClearanceCookie) {
-    await injectTurnstileToken(form, 'cf_clearance_verified', widgetInfo.callback);
-    log({ source: 'clearance-cookies' }, 'ensureFormTurnstile: clearance cookies present, submit control enabled');
-    return { turnstile: true, interactive: false };
+  const isSubmitEnabled = await control.isEnabled().catch(() => false);
+  if (!widgetInfo.sitekey && hasClearanceCookie && isSubmitEnabled) {
+    log({ source: 'clearance-cookies' }, 'ensureFormTurnstile: clearance cookies present and submit control enabled without widget');
+    return { turnstile: false, interactive: false };
   }
 
   const diagnostics = await page.evaluate(() => ({

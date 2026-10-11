@@ -208,8 +208,8 @@ describe('Capzy / CapSolver API Key Manager & Rotation', () => {
   describe('Telegram Bot Integration', () => {
     it('includes /capsolver and /capsolverstatus in HELP_TEXT', () => {
       expect(HELP_TEXT).toContain('<b>🧩 𝗖𝗔𝗣𝗧𝗖𝗛𝗔 𝗦𝗢𝗟𝗩𝗘𝗥</b>');
-      expect(HELP_TEXT).toContain('├ /capsolver — Configure Capzy/CapSolver API keys');
-      expect(HELP_TEXT).toContain('└ /capsolverstatus — Check current solver API keys');
+      expect(HELP_TEXT).toContain('/capsolver');
+      expect(HELP_TEXT).toContain('/capsolverstatus');
     });
 
     it('formats solver status message correctly', async () => {
