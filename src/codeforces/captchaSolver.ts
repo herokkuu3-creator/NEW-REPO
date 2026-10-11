@@ -652,16 +652,17 @@ export async function solveTurnstileOrchestrated(params: {
 
       log({ attempt, maxTries }, 'Invoking CPSolver');
       const attemptStartTime = Date.now();
+      const proxyForCPSolver = process.env.CPSOLVER_FORWARD_PROXY === 'true' ? params.proxyUrl : undefined;
       const res = await solveTurnstileWithCPSolver({
         siteurl: params.siteurl,
         sitekey: params.sitekey,
         action: params.action,
         cdata: params.cdata,
-        proxy: params.proxyUrl,
+        proxy: proxyForCPSolver,
         timeoutMs,
       });
 
-      if (res.ok && res.token) {
+      if (res.ok && (res.token || res.cfClearance || (res.cookies && Object.keys(res.cookies).length > 0))) {
         const sec = Math.max(1, Math.round(res.durationMs / 1000));
         const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${res.proxyUsed}</code>` : '';
         const successNotice = `✅ <b>Turnstile solved via CPSolver!</b> <i>(${sec}s, attempt ${attempt}/${maxTries})</i>${proxyInfo}`;
@@ -769,9 +770,10 @@ export async function solveCloudflareOrchestrated(params: {
       const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Cloudflare Challenge via CPSolver (${solverHost})...</b>`;
       await sendSolverTelegramNotification(attemptNotice).catch(() => undefined);
 
+      const proxyForCPSolver = process.env.CPSOLVER_FORWARD_PROXY === 'true' ? params.proxyUrl : undefined;
       const res = await solveCloudflareWithCPSolver({
         siteurl: params.websiteURL,
-        proxy: params.proxyUrl,
+        proxy: proxyForCPSolver,
         timeoutMs,
       });
 
