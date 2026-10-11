@@ -65,6 +65,7 @@ import {
 import { testProxyDetailed, type ProxyTestResult } from '../codeforces/proxyRotator';
 import {
   saveCapzyApiKeys,
+  addCapzyApiKeys,
   getCapzyApiKeys,
   getActiveCapzyKeyIndex,
   checkCapzyKeyBalance,
@@ -151,11 +152,12 @@ interface TgUpdate {
 
 export type InlineButton = { text: string; callback_data: string };
 
-export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | 'capzy' | null;
+export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | 'capzy' | 'addcapzy' | null;
 let pendingPromptType: PendingPromptType = null;
 let pendingRangePrompt = false;
 let pendingQueuePrompt = false;
 let pendingCapzyPrompt = false;
+let pendingAddCapzyPrompt = false;
 
 export function getPendingPromptType(): PendingPromptType {
   return pendingPromptType;
@@ -240,7 +242,8 @@ export const HELP_TEXT = [
   '└ /cfnetwork — Switch network mode (Proxy / Tailscale)',
   '',
   '<b>🧩 𝗖𝗔𝗣𝗧𝗖𝗛𝗔 𝗦𝗢𝗟𝗩𝗘𝗥</b>',
-  '├ /capsolver — Configure Capzy/CapSolver API keys (multi-key rotation)',
+  '├ /addcapsolver &lt;key&gt; — Append new Capzy/CapSolver API key(s) (preserves existing)',
+  '├ /capsolver &lt;key&gt; — Replace Capzy/CapSolver API keys',
   '└ /capsolverstatus — Check current solver API keys &amp; balances',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
@@ -489,7 +492,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     }
   }
 
-  // Handle active Capzy / CapSolver key prompt
+  // Handle active Capzy / CapSolver key prompt (replace)
   if (pendingCapzyPrompt) {
     if (text === '/cancel' || lowerText === 'cancel') {
       pendingCapzyPrompt = false;
@@ -498,6 +501,18 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       return;
     }
     await handleCapSolverCommand(text);
+    return;
+  }
+
+  // Handle active Add Capzy / CapSolver key prompt (append)
+  if (pendingAddCapzyPrompt) {
+    if (text === '/cancel' || lowerText === 'cancel') {
+      pendingAddCapzyPrompt = false;
+      pendingPromptType = null;
+      await reply('✖️ Add CapSolver key cancelled.');
+      return;
+    }
+    await handleAddCapSolverCommand(text);
     return;
   }
 
@@ -678,6 +693,17 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/resetproxies':
       case '/restoreproxy':
         await handleRestoreProxiesCommand();
+        return;
+      case '/addcapsolver':
+      case '/addcapsolverkey':
+      case '/addcapsolverkeys':
+      case '/addcapzy':
+      case '/addcapzykey':
+      case '/addcapzykeys':
+      case '/addsolver':
+      case '/addsolverkey':
+      case '/addsolverkeys':
+        await handleAddCapSolverCommand(commandArg);
         return;
       case '/capsolver':
       case '/capsolverkey':
@@ -2565,6 +2591,7 @@ export async function formatCapzyStatusMessage(): Promise<string> {
   }
 
   lines.push('');
+  lines.push('💡 <i>Commands: Use /addcapsolver &lt;key&gt; to add keys without removing older ones, or /capsolver &lt;key&gt; to replace all keys.</i>');
   lines.push('💡 <i>Execution flow: Submissions first attempt solving via CPSolver (up to 3 tries with residential proxy failover). If CPSolver fails, it automatically fails over to CapSolver/Capzy.</i>');
   return lines.join('\n');
 }
@@ -2613,6 +2640,7 @@ export async function handleCapSolverCommand(commandArg?: string): Promise<void>
 
   // If no argument provided: prompt user
   pendingCapzyPrompt = true;
+  pendingAddCapzyPrompt = false;
   pendingPromptType = 'capzy';
   pendingRangePrompt = false;
   pendingQueuePrompt = false;
@@ -2622,11 +2650,92 @@ export async function handleCapSolverCommand(commandArg?: string): Promise<void>
     currentStatus,
     '',
     '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-    '🔑 <b>Enter New API Key(s)</b>',
+    '🔑 <b>Replace All CapSolver / Capzy Key(s)</b>',
     '',
     'Please send your API key(s) in your next message.',
     'You can enter a single key or comma-separated multiple keys:',
     '<code>capzy_xxx..., capzy_yyy...</code>',
+    '',
+    '💡 <i>Note: This will replace the entire key list. To ADD keys without removing existing ones, use /addcapsolver &lt;key&gt; instead.</i>',
+    'Send /cancel to abort.',
+  ].join('\n');
+
+  await replyHtml(promptMsg);
+}
+
+export async function handleAddCapSolverCommand(commandArg?: string): Promise<void> {
+  const arg = (commandArg ?? '').trim();
+  if (arg) {
+    pendingAddCapzyPrompt = false;
+    pendingCapzyPrompt = false;
+    pendingPromptType = null;
+    await reply('⏳ Verifying and appending CapSolver/Capzy API key(s)...');
+    const addResult = await addCapzyApiKeys(arg);
+    if (!addResult.ok || addResult.totalKeys.length === 0) {
+      await replyHtml(`❌ <b>Failed to add API key(s):</b> ${escapeHtml(addResult.error ?? 'Invalid input')}`);
+      return;
+    }
+
+    const activeIdx = await getActiveCapzyKeyIndex();
+    const lines: string[] = [
+      '➕ <b>CapSolver / Capzy API Key(s) Added</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    ];
+
+    if (addResult.addedKeys.length > 0) {
+      lines.push(`Added <b>${addResult.addedKeys.length}</b> new key(s).`);
+    }
+    if (addResult.alreadyPresentKeys.length > 0) {
+      lines.push(`ℹ️ <b>${addResult.alreadyPresentKeys.length}</b> key(s) already existed in pool.`);
+    }
+    lines.push(`Total active pool: <b>${addResult.totalKeys.length}</b> key(s).`);
+    lines.push(`Active key: <b>#${activeIdx + 1} (${escapeHtml(maskApiKey(addResult.totalKeys[activeIdx] ?? ''))})</b>`);
+    lines.push('');
+    lines.push('<b>Current Key Pool &amp; Balances:</b>');
+
+    const addedSet = new Set(addResult.addedKeys);
+
+    for (let i = 0; i < addResult.totalKeys.length; i++) {
+      const key = addResult.totalKeys[i]!;
+      const masked = maskApiKey(key);
+      const bal = addResult.balances[i];
+      const isActive = i === activeIdx;
+      const isNew = addedSet.has(key);
+      let badges = '';
+      if (isActive) badges += ' <b>[ACTIVE]</b>';
+      if (isNew) badges += ' <i>[NEW]</i>';
+
+      if (bal && bal.ok && bal.balance > 0) {
+        lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ✅ $${bal.balance.toFixed(4)}${badges}`);
+      } else {
+        const errDesc = bal?.error || 'Zero balance / invalid';
+        lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ⚠️ ${escapeHtml(errDesc)}${badges}`);
+      }
+    }
+
+    lines.push('');
+    lines.push('🔄 <i>Automatic rotation will cycle through all keys seamlessly during CF challenge solving. Older keys are safely preserved.</i>');
+    await replyHtml(lines.join('\n'));
+    return;
+  }
+
+  // If no argument provided: prompt user
+  pendingAddCapzyPrompt = true;
+  pendingCapzyPrompt = false;
+  pendingPromptType = 'addcapzy';
+  pendingRangePrompt = false;
+  pendingQueuePrompt = false;
+
+  const currentStatus = await formatCapzyStatusMessage();
+  const promptMsg = [
+    currentStatus,
+    '',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    '➕ <b>Add New CapSolver / Capzy API Key(s)</b>',
+    '',
+    'Existing keys will <b>NOT</b> be removed.',
+    'Please send the new API key(s) in your next message (single key or comma-separated):',
+    '<code>capzy_new1..., capzy_new2...</code>',
     '',
     'Send /cancel to abort.',
   ].join('\n');

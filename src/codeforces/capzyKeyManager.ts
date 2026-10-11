@@ -290,6 +290,107 @@ export async function saveCapzyApiKeys(
   return { ok: true, keys, balances };
 }
 
+export async function addCapzyApiKeys(
+  rawInput: string | string[],
+): Promise<{
+  ok: boolean;
+  totalKeys: string[];
+  addedKeys: string[];
+  alreadyPresentKeys: string[];
+  balances: KeyBalanceResult[];
+  error?: string;
+}> {
+  const newKeys = parseCapzyApiKeys(rawInput);
+  if (newKeys.length === 0) {
+    return {
+      ok: false,
+      totalKeys: [],
+      addedKeys: [],
+      alreadyPresentKeys: [],
+      balances: [],
+      error: 'No valid Capzy / CapSolver API keys detected in input.',
+    };
+  }
+
+  const existingKeys = await getCapzyApiKeys();
+  const existingSet = new Set(existingKeys);
+
+  const addedKeys: string[] = [];
+  const alreadyPresentKeys: string[] = [];
+
+  for (const k of newKeys) {
+    if (existingSet.has(k)) {
+      alreadyPresentKeys.push(k);
+    } else {
+      addedKeys.push(k);
+      existingSet.add(k); // avoid internal duplicates in input
+    }
+  }
+
+  if (addedKeys.length === 0) {
+    const balances: KeyBalanceResult[] = [];
+    for (const k of existingKeys) {
+      balances.push(await checkCapzyKeyBalance(k));
+    }
+    return {
+      ok: true,
+      totalKeys: existingKeys,
+      addedKeys: [],
+      alreadyPresentKeys,
+      balances,
+    };
+  }
+
+  const mergedKeys = [...existingKeys, ...addedKeys];
+  const balances: KeyBalanceResult[] = [];
+  for (const k of mergedKeys) {
+    balances.push(await checkCapzyKeyBalance(k));
+  }
+
+  // Preserve active key index if current active key is valid; otherwise choose the first funded key
+  const currentActiveIdx = await getActiveCapzyKeyIndex();
+  let targetActiveIdx = currentActiveIdx;
+  if (
+    currentActiveIdx < 0 ||
+    currentActiveIdx >= mergedKeys.length ||
+    !balances[currentActiveIdx]?.ok ||
+    (balances[currentActiveIdx]?.balance ?? 0) <= 0
+  ) {
+    const firstFundedIdx = balances.findIndex((b) => b.ok && b.balance > 0);
+    targetActiveIdx = firstFundedIdx >= 0 ? firstFundedIdx : 0;
+  }
+
+  inMemoryKeys = mergedKeys;
+  inMemoryActiveIndex = targetActiveIdx;
+
+  if (!process.env.VITEST && process.env.NODE_ENV !== 'test') {
+    try {
+      await safeSetSystemState(CAPZY_API_KEYS_KEY, JSON.stringify(mergedKeys));
+      await safeSetSystemState(CAPZY_ACTIVE_KEY_INDEX_KEY, String(targetActiveIdx));
+    } catch (err) {
+      logWarn({ err: err instanceof Error ? err.message : String(err) }, 'Failed to persist appended Capzy keys to database');
+    }
+  }
+
+  logInfo(
+    {
+      total: mergedKeys.length,
+      added: addedKeys.length,
+      alreadyPresent: alreadyPresentKeys.length,
+      activeIdx: targetActiveIdx,
+    },
+    'Appended new Capzy API keys to database pool',
+  );
+
+  return {
+    ok: true,
+    totalKeys: mergedKeys,
+    addedKeys,
+    alreadyPresentKeys,
+    balances,
+  };
+}
+
 export async function rotateToNextCapzyKey(
   failedKey?: string,
   reason?: string,

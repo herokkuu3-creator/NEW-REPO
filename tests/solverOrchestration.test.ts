@@ -377,4 +377,26 @@ describe('Solver Orchestration & Fallback Engine', () => {
     expect(result?.cfClearance).toBe('real_cf_clearance_cookie_value');
     expect(result?.source).toBe('cpsolver');
   });
+
+  it('addCapzyApiKeys preserves existing keys and appends new unique keys', async () => {
+    const { initCapzyKeys, getCapzyApiKeys, addCapzyApiKeys, saveCapzyApiKeys } = await import(
+      '../src/codeforces/capzyKeyManager'
+    );
+
+    // Initial setup with two keys
+    await saveCapzyApiKeys(['existing_key_1', 'existing_key_2']);
+    let keys = await getCapzyApiKeys();
+    expect(keys).toEqual(['existing_key_1', 'existing_key_2']);
+
+    // Append new keys (including one duplicate)
+    const addResult = await addCapzyApiKeys(['existing_key_1', 'new_key_3', 'new_key_4']);
+    expect(addResult.ok).toBe(true);
+    expect(addResult.addedKeys).toEqual(['new_key_3', 'new_key_4']);
+    expect(addResult.alreadyPresentKeys).toEqual(['existing_key_1']);
+    expect(addResult.totalKeys).toEqual(['existing_key_1', 'existing_key_2', 'new_key_3', 'new_key_4']);
+
+    keys = await getCapzyApiKeys();
+    expect(keys).toEqual(['existing_key_1', 'existing_key_2', 'new_key_3', 'new_key_4']);
+  });
 });
+
