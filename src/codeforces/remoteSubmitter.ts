@@ -175,15 +175,27 @@ export async function submitViaRemoteSubmitter(
   };
 
   const submittedAt = Math.floor(Date.now() / 1000);
+  const requestStartedAt = Date.now();
+  const requestTimeoutMs = Math.max(1, Math.min(SUBMIT_TIMEOUT_MS, deadline - requestStartedAt));
+  const requestSignal = AbortSignal.timeout(requestTimeoutMs);
+  logger.info({ requestId: payload.requestId, requestTimeoutMs, attemptDeadline: deadline }, 'isolated submitter HTTP request started');
   let response: Response;
   try {
     response = await fetch(`${url}/submit`, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(Math.max(1, Math.min(SUBMIT_TIMEOUT_MS, deadline - Date.now()))),
+      signal: requestSignal,
     });
   } catch (err) {
+    logger.warn({
+      requestId: payload.requestId,
+      elapsedMs: Date.now() - requestStartedAt,
+      requestTimeoutMs,
+      locallyAborted: requestSignal.aborted,
+      abortReason: requestSignal.aborted && requestSignal.reason instanceof Error ? requestSignal.reason.name : null,
+      errorType: err instanceof Error ? err.name : 'unknown',
+    }, 'isolated submitter HTTP request lost before response; submission outcome uncertain');
     // Deliberately NOT retried: the POST may have reached Codeforces.
     const recovered = await waitForActionResult(url, token, payload.requestId, deadline, options.onProgress);
     if (recovered) return normalizeOutcome(recovered, submittedAt, 'GitHub browser');
@@ -227,6 +239,7 @@ export async function submitViaRemoteSubmitter(
   const outcome = normalizeOutcome(body, submittedAt, response.status === 202 ? 'GitHub browser' : 'isolated browser');
   logger.info(
     {
+      requestId: payload.requestId,
       transport: outcome.transport,
       httpStatus: response.status,
       ok: outcome.ok,

@@ -147,3 +147,89 @@ supported browser verification flow for actual third-party verification.
 
 This investigation does not claim that every possible edge case or the remote
 token-issuance failure has been solved.
+
+## Follow-up: the 02:14–02:16 screenshot
+
+Both health endpoints now report the pushed revisions: submitter
+`19260848308514fea988709bef99c5b1cfbd81c1`, CPSolver
+`a4a1dfb9237f3b188c1dc7d086dafab506b1a294`.
+The retained post-deployment submission for `me_petro` has shared request ID
+`50f67e46-a929-45b4-997d-abd9b243c2b8`, contest 112. The screenshot's minute labels
+are approximately one minute earlier than this server trace converted to IST;
+the screenshot lacks seconds, date, timezone, and request ID. Account and operation
+support correlation, but the clock discrepancy must remain explicit.
+
+| UTC, 12 October | IST, 13 October | Confirmed event for this ID |
+| --- | --- | --- |
+| 20:45:44.612 | 02:15:44.612 | Submission started; browser deadline was 20:52:42.678 UTC. |
+| 20:45:52.503 | 02:15:52.503 | Browser launched. |
+| 20:46:04.206 | 02:16:04.206 | Form document returned HTTP 200. |
+| 20:46:08.184 | 02:16:08.184 | First harness solve request received. |
+| 20:47:18.674 | 02:17:18.674 | HTTP 408 after 70,490ms including work/cleanup. |
+| 20:47:21.657 | 02:17:21.657 | Second solve request received. |
+| 20:48:35.073 | 02:18:35.073 | HTTP 408 after 73,416ms. |
+| 20:48:37.537 | 02:18:37.537 | Third solve request received. |
+| 20:49:20.247 | 02:19:20.247 | Submission client disconnected; cancellation reports clicked=false. |
+| 20:49:20.274 | 02:19:20.274 | CPSolver received propagated disconnect. |
+| 20:49:21.170 | 02:19:21.170 | Active solver work stopped with cancellation. |
+| 20:49:21.307 | 02:19:21.307 | Browser closed; terminal failure confirms no POST was sent. |
+
+This verifies deployed cancellation behavior. It also proves that the final
+cancellation occurred before the browser's deadline and was triggered by the
+client connection closing. It does **not** establish why that connection closed.
+The caller's logs are necessary to distinguish its configured HTTP timeout,
+process restart, and network interruption. Its source uses a configurable
+`CODEFORCES_SUBMITTER_TIMEOUT_MS`, default 300,000ms, capped by remaining attempt
+time. The observed server lifetime was 216,696ms; treating that as proof of the
+default timeout would be incorrect.
+
+Caller-side diagnostics now record the selected HTTP budget, elapsed time,
+request ID, whether its own abort signal fired, and the abort reason's name.
+They intentionally omit the request payload. No timeout or challenge strategy
+was changed on the basis of an unproven hypothesis.
+
+The token failure remains the same: the synthetic harness did not produce a
+form token. The original page's widget callback/error evidence and the remote
+verification decision are absent. Origin-mismatch, adapter, and font warnings
+do not establish a definitive cause. A supported browser verification/handoff
+is the legitimate completion path when the site requires user verification.
+Successful token issuance for every third-party challenge is not a behavior
+this implementation can guarantee.
+
+### Main service follow-up
+
+The user provided `https://leetcode-daily-agent.onrender.com`. Initial `/health`
+and `/logs` requests each exceeded a 20-second client timeout. A later `/logs`
+request succeeded and contained only seven startup messages, beginning at
+`2026-10-13T02:24:56.736+05:30`. The health server started at 02:24:57.343 and
+Telegram polling started at 02:24:57.660. No entries from the disconnected
+submission survived in this process's ring.
+
+This establishes a fresh main process and missing caller history. It does not
+prove the reason the connection closed at 02:19:20. Both browser services later
+reported no active work: submitter busy=false, CPSolver active=0/waiting=0.
+
+The Blueprint configures the main bot as a free web service. Render documents
+that these services spin down after 15 minutes without inbound traffic and
+start again on an incoming request. Telegram long polling is initiated by the
+service; it is not an inbound request to the service. This makes hosting
+suspension a plausible contributor, rather than a confirmed explanation of this
+incident. A crash, deployment, or connection failure remains possible.
+Source: https://render.com/docs/free#spinning-down-on-idle
+
+Deployment documentation already calls for an external liveness monitor. If
+Render's retained event history confirms idle suspension, ensure that monitor
+targets the **main** service's `/health`, not only the isolated browser and
+CPSolver. A continuously running bot requires hosting that meets its uptime
+needs. No hosting plan, paid setting, or external monitor was changed here.
+
+To settle the disconnect cause, the exact remaining resource is Render's
+retained event/runtime history for `leetcode-daily-agent` around
+02:19:20 IST on 13 October, including shutdown, deploy, suspension, or OOM events.
+The public `/logs` endpoint cannot recover those entries after restart.
+
+Validation of the additional caller diagnostics: the two offline
+`remoteSubmitterDiagnostics.test.ts` tests passed; root TypeScript validation
+and `git diff --check` passed. These fixtures test selected timeout budgeting,
+shared IDs, payload omission, connection-failure classification, and protection
+against retrying an uncertain POST. They do not assert a production token success.
