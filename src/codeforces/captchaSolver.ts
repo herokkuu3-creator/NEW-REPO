@@ -174,6 +174,7 @@ export async function solveTurnstileWithCPSolver(params: {
   durationMs: number;
   error?: string;
   proxyUsed?: string;
+  verificationRequired?: boolean;
 }> {
   const solverUrl = getCPSolverUrl();
   if (!solverUrl) {
@@ -204,9 +205,19 @@ export async function solveTurnstileWithCPSolver(params: {
     const durationMs = Date.now() - startTime;
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
+      // A completed widget attempt with no token requires user verification;
+      // it is not a transport failure to retry against another provider.
+      let verificationRequired = false;
+      try {
+        const failure = JSON.parse(errText) as { ok?: boolean; error?: unknown };
+        verificationRequired = response.status === 408 && failure.ok === false &&
+          typeof failure.error === 'string' &&
+          /^Turnstile challenge timed out after \d+ms without token\.?$/.test(failure.error);
+      } catch { /* Non-JSON transport errors keep their existing classification. */ }
       return {
         ok: false,
         durationMs,
+        verificationRequired,
         error: `CPSolver HTTP ${response.status}: ${errText.slice(0, 200)}`,
       };
     }
@@ -654,7 +665,8 @@ export async function solveTurnstileOrchestrated(params: {
   const solverUrl = getCPSolverUrl();
   const timeoutMs = params.timeoutMs ?? 90_000;
 
-  // Phase 1: Local / Render CPSolver (up to 3 tries)
+  // Phase 1: Local / Render CPSolver. Explicit no-token verification timeouts
+  // stop here; only other failures retain the existing retry policy.
   if (solverUrl) {
     let solverHost = solverUrl;
     try {
@@ -684,6 +696,14 @@ export async function solveTurnstileOrchestrated(params: {
         timeoutMs: cpsolverTimeoutMs,
       });
       throwIfAttemptAborted();
+
+      if (res.verificationRequired) {
+        logWarn({ attempt, durationMs: res.durationMs }, 'Turnstile verification required; automatic solver attempts stopped');
+        await sendSolverTelegramNotification(
+          '⚠️ <b>Verification required on Codeforces.</b> No token was issued. Automatic solver attempts stopped; complete verification in a supported browser.',
+        ).catch(() => undefined);
+        return null;
+      }
 
       const isInterstitialKey = params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj';
       const hasValidToken = typeof res.token === 'string' && res.token.trim().length > 10;
