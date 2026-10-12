@@ -667,7 +667,7 @@ export async function solveTurnstileOrchestrated(params: {
 
       log({ attempt, maxTries }, 'Invoking CPSolver');
       const attemptStartTime = Date.now();
-      const proxyForCPSolver = process.env.CPSOLVER_FORWARD_PROXY === 'true' ? params.proxyUrl : undefined;
+      const proxyForCPSolver = params.proxyUrl || undefined;
       const res = await solveTurnstileWithCPSolver({
         siteurl: params.siteurl,
         sitekey: params.sitekey,
