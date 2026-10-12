@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { BrowserManager } from '../CPSolver/src/browser';
 
-// Recycle regression plus characterization of the remaining documented defects.
+// Lifecycle regressions plus characterization of the remaining expiry defect.
 // No browser launch, network request, credentials, or production challenge.
 afterEach(() => vi.useRealTimers());
 
@@ -38,13 +38,15 @@ describe('offline verification failure evidence', () => {
     (BrowserManager as any).instance = null;
   });
 
-  it('queue timeout releases capacity while the original task is still running', async () => {
+  it('queue timeout cancels work and holds capacity until cleanup completes', async () => {
     vi.useFakeTimers();
     const queue = new ConcurrencyQueue(1, 2);
     let finish!: () => void;
     let running = 0;
     let observed = 0;
-    const first = queue.run(async () => {
+    let workSignal!: AbortSignal;
+    const first = queue.run(async signal => {
+      workSignal = signal;
       running++;
       await new Promise<void>(resolve => { finish = resolve; });
       running--;
@@ -53,23 +55,32 @@ describe('offline verification failure evidence', () => {
     const second = queue.run(async () => { observed = running + 1; });
     await vi.advanceTimersByTimeAsync(120_000);
     await rejection;
-    await second;
-    expect(observed).toBe(2);
-    expect(queue.active).toBe(0);
+    expect(workSignal.aborted).toBe(true);
+    expect(observed).toBe(0);
+    expect(queue.active).toBe(1);
     expect(running).toBe(1);
     finish();
-    await Promise.resolve();
+    await second;
+    expect(observed).toBe(1);
+    expect(queue.active).toBe(0);
   });
 
-  it('aborting an active task does not cancel its work', async () => {
+  it('aborting an active task propagates cancellation and preserves capacity until cleanup', async () => {
     const queue = new ConcurrencyQueue(1, 1);
     const controller = new AbortController();
     let finish!: () => void;
-    const work = queue.run(() => new Promise<void>(resolve => { finish = resolve; }), controller.signal);
+    let workSignal!: AbortSignal;
+    const work = queue.run(signal => {
+      workSignal = signal;
+      return new Promise<void>(resolve => { finish = resolve; });
+    }, controller.signal);
+    const rejected = expect(work).rejects.toThrow('aborted during execution');
     controller.abort();
+    await rejected;
+    expect(workSignal.aborted).toBe(true);
     expect(queue.active).toBe(1);
     finish();
-    await expect(work).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(queue.active).toBe(0));
   });
 
   it('the actual harness expiry callback leaves token copies in title and inputs', () => {

@@ -24,6 +24,10 @@
  */
 import http from 'node:http';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { AttemptCancelledError, attemptSleep, getAttemptContext, throwIfAttemptAborted, withAttemptContext } from './attemptContext';
+import { diagnosticLog, logRingBuffer } from './diagnosticLog';
+export { logRingBuffer } from './diagnosticLog';
 import { ActionBroker, dispatchAction } from './actionBroker';
 import { submissionLogSummary } from './submissionLog';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy, getDefaultUserAgent } from './browserForm';
@@ -110,35 +114,16 @@ let busy = false;
 // so both services' output reads consistently in the Render log view.
 // ---------------------------------------------------------------------------
 
-const LOG_BUFFER_SIZE = 1000;
-export const logRingBuffer: Array<{ level: number; time: string; service: string; msg: string; [key: string]: unknown }> = [];
-
-function appendLog(entry: { level: number; time: string; service: string; msg: string; [key: string]: unknown }): void {
-  logRingBuffer.push(entry);
-  if (logRingBuffer.length > LOG_BUFFER_SIZE) {
-    logRingBuffer.shift();
-  }
-}
-
 function log(fields: Record<string, unknown>, msg: string): void {
-  const time = new Date().toISOString();
-  const entry = { level: 30, time, service: 'codeforces-submit-browser', ...fields, msg };
-  appendLog(entry);
-  process.stdout.write(`${JSON.stringify(entry)}\n`);
+  diagnosticLog('codeforces-submit-browser', 30, fields, msg);
 }
 
 function logWarn(fields: Record<string, unknown>, msg: string): void {
-  const time = new Date().toISOString();
-  const entry = { level: 40, time, service: 'codeforces-submit-browser', ...fields, msg };
-  appendLog(entry);
-  process.stdout.write(`${JSON.stringify(entry)}\n`);
+  diagnosticLog('codeforces-submit-browser', 40, fields, msg);
 }
 
 function logError(fields: Record<string, unknown>, msg: string): void {
-  const time = new Date().toISOString();
-  const entry = { level: 50, time, service: 'codeforces-submit-browser', ...fields, msg };
-  appendLog(entry);
-  process.stdout.write(`${JSON.stringify(entry)}\n`);
+  diagnosticLog('codeforces-submit-browser', 50, fields, msg);
 }
 
 function errorMessage(err: unknown): string {
@@ -146,7 +131,7 @@ function errorMessage(err: unknown): string {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return attemptSleep(ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +474,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
           }
         }
     } catch (solverErr) {
+      throwIfAttemptAborted();
       logWarn({ err: errorMessage(solverErr) }, 'waitOutChallenge: orchestrated solver threw an error');
     }
   }
@@ -496,6 +482,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
   // Fallback: check loop until deadline
   let clickAttemptedAt = 0;
   while (Date.now() < deadline) {
+    throwIfAttemptAborted();
     try {
       const cookies = await page.context().cookies().catch(() => []);
       const hasClearance = cookies.some((c) => c.name === 'cf_clearance' && c.value.length > 5);
@@ -544,6 +531,7 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
   const attempts: string[] = [];
 
   for (const path of paths) {
+    throwIfAttemptAborted();
     try {
       log({ path }, 'openSubmitForm: navigating to candidate submit path');
       const response = await page.goto(`https://codeforces.com${path}`, {
@@ -635,6 +623,7 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
       }
       attempts.push(`${path}: no submit form (url ${page.url()}; title "${title}"; fields: ${summarize(fields)})`);
     } catch (err) {
+      throwIfAttemptAborted();
       if (err instanceof BrowserFormError) throw err;
       attempts.push(`${path}: ${errorMessage(err)}`);
     }
@@ -766,7 +755,22 @@ function isAlreadySubmittedCodeError(error: string | null | undefined): boolean 
   return /exactly the same code|same code before|already submitted/i.test(error ?? '');
 }
 
-export async function submit(request: SubmitRequest, authorizePost?: () => Promise<boolean>): Promise<SubmitResponse> {
+export async function submit(request: SubmitRequest, authorizePost?: () => Promise<boolean>, signal?: AbortSignal): Promise<SubmitResponse> {
+  const deadline = Math.min(Date.now() + 7 * 60_000,
+    typeof request.attemptDeadline === 'number' && Number.isFinite(request.attemptDeadline) ? request.attemptDeadline - 60_000 : Infinity);
+  const requestId = typeof request.requestId === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(request.requestId) ? request.requestId : randomUUID();
+  try {
+    return await withAttemptContext(requestId, deadline, async () => {
+      log({ deadline: new Date(deadline).toISOString() }, 'browser submission attempt started');
+      return submitWithinAttempt(request, authorizePost);
+    }, signal);
+  } catch (err) {
+    if (err instanceof AttemptCancelledError) throw new BrowserFormError(`${err.message}; no submission was sent.`, 'blocked');
+    throw err;
+  }
+}
+
+async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () => Promise<boolean>): Promise<SubmitResponse> {
   if (request.capzyApiKeys && request.capzyApiKeys.length > 0) {
     initCapzyKeys(request.capzyApiKeys, request.capzyActiveKeyIndex);
   }
@@ -779,8 +783,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
   }
 
   // Leave one minute for result delivery and browserless judge polling.
-  const deadline = Math.min(Date.now() + 7 * 60_000,
-    typeof request.attemptDeadline === 'number' ? request.attemptDeadline - 60_000 : Infinity);
+  const { deadline, signal, requestId } = getAttemptContext()!;
   if (Date.now() >= deadline) throw new BrowserFormError('Browser attempt expired before starting; no submission was sent.', 'blocked');
   const label = request.label ?? request.handle ?? 'account';
   const available = freeMemoryMb();
@@ -805,22 +808,26 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
 
   const flags = { turnstile: false, interactive: false };
   let clickStarted = false;
-  let expired = false;
-  const timer = setTimeout(() => {
-    expired = true;
+  const onAbort = () => {
+    log({ requestId, reason: signal.reason instanceof AttemptCancelledError ? signal.reason.reason : 'cancelled', clicked: clickStarted }, 'browser submission attempt cancelled');
     void session.browser.close().catch(() => undefined);
-  }, Math.max(1, deadline - Date.now()));
+  };
+  signal.addEventListener('abort', onAbort, { once: true });
+  if (signal.aborted) onAbort();
   try {
+    throwIfAttemptAborted();
     await openSubmitForm(session.page, request.entry, request.proxy, request.capzyApiKeys);
     const ts = await fillSubmitForm(session.page, request.entry, request.code, request.proxy, request.capzyApiKeys);
     flags.turnstile = ts.turnstile;
     flags.interactive = ts.interactive;
 
-    if (expired || Date.now() >= deadline) throw new BrowserFormError('Browser attempt expired before submission.', 'blocked');
+    throwIfAttemptAborted();
+    if (Date.now() >= deadline) throw new BrowserFormError('Browser attempt expired before submission.', 'blocked');
     if (request.requiresPostAuthorization && (!authorizePost || !await authorizePost())) {
       throw new BrowserFormError('The attempt was cancelled before submission; no POST was sent.', 'blocked');
     }
-    if (expired || Date.now() >= deadline) throw new BrowserFormError('Browser attempt expired before submission.', 'blocked');
+    throwIfAttemptAborted();
+    if (Date.now() >= deadline) throw new BrowserFormError('Browser attempt expired before submission.', 'blocked');
     clickStarted = true;
     const click = await clickSubmitForm(session.page);
     if (!click.clicked) {
@@ -941,7 +948,9 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
     }
     return { ok: true, status: click.status, finalUrl, clicked: true, updatedCookies: latestCookies, activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0), ...flags };
   } catch (err) {
-    if (expired) throw new BrowserFormError('Browser attempt timed out and was closed.', clickStarted ? 'submission-error' : 'blocked', flags, clickStarted);
+    if (signal.aborted) throw new BrowserFormError(
+      clickStarted ? 'Browser attempt cancelled after submission started; acceptance is uncertain. Do not retry the POST.' : 'Browser attempt cancelled before submission; no POST was sent.',
+      clickStarted ? 'submission-error' : 'blocked', flags, clickStarted);
     if (err instanceof BrowserFormError) {
       throw new BrowserFormError(err.message, err.kind, {
         turnstile: flags.turnstile || err.flags.turnstile,
@@ -950,7 +959,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
     }
     throw new BrowserFormError(err instanceof Error ? err.message : String(err), 'submission-error', flags, clickStarted);
   } finally {
-    clearTimeout(timer);
+    signal.removeEventListener('abort', onAbort);
     let closeTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([session.close(), new Promise<void>(resolve => { closeTimer = setTimeout(resolve, 3000); })]);
@@ -964,6 +973,7 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
 // ---------------------------------------------------------------------------
 
 function json(res: http.ServerResponse, code: number, payload: unknown): void {
+  if (res.destroyed || res.writableEnded) return;
   const body = JSON.stringify(payload);
   res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
   res.end(body);
@@ -992,6 +1002,7 @@ export const server = http.createServer((req, res) => {
     const body = JSON.stringify({
       ok: true,
       service: 'codeforces-submit-browser',
+      revision: process.env.RENDER_GIT_COMMIT ?? null,
       busy: broker?.busy ?? busy,
       usedMb: cgroupUsedMb(),
       uptimeSeconds: Math.round(process.uptime()),
@@ -1014,6 +1025,8 @@ export const server = http.createServer((req, res) => {
     const query = new URL(url, 'http://localhost').searchParams;
     const limit = Math.min(1000, Math.max(1, parseInt(query.get('limit') || '200', 10)));
     let entries = logRingBuffer.slice(-limit);
+    const requestId = query.get('requestId');
+    if (requestId) entries = logRingBuffer.filter(entry => entry.requestId === requestId).slice(-limit);
     const lvl = query.get('level');
     if (lvl) {
       const minLevel = parseInt(lvl, 10);
@@ -1180,6 +1193,12 @@ export const server = http.createServer((req, res) => {
       return;
     }
 
+    // Recheck after reading the body: two slow uploads can both pass the first
+    // check before either one reserves the browser slot.
+    if (broker?.busy ?? busy) {
+      json(res, 409, { ok: false, error: 'a Codeforces submission is already running' });
+      return;
+    }
     if (broker) {
       void broker.enqueue(parsed, parsed.requestId)
         .then((id) => { log({ id }, 'Codeforces browser job dispatched'); json(res, 202, { jobId: id }); })
@@ -1188,16 +1207,20 @@ export const server = http.createServer((req, res) => {
     }
     busy = true;
     const startedAt = Date.now();
+    if (typeof parsed.requestId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(parsed.requestId)) parsed.requestId = randomUUID();
+    const controller = new AbortController();
+    const onClose = () => { if (!res.writableEnded) controller.abort(new AttemptCancelledError('disconnect')); };
+    res.on('close', onClose);
     // Direct service mode has no deferred runner that can outlive this request.
-    void submit(parsed, async () => true)
+    void submit(parsed, async () => !controller.signal.aborted, controller.signal)
       .then((result) => {
-        log({ result: submissionLogSummary(result), ms: Date.now() - startedAt }, 'isolated Codeforces browser submitter finished');
+        log({ requestId: parsed.requestId, result: submissionLogSummary(result), ms: Date.now() - startedAt }, 'isolated Codeforces browser submitter finished');
         json(res, 200, result);
       })
       .catch((err) => {
         const message = errorMessage(err);
         const kind = err instanceof BrowserFormError ? err.kind : /^blocked:/.test(message) ? 'blocked' : 'submission-error';
-        logError({ err: message, ms: Date.now() - startedAt }, 'isolated Codeforces browser submitter failed');
+        logError({ requestId: parsed.requestId, err: message, ms: Date.now() - startedAt }, 'isolated Codeforces browser submitter failed');
         json(res, 200, {
           ok: false,
           kind,
@@ -1210,6 +1233,7 @@ export const server = http.createServer((req, res) => {
         });
       })
       .finally(() => {
+        res.removeListener('close', onClose);
         busy = false;
         releaseHeap();
       });

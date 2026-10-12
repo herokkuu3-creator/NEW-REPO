@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AddressInfo } from 'node:net';
 
-const state = vi.hoisted(() => ({ entered: 0, signals: [] as AbortSignal[] }));
+const state = vi.hoisted(() => ({ entered: 0, signals: [] as AbortSignal[], ids: [] as (string | undefined)[] }));
 vi.mock('../CPSolver/src/solver', async () => {
   const { ConcurrencyQueue } = await import('../CPSolver/src/queue');
   const queue = new ConcurrencyQueue(1, 10);
@@ -12,6 +12,8 @@ vi.mock('../CPSolver/src/solver', async () => {
     solveTurnstile: (_request: unknown, signal: AbortSignal) => {
       state.signals.push(signal);
       return queue.run(async () => {
+        const { requestLogContext } = await import('../CPSolver/src/config');
+        state.ids.push(requestLogContext.getStore()?.requestId);
         state.entered++;
         await new Promise(resolve => setTimeout(resolve, 100));
         return { ok: false, error: 'Controlled fixture result', durationMs: 100 };
@@ -20,6 +22,7 @@ vi.mock('../CPSolver/src/solver', async () => {
   };
 });
 import { app } from '../CPSolver/src/index';
+import { getLogs } from '../CPSolver/src/config';
 
 describe('HTTP request completion versus client disconnect', () => {
   it('keeps connected requests queued after their JSON bodies finish', async () => {
@@ -27,17 +30,20 @@ describe('HTTP request completion versus client disconnect', () => {
     await new Promise<void>(resolve => server.once('listening', resolve));
     try {
       const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/solve`;
-      const post = () => fetch(url, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      const post = (id: string) => fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-request-id': id },
         body: JSON.stringify({ siteurl: 'http://localhost/fixture', mode: 'navigate' }),
       });
-      const first = post();
+      const first = post('http-first');
       while (!state.entered) await new Promise(resolve => setTimeout(resolve, 1));
-      const second = post();
+      const second = post('http-second');
       const responses = await Promise.all([first, second]);
       expect(responses.map(r => r.status)).toEqual([422, 422]);
       expect(state.entered).toBe(2);
       expect(state.signals.every(signal => !signal.aborted)).toBe(true);
+      expect(responses.map(response => response.headers.get('x-request-id'))).toEqual(['http-first', 'http-second']);
+      expect(state.ids).toEqual(['http-first', 'http-second']);
+      expect(getLogs(200).filter(entry => entry.msg === 'Solve HTTP response completed' && String(entry.requestId).startsWith('http-'))).toHaveLength(2);
       for (const response of responses) {
         expect((await response.json() as any).error).toBe('Controlled fixture result');
       }

@@ -1,4 +1,6 @@
 import type { Page, Request, Response } from 'playwright';
+import { attemptSleep, throwIfAttemptAborted } from './attemptContext';
+import { diagnosticLog } from './diagnosticLog';
 import { interactWithTurnstileCheckbox, simulateHumanMouseMove } from '../browser/stealth';
 import {
   getCandidateCapzyKeys,
@@ -10,13 +12,11 @@ import {
 
 
 function log(fields: Record<string, unknown>, msg: string): void {
-  const time = new Date().toISOString();
-  process.stdout.write(`${JSON.stringify({ level: 30, time, service: 'browser-form', ...fields, msg })}\n`);
+  diagnosticLog('browser-form', 30, fields, msg);
 }
 
 function logWarn(fields: Record<string, unknown>, msg: string): void {
-  const time = new Date().toISOString();
-  process.stdout.write(`${JSON.stringify({ level: 40, time, service: 'browser-form', ...fields, msg })}\n`);
+  diagnosticLog('browser-form', 40, fields, msg);
 }
 
 export interface VerificationFlags {
@@ -299,6 +299,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   let solverPromise: Promise<void> | null = null;
   const awaitSolver = async () => {
     if (solverPromise) await solverPromise.catch(() => {});
+    throwIfAttemptAborted();
   };
 
   const triggerSolver = (info: { sitekey: string | null; action: string | null; cdata: string | null; callback: string | null }) => {
@@ -379,6 +380,9 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         }
       }
     })();
+    // The page can fail while this helper is still running. Its rejection must
+    // be observed even when the caller exits before reaching awaitSolver().
+    void solverPromise.catch(() => {});
   };
 
   let widgetInfo = await extractWidgetInfo();
@@ -398,6 +402,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   let clickAttemptedAt = 0;
 
   while (Date.now() < deadline) {
+    throwIfAttemptAborted();
     if (await hasToken()) {
       await awaitSolver();
       return { turnstile: true, interactive: false };
@@ -473,7 +478,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
       await interactWithTurnstileCheckbox(page).catch(() => {});
     }
 
-    await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
+    await attemptSleep(Math.min(250, Math.max(0, deadline - Date.now())));
   }
 
   await awaitSolver();
@@ -501,6 +506,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     responseInputPresent: !!document.querySelector('form:has(textarea[name="source"]) input[name="cf-turnstile-response"]'),
     widgetId: (document.querySelector('form:has(textarea[name="source"]) .cf-turnstile') as HTMLElement | null)?.dataset.widgetId ?? null,
   }));
+  logWarn({ ...diagnostics, timeoutMs, renderAttempt, executeAttempt, executeCount }, 'form verification ended without a token; no submission sent');
   throw new BrowserFormError(
     `Codeforces Turnstile did not issue a token within ${timeoutMs}ms (${JSON.stringify({ ...diagnostics, renderAttempt, executeAttempt, executeCount })}). ` +
     'No submission was sent. Complete verification in a supported browser or use an accessible submitter connection.',

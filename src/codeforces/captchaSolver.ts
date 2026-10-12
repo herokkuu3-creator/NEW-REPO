@@ -4,15 +4,15 @@ import {
   isCapzyKeyError,
   maskApiKey,
 } from './capzyKeyManager';
+import { attemptFetch as fetch, attemptSleep, getAttemptContext, throwIfAttemptAborted } from './attemptContext';
+import { diagnosticLog } from './diagnosticLog';
 
 function log(fields: Record<string, unknown>, msg: string): void {
-  const time = new Date().toISOString();
-  process.stdout.write(`${JSON.stringify({ level: 30, time, service: 'captcha-solver', ...fields, msg })}\n`);
+  diagnosticLog('captcha-solver', 30, fields, msg);
 }
 
 function logWarn(fields: Record<string, unknown>, msg: string): void {
-  const time = new Date().toISOString();
-  process.stdout.write(`${JSON.stringify({ level: 40, time, service: 'captcha-solver', ...fields, msg })}\n`);
+  diagnosticLog('captcha-solver', 40, fields, msg);
 }
 
 export interface SolverResult {
@@ -186,7 +186,7 @@ export async function solveTurnstileWithCPSolver(params: {
   try {
     const response = await fetch(`${solverUrl}/solve`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...(getAttemptContext() ? { 'x-request-id': getAttemptContext()!.requestId } : {}) },
       body: JSON.stringify({
         siteurl: params.siteurl,
         sitekey: params.sitekey,
@@ -286,7 +286,7 @@ export async function solveCloudflareWithCPSolver(params: {
   try {
     const response = await fetch(`${solverUrl}/solve`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...(getAttemptContext() ? { 'x-request-id': getAttemptContext()!.requestId } : {}) },
       body: JSON.stringify({
         siteurl: params.siteurl,
         proxy: params.proxy,
@@ -452,7 +452,7 @@ export async function solveTurnstileWithCapzy(
 
       const deadline = Date.now() + taskTimeoutMs;
       while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2000));
+        await attemptSleep(2000);
         const poll = await fetch('https://api.capzy.ai/getTaskResult', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -487,12 +487,14 @@ export async function solveTurnstileWithCapzy(
         }
       }
     } catch (err) {
+      throwIfAttemptAborted();
       logWarn({ err: err instanceof Error ? err.message : String(err), key: maskApiKey(apiKey) }, 'Capzy task execution threw');
     }
     return { result: null, isKeyError: false };
   };
 
   for (const apiKey of candidateKeys) {
+    throwIfAttemptAborted();
     if (proxyTask) {
       const attempt1Timeout = Math.min(16_000, Math.max(5_000, Math.floor(timeoutMs * 0.45)));
       const { result, isKeyError } = await runCapzyTask(apiKey, proxyTask, attempt1Timeout);
@@ -544,6 +546,7 @@ export async function solveCloudflareWithCapzy(
   const ua = userAgent || DEFAULT_DESKTOP_CHROME_USER_AGENT;
 
   for (const apiKey of candidateKeys) {
+    throwIfAttemptAborted();
     try {
       const parsed = new URL(proxy);
       const parsedPort = parseInt(parsed.port, 10);
@@ -584,7 +587,7 @@ export async function solveCloudflareWithCapzy(
       const deadline = Date.now() + timeoutMs;
       let rotatedDuringPoll = false;
       while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2000));
+        await attemptSleep(2000);
         const poll = await fetch('https://api.capzy.ai/getTaskResult', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -620,6 +623,7 @@ export async function solveCloudflareWithCapzy(
       }
       if (rotatedDuringPoll) continue;
     } catch (err) {
+      throwIfAttemptAborted();
       logWarn({ err: err instanceof Error ? err.message : String(err), key: maskApiKey(apiKey) }, 'Capzy solveCloudflare threw');
     }
   }
@@ -662,6 +666,7 @@ export async function solveTurnstileOrchestrated(params: {
     log({ solverUrl, maxTries, siteurl: params.siteurl, cpsolverTimeoutMs }, 'Starting Turnstile solve with local CPSolver');
 
     for (let attempt = 1; attempt <= maxTries; attempt++) {
+      throwIfAttemptAborted();
       const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Turnstile via CPSolver (${solverHost})...</b>`;
       await sendSolverTelegramNotification(attemptNotice).catch(() => undefined);
 
@@ -678,6 +683,7 @@ export async function solveTurnstileOrchestrated(params: {
         cookies: params.cookies,
         timeoutMs: cpsolverTimeoutMs,
       });
+      throwIfAttemptAborted();
 
       const isInterstitialKey = params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj';
       const hasValidToken = typeof res.token === 'string' && res.token.trim().length > 10;
@@ -716,7 +722,7 @@ export async function solveTurnstileOrchestrated(params: {
       await sendSolverTelegramNotification(failNotice).catch(() => undefined);
 
       if (attempt < maxTries) {
-        await new Promise((r) => setTimeout(r, 2000));
+        await attemptSleep(2000);
       }
     }
 
@@ -729,6 +735,7 @@ export async function solveTurnstileOrchestrated(params: {
   }
 
   // Phase 2: CapSolver / Capzy commercial fallback
+  throwIfAttemptAborted();
   const capzyNotice = `🧩 <b>Solving Turnstile via CapSolver / Capzy (multi-key rotation)...</b>`;
   await sendSolverTelegramNotification(capzyNotice).catch(() => undefined);
 
@@ -742,6 +749,7 @@ export async function solveTurnstileOrchestrated(params: {
     params.cdata,
     params.overrideKeys,
   );
+  throwIfAttemptAborted();
 
   if (capzySol?.token) {
     const successNotice = `✅ <b>Turnstile solved via CapSolver / Capzy!</b>`;
@@ -805,6 +813,7 @@ export async function solveCloudflareOrchestrated(params: {
     log({ solverUrl, maxTries, url: params.websiteURL }, 'Starting Cloudflare clearance solve with local CPSolver');
 
     for (let attempt = 1; attempt <= maxTries; attempt++) {
+      throwIfAttemptAborted();
       const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Cloudflare Challenge via CPSolver (${solverHost})...</b>`;
       await sendSolverTelegramNotification(attemptNotice).catch(() => undefined);
 
@@ -816,6 +825,7 @@ export async function solveCloudflareOrchestrated(params: {
         cookies: params.cookies,
         timeoutMs,
       });
+      throwIfAttemptAborted();
 
       if (res.ok && (res.token || res.cfClearance || (res.cookies && Object.keys(res.cookies).length > 0))) {
         const sec = Math.max(1, Math.round(res.durationMs / 1000));
@@ -838,7 +848,7 @@ export async function solveCloudflareOrchestrated(params: {
       await sendSolverTelegramNotification(failNotice).catch(() => undefined);
 
       if (attempt < maxTries) {
-        await new Promise((r) => setTimeout(r, 2000));
+        await attemptSleep(2000);
       }
     }
 
@@ -847,6 +857,7 @@ export async function solveCloudflareOrchestrated(params: {
   }
 
   // Phase 2: CapSolver / Capzy commercial fallback
+  throwIfAttemptAborted();
   const capzyNotice = `🧩 <b>Solving Cloudflare Challenge via CapSolver / Capzy...</b>`;
   await sendSolverTelegramNotification(capzyNotice).catch(() => undefined);
 
@@ -860,6 +871,7 @@ export async function solveCloudflareOrchestrated(params: {
     params.cdata,
     params.overrideKeys,
   );
+  throwIfAttemptAborted();
 
   if (capzySol && (capzySol.token || capzySol.cookies)) {
     const successNotice = `✅ <b>Cloudflare Challenge cleared via CapSolver / Capzy!</b>`;
