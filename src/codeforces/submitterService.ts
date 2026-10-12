@@ -25,6 +25,7 @@
 import http from 'node:http';
 import os from 'node:os';
 import { ActionBroker, dispatchAction } from './actionBroker';
+import { submissionLogSummary } from './submissionLog';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy, getDefaultUserAgent } from './browserForm';
 import { initCapzyKeys, getActiveCapzyKeyIndex } from './capzyKeyManager';
 import { solveCloudflareOrchestrated, initCPSolverConfig, getCPSolverUrl } from './captchaSolver';
@@ -669,7 +670,7 @@ async function setSelectValue(page: Page, name: string, value: string): Promise<
 }
 
 async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string, proxyUrl?: string, overrideKeys?: string[]): Promise<{ turnstile: boolean; interactive: boolean }> {
-  log({ proxyUrl }, 'fillSubmitForm: starting form fill with proxyUrl');
+  log({ hasProxy: !!proxyUrl }, 'fillSubmitForm: starting form fill');
   log({}, 'waiting for form to settle');
   const settled = await page.locator('form:has(textarea[name="source"])').waitFor({ state: 'attached', timeout: 15_000 }).then(() => true).catch(() => false);
   if (!settled) {
@@ -1190,7 +1191,7 @@ export const server = http.createServer((req, res) => {
     // Direct service mode has no deferred runner that can outlive this request.
     void submit(parsed, async () => true)
       .then((result) => {
-        log({ result, ms: Date.now() - startedAt }, 'isolated Codeforces browser submitter finished');
+        log({ result: submissionLogSummary(result), ms: Date.now() - startedAt }, 'isolated Codeforces browser submitter finished');
         json(res, 200, result);
       })
       .catch((err) => {
