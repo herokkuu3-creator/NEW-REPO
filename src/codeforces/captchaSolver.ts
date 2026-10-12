@@ -194,7 +194,7 @@ export async function solveTurnstileWithCPSolver(params: {
         cdata: params.cdata,
         proxy: params.proxy,
         timeout,
-        mode: params.mode ?? ((params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj' || (params.siteurl ?? '').includes('codeforces.com')) ? 'navigate' : 'harness'),
+        mode: params.mode ?? (params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj' ? 'navigate' : (params.sitekey ? 'harness' : 'navigate')),
         userAgent: params.userAgent,
         cookies: params.cookies,
       }),
@@ -225,10 +225,10 @@ export async function solveTurnstileWithCPSolver(params: {
     const hasClearance = typeof data.cfClearance === 'string' && data.cfClearance.trim().length > 0;
     const hasCookies = !!(data.cookies && Object.keys(data.cookies).some((k) => k.toLowerCase().startsWith('cf_')));
 
-    // Codeforces uses a managed Turnstile key; CPSolver runs in navigate mode and returns
-    // cfClearance / cf_ cookies (not a Turnstile token). Accept both token and clearance as success.
-    const isCfKey = params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj' || (params.siteurl ?? '').includes('codeforces.com');
-    const isSuccess = data.ok !== false && (hasToken || (isCfKey ? (hasClearance || hasCookies) : false));
+    // Interstitial challenge key (0x4AAAAAAADnPIDROrmt1Wwj) succeeds via clearance cookies.
+    // Form widget keys (e.g. 0x4AAAAAACDz1ltMYNJCAQZS) strictly require a real Turnstile token.
+    const isInterstitialKey = params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj';
+    const isSuccess = data.ok !== false && (hasToken || (isInterstitialKey ? (hasClearance || hasCookies) : false));
 
     if (isSuccess) {
       return {
