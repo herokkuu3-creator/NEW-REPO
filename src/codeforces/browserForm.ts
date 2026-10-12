@@ -316,7 +316,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
           cdata: info.cdata ?? undefined,
           proxyUrl,
           userAgent,
-          cookies: currentCookies,
+          cookies: undefined,
           timeoutMs,
           overrideKeys,
         });
