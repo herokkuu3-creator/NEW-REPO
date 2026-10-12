@@ -212,6 +212,9 @@ export async function submitViaRemoteSubmitter(
   let body = (await response.json().catch(() => null)) as
     | (Partial<PostedResult> & { error?: string; kind?: string })
     | null;
+  if (response.status >= 500) {
+    logger.warn({ requestId: payload.requestId, httpStatus: response.status, elapsedMs: Date.now() - requestStartedAt, bodyPresent: !!body }, 'isolated submitter returned upstream/server error');
+  }
   if (!body && response.status >= 500) {
     body = await waitForActionResult(url, token, payload.requestId, deadline, options.onProgress);
     if (body) return normalizeOutcome(body, submittedAt, 'GitHub browser');

@@ -994,6 +994,18 @@ function runnerAuthorized(req: http.IncomingMessage): boolean {
 
 export const server = http.createServer((req, res) => {
   const url = req.url ?? '/';
+  // Keep this before auth/body parsing so missing ingress proves a Render or
+  // connection-boundary failure, before any browser or CAPTCHA code runs.
+  const ingressId = req.headers['x-request-id'];
+  log({
+    requestId: typeof ingressId === 'string' ? ingressId : null,
+    method: req.method,
+    path: url.split('?')[0],
+    contentLength: req.headers['content-length'] ?? null,
+    connection: req.headers.connection ?? null,
+  }, 'HTTP request entered isolated submitter');
+  req.on('aborted', () => log({ requestId: typeof ingressId === 'string' ? ingressId : null, method: req.method, path: url.split('?')[0] }, 'HTTP request body aborted'));
+  res.on('close', () => log({ requestId: typeof ingressId === 'string' ? ingressId : null, method: req.method, path: url.split('?')[0], writableEnded: res.writableEnded }, 'HTTP response connection closed'));
 
   // Public liveness endpoint for Render/UptimeRobot. Keep this path completely
   // independent of the browser, auth token, or Codeforces itself. Support both
