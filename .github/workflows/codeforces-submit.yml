@@ -1,4 +1,5 @@
 name: Codeforces browser submission
+run-name: Codeforces browser — ${{ inputs.job_id || github.event_name }}
 
 on:
   schedule:
@@ -15,7 +16,8 @@ permissions:
 
 concurrency:
   group: codeforces-browser
-  cancel-in-progress: true
+  # A scheduled lookup must not terminate an active submission or its setup.
+  cancel-in-progress: false
 
 jobs:
   submit:
@@ -43,6 +45,10 @@ jobs:
           node <<'NODE'
           const fs = require('node:fs');
           const base = process.env.CODEFORCES_SUBMITTER_URL;
+          if (!process.env.CODEFORCES_SUBMITTER_TOKEN?.trim()) {
+            console.error('::error::Missing GitHub Actions secret CODEFORCES_SUBMITTER_TOKEN. Configure the same token used by the Render submitter.');
+            process.exit(1);
+          }
           const fallbackProxy = process.env.FALLBACK_CODEFORCES_PROXY;
           if (fallbackProxy && base) {
             fetch(`${base}/proxy/sync`, {
@@ -61,6 +67,7 @@ jobs:
             headers: { authorization: `Bearer ${process.env.CODEFORCES_SUBMITTER_TOKEN}` },
             signal: AbortSignal.timeout(30000),
           }).then(async response => {
+            if (response.status === 401) throw new Error('Render rejected CODEFORCES_SUBMITTER_TOKEN (HTTP 401). Check that the GitHub secret matches the Render submitter token.');
             if (!response.ok) throw new Error(`Render job lookup failed: HTTP ${response.status}`);
             const body = await response.json();
             const jobId = requested || body.jobId;

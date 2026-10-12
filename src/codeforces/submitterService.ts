@@ -1063,11 +1063,15 @@ export const server = http.createServer((req, res) => {
     }
     if (req.method === 'POST' && action === 'claim') {
       const payload = broker.claim(id, req.headers['x-codeforces-post-guard'] === '1');
+      log({ id, accepted: !!payload }, 'Codeforces browser job claim');
       json(res, payload ? 200 : 404, payload ?? { error: 'job not found or already claimed' });
       return;
     }
     if (req.method === 'POST' && action === 'cancel') {
-      json(res, 200, { cancelled: broker.cancelUnclaimed(id) });
+      const claimed = broker.isClaimed(id);
+      const cancelled = broker.cancelUnclaimed(id);
+      log({ id, claimed, cancelled }, 'Codeforces browser job cancellation');
+      json(res, 200, { cancelled });
       return;
     }
     if (req.method === 'POST' && action === 'authorize-post') {
