@@ -1,6 +1,7 @@
 import type { Page, Request, Response } from 'playwright';
 import { attemptSleep, throwIfAttemptAborted } from './attemptContext';
 import { diagnosticLog } from './diagnosticLog';
+import { logVerificationInventory } from './verificationDiagnostics';
 import { interactWithTurnstileCheckbox, simulateHumanMouseMove } from '../browser/stealth';
 import {
   getCandidateCapzyKeys,
@@ -186,6 +187,7 @@ async function injectTurnstileToken(form: ReturnType<Page['locator']>, token: st
 }
 
 export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUrl?: string, overrideKeys?: string[]): Promise<VerificationFlags> {
+  await logVerificationInventory(page, 'before-verification');
   const form = page.locator('form:has(textarea[name="source"])').first();
   const challengeIframe = page.locator('iframe[src*="challenges.cloudflare.com"]');
   const control = form.locator('input[type="submit"], button[type="submit"], button:not([type])').first();
@@ -306,6 +308,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     if (solverStarted) return;
     solverStarted = true;
     solverPromise = (async () => {
+      await logVerificationInventory(page, 'helper-start', info.sitekey);
       const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
       const currentCookies = await page.context().cookies().catch(() => []);
 
@@ -386,6 +389,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   };
 
   let widgetInfo = await extractWidgetInfo();
+  await logVerificationInventory(page, 'after-widget-selection', widgetInfo.sitekey);
   if (widgetInfo.sitekey) {
     triggerSolver(widgetInfo);
   }
@@ -496,6 +500,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     return { turnstile: false, interactive: false };
   }
 
+  await logVerificationInventory(page, 'verification-exhausted', widgetInfo.sitekey);
   const diagnostics = await page.evaluate(() => ({
     apiLoaded: typeof (window as unknown as { turnstile?: unknown }).turnstile !== 'undefined',
     iframePresent: !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
