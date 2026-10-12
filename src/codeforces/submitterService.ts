@@ -46,7 +46,10 @@ const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ??
 const PROXY_SERVER = (process.env.CODEFORCES_PROXY ?? '').trim();
 const RUNNER_REPOSITORY = (process.env.CODEFORCES_RUNNER_REPOSITORY ?? '').trim();
 const GITHUB_DISPATCH_TOKEN = (process.env.GITHUB_DISPATCH_TOKEN ?? '').trim();
-const RUNNER_MODE = (process.env.CODEFORCES_RUNNER_MODE ?? 'github').trim().toLowerCase();
+// Default to the self-contained Render browser. GitHub-hosted execution must be
+// opted into explicitly because dispatch can succeed even when account billing
+// prevents the workflow job from ever starting.
+const RUNNER_MODE = (process.env.CODEFORCES_RUNNER_MODE ?? 'render').trim().toLowerCase();
 const LOCAL_RUNNER_MODE = RUNNER_MODE === 'local';
 const GITHUB_RUNNER_MODE = RUNNER_MODE === 'github';
 const LOCAL_RUNNER_TOKEN = (process.env.CODEFORCES_LOCAL_RUNNER_TOKEN ?? '').trim();
