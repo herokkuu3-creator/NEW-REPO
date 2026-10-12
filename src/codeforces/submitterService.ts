@@ -38,7 +38,7 @@ const HEADLESS = process.env.HEADLESS !== 'false';
 const BROWSER_ENGINE = process.env.CODEFORCES_BROWSER === 'chromium' ? 'chromium' : 'firefox';
 const BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const NAV_TIMEOUT_MS = Number(process.env.CODEFORCES_NAV_TIMEOUT_MS ?? 60_000);
-const TURNSTILE_WAIT_MS = Math.max(Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 60_000), 60_000);
+const TURNSTILE_WAIT_MS = Math.max(Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 90_000), 60_000);
 const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 50_000);
 const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 300);
 // Outbound proxy for Firefox, e.g. socks5://127.0.0.1:40000 (the local WARP

@@ -181,7 +181,7 @@ export async function solveTurnstileWithCPSolver(params: {
   }
 
   const startTime = Date.now();
-  const timeout = params.timeoutMs ?? 85_000;
+  const timeout = params.timeoutMs ?? 90_000;
 
   try {
     const response = await fetch(`${solverUrl}/solve`, {
@@ -648,17 +648,17 @@ export async function solveTurnstileOrchestrated(params: {
   overrideKeys?: string[];
 }): Promise<SolverResult | null> {
   const solverUrl = getCPSolverUrl();
-  const timeoutMs = params.timeoutMs ?? 85_000;
+  const timeoutMs = params.timeoutMs ?? 90_000;
 
-  // Phase 1: Local / Render CPSolver (up to 2 tries)
+  // Phase 1: Local / Render CPSolver (up to 3 tries)
   if (solverUrl) {
     let solverHost = solverUrl;
     try {
       solverHost = new URL(solverUrl).host;
     } catch {}
 
-    const maxTries = Math.max(1, parseInt(process.env.CPSOLVER_MAX_TRIES || '2', 10));
-    const cpsolverTimeoutMs = Math.min(timeoutMs, parseInt(process.env.CPSOLVER_TIMEOUT_MS || '85000', 10));
+    const maxTries = Math.max(1, parseInt(process.env.CPSOLVER_MAX_TRIES || '3', 10));
+    const cpsolverTimeoutMs = Math.min(timeoutMs, parseInt(process.env.CPSOLVER_TIMEOUT_MS || '90000', 10));
     log({ solverUrl, maxTries, siteurl: params.siteurl, cpsolverTimeoutMs }, 'Starting Turnstile solve with local CPSolver');
 
     for (let attempt = 1; attempt <= maxTries; attempt++) {

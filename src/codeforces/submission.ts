@@ -56,9 +56,9 @@ const REJECTION_RE =
 const PENDING_VERDICTS = new Set(['TESTING', 'QUEUE', 'QUEUED', undefined, null]);
 const VERIFICATION_WINDOW_MS = 150_000;
 const VERIFICATION_POLL_MS = 2_500;
-const configuredTurnstileWait = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 60_000);
+const configuredTurnstileWait = Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 90_000);
 const TURNSTILE_WAIT_MS = Math.max(
-  Number.isFinite(configuredTurnstileWait) ? configuredTurnstileWait : 60_000,
+  Number.isFinite(configuredTurnstileWait) ? configuredTurnstileWait : 90_000,
   60_000,
 );
 
