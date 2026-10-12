@@ -7,6 +7,7 @@ let origin: string;
 const headers = { authorization: 'Bearer test-broker-token', 'content-type': 'application/json', 'x-codeforces-post-guard': '1' };
 
 beforeAll(async () => {
+  vi.stubEnv('CODEFORCES_RUNNER_MODE', 'github');
   vi.stubEnv('CODEFORCES_RUNNER_REPOSITORY', 'owner/repo');
   vi.stubEnv('CODEFORCES_SUBMITTER_TOKEN', 'test-broker-token');
   vi.stubEnv('GITHUB_DISPATCH_TOKEN', 'test-dispatch-token');
