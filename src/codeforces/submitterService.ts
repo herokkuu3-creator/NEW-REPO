@@ -48,8 +48,9 @@ const RUNNER_REPOSITORY = (process.env.CODEFORCES_RUNNER_REPOSITORY ?? '').trim(
 const GITHUB_DISPATCH_TOKEN = (process.env.GITHUB_DISPATCH_TOKEN ?? '').trim();
 const RUNNER_MODE = (process.env.CODEFORCES_RUNNER_MODE ?? 'github').trim().toLowerCase();
 const LOCAL_RUNNER_MODE = RUNNER_MODE === 'local';
+const GITHUB_RUNNER_MODE = RUNNER_MODE === 'github';
 const LOCAL_RUNNER_TOKEN = (process.env.CODEFORCES_LOCAL_RUNNER_TOKEN ?? '').trim();
-const broker = RUNNER_REPOSITORY || LOCAL_RUNNER_MODE
+const broker = (GITHUB_RUNNER_MODE && RUNNER_REPOSITORY) || LOCAL_RUNNER_MODE
   ? new ActionBroker((id) => LOCAL_RUNNER_MODE ? Promise.resolve() : dispatchAction(RUNNER_REPOSITORY, GITHUB_DISPATCH_TOKEN, id))
   : null;
 

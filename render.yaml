@@ -142,8 +142,15 @@ services:
     envVars:
       - key: HEADLESS
         value: "true"
-      # On-demand browser jobs use a standard free GitHub Actions runner.
-      # This 512 MB service brokers the request without launching Firefox.
+      # GitHub-hosted runners are unavailable when Actions billing is blocked.
+      # Run Chromium inside this isolated service instead; no other application
+      # workload shares this service's memory allocation.
+      - key: CODEFORCES_RUNNER_MODE
+        value: render
+      - key: CODEFORCES_BROWSER
+        value: chromium
+      # Retained so switching CODEFORCES_RUNNER_MODE back to github needs no
+      # repository configuration change.
       - key: CODEFORCES_RUNNER_REPOSITORY
         value: pateljk479-afk/NEW-REPO
       # Required: a fine-grained Actions-write token dispatches the browser job.

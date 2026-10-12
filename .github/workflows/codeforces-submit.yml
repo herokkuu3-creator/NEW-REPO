@@ -2,8 +2,6 @@ name: Codeforces browser submission
 run-name: Codeforces browser — ${{ inputs.job_id || github.event_name }}
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       job_id:
@@ -40,7 +38,7 @@ jobs:
     steps:
       - name: Find waiting browser job
         id: lookup
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch'
         run: |
           node <<'NODE'
           const fs = require('node:fs');
