@@ -5,6 +5,13 @@ import { LeetCodeApi, looksLikeChallenge, SubmissionOutcome } from '../leetcode/
 import { fetchQuestionData, RawQuestionData } from '../leetcode/dailyChallenge';
 import { checkSession, SessionCheckResult } from '../browser/sessionCheck';
 import { fetchWalkcccPage, signatureMatchesStarter, WalkcccError, WalkcccPage } from '../solutions/walkccc';
+import {
+  fetchCommunitySolution,
+  resolveLeetCodeSlugByNumber,
+  CommunitySolution,
+  FetchCommunitySolutionOptions,
+} from '../solutions/communitySolutions';
+import { shouldRetryWithOriginal, stripCppComments } from '../codeforces/codeSanitizer';
 import { ParsedProblem } from '../leetcode/parser';
 import { isRunInProgress } from './dailyWorker';
 import { config } from '../config';
@@ -128,6 +135,14 @@ export interface RangeDeps {
   openSession(account: AccountRecord): Promise<RangeSession>;
   /** The walkccc page for a question number: the slug (and often the solution). */
   getPage(questionNumber: number): Promise<WalkcccPage>;
+  /** Direct LeetCode slug resolution by question number when walkccc has no page. */
+  resolveSlug?(questionNumber: number): Promise<string | null>;
+  /** Fetches community solutions (or mocked in tests). */
+  fetchCommunity?(
+    slug: string,
+    problem: ParsedProblem,
+    options?: FetchCommunitySolutionOptions,
+  ): Promise<CommunitySolution>;
   notify(text: string): Promise<void>;
   /** Resolves after `ms`, or early (without throwing) when `signal` aborts. */
   sleep(ms: number, signal: AbortSignal): Promise<void>;
@@ -308,6 +323,7 @@ async function executeRangeJob(
   const { info, abort } = job;
   const all: AccountRangeResult[] = [];
   const stopKeepAlive = deps.keepAlive();
+  const usedCommunityUuidsByQuestion = new Map<number, Set<string>>();
   try {
     for (let i = 0; i < accounts.length; i++) {
       if (abort.signal.aborted) break;
@@ -318,7 +334,16 @@ async function executeRangeJob(
       info.doneInAccount = 0;
       info.counts = { accepted: 0, failed: 0, error: 0, premium: 0 };
 
-      const result = await runAccountRange(account, range, deps, info, abort.signal, i + 1, accounts.length);
+      const result = await runAccountRange(
+        account,
+        range,
+        deps,
+        info,
+        abort.signal,
+        i + 1,
+        accounts.length,
+        usedCommunityUuidsByQuestion,
+      );
       all.push(result);
       await deps
         .notify(formatAccountRangeSummary(result, i + 1, accounts.length))
@@ -358,6 +383,7 @@ async function runAccountRange(
   signal: AbortSignal,
   index: number,
   total: number,
+  usedCommunityUuidsByQuestion: Map<number, Set<string>> = new Map(),
 ): Promise<AccountRangeResult> {
   const result: AccountRangeResult = {
     label: account.label,
@@ -409,7 +435,18 @@ async function runAccountRange(
       if (signal.aborted) break;
 
       info.currentQuestion = n;
-      const { outcome, touchedLeetCode, blocked } = await solveOneWithRetries(n, session.api, deps, signal);
+      let usedUuids = usedCommunityUuidsByQuestion.get(n);
+      if (!usedUuids) {
+        usedUuids = new Set<string>();
+        usedCommunityUuidsByQuestion.set(n, usedUuids);
+      }
+      const { outcome, touchedLeetCode, blocked } = await solveOneWithRetries(
+        n,
+        session.api,
+        deps,
+        signal,
+        usedUuids,
+      );
       if (outcome === null) break; // cancelled during a back-off wait
       result.results.push(outcome);
       info.doneInAccount++;
@@ -482,10 +519,11 @@ async function solveOneWithRetries(
   api: RangeApi,
   deps: RangeDeps,
   signal: AbortSignal,
+  usedCommunityUuids?: Set<string>,
 ): Promise<OneOutcome> {
   let touched = false;
   for (let attempt = 0; ; attempt++) {
-    const r = await solveOne(n, api, deps);
+    const r = await solveOne(n, api, deps, usedCommunityUuids);
     touched ||= r.touchedLeetCode;
     if (!r.blocked) return { ...r, touchedLeetCode: touched };
     const wait = deps.blockedBackoffMs[attempt];
@@ -501,6 +539,7 @@ async function solveOne(
   n: number,
   api: RangeApi,
   deps: RangeDeps,
+  usedCommunityUuids?: Set<string>,
 ): Promise<{ outcome: QuestionResult; touchedLeetCode: boolean; blocked: boolean }> {
   const err = (detail: string, touched = true, blocked = false) => ({
     outcome: { number: n, status: 'error' as const, detail },
@@ -508,37 +547,162 @@ async function solveOne(
     blocked,
   });
 
-  // 1) The walkccc page resolves the slug (shared across accounts; no LeetCode request).
-  let page: WalkcccPage;
-  try {
-    page = await deps.getPage(n);
-  } catch (e) {
-    if (e instanceof WalkcccError && /no walkccc page/i.test(e.message)) {
-      return err('no walkccc page', false);
-    }
-    return err(`walkccc: ${shortErr(e)}`, false);
-  }
-  if (!page.slug) return err('walkccc page has no LeetCode link', false);
+  // 1) Slug resolution:
+  //    Try walkccc first (shared cache, no LeetCode API call).
+  //    If walkccc has no page or no slug, fall back to LeetCode GraphQL slug resolution.
+  let walkcccPage: WalkcccPage | null = null;
+  let slug: string | null = null;
 
   try {
-    // 2) The question — the premium/locked check comes FIRST: locked questions
-    //    are skipped before touching the solution, the editor or the judge.
-    const q = await api.question(page.slug);
+    walkcccPage = await deps.getPage(n);
+    if (walkcccPage?.slug) {
+      slug = walkcccPage.slug;
+    }
+  } catch (e) {
+    if (e instanceof WalkcccError && /no walkccc page/i.test(e.message)) {
+      logger.debug({ question: n }, 'no walkccc page for question; resolving slug via LeetCode');
+    } else {
+      logger.warn({ question: n, err: shortErr(e) }, 'walkccc getPage failed; resolving slug via LeetCode');
+    }
+  }
+
+  if (!slug && deps.resolveSlug) {
+    try {
+      slug = await deps.resolveSlug(n);
+    } catch (e) {
+      logger.warn({ question: n, err: shortErr(e) }, 'failed to resolve LeetCode slug by number');
+    }
+  }
+
+  if (!slug) {
+    return err('no walkccc page', false);
+  }
+
+  try {
+    // 2) Premium check: locked questions are skipped before touching solutions or judge
+    const q = await api.question(slug);
     if (q.isPaidOnly) {
-      logger.info({ question: n, slug: page.slug }, 'range question is premium-locked - skipping');
+      logger.info({ question: n, slug }, 'range question is premium-locked - skipping');
       return { outcome: { number: n, status: 'premium' }, touchedLeetCode: true, blocked: false };
     }
     if (!q.questionId) return err('LeetCode returned no question id');
-    if (!page.code) return err('no walkccc C++ solution for this question');
+    const questionId = q.questionId;
+
     const cpp = q.codeSnippets.find((s) => s.langSlug === 'cpp');
     if (!cpp) return err('no C++ for this question');
-    if (!signatureMatchesStarter(page.code, { starterCode: cpp.code } as ParsedProblem)) {
-      return err('walkccc signature does not match');
+    const problem: ParsedProblem = { starterCode: cpp.code } as ParsedProblem;
+
+    // 3) Obtain solution:
+    //    Primary: LeetCode Community Solutions (random 1..10 per account, diversifying across accounts)
+    //    Fallback: Walkccc solution
+    let solutionCode: string | null = null;
+    let fallbackWalkcccCode: string | null = null;
+    let chosenSource: 'community' | 'walkccc' = 'walkccc';
+    let chosenUuid: string | null = null;
+
+    if (walkcccPage?.code && signatureMatchesStarter(walkcccPage.code, problem)) {
+      fallbackWalkcccCode = walkcccPage.code;
     }
 
-    // 3) Submit + wait for the judge.
-    const submissionId = await api.submit({ slug: page.slug, questionId: q.questionId, lang: 'cpp', code: page.code });
-    const verdict = await api.awaitResult(submissionId, page.slug);
+    const commFetcher = deps.fetchCommunity;
+
+    if (commFetcher) {
+      try {
+        const commSol = await commFetcher(slug, problem, {
+          language: 'cpp',
+          excludeUuids: usedCommunityUuids,
+          randomize: true,
+        });
+        if (commSol?.code) {
+          solutionCode = commSol.code;
+          chosenSource = 'community';
+          chosenUuid = commSol.uuid;
+        }
+      } catch (commErr) {
+        logger.warn({ question: n, slug, err: shortErr(commErr) }, 'community solution fetch failed; checking walkccc fallback');
+      }
+    }
+
+    if (!solutionCode && fallbackWalkcccCode) {
+      solutionCode = fallbackWalkcccCode;
+      chosenSource = 'walkccc';
+    }
+
+    if (!solutionCode && !walkcccPage) {
+      try {
+        const p = await deps.getPage(n);
+        if (p?.code && signatureMatchesStarter(p.code, problem)) {
+          solutionCode = p.code;
+          fallbackWalkcccCode = p.code;
+          chosenSource = 'walkccc';
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!solutionCode) {
+      if (walkcccPage && !walkcccPage.code && !commFetcher) {
+        return err('no walkccc C++ solution for this question');
+      }
+      return err('no valid C++ solution found');
+    }
+
+    if (chosenUuid && usedCommunityUuids) {
+      usedCommunityUuids.add(chosenUuid);
+    }
+
+    // 4) Submit with comment-stripping fallback + judge failure fallback
+    const submitCode = async (code: string) => {
+      const strippedCode = stripCppComments(code);
+      const useStripped = strippedCode.trim().length > 0 && strippedCode !== code;
+      const codeToTryFirst = useStripped ? strippedCode : code;
+
+      const subId = await api.submit({ slug: slug!, questionId, lang: 'cpp', code: codeToTryFirst });
+      let verdict = await api.awaitResult(subId, slug!);
+
+      if (useStripped && shouldRetryWithOriginal(verdict.statusDisplay)) {
+        logger.warn(
+          { question: n, slug, verdict: verdict.statusDisplay },
+          'comment-stripped code failed with compile/runtime error; retrying with original code',
+        );
+        const retrySubId = await api.submit({ slug: slug!, questionId, lang: 'cpp', code });
+        verdict = await api.awaitResult(retrySubId, slug!);
+        return { verdict, submissionId: retrySubId };
+      }
+
+      return { verdict, submissionId: subId };
+    };
+
+    let { verdict, submissionId } = await submitCode(solutionCode);
+
+    // If verdict was rejected (wrong answer, compile error, runtime error) and we have a walkccc fallback:
+    if (
+      verdict.classification !== 'ACCEPTED' &&
+      chosenSource === 'community' &&
+      fallbackWalkcccCode &&
+      fallbackWalkcccCode !== solutionCode
+    ) {
+      logger.warn(
+        { question: n, slug, verdict: verdict.statusDisplay },
+        'community solution was rejected by judge; attempting walkccc fallback',
+      );
+      try {
+        const fallbackRes = await submitCode(fallbackWalkcccCode);
+        if (fallbackRes.verdict.classification === 'ACCEPTED') {
+          return {
+            outcome: { number: n, status: 'accepted', submissionId: fallbackRes.submissionId },
+            touchedLeetCode: true,
+            blocked: false,
+          };
+        }
+        verdict = fallbackRes.verdict;
+        submissionId = fallbackRes.submissionId;
+      } catch (fbErr) {
+        logger.warn({ question: n, slug, err: shortErr(fbErr) }, 'walkccc fallback submission failed');
+      }
+    }
+
     if (verdict.classification === 'ACCEPTED') {
       return { outcome: { number: n, status: 'accepted', submissionId }, touchedLeetCode: true, blocked: false };
     }
@@ -780,6 +944,8 @@ export function defaultRangeDeps(notify: (text: string) => Promise<void> = async
     getAccount: getAccountById,
     openSession: openRequestSession,
     getPage: (n) => sharedCache.get(n),
+    resolveSlug: (n) => resolveLeetCodeSlugByNumber(n),
+    fetchCommunity: (slug, problem, options) => fetchCommunitySolution(slug, problem, options),
     notify,
     sleep: abortableSleep,
     isDailyRunInProgress: isRunInProgress,

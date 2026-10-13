@@ -523,3 +523,81 @@ export async function fetchCommunitySolution(
     `none of the ${N} inspected community solution articles for ${questionSlug} contained a valid matching ${language} solution`,
   );
 }
+
+export const PROBLEMSET_QUESTION_LIST_QUERY = `
+  query problemsetQuestionList($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionListFilterInput) {
+    problemsetQuestionList: questionList(
+      categorySlug: $categorySlug
+      limit: $limit
+      skip: $skip
+      filters: $filters
+    ) {
+      total: totalNum
+      questions: data {
+        frontendQuestionId: questionFrontendId
+        titleSlug
+        title
+        paidOnly: isPaidOnly
+      }
+    }
+  }
+`;
+
+const slugByNumberCache = new Map<number, string>();
+
+/**
+ * Resolves a LeetCode problem's titleSlug given its frontend question number.
+ * Uses the GraphQL problemsetQuestionList query with keyword filter.
+ * Caches resolved slugs in memory so each question number is looked up at most once.
+ */
+export async function resolveLeetCodeSlugByNumber(
+  questionNumber: number,
+  options?: FetchCommunitySolutionOptions,
+): Promise<string | null> {
+  const cached = slugByNumberCache.get(questionNumber);
+  if (cached) return cached;
+
+  const targetStr = String(questionNumber);
+  try {
+    const data = await executeLeetCodeGraphQL<{
+      problemsetQuestionList?: {
+        total?: number;
+        questions?: Array<{
+          frontendQuestionId?: string;
+          titleSlug?: string;
+          title?: string;
+          paidOnly?: boolean;
+        }>;
+      };
+    }>(
+      PROBLEMSET_QUESTION_LIST_QUERY,
+      {
+        categorySlug: '',
+        skip: 0,
+        limit: 10,
+        filters: { searchKeywords: targetStr },
+      },
+      options,
+    );
+
+    const questions = data.problemsetQuestionList?.questions ?? [];
+    const matched = questions.find((q) => q.frontendQuestionId === targetStr);
+    if (matched?.titleSlug) {
+      slugByNumberCache.set(questionNumber, matched.titleSlug);
+      logger.info(
+        { questionNumber, slug: matched.titleSlug, title: matched.title },
+        'resolved LeetCode slug by question number',
+      );
+      return matched.titleSlug;
+    }
+    logger.warn({ questionNumber, totalResults: questions.length }, 'no exact frontendQuestionId match found in LeetCode problemset query');
+    return null;
+  } catch (err) {
+    logger.error({ questionNumber, err: String(err) }, 'failed to resolve LeetCode slug by question number');
+    return null;
+  }
+}
+
+export function clearSlugByNumberCacheForTests(): void {
+  slugByNumberCache.clear();
+}

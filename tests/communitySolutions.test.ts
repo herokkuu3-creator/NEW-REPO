@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   clearCommunitySolutionsCache,
+  clearSlugByNumberCacheForTests,
   CommunitySolutionError,
   extractCppCode,
   fetchCommunitySolution,
+  resolveLeetCodeSlugByNumber,
   UGC_SOLUTION_ARTICLE_QUERY,
   UGC_SOLUTION_ARTICLES_QUERY,
 } from '../src/solutions/communitySolutions';
@@ -126,6 +128,7 @@ class Solution:
 describe('fetchCommunitySolution', () => {
   beforeEach(() => {
     clearCommunitySolutionsCache();
+    clearSlugByNumberCacheForTests();
   });
 
   it('fetches and extracts the first matching solution article', async () => {
@@ -414,5 +417,74 @@ public:
     expect(sol2.uuid).not.toBe(sol3.uuid);
     expect(sol1.uuid).not.toBe(sol3.uuid);
     expect(usedUuids.size).toBe(3);
+  });
+});
+
+
+describe('resolveLeetCodeSlugByNumber', () => {
+  beforeEach(() => {
+    clearSlugByNumberCacheForTests();
+  });
+
+  it('resolves slug matching exact frontendQuestionId and caches the result', async () => {
+    let fetchCount = 0;
+    const mockFetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      fetchCount++;
+      const body = JSON.parse(init?.body as string);
+      expect(body.variables.filters.searchKeywords).toBe('3800');
+
+      return new Response(
+        JSON.stringify({
+          data: {
+            problemsetQuestionList: {
+              total: 1,
+              questions: [
+                {
+                  frontendQuestionId: '3800',
+                  titleSlug: 'minimum-cost-to-make-two-binary-strings-equal',
+                  title: 'Minimum Cost to Make Two Binary Strings Equal',
+                  paidOnly: false,
+                },
+                {
+                  frontendQuestionId: '380',
+                  titleSlug: 'insert-delete-getrandom-o1',
+                  title: 'Insert Delete GetRandom O(1)',
+                  paidOnly: false,
+                },
+              ],
+            },
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    });
+
+    const slug1 = await resolveLeetCodeSlugByNumber(3800, { fetchFn: mockFetch as unknown as typeof fetch });
+    expect(slug1).toBe('minimum-cost-to-make-two-binary-strings-equal');
+    expect(fetchCount).toBe(1);
+
+    // Second call should return cached slug without hitting network
+    const slug2 = await resolveLeetCodeSlugByNumber(3800, { fetchFn: mockFetch as unknown as typeof fetch });
+    expect(slug2).toBe('minimum-cost-to-make-two-binary-strings-equal');
+    expect(fetchCount).toBe(1);
+  });
+
+  it('returns null when question number is not found in results', async () => {
+    const mockFetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          data: {
+            problemsetQuestionList: {
+              total: 0,
+              questions: [],
+            },
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    });
+
+    const slug = await resolveLeetCodeSlugByNumber(9999, { fetchFn: mockFetch as unknown as typeof fetch });
+    expect(slug).toBeNull();
   });
 });

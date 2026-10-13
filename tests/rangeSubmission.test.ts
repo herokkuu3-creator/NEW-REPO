@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AccountRecord } from '../src/database/accounts';
 import { LeetCodeHttpError } from '../src/leetcode/apiClient';
 import { WalkcccError, WalkcccPage } from '../src/solutions/walkccc';
+import type { CommunitySolution } from '../src/solutions/communitySolutions';
 import {
   countResults,
   estimateAccountMs,
@@ -398,5 +399,141 @@ describe('message formats', () => {
     expect(s).toContain('❌ Failed: 1');
     expect(s).toContain('⚠️ Error: 1');
     expect(s).toContain('🛑 Cancelled — 2 question(s) not attempted');
+  });
+});
+
+
+describe('Community solutions and slug resolution in range submission', () => {
+  it('resolves slug via resolveSlug and solves via fetchCommunity when walkccc has no page', async () => {
+    const log: string[] = [];
+    const submittedCodes: string[] = [];
+    const session = makeSession(() => 'accepted', log);
+    const origSubmit = session.api.submit;
+    session.api.submit = async (p) => {
+      submittedCodes.push(p.code);
+      return origSubmit(p);
+    };
+
+    const commSolution: CommunitySolution = {
+      code: 'class Solution { public: int main() { /* comment */ return 42; } };',
+      sourceUrl: 'https://leetcode.com/solutions/test',
+      title: 'Optimal C++ Solution',
+      uuid: 'uuid-3800',
+      rankIndex: 3,
+    };
+
+    const resolveSlug = vi.fn(async (n: number) => `slug-${n}`);
+    const fetchCommunity = vi.fn(async () => commSolution);
+
+    const { deps } = makeDeps(session, [acc('a1')], {
+      getPage: async (n) => {
+        throw new WalkcccError(`no walkccc page for problem ${n}`);
+      },
+      resolveSlug,
+      fetchCommunity,
+    });
+
+    const r = await startRangeJob({ from: 3800, to: 3800 }, 'a1', deps);
+    const results = await r.done;
+
+    expect(resolveSlug).toHaveBeenCalledWith(3800);
+    expect(fetchCommunity).toHaveBeenCalledWith(
+      'slug-3800',
+      expect.anything(),
+      expect.objectContaining({ language: 'cpp', randomize: true }),
+    );
+    expect(countResults(results[0]!.results)).toEqual({ accepted: 1, failed: 0, error: 0, premium: 0 });
+    expect(results[0]!.results[0]!.number).toBe(3800);
+    expect(results[0]!.results[0]!.status).toBe('accepted');
+    // Check comment stripping was applied:
+    expect(submittedCodes[0]).not.toContain('/* comment */');
+  });
+
+  it('diversifies community solution candidates across multiple accounts (excludeUuids)', async () => {
+    const session = makeSession(() => 'accepted', []);
+    const excludedSeenByAccount: Array<string[]> = [];
+
+    const fetchCommunity = vi.fn(async (slug: string, problem: unknown, options?: { excludeUuids?: Set<string> }) => {
+      const excluded = Array.from(options?.excludeUuids ?? []);
+      excludedSeenByAccount.push(excluded);
+      const uuid = excluded.includes('uuid-cand-1') ? 'uuid-cand-2' : 'uuid-cand-1';
+      return {
+        code: `class Solution { public: int main() { return ${uuid === 'uuid-cand-1' ? 1 : 2}; } };`,
+        sourceUrl: `https://leetcode.com/solutions/${uuid}`,
+        title: `Solution ${uuid}`,
+        uuid,
+      };
+    });
+
+    const { deps } = makeDeps(session, [acc('user1'), acc('user2')], {
+      getPage: async (n) => {
+        throw new WalkcccError(`no walkccc page for problem ${n}`);
+      },
+      resolveSlug: async (n) => `slug-${n}`,
+      fetchCommunity,
+    });
+
+    const r = await startRangeJob({ from: 3800, to: 3800 }, 'all', deps);
+    const results = await r.done;
+
+    expect(results).toHaveLength(2);
+    expect(results[0]!.results[0]!.status).toBe('accepted');
+    expect(results[1]!.results[0]!.status).toBe('accepted');
+
+    // First account had empty excludeUuids:
+    expect(excludedSeenByAccount[0]).toEqual([]);
+    // Second account had first account's chosen UUID in excludeUuids:
+    expect(excludedSeenByAccount[1]).toContain('uuid-cand-1');
+  });
+
+  it('falls back to walkccc when community solution is rejected with wrong answer', async () => {
+    let callCount = 0;
+    const session = makeSession(() => 'accepted', []);
+    session.api.awaitResult = async (id: string) => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          submissionId: id,
+          classification: 'WRONG_ANSWER' as const,
+          statusDisplay: 'Wrong Answer',
+          runtime: null,
+          memory: null,
+          rawStatusMsg: 'Wrong Answer',
+        };
+      }
+      return {
+        submissionId: id,
+        classification: 'ACCEPTED' as const,
+        statusDisplay: 'Accepted',
+        runtime: '4 ms',
+        memory: '10 MB',
+        rawStatusMsg: 'Accepted',
+      };
+    };
+
+    const commSolution: CommunitySolution = {
+      code: 'class Solution { public: int main() { return 1; } };',
+      sourceUrl: 'https://leetcode.com/solutions/comm',
+      title: 'Community Code',
+      uuid: 'uuid-wrong',
+    };
+
+    const walkcccCode = 'class Solution { public: int main() { return 999; } };';
+
+    const { deps } = makeDeps(session, [acc('a1')], {
+      getPage: async (n) => ({
+        code: walkcccCode,
+        sourceUrl: 'https://walkccc.me',
+        slug: `slug-${n}`,
+        title: `T${n}`,
+      }),
+      fetchCommunity: async () => commSolution,
+    });
+
+    const r = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
+    const results = await r.done;
+
+    expect(callCount).toBe(2);
+    expect(results[0]!.results[0]!.status).toBe('accepted');
   });
 });
