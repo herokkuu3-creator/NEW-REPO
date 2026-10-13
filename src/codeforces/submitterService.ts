@@ -641,8 +641,13 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
           continue;
         }
 
-        attempts.push(`${path}: HTTP ${status} (Cloudflare challenge could not be cleared)`);
-        continue;
+        // A challenge is tied to this browser session. Probing alternate submit
+        // URLs after it fails only creates more challenge requests; it cannot
+        // make the pending source safe to submit. Stop this attempt intact.
+        throw new BrowserFormError(
+          `Codeforces verification could not be completed at ${path}; the current solution remains pending.`,
+          'blocked',
+        );
       }
 
       const body = await readBody(page);
@@ -669,8 +674,10 @@ export async function openSubmitForm(page: Page, entry: SubmitterEntry, proxyUrl
           attempts.push(`${path}: challenge cleared but submit form missing on ${page.url()}`);
           continue;
         }
-        attempts.push(`${path}: challenge in body could not be cleared`);
-        continue;
+        throw new BrowserFormError(
+          `Codeforces verification could not be completed at ${path}; the current solution remains pending.`,
+          'blocked',
+        );
       }
 
       const fields = await readFields(page);

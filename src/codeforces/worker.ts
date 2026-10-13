@@ -18,7 +18,7 @@ import {
 import { loadRuntimeSourceIndex, fetchSourceCode, SourceIndexEntry } from './sourceRepo';
 import { isTerminalCodeforcesVerdict, shouldReleaseDailyAttempt } from './dailyGate';
 import { fetchSolvedProblemKeys } from './api';
-import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
+import { firstUnsolvedIndex, HANDOFF_VERDICT, sendHandoff } from './handoff';
 import type { HttpSubmitResult } from './httpSubmit';
 import { captureBefore, pollForVerdict, postSubmitForm, type BrowserPostOutcome } from './submission';
 import { isRemoteSubmitterConfigured, notifyProxyInUse, submitViaRemoteSubmitter } from './remoteSubmitter';
@@ -712,8 +712,20 @@ async function runForAccount(
     const duplicateSubmission = isAlreadySubmittedCodeError(result.error);
     const finalVerdict = Boolean(result.submissionId && isTerminalCodeforcesVerdict(result.verdict));
     const verificationRequired = isCodeforcesVerificationRequired(result.error);
+    let handoffSent = false;
     if (verificationRequired) {
       logger.warn({ label, problem: problemLabel(entry), error: result.error, kind: result.kind, result }, 'Codeforces requires verification; automatic attempts stopped');
+      // The verification service declined the automated browser. Do not retry or
+      // submit a partial form; hand the unchanged source to the account owner
+      // for completion in their already signed-in, supported browser.
+      handoffSent = await sendHandoff(entry, username, originalCode)
+        .catch((err) => {
+          logger.warn({ label, err: err instanceof Error ? err.message : String(err) }, 'Codeforces verification handoff could not be sent');
+          return false;
+        });
+      if (handoffSent) {
+        await recordAttempt(account.id, { submissionId: null, verdict: HANDOFF_VERDICT });
+      }
     }
     if (finalVerdict || duplicateSubmission) {
       const index = source.queue.findIndex((e) => e.key === entry.key);
@@ -743,11 +755,13 @@ async function runForAccount(
     return {
       label,
       username,
-      kind: result.kind === 'signed-out' ? 'rejected' : 'failed',
+      kind: result.kind === 'signed-out' ? 'rejected' : verificationRequired && handoffSent ? 'pending' : 'failed',
       performed: finalVerdict || duplicateSubmission,
       browserAttempted,
       note: verificationRequired
-        ? 'Verification required on Codeforces. This account batch is paused; the current solution remains pending.'
+        ? handoffSent
+          ? 'Verification required on Codeforces. The source file and matching submit link were sent to you; this account batch is paused until Codeforces reports the submitted solution as accepted.'
+          : 'Verification required on Codeforces. This account batch is paused; the current solution remains pending. Use /cfmanualnext to receive the source and submit link.'
         : duplicateSubmission
         ? `${note ? `${note} ` : ''}Codeforces already had this exact source; marked it performed and advanced to the next solution.`
         : note,

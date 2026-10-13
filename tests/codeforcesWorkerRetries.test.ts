@@ -31,6 +31,7 @@ vi.mock('../src/codeforces/remoteSubmitter', () => ({
 }));
 vi.mock('../src/notifications/telegram', () => ({
   sendTelegramMessage: vi.fn(async () => true),
+  sendTelegramDocument: vi.fn(async () => true),
 }));
 import { runCodeforcesNow, isAfterCodeforcesSchedule } from '../src/codeforces/worker';
 
@@ -71,11 +72,13 @@ it('pauses a challenged account at its first failure without skipping its source
   const run = runCodeforcesNow('manual', { batchCount: 3, forceDailyAttempt: true, onAccountOutcome: mocks.outcomes });
   await vi.runAllTimersAsync();
   const report = await run;
+  const { sendTelegramDocument } = await import('../src/notifications/telegram');
   expect(mocks.post.mock.calls.map(call => call[1])).toEqual(['first', 'second', 'second', 'second']);
   expect(mocks.complete.mock.calls.every(([id]) => id === 'a2')).toBe(true);
-  expect(mocks.outcomes.mock.calls[0][0]).toMatchObject({ performed: false, note: expect.stringContaining('batch is paused') });
+  expect(sendTelegramDocument).toHaveBeenCalledWith('8B.cpp', 'int main() {return 0;}', expect.stringContaining('https://codeforces.com/problemset/submit/8/B'));
+  expect(mocks.outcomes.mock.calls[0][0]).toMatchObject({ kind: 'pending', performed: false, note: expect.stringContaining('source file') });
   expect(mocks.outcomes).toHaveBeenCalledTimes(4);
-  expect(report?.totals).toMatchObject({ solved: 3, failed: 1 });
+  expect(report?.totals).toMatchObject({ solved: 3, failed: 0, pending: 1 });
 });
 
 it('never marks an unsubmitted source completed after repeated transport failures in a batch', async () => {
