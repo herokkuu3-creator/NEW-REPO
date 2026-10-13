@@ -13,7 +13,14 @@ import {
   setSystemState,
   SystemKeys,
 } from '../database/models';
-import { AccountRecord, deleteAccountById, deleteAllAccounts, listAccounts } from '../database/accounts';
+import {
+  AccountRecord,
+  deleteAccountById,
+  deleteAllAccounts,
+  getAccountById,
+  listAccounts,
+  listEnabledAccounts,
+} from '../database/accounts';
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
@@ -85,7 +92,9 @@ import { formatAccountMessage, summarizeReport } from '../scheduler/report';
 import { claimContestRewardForAccount, ContestRewardResult } from '../leetcode/contestReward';
 import { humanLocal } from '../time';
 import {
+  AccountRangeResult,
   cancelRangeJob,
+  countResults,
   currentRangeJob,
   defaultRangeDeps,
   estimateAccountMs,
@@ -93,6 +102,8 @@ import {
   formatRangeJobStatus,
   parseQuestionRange,
   QuestionRange,
+  RangeDeps,
+  RangeProgressEvent,
   rangeSize,
   rangeQueueLength,
   startRangeJob,
@@ -3630,8 +3641,344 @@ export interface RangeUiDeps {
   queueLength?: () => number;
 }
 
+export interface RangeAccountSectionState {
+  accIndex: number;
+  label: string;
+  username?: string | null;
+  completedItems: string[];
+  activeLine?: string;
+  accountStatus?: string;
+}
+
+export function renderRangeProgressSections(
+  sections: ReadonlyMap<number, RangeAccountSectionState>,
+  totalAccounts: number,
+): string[] {
+  const sorted = [...sections.values()].sort((a, b) => a.accIndex - b.accIndex);
+  if (sorted.length === 0) {
+    return ['<i>Waiting for progress updates…</i>'];
+  }
+
+  const effectiveTotal = Math.max(totalAccounts, sorted.length);
+  const escape = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const buildBlocks = (pruneThreshold?: number): string[] => {
+    return sorted.map((sec) => {
+      const accNum = sec.accIndex + 1;
+      const name = escape(sec.username ?? sec.label);
+      const header = `👤 <b>Account ${accNum}/${effectiveTotal} · <code>${name}</code></b>`;
+
+      let completed = sec.completedItems;
+      let prunedNotice: string | null = null;
+      if (pruneThreshold && completed.length > pruneThreshold) {
+        const skippedCount = completed.length - pruneThreshold;
+        prunedNotice = `<i>… ${skippedCount} earlier completed question(s)</i>`;
+        completed = completed.slice(completed.length - pruneThreshold);
+      }
+
+      const items: string[] = [];
+      if (prunedNotice) items.push(prunedNotice);
+      items.push(...completed);
+
+      if (sec.activeLine) {
+        items.push(sec.activeLine);
+      } else if (sec.accountStatus && items.length === 0) {
+        items.push(sec.accountStatus);
+      }
+
+      if (items.length === 0) {
+        items.push('⏳ Queued…');
+      }
+
+      const treeLines = items.map((item, idx) => {
+        const isLast = idx === items.length - 1;
+        const connector = isLast ? '└ ' : '├ ';
+        return `${connector}${item}`;
+      });
+
+      return [header, ...treeLines].join('\n');
+    });
+  };
+
+  let blocks = buildBlocks();
+  if (blocks.join('\n\n').length > 3400) {
+    blocks = buildBlocks(6);
+  }
+  if (blocks.join('\n\n').length > 3400) {
+    blocks = buildBlocks(3);
+  }
+
+  return blocks;
+}
+
+export interface RangeTriggerDeps {
+  listAccounts: () => Promise<AccountRecord[]>;
+  getAccount: (id: string) => Promise<AccountRecord | null>;
+  startJob: (range: QuestionRange, target: string | 'all', deps: RangeDeps) => Promise<StartRangeResult>;
+  send?: (text: string) => Promise<void>;
+  edit?: (chatId: number | string, messageId: number, text: string) => Promise<void>;
+}
+
+export const defaultRangeTriggerDeps: RangeTriggerDeps = {
+  listAccounts: listEnabledAccounts,
+  getAccount: getAccountById,
+  startJob: startRangeJob,
+};
+
+export async function handleQuestionRangeTrigger(
+  range: QuestionRange,
+  target: string | 'all',
+  triggerDeps: RangeTriggerDeps = defaultRangeTriggerDeps,
+  chatId: number | string = config.telegram.chatId,
+): Promise<StartRangeResult> {
+  let configuredAccounts: AccountRecord[] = [];
+  if (target === 'all') {
+    configuredAccounts = await triggerDeps.listAccounts().catch(() => []);
+    if (configuredAccounts.length === 0) return { started: false, reason: 'no-accounts' };
+  } else {
+    const acc = await triggerDeps.getAccount(target).catch(() => null);
+    if (!acc) return { started: false, reason: 'account-not-found' };
+    configuredAccounts = [acc];
+  }
+
+  const initialTotalAccounts = Math.max(1, configuredAccounts.length);
+  const accountSections = new Map<number, RangeAccountSectionState>();
+
+  for (let i = 0; i < configuredAccounts.length; i++) {
+    const acc = configuredAccounts[i];
+    if (!acc) continue;
+    accountSections.set(i, {
+      accIndex: i,
+      label: acc.label,
+      username: acc.username,
+      completedItems: [],
+      activeLine: i === 0 ? '🔎 Initializing session…' : '⏳ Queued…',
+    });
+  }
+
+  const title = `🎯 <b>LEETCODE QUESTION RANGE (#${range.from}–#${range.to})</b>`;
+  const initialSubtitle = `🔎 Initializing range #${range.from}–#${range.to}…\n<i>⏳ 30s pacing between questions · /rangestatus · /cancelrange</i>`;
+  const initialBlocks = configuredAccounts.length > 0
+    ? renderRangeProgressSections(accountSections, initialTotalAccounts).join('\n\n')
+    : initialSubtitle;
+
+  let statusMessageId: number | null = null;
+  if (triggerDeps.send) {
+    statusMessageId = 1;
+    await triggerDeps.send(`${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${initialBlocks}`);
+  } else {
+    const statusMsg = await tgApi<{ message_id: number }>('sendMessage', {
+      chat_id: chatId,
+      text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${initialBlocks}`,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    }).catch((err) => {
+      logger.warn({ err: errText(err) }, 'failed to send initial LeetCode range progress message');
+      return null;
+    });
+    if (statusMsg) statusMessageId = statusMsg.message_id;
+  }
+
+  let totalAccounts = initialTotalAccounts;
+  const editProgress = async (extraFooter?: string): Promise<boolean> => {
+    const blocks = renderRangeProgressSections(accountSections, totalAccounts);
+    let body = blocks.join('\n\n');
+    if (extraFooter) body += extraFooter;
+    const fullText = `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${body}`;
+
+    if (triggerDeps.edit && statusMessageId) {
+      await triggerDeps.edit(chatId, statusMessageId, fullText).catch(() => undefined);
+      return true;
+    }
+
+    if (!statusMessageId) return false;
+    const updated = await tgApi('editMessageText', {
+      chat_id: chatId,
+      message_id: statusMessageId,
+      text: fullText,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    }).then(() => true).catch((err) => {
+      if (/message is not modified/i.test(errText(err))) return true;
+      logger.warn({ err: errText(err) }, 'could not update LeetCode range progress message');
+      return false;
+    });
+    return updated;
+  };
+
+  const onProgress = async (event: RangeProgressEvent) => {
+    if (event.accTotal && event.accTotal > totalAccounts) {
+      totalAccounts = event.accTotal;
+    }
+    const accIdx = event.accIndex;
+    let sec = accountSections.get(accIdx);
+    if (!sec) {
+      sec = {
+        accIndex: accIdx,
+        label: event.label,
+        username: event.username,
+        completedItems: [],
+      };
+      accountSections.set(accIdx, sec);
+    }
+    if (event.username && !sec.username) {
+      sec.username = event.username;
+    }
+
+    const stepPrefix = event.stepTotal && event.stepTotal > 1 ? `[${event.stepIndex}/${event.stepTotal}] ` : '';
+    const qName = event.questionTitle ? ` ${event.questionTitle}` : '';
+    const qTag = `<code>#${event.questionNumber}${escapeHtml(qName)}</code>`;
+
+    switch (event.phase) {
+      case 'checking':
+        sec.activeLine = `🔎 Checking session…`;
+        break;
+      case 'processing':
+        sec.activeLine = `⏳ ${stepPrefix}${qTag} — Processing…`;
+        break;
+      case 'submitting':
+        sec.activeLine = `🚀 ${stepPrefix}${qTag} — Submitting…`;
+        break;
+      case 'verdict':
+        sec.activeLine = `⏳ ${stepPrefix}${qTag} — Waiting for verdict…`;
+        break;
+      case 'accepted': {
+        const sub = event.submissionId ? ` · #${escapeHtml(event.submissionId)}` : '';
+        sec.completedItems.push(`✅ ${stepPrefix}${qTag} — <b>Accepted</b>${sub}`);
+        sec.activeLine = undefined;
+        break;
+      }
+      case 'failed': {
+        const verdict = escapeHtml(event.verdict ?? 'Wrong Answer');
+        const sub = event.submissionId ? ` · #${escapeHtml(event.submissionId)}` : '';
+        sec.completedItems.push(`❌ ${stepPrefix}${qTag} — <b>${verdict}</b>${sub}`);
+        sec.activeLine = undefined;
+        break;
+      }
+      case 'premium': {
+        sec.completedItems.push(`🔒 ${stepPrefix}${qTag} — <b>Premium Locked</b>`);
+        sec.activeLine = undefined;
+        break;
+      }
+      case 'error': {
+        const detail = escapeHtml((event.detail ?? 'Error').slice(0, 100));
+        const sub = event.submissionId ? ` · #${escapeHtml(event.submissionId)}` : '';
+        sec.completedItems.push(`⚠️ ${stepPrefix}${qTag} — <i>${detail}</i>${sub}`);
+        sec.activeLine = undefined;
+        break;
+      }
+      case 'waiting': {
+        const nextStep = event.stepIndex + 1;
+        const nextStepStr = event.stepTotal > 1 ? ` before question [${nextStep}/${event.stepTotal}]` : '';
+        sec.activeLine = `⏳ Waiting ${event.waitSeconds ?? 30}s${nextStepStr} (human pacing)…`;
+        break;
+      }
+      case 'blocked': {
+        sec.activeLine = '🧱 LeetCode rate-limit / challenge blocked';
+        sec.accountStatus = '🧱 Blocked by LeetCode';
+        break;
+      }
+      case 'cancelled': {
+        sec.activeLine = '🛑 Range cancelled by user';
+        sec.accountStatus = '🛑 Cancelled';
+        break;
+      }
+      case 'completed': {
+        sec.activeLine = undefined;
+        break;
+      }
+    }
+
+    await editProgress();
+  };
+
+  const deps: RangeDeps = defaultRangeDeps(async () => undefined, onProgress);
+
+  const res = await triggerDeps.startJob(range, target, deps);
+  if (!res.started) {
+    if ('queued' in res) {
+      const sec = accountSections.get(0);
+      if (sec) sec.activeLine = `🗂️ Waiting in queue (position ${res.position})…`;
+      await editProgress();
+      const wrappedDone = (async () => {
+        try {
+          const results = await res.done;
+          for (const s of accountSections.values()) {
+            s.activeLine = undefined;
+          }
+          const sum = { accepted: 0, failed: 0, error: 0, premium: 0 };
+          for (const r of results) {
+            const c = countResults(r.results);
+            sum.accepted += c.accepted;
+            sum.failed += c.failed;
+            sum.error += c.error;
+            sum.premium += c.premium;
+          }
+          const summaryText = `\n\n🎯 <b>Finished:</b> ${sum.accepted} accepted · ${sum.failed} failed · ${sum.error} errors${sum.premium ? ` · 🔒 ${sum.premium} premium` : ''}`;
+          await editProgress(summaryText);
+          return results;
+        } catch (err) {
+          logger.warn({ err: errText(err) }, 'LeetCode range execution error');
+          if (statusMessageId) {
+            await tgApi('editMessageText', {
+              chat_id: chatId,
+              message_id: statusMessageId,
+              text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${escapeHtml(errText(err))}`,
+              parse_mode: 'HTML',
+              disable_web_page_preview: true,
+            }).catch(() => undefined);
+          }
+          throw err;
+        }
+      })();
+      return {
+        ...res,
+        done: wrappedDone,
+      };
+    }
+    return res;
+  }
+
+  const wrappedDone = (async () => {
+    try {
+      const results = await res.done;
+      for (const sec of accountSections.values()) {
+        sec.activeLine = undefined;
+      }
+      const sum = { accepted: 0, failed: 0, error: 0, premium: 0 };
+      for (const r of results) {
+        const c = countResults(r.results);
+        sum.accepted += c.accepted;
+        sum.failed += c.failed;
+        sum.error += c.error;
+        sum.premium += c.premium;
+      }
+      const summaryText = `\n\n🎯 <b>Finished:</b> ${sum.accepted} accepted · ${sum.failed} failed · ${sum.error} errors${sum.premium ? ` · 🔒 ${sum.premium} premium` : ''}`;
+      await editProgress(summaryText);
+      return results;
+    } catch (err) {
+      logger.warn({ err: errText(err) }, 'LeetCode range execution error');
+      if (statusMessageId) {
+        await tgApi('editMessageText', {
+          chat_id: chatId,
+          message_id: statusMessageId,
+          text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${escapeHtml(errText(err))}`,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }).catch(() => undefined);
+      }
+      throw err;
+    }
+  })();
+
+  return {
+    ...res,
+    done: wrappedDone,
+  };
+}
+
 const defaultRangeUiDeps: RangeUiDeps = {
-  start: (range, target) => startRangeJob(range, target, defaultRangeDeps(reply)),
+  start: (range, target) => handleQuestionRangeTrigger(range, target),
   current: currentRangeJob,
   cancel: cancelRangeJob,
   now: () => Date.now(),
@@ -3708,7 +4055,8 @@ export async function handleQuestionRangeCommand(
   }
   pendingRangePrompt = false;
   pendingPromptType = null;
-  const parsed = parseQuestionRange(arg);
+  const tokens = arg.trim().split(/\s+/);
+  const parsed = parseQuestionRange(tokens[0] || '');
   if (!parsed.ok) {
     await deps.send(`⚠️ ${parsed.error}\nExample: /questionrangesubmission 200-400`);
     return;
@@ -3716,6 +4064,22 @@ export async function handleQuestionRangeCommand(
   const accounts = await deps.listAccounts();
   if (accounts.length === 0) {
     await deps.send('📭 No accounts configured — send cookie .json files first (/renew).');
+    return;
+  }
+  if (tokens.length >= 2 && tokens[1]) {
+    const target = tokens[1];
+    const result = await ui.start(parsed.range, target);
+    if (!result.started) {
+      if ('queued' in result) {
+        await deps.send(`🗂️ Queued: questions #${parsed.range.from}–#${parsed.range.to} (Queue position: ${result.position})`);
+      } else {
+        await deps.send(
+          result.reason === 'no-accounts'
+            ? '📭 No accounts configured — send cookie .json files first.'
+            : '🔍 That account does not exist — check /accounts.',
+        );
+      }
+    }
     return;
   }
   const picker = buildRangePicker(parsed.range, accounts);
@@ -4225,9 +4589,8 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
       const parsed = parseQuestionRange(parts[0] || '');
       const accountId = parts[1] || 'all';
       if (parsed.ok) {
-        const res = await startRangeJob(parsed.range, accountId);
+        const res = await handleQuestionRangeTrigger(parsed.range, accountId);
         if (res.started || 'queued' in res) {
-          await replyHtml(`🎯 <b>LeetCode Question Range Started:</b> #${parsed.range.from}–#${parsed.range.to}`);
           await res.done;
         } else if (!res.started && 'reason' in res) {
           await reply(`⚠️ Could not start question range: ${res.reason}`);

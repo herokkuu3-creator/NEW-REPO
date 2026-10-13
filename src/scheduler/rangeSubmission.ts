@@ -129,6 +129,44 @@ export interface RangeSession {
   close(): Promise<void>;
 }
 
+export interface RangeProgressEvent {
+  phase:
+    | 'checking'
+    | 'processing'
+    | 'submitting'
+    | 'verdict'
+    | 'accepted'
+    | 'failed'
+    | 'premium'
+    | 'error'
+    | 'waiting'
+    | 'blocked'
+    | 'cancelled'
+    | 'completed';
+  label: string;
+  username?: string | null;
+  accIndex: number;
+  accTotal: number;
+  stepIndex: number;
+  stepTotal: number;
+  questionNumber: number;
+  questionTitle?: string | null;
+  slug?: string | null;
+  verdict?: string | null;
+  submissionId?: string | null;
+  detail?: string | null;
+  waitSeconds?: number;
+}
+
+export interface RangeProgressContext {
+  label: string;
+  username?: string | null;
+  accIndex: number;
+  accTotal: number;
+  stepIndex: number;
+  stepTotal: number;
+}
+
 export interface RangeDeps {
   listAccounts(): Promise<AccountRecord[]>;
   getAccount(id: string): Promise<AccountRecord | null>;
@@ -144,6 +182,8 @@ export interface RangeDeps {
     options?: FetchCommunitySolutionOptions,
   ): Promise<CommunitySolution>;
   notify(text: string): Promise<void>;
+  /** Real-time progress updates for Telegram live progress bar (matching Codeforces format). */
+  onProgress?: (event: RangeProgressEvent) => Promise<void> | void;
   /** Resolves after `ms`, or early (without throwing) when `signal` aborts. */
   sleep(ms: number, signal: AbortSignal): Promise<void>;
   isDailyRunInProgress(): boolean;
@@ -405,10 +445,32 @@ async function runAccountRange(
   } catch (err) {
     result.fatal = `could not open a session: ${errText(err)}`;
     for (let n = range.from; n <= range.to; n++) result.notAttempted.push(n);
+    void deps.onProgress?.({
+      phase: 'failed',
+      label: account.label,
+      username: account.username,
+      accIndex: index - 1,
+      accTotal: total,
+      stepIndex: 1,
+      stepTotal: rangeSize(range),
+      questionNumber: range.from,
+      detail: result.fatal,
+    });
     return finish();
   }
 
   try {
+    void deps.onProgress?.({
+      phase: 'checking',
+      label: account.label,
+      username: account.username,
+      accIndex: index - 1,
+      accTotal: total,
+      stepIndex: 1,
+      stepTotal: rangeSize(range),
+      questionNumber: range.from,
+    });
+
     const check = await session.api.checkSession();
     if (!check.authenticated) {
       result.fatal =
@@ -416,6 +478,17 @@ async function runAccountRange(
           ? 'LeetCode rejected this session (signed out) — send fresh cookies'
           : 'could not verify the session (LeetCode request failed)';
       for (let n = range.from; n <= range.to; n++) result.notAttempted.push(n);
+      void deps.onProgress?.({
+        phase: 'failed',
+        label: account.label,
+        username: account.username,
+        accIndex: index - 1,
+        accTotal: total,
+        stepIndex: 1,
+        stepTotal: rangeSize(range),
+        questionNumber: range.from,
+        detail: result.fatal,
+      });
       return finish();
     }
     result.username = check.username ?? account.username;
@@ -434,18 +507,29 @@ async function runAccountRange(
       await waitForDailyRun(deps, info, signal);
       if (signal.aborted) break;
 
+      const stepIndex = n - range.from + 1;
+      const stepTotal = rangeSize(range);
       info.currentQuestion = n;
       let usedUuids = usedCommunityUuidsByQuestion.get(n);
       if (!usedUuids) {
         usedUuids = new Set<string>();
         usedCommunityUuidsByQuestion.set(n, usedUuids);
       }
+      const progressCtx: RangeProgressContext = {
+        label: account.label,
+        username: result.username,
+        accIndex: index - 1,
+        accTotal: total,
+        stepIndex,
+        stepTotal,
+      };
       const { outcome, touchedLeetCode, blocked } = await solveOneWithRetries(
         n,
         session.api,
         deps,
         signal,
         usedUuids,
+        progressCtx,
       );
       if (outcome === null) break; // cancelled during a back-off wait
       result.results.push(outcome);
@@ -479,9 +563,31 @@ async function runAccountRange(
       }
 
       if (n < range.to && touchedLeetCode && !signal.aborted) {
+        void deps.onProgress?.({
+          phase: 'waiting',
+          label: account.label,
+          username: result.username,
+          accIndex: index - 1,
+          accTotal: total,
+          stepIndex,
+          stepTotal,
+          questionNumber: n,
+          waitSeconds: Math.round(deps.questionGapMs / 1000),
+        });
         await deps.sleep(deps.questionGapMs, signal);
       }
     }
+
+    void deps.onProgress?.({
+      phase: signal.aborted ? 'cancelled' : 'completed',
+      label: account.label,
+      username: result.username,
+      accIndex: index - 1,
+      accTotal: total,
+      stepIndex: rangeSize(range),
+      stepTotal: rangeSize(range),
+      questionNumber: range.to,
+    });
 
     if (signal.aborted) result.stoppedEarly = 'cancelled';
     const last = result.results.at(-1)?.number ?? range.from - 1;
@@ -520,10 +626,11 @@ async function solveOneWithRetries(
   deps: RangeDeps,
   signal: AbortSignal,
   usedCommunityUuids?: Set<string>,
+  progressCtx?: RangeProgressContext,
 ): Promise<OneOutcome> {
   let touched = false;
   for (let attempt = 0; ; attempt++) {
-    const r = await solveOne(n, api, deps, usedCommunityUuids);
+    const r = await solveOne(n, api, deps, usedCommunityUuids, progressCtx);
     touched ||= r.touchedLeetCode;
     if (!r.blocked) return { ...r, touchedLeetCode: touched };
     const wait = deps.blockedBackoffMs[attempt];
@@ -540,23 +647,59 @@ async function solveOne(
   api: RangeApi,
   deps: RangeDeps,
   usedCommunityUuids?: Set<string>,
+  progressCtx?: RangeProgressContext,
 ): Promise<{ outcome: QuestionResult; touchedLeetCode: boolean; blocked: boolean }> {
-  const err = (detail: string, touched = true, blocked = false) => ({
-    outcome: { number: n, status: 'error' as const, detail },
-    touchedLeetCode: touched,
-    blocked,
-  });
+  let questionTitle: string | null = null;
+  let slug: string | null = null;
+
+  const err = (detail: string, touched = true, blocked = false) => {
+    if (progressCtx) {
+      void deps.onProgress?.({
+        phase: 'error',
+        label: progressCtx.label,
+        username: progressCtx.username,
+        accIndex: progressCtx.accIndex,
+        accTotal: progressCtx.accTotal,
+        stepIndex: progressCtx.stepIndex,
+        stepTotal: progressCtx.stepTotal,
+        questionNumber: n,
+        questionTitle: questionTitle ?? slug ?? undefined,
+        slug: slug ?? undefined,
+        detail,
+      });
+    }
+    return {
+      outcome: { number: n, status: 'error' as const, detail },
+      touchedLeetCode: touched,
+      blocked,
+    };
+  };
+
+  if (progressCtx) {
+    void deps.onProgress?.({
+      phase: 'processing',
+      label: progressCtx.label,
+      username: progressCtx.username,
+      accIndex: progressCtx.accIndex,
+      accTotal: progressCtx.accTotal,
+      stepIndex: progressCtx.stepIndex,
+      stepTotal: progressCtx.stepTotal,
+      questionNumber: n,
+    });
+  }
 
   // 1) Slug resolution:
   //    Try walkccc first (shared cache, no LeetCode API call).
   //    If walkccc has no page or no slug, fall back to LeetCode GraphQL slug resolution.
   let walkcccPage: WalkcccPage | null = null;
-  let slug: string | null = null;
 
   try {
     walkcccPage = await deps.getPage(n);
     if (walkcccPage?.slug) {
       slug = walkcccPage.slug;
+    }
+    if (walkcccPage?.title) {
+      questionTitle = walkcccPage.title;
     }
   } catch (e) {
     if (e instanceof WalkcccError && /no walkccc page/i.test(e.message)) {
@@ -581,8 +724,24 @@ async function solveOne(
   try {
     // 2) Premium check: locked questions are skipped before touching solutions or judge
     const q = await api.question(slug);
+    questionTitle = q.title ?? questionTitle ?? slug;
     if (q.isPaidOnly) {
       logger.info({ question: n, slug }, 'range question is premium-locked - skipping');
+      if (progressCtx) {
+        void deps.onProgress?.({
+          phase: 'premium',
+          label: progressCtx.label,
+          username: progressCtx.username,
+          accIndex: progressCtx.accIndex,
+          accTotal: progressCtx.accTotal,
+          stepIndex: progressCtx.stepIndex,
+          stepTotal: progressCtx.stepTotal,
+          questionNumber: n,
+          questionTitle,
+          slug,
+          verdict: 'Premium Locked',
+        });
+      }
       return { outcome: { number: n, status: 'premium' }, touchedLeetCode: true, blocked: false };
     }
     if (!q.questionId) return err('LeetCode returned no question id');
@@ -658,7 +817,39 @@ async function solveOne(
       const useStripped = strippedCode.trim().length > 0 && strippedCode !== code;
       const codeToTryFirst = useStripped ? strippedCode : code;
 
+      if (progressCtx) {
+        void deps.onProgress?.({
+          phase: 'submitting',
+          label: progressCtx.label,
+          username: progressCtx.username,
+          accIndex: progressCtx.accIndex,
+          accTotal: progressCtx.accTotal,
+          stepIndex: progressCtx.stepIndex,
+          stepTotal: progressCtx.stepTotal,
+          questionNumber: n,
+          questionTitle,
+          slug,
+        });
+      }
+
       const subId = await api.submit({ slug: slug!, questionId, lang: 'cpp', code: codeToTryFirst });
+
+      if (progressCtx) {
+        void deps.onProgress?.({
+          phase: 'verdict',
+          label: progressCtx.label,
+          username: progressCtx.username,
+          accIndex: progressCtx.accIndex,
+          accTotal: progressCtx.accTotal,
+          stepIndex: progressCtx.stepIndex,
+          stepTotal: progressCtx.stepTotal,
+          questionNumber: n,
+          questionTitle,
+          slug,
+          submissionId: subId,
+        });
+      }
+
       let verdict = await api.awaitResult(subId, slug!);
 
       if (useStripped && shouldRetryWithOriginal(verdict.statusDisplay)) {
@@ -690,6 +881,22 @@ async function solveOne(
       try {
         const fallbackRes = await submitCode(fallbackWalkcccCode);
         if (fallbackRes.verdict.classification === 'ACCEPTED') {
+          if (progressCtx) {
+            void deps.onProgress?.({
+              phase: 'accepted',
+              label: progressCtx.label,
+              username: progressCtx.username,
+              accIndex: progressCtx.accIndex,
+              accTotal: progressCtx.accTotal,
+              stepIndex: progressCtx.stepIndex,
+              stepTotal: progressCtx.stepTotal,
+              questionNumber: n,
+              questionTitle,
+              slug,
+              verdict: 'Accepted',
+              submissionId: fallbackRes.submissionId,
+            });
+          }
           return {
             outcome: { number: n, status: 'accepted', submissionId: fallbackRes.submissionId },
             touchedLeetCode: true,
@@ -704,14 +911,62 @@ async function solveOne(
     }
 
     if (verdict.classification === 'ACCEPTED') {
+      if (progressCtx) {
+        void deps.onProgress?.({
+          phase: 'accepted',
+          label: progressCtx.label,
+          username: progressCtx.username,
+          accIndex: progressCtx.accIndex,
+          accTotal: progressCtx.accTotal,
+          stepIndex: progressCtx.stepIndex,
+          stepTotal: progressCtx.stepTotal,
+          questionNumber: n,
+          questionTitle,
+          slug,
+          verdict: 'Accepted',
+          submissionId,
+        });
+      }
       return { outcome: { number: n, status: 'accepted', submissionId }, touchedLeetCode: true, blocked: false };
     }
     if (verdict.classification === 'UNKNOWN') {
+      if (progressCtx) {
+        void deps.onProgress?.({
+          phase: 'error',
+          label: progressCtx.label,
+          username: progressCtx.username,
+          accIndex: progressCtx.accIndex,
+          accTotal: progressCtx.accTotal,
+          stepIndex: progressCtx.stepIndex,
+          stepTotal: progressCtx.stepTotal,
+          questionNumber: n,
+          questionTitle,
+          slug,
+          detail: 'judge timeout',
+          submissionId,
+        });
+      }
       return {
         outcome: { number: n, status: 'error', detail: 'judge timeout', submissionId },
         touchedLeetCode: true,
         blocked: false,
       };
+    }
+    if (progressCtx) {
+      void deps.onProgress?.({
+        phase: 'failed',
+        label: progressCtx.label,
+        username: progressCtx.username,
+        accIndex: progressCtx.accIndex,
+        accTotal: progressCtx.accTotal,
+        stepIndex: progressCtx.stepIndex,
+        stepTotal: progressCtx.stepTotal,
+        questionNumber: n,
+        questionTitle,
+        slug,
+        verdict: verdict.statusDisplay,
+        submissionId,
+      });
     }
     return {
       outcome: { number: n, status: 'failed', detail: verdict.statusDisplay, submissionId },
@@ -719,7 +974,24 @@ async function solveOne(
       blocked: false,
     };
   } catch (e) {
-    if (looksLikeChallenge(e)) return err('blocked by LeetCode', true, true);
+    if (looksLikeChallenge(e)) {
+      if (progressCtx) {
+        void deps.onProgress?.({
+          phase: 'blocked',
+          label: progressCtx.label,
+          username: progressCtx.username,
+          accIndex: progressCtx.accIndex,
+          accTotal: progressCtx.accTotal,
+          stepIndex: progressCtx.stepIndex,
+          stepTotal: progressCtx.stepTotal,
+          questionNumber: n,
+          questionTitle: questionTitle ?? slug ?? undefined,
+          slug: slug ?? undefined,
+          detail: 'blocked by LeetCode',
+        });
+      }
+      return err('blocked by LeetCode', true, true);
+    }
     return err(shortErr(e));
   }
 }
@@ -936,7 +1208,10 @@ function selfKeepAlive(): () => void {
 
 let sharedCache = new RangeSolutionCache();
 
-export function defaultRangeDeps(notify: (text: string) => Promise<void> = async () => undefined): RangeDeps {
+export function defaultRangeDeps(
+  notify: (text: string) => Promise<void> = async () => undefined,
+  onProgress?: (event: RangeProgressEvent) => Promise<void> | void,
+): RangeDeps {
   // A fresh cache per job keeps memory bounded to one range.
   sharedCache = new RangeSolutionCache();
   return {
@@ -947,6 +1222,7 @@ export function defaultRangeDeps(notify: (text: string) => Promise<void> = async
     resolveSlug: (n) => resolveLeetCodeSlugByNumber(n),
     fetchCommunity: (slug, problem, options) => fetchCommunitySolution(slug, problem, options),
     notify,
+    onProgress,
     sleep: abortableSleep,
     isDailyRunInProgress: isRunInProgress,
     now: () => Date.now(),
