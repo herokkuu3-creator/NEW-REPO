@@ -158,6 +158,27 @@ function cgroupUsedMb(): number | null {
   return null;
 }
 
+function cgroupReclaimableMb(): number {
+  const candidates = [
+    '/sys/fs/cgroup/memory.stat',
+    '/sys/fs/cgroup/memory/memory.stat',
+  ];
+  for (const path of candidates) {
+    try {
+      const raw = require('node:fs').readFileSync(path, 'utf8') as string;
+      const match = /^(?:total_)?inactive_file\s+(\d+)$/m.exec(raw);
+      if (match) return Math.max(0, Math.round(Number(match[1]) / 1_048_576));
+    } catch {
+      // try the next cgroup layout
+    }
+  }
+  return 0;
+}
+
+export function availableMemoryMb(limitMb: number, usedMb: number, reclaimableMb: number): number {
+  return Math.max(0, Math.min(limitMb, limitMb - usedMb + Math.max(0, reclaimableMb)));
+}
+
 function freeMemoryMb(): number | null {
   const cgroupLimit = (() => {
     try {
@@ -167,7 +188,7 @@ function freeMemoryMb(): number | null {
   })();
   const limit = Number(process.env.MEMORY_LIMIT_MB ?? cgroupLimit ?? Math.round(os.totalmem() / 1_048_576));
   const used = cgroupUsedMb();
-  return used === null ? Math.round(os.freemem() / 1_048_576) : Math.max(0, limit - used);
+  return used === null ? Math.round(os.freemem() / 1_048_576) : availableMemoryMb(limit, used, cgroupReclaimableMb());
 }
 
 function releaseHeap(): void {
@@ -786,8 +807,9 @@ async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () =>
   const { deadline, signal, requestId } = getAttemptContext()!;
   if (Date.now() >= deadline) throw new BrowserFormError('Browser attempt expired before starting; no submission was sent.', 'blocked');
   const label = request.label ?? request.handle ?? 'account';
+  releaseHeap();
   const available = freeMemoryMb();
-  log({ label, availableMb: available, minimumFreeMb: BROWSER_MIN_FREE_MB }, 'isolated Codeforces browser preflight');
+  log({ label, availableMb: available, minimumFreeMb: BROWSER_MIN_FREE_MB, rawUsedMb: cgroupUsedMb(), reclaimableMb: cgroupReclaimableMb() }, 'isolated Codeforces browser preflight');
   if (available !== null && available < BROWSER_MIN_FREE_MB) {
     return {
       ok: false,
@@ -802,7 +824,6 @@ async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () =>
     };
   }
 
-  releaseHeap();
   const session = await launchFirefox(request.state, label, request.networkMode, request.proxy);
   log({ label, browser: BROWSER_ENGINE, usedMb: cgroupUsedMb() }, 'browser launched for isolated Codeforces submission');
 
@@ -997,15 +1018,17 @@ export const server = http.createServer((req, res) => {
   // Keep this before auth/body parsing so missing ingress proves a Render or
   // connection-boundary failure, before any browser or CAPTCHA code runs.
   const ingressId = req.headers['x-request-id'];
-  log({
-    requestId: typeof ingressId === 'string' ? ingressId : null,
-    method: req.method,
-    path: url.split('?')[0],
-    contentLength: req.headers['content-length'] ?? null,
-    connection: req.headers.connection ?? null,
-  }, 'HTTP request entered isolated submitter');
-  req.on('aborted', () => log({ requestId: typeof ingressId === 'string' ? ingressId : null, method: req.method, path: url.split('?')[0] }, 'HTTP request body aborted'));
-  res.on('close', () => log({ requestId: typeof ingressId === 'string' ? ingressId : null, method: req.method, path: url.split('?')[0], writableEnded: res.writableEnded }, 'HTTP response connection closed'));
+  if (req.method === 'POST' && url === '/submit') {
+    log({
+      requestId: typeof ingressId === 'string' ? ingressId : null,
+      method: req.method,
+      path: url,
+      contentLength: req.headers['content-length'] ?? null,
+      connection: req.headers.connection ?? null,
+    }, 'HTTP request entered isolated submitter');
+    req.on('aborted', () => log({ requestId: typeof ingressId === 'string' ? ingressId : null, method: req.method, path: url }, 'HTTP request body aborted'));
+    res.on('close', () => log({ requestId: typeof ingressId === 'string' ? ingressId : null, method: req.method, path: url, writableEnded: res.writableEnded }, 'HTTP response connection closed'));
+  }
 
   // Public liveness endpoint for Render/UptimeRobot. Keep this path completely
   // independent of the browser, auth token, or Codeforces itself. Support both

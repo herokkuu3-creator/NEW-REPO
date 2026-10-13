@@ -183,7 +183,7 @@ export async function submitViaRemoteSubmitter(
   try {
     response = await fetch(`${url}/submit`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'x-request-id': payload.requestId },
       body: JSON.stringify(payload),
       signal: requestSignal,
     });

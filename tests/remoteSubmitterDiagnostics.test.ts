@@ -22,14 +22,16 @@ function setup() {
 
 it('records the selected request budget and correlates completion without logging credentials or source', async () => {
   const args = setup();
-  vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith('/health')
-    ? { busy: false } : { ok: false, kind: 'blocked', clicked: false, error: 'Controlled fixture verification required' }), { status: 200 })));
+  const request = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith('/health')
+    ? { busy: false } : { ok: false, kind: 'blocked', clicked: false, error: 'Controlled fixture verification required' }), { status: 200 }));
+  vi.stubGlobal('fetch', request);
   await submit(...args, 'proxy', { activeProxy: null, deadline: Date.now() + 1000 });
   const start = logs.info.mock.calls.find(call => call[1] === 'isolated submitter HTTP request started')![0];
   const end = logs.info.mock.calls.find(call => call[1] === 'isolated Codeforces browser submitter finished')![0];
   expect(start.requestTimeoutMs).toBeGreaterThan(0);
   expect(start.requestTimeoutMs).toBeLessThanOrEqual(1000);
   expect(end.requestId).toBe(start.requestId);
+  expect(new Headers(request.mock.calls.find(call => call[0].endsWith('/submit'))![1]?.headers).get('x-request-id')).toBe(start.requestId);
   expect(JSON.stringify(logs.info.mock.calls)).not.toContain('PRIVATE_FIXTURE');
 });
 
