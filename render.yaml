@@ -57,7 +57,7 @@ services:
         value: "15"
       # Firefox may only start once cleanup has released this much memory.
       - key: CODEFORCES_BROWSER_MIN_FREE_MB
-        value: "300"
+        value: "120"
       # Never hold an expensive browser open for a long Cloudflare/Turnstile wait.
       - key: CODEFORCES_TURNSTILE_WAIT_MS
         value: "8000"
@@ -175,6 +175,8 @@ services:
         sync: false
       - key: LOG_LEVEL
         value: info
+      - key: CODEFORCES_BROWSER_MIN_FREE_MB
+        value: "120"
 
 databases:
   - name: leetcode-agent-db

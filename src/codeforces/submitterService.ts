@@ -45,7 +45,7 @@ const BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const NAV_TIMEOUT_MS = Number(process.env.CODEFORCES_NAV_TIMEOUT_MS ?? 60_000);
 const TURNSTILE_WAIT_MS = Math.max(Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 90_000), 60_000);
 const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 50_000);
-const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 300);
+const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 120);
 // Outbound proxy for Firefox, e.g. socks5://127.0.0.1:40000 (the local WARP
 // tunnel started by scripts/start-submitter.sh). Empty = direct connection.
 const PROXY_SERVER = (process.env.CODEFORCES_PROXY ?? '').trim();
@@ -856,7 +856,7 @@ async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () =>
   if (available !== null && available < BROWSER_MIN_FREE_MB) {
     return {
       ok: false,
-      kind: 'blocked',
+      kind: 'submission-error',
       error: `isolated submitter only has ${available}MB free; floor is ${BROWSER_MIN_FREE_MB}MB`,
       status: null,
       finalUrl: '',

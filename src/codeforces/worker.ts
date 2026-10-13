@@ -52,7 +52,7 @@ export function isAlreadySubmittedCodeError(error: string | null | undefined): b
  * the browser before the kernel OOM-kills the service. Demanding a full 520MB
  * free made the browser path impossible by construction.
  */
-const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 300);
+const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 120);
 
 /** Free container memory in MB, or null when the container does not report it. */
 export function availableMemoryMb(): number | null {
@@ -950,7 +950,7 @@ async function postViaLocalBrowser(
   if (available !== null && available < BROWSER_MIN_FREE_MB) {
     return {
       ok: false,
-      kind: 'blocked',
+      kind: 'submission-error',
       error:
         `not starting Firefox locally: only ${available}MB is free after cleanup; the floor is ${BROWSER_MIN_FREE_MB}MB. ` +
         'Set CODEFORCES_SUBMITTER_URL to run the browser in its own free service instead.',
