@@ -427,9 +427,11 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
       } else {
         try {
           await page.addScriptTag({ url: 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit' });
-          apiScriptInjection = await page.evaluate(() => typeof (window as any).turnstile !== 'undefined')
-            ? 'loaded'
-            : 'loaded-without-api';
+          const hasTurnstile = await page.waitForFunction(
+            () => typeof (window as any).turnstile !== 'undefined',
+            { timeout: 3500 }
+          ).then(() => true).catch(() => false);
+          apiScriptInjection = hasTurnstile ? 'loaded' : 'loaded-without-api';
         } catch (err) {
           // Keep the page untouched and log only the error category, never a
           // URL, response body, cookie, or verification token.
