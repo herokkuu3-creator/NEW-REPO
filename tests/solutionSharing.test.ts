@@ -67,6 +67,7 @@ describe('SolutionCache', () => {
 
 const h = vi.hoisted(() => ({
   fetchWalkccc: vi.fn(),
+  fetchCommunity: vi.fn(),
   submit: vi.fn(),
   await: vi.fn(),
   accounts: [] as Array<Record<string, unknown>>,
@@ -89,6 +90,11 @@ vi.mock('../src/solutions/walkccc', async (orig) => ({
   ...((await orig()) as object),
   fetchWalkcccSolution: h.fetchWalkccc,
   signatureMatchesStarter: () => true,
+}));
+
+vi.mock('../src/solutions/communitySolutions', async (orig) => ({
+  ...((await orig()) as object),
+  fetchCommunitySolution: h.fetchCommunity,
 }));
 
 vi.mock('../src/database/accounts', () => ({
@@ -166,6 +172,8 @@ vi.mock('../src/leetcode/apiClient', async (orig) => {
 describe('multi-account run shares one solution', () => {
   beforeEach(() => {
     h.fetchWalkccc.mockReset();
+    h.fetchCommunity.mockReset();
+    h.fetchCommunity.mockRejectedValue(new Error('no community solution'));
     h.submit.mockReset();
     h.await.mockReset();
     h.runs.clear();
@@ -269,5 +277,26 @@ describe('multi-account run shares one solution', () => {
     expect(report.accounts.map((a) => a.kind)).toEqual(['failed', 'solved', 'solved']);
     expect(h.fetchWalkccc).toHaveBeenCalledTimes(2);
     expect(h.submit).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back to community solution when walkccc fails, sharing it across accounts', async () => {
+    const { WalkcccError } = await import('../src/solutions/walkccc');
+    h.fetchWalkccc.mockRejectedValue(new WalkcccError('walkccc 404'));
+    h.fetchCommunity.mockResolvedValue({
+      code: 'class Solution { public: string reverseParentheses(string s) { return s; } };',
+      sourceUrl: 'https://leetcode.com/solutions/test',
+      title: 'Community Solution',
+      uuid: 'comm-123',
+    });
+    vi.resetModules();
+    const { executeDailyRun } = await import('../src/scheduler/dailyWorker');
+
+    const report = await executeDailyRun('trigger-submission');
+
+    expect(report.totals.solved).toBe(3);
+    expect(report.accounts.map((a) => a.kind)).toEqual(['solved', 'solved', 'solved']);
+    expect(h.fetchWalkccc).toHaveBeenCalledTimes(3);
+    expect(h.fetchCommunity).toHaveBeenCalledTimes(1);
+    expect(h.submit).toHaveBeenCalledTimes(3);
   });
 });
