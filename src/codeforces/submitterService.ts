@@ -209,31 +209,67 @@ interface Session {
 
 interface BrowserTrafficMeter {
   record: (url: string, type: string, bytes: number) => void;
-  summary: () => { responses: number; bytes: number; codeforcesBytes: number; challengeBytes: number; otherBytes: number };
+  summary: () => {
+    responses: number;
+    bytes: number;
+    unknownLengthResponses: number;
+    codeforcesResponses: number;
+    challengeResponses: number;
+    otherResponses: number;
+    codeforcesBytes: number;
+    challengeBytes: number;
+    otherBytes: number;
+  };
 }
 
 function createBrowserTrafficMeter(): BrowserTrafficMeter {
   let responses = 0;
   let bytes = 0;
+  let unknownLengthResponses = 0;
+  let codeforcesResponses = 0;
+  let challengeResponses = 0;
+  let otherResponses = 0;
   let codeforcesBytes = 0;
   let challengeBytes = 0;
   let otherBytes = 0;
   return {
     record(url, type, size) {
-      // Only count useful page response bodies. Headers and the proxy tunnel
-      // overhead are provider-specific, but this makes unexpected payloads
-      // visible in the GitHub runner log without recording URLs or secrets.
-      if (!Number.isFinite(size) || size <= 0 || type === 'document' && size > 10 * 1024 * 1024) return;
+      // A response without Content-Length is still evidence that the browser
+      // reached an origin. Count it separately, rather than silently dropping
+      // it; chunked Cloudflare resources commonly omit that header. URLs and
+      // credentials are deliberately never included in this diagnostic.
       responses += 1;
-      bytes += size;
+      const hasUsableLength = Number.isFinite(size) && size > 0 && !(type === 'document' && size > 10 * 1024 * 1024);
+      if (hasUsableLength) bytes += size;
+      else unknownLengthResponses += 1;
       try {
         const host = new URL(url).hostname.toLowerCase();
-        if (host === 'challenges.cloudflare.com' || host.endsWith('.challenges.cloudflare.com')) challengeBytes += size;
-        else if (host === 'codeforces.com' || host.endsWith('.codeforces.com')) codeforcesBytes += size;
-        else otherBytes += size;
-      } catch { otherBytes += size; }
+        if (host === 'challenges.cloudflare.com' || host.endsWith('.challenges.cloudflare.com')) {
+          challengeResponses += 1;
+          if (hasUsableLength) challengeBytes += size;
+        } else if (host === 'codeforces.com' || host.endsWith('.codeforces.com')) {
+          codeforcesResponses += 1;
+          if (hasUsableLength) codeforcesBytes += size;
+        } else {
+          otherResponses += 1;
+          if (hasUsableLength) otherBytes += size;
+        }
+      } catch {
+        otherResponses += 1;
+        if (hasUsableLength) otherBytes += size;
+      }
     },
-    summary: () => ({ responses, bytes, codeforcesBytes, challengeBytes, otherBytes }),
+    summary: () => ({
+      responses,
+      bytes,
+      unknownLengthResponses,
+      codeforcesResponses,
+      challengeResponses,
+      otherResponses,
+      codeforcesBytes,
+      challengeBytes,
+      otherBytes,
+    }),
   };
 }
 
