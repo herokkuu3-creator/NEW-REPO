@@ -9,6 +9,7 @@ export interface CommunitySolution {
   title: string;
   uuid: string;
   author?: string | null;
+  rankIndex?: number;
 }
 
 export class CommunitySolutionError extends Error {
@@ -23,6 +24,18 @@ export interface FetchCommunitySolutionOptions {
   maxArticles?: number;
   page?: Page;
   fetchFn?: typeof fetch;
+  randomize?: boolean;
+  targetIndex?: number;
+  excludeUuids?: string[] | Set<string>;
+}
+
+export interface CommunityArticleNode {
+  uuid: string;
+  title: string;
+  slug: string;
+  topicId?: number;
+  tags?: Array<{ name: string; slug: string }>;
+  author?: { userName?: string; realName?: string };
 }
 
 export const UGC_SOLUTION_ARTICLES_QUERY = `
@@ -277,29 +290,47 @@ function cleanExtractedCode(code: string): string {
   return cleaned.trim();
 }
 
+// In-memory cache for article lists: key = `${questionSlug}:${langTag}:${maxArticles}`
+interface CachedArticleList {
+  timestamp: number;
+  edges: Array<{ node: CommunityArticleNode }>;
+}
+const articleListCache = new Map<string, CachedArticleList>();
+
+// In-memory cache for article raw contents: key = articleId (uuid)
+interface CachedArticleContent {
+  timestamp: number;
+  content: string;
+}
+const articleContentCache = new Map<string, CachedArticleContent>();
+
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+export function clearCommunitySolutionsCache(): void {
+  articleListCache.clear();
+  articleContentCache.clear();
+}
+
 /**
- * Fetches and returns a verified community C++ solution for a LeetCode problem.
- *
- * Sequence:
- * 1. Queries `ugcArticleSolutionArticles` sorted by HOT/most votes, filtered by tag `cpp`.
- * 2. If no tagged articles exist, retries without language tags.
- * 3. Inspects each article via `ugcArticleSolutionArticle` and extracts the C++ block.
- * 4. Validates that the C++ code matches LeetCode's method signature for the problem.
- * 5. Returns the verified solution code and source URL.
+ * Fetches the ranked community solution articles list from LeetCode GraphQL.
+ * Caches results in memory to avoid duplicate network queries across multiple accounts.
  */
-export async function fetchCommunitySolution(
+export async function fetchCommunityArticleList(
   questionSlug: string,
-  problem: ParsedProblem,
   options?: FetchCommunitySolutionOptions,
-): Promise<CommunitySolution> {
+): Promise<Array<{ node: CommunityArticleNode }>> {
   const language = options?.language ?? 'cpp';
   const maxArticles = options?.maxArticles ?? 10;
   const langTag = language === 'cpp' ? 'cpp' : language === 'python3' ? 'python3' : language;
+  const cacheKey = `${questionSlug}:${langTag}:${maxArticles}`;
 
-  logger.info({ questionSlug, language, maxArticles }, 'fetching LeetCode community solutions fallback');
+  const cached = articleListCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS && cached.edges.length > 0) {
+    return cached.edges;
+  }
 
   // 1. Fetch solution articles tagged with the target language
-  let edges: NonNullable<NonNullable<UgcArticlesResponse['ugcArticleSolutionArticles']>['edges']> = [];
+  let edges: Array<{ node: CommunityArticleNode }> = [];
   try {
     const listData = await executeLeetCodeGraphQL<UgcArticlesResponse>(
       UGC_SOLUTION_ARTICLES_QUERY,
@@ -319,7 +350,7 @@ export async function fetchCommunitySolution(
     logger.warn({ questionSlug, err: String(err) }, 'failed to fetch tagged community solution articles; trying untagged');
   }
 
-  // 2. If no tagged articles found, fall back to untagged articles
+  // 2. Fallback to untagged if 0 tagged articles found
   if (edges.length === 0) {
     const untaggedData = await executeLeetCodeGraphQL<UgcArticlesResponse>(
       UGC_SOLUTION_ARTICLES_QUERY,
@@ -337,25 +368,118 @@ export async function fetchCommunitySolution(
     logger.info({ questionSlug, count: edges.length }, 'community solution articles found without language tag');
   }
 
+  if (edges.length > 0) {
+    articleListCache.set(cacheKey, { timestamp: Date.now(), edges });
+  }
+
+  return edges;
+}
+
+/**
+ * Fetches the markdown content for an article ID, caching in-memory.
+ */
+export async function fetchArticleContent(
+  uuid: string,
+  options?: FetchCommunitySolutionOptions,
+): Promise<string | null> {
+  const cached = articleContentCache.get(uuid);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.content;
+  }
+
+  const artData = await executeLeetCodeGraphQL<UgcArticleResponse>(
+    UGC_SOLUTION_ARTICLE_QUERY,
+    { articleId: uuid },
+    options,
+  );
+  const content = artData.ugcArticleSolutionArticle?.content ?? null;
+  if (content) {
+    articleContentCache.set(uuid, { timestamp: Date.now(), content });
+  }
+  return content;
+}
+
+/**
+ * Fetches and returns a verified community C++ solution for a LeetCode problem.
+ *
+ * Supports randomized candidate selection from top 10 results (or targetIndex):
+ * - Picks a random candidate from 1..10 to avoid predictable solution patterns.
+ * - Prioritizes unused candidates across accounts so each account receives a distinct solution.
+ * - Validates C++ syntax and LeetCode method signature.
+ * - Automatically falls back to other candidates among the top results if a candidate is invalid.
+ */
+export async function fetchCommunitySolution(
+  questionSlug: string,
+  problem: ParsedProblem,
+  options?: FetchCommunitySolutionOptions,
+): Promise<CommunitySolution> {
+  const language = options?.language ?? 'cpp';
+  const maxArticles = options?.maxArticles ?? 10;
+  logger.info({ questionSlug, language, maxArticles }, 'fetching LeetCode community solutions');
+
+  const edges = await fetchCommunityArticleList(questionSlug, options);
   if (edges.length === 0) {
     throw new CommunitySolutionError(`no community solution articles found for problem ${questionSlug}`);
   }
 
-  // 3. Inspect articles in rank order until we extract a verified matching solution
-  for (const edge of edges) {
-    const node = edge.node;
-    logger.info({ questionSlug, articleTitle: node.title, uuid: node.uuid }, 'inspecting community solution article');
+  const N = edges.length;
+  const excluded = new Set<string>();
+  if (options?.excludeUuids) {
+    for (const u of options.excludeUuids) excluded.add(u);
+  }
+
+  let inspectionOrder: number[] = [];
+
+  if (options?.targetIndex !== undefined) {
+    const start = Math.max(0, options.targetIndex) % N;
+    const cycle: number[] = [];
+    for (let i = 0; i < N; i++) {
+      cycle.push((start + i) % N);
+    }
+    const unused = cycle.filter((idx) => !excluded.has(edges[idx]!.node.uuid));
+    const used = cycle.filter((idx) => excluded.has(edges[idx]!.node.uuid));
+    inspectionOrder = [...unused, ...used];
+  } else if (options?.randomize === false) {
+    const seq = Array.from({ length: N }, (_, i) => i);
+    const unused = seq.filter((idx) => !excluded.has(edges[idx]!.node.uuid));
+    const used = seq.filter((idx) => excluded.has(edges[idx]!.node.uuid));
+    inspectionOrder = [...unused, ...used];
+  } else {
+    // Randomized variation per account from 1..N
+    const allIndices = Array.from({ length: N }, (_, i) => i);
+    const unusedIndices = allIndices.filter((idx) => !excluded.has(edges[idx]!.node.uuid));
+    const usedIndices = allIndices.filter((idx) => excluded.has(edges[idx]!.node.uuid));
+
+    const shuffle = (arr: number[]) => {
+      const copy = [...arr];
+      for (let i = copy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [copy[i], copy[j]] = [copy[j]!, copy[i]!];
+      }
+      return copy;
+    };
+
+    if (unusedIndices.length > 0) {
+      inspectionOrder = [...shuffle(unusedIndices), ...shuffle(usedIndices)];
+    } else {
+      inspectionOrder = shuffle(allIndices);
+    }
+  }
+
+  const targetChoice = (inspectionOrder[0] ?? 0) + 1;
+  logger.info(
+    { questionSlug, targetResultRank: targetChoice, totalArticles: N, excludedCount: excluded.size },
+    'evaluating community solution articles with randomized target rank',
+  );
+
+  for (const candidateIndex of inspectionOrder) {
+    const node = edges[candidateIndex]!.node;
+    const rank1Based = candidateIndex + 1;
 
     try {
-      const artData = await executeLeetCodeGraphQL<UgcArticleResponse>(
-        UGC_SOLUTION_ARTICLE_QUERY,
-        { articleId: node.uuid },
-        options,
-      );
-
-      const content = artData.ugcArticleSolutionArticle?.content;
+      const content = await fetchArticleContent(node.uuid, options);
       if (!content) {
-        logger.warn({ questionSlug, uuid: node.uuid }, 'community solution article content was empty');
+        logger.warn({ questionSlug, uuid: node.uuid, rank: rank1Based }, 'community solution article content was empty');
         continue;
       }
 
@@ -363,8 +487,15 @@ export async function fetchCommunitySolution(
       if (code) {
         const sourceUrl = `https://leetcode.com/problems/${questionSlug}/solutions/${node.topicId ?? ''}/${node.slug}/`;
         logger.info(
-          { questionSlug, articleTitle: node.title, sourceUrl, codeLength: code.length },
-          'verified community C++ solution obtained',
+          {
+            questionSlug,
+            rank: rank1Based,
+            articleTitle: node.title,
+            sourceUrl,
+            codeLength: code.length,
+            author: node.author?.userName ?? node.author?.realName,
+          },
+          'verified community C++ solution obtained at selected rank',
         );
         return {
           code,
@@ -372,16 +503,23 @@ export async function fetchCommunitySolution(
           title: node.title,
           uuid: node.uuid,
           author: node.author?.userName ?? node.author?.realName ?? null,
+          rankIndex: rank1Based,
         };
       } else {
-        logger.warn({ questionSlug, articleTitle: node.title }, 'article did not contain a matching C++ solution');
+        logger.warn(
+          { questionSlug, rank: rank1Based, articleTitle: node.title },
+          'community article did not contain a matching C++ solution; checking next candidate',
+        );
       }
     } catch (err) {
-      logger.warn({ questionSlug, uuid: node.uuid, err: String(err) }, 'failed to inspect community solution article');
+      logger.warn(
+        { questionSlug, rank: rank1Based, uuid: node.uuid, err: String(err) },
+        'failed to inspect community solution article; checking next candidate',
+      );
     }
   }
 
   throw new CommunitySolutionError(
-    `none of the ${edges.length} inspected community solution articles for ${questionSlug} contained a valid matching ${language} solution`,
+    `none of the ${N} inspected community solution articles for ${questionSlug} contained a valid matching ${language} solution`,
   );
 }

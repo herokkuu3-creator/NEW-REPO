@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  clearCommunitySolutionsCache,
   CommunitySolutionError,
   extractCppCode,
   fetchCommunitySolution,
@@ -123,6 +124,10 @@ class Solution:
 });
 
 describe('fetchCommunitySolution', () => {
+  beforeEach(() => {
+    clearCommunitySolutionsCache();
+  });
+
   it('fetches and extracts the first matching solution article', async () => {
     const mockFetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(init?.body as string);
@@ -282,5 +287,132 @@ public:
         fetchFn: mockFetch as unknown as typeof fetch,
       }),
     ).rejects.toThrow(CommunitySolutionError);
+  });
+
+  it('picks a specific result rank when targetIndex is specified (e.g. 4th result)', async () => {
+    const mockFetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(init?.body as string);
+
+      if (body.query.includes('ugcArticleSolutionArticles')) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              ugcArticleSolutionArticles: {
+                totalNum: 4,
+                edges: [
+                  { node: { uuid: 'art-1', title: 'Result 1', slug: 'r1', topicId: 1 } },
+                  { node: { uuid: 'art-2', title: 'Result 2', slug: 'r2', topicId: 2 } },
+                  { node: { uuid: 'art-3', title: 'Result 3', slug: 'r3', topicId: 3 } },
+                  { node: { uuid: 'art-4', title: 'Result 4', slug: 'r4', topicId: 4 } },
+                ],
+              },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+
+      if (body.query.includes('ugcArticleSolutionArticle')) {
+        const artId = body.variables.articleId;
+        const rank = artId.split('-')[1];
+        return new Response(
+          JSON.stringify({
+            data: {
+              ugcArticleSolutionArticle: {
+                uuid: artId,
+                title: `Result ${rank}`,
+                slug: `r${rank}`,
+                content: `\`\`\`cpp\nclass Solution {\npublic:\n long long maxAlternatingSum(vector<int>& nums) { return ${rank}; }\n};\n\`\`\``,
+              },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+
+      return new Response('{}', { status: 404 });
+    });
+
+    // targetIndex = 3 corresponds to the 4th result (0-indexed)
+    const sol = await fetchCommunitySolution('maximum-alternating-sum-of-squares', mockProblem3727, {
+      fetchFn: mockFetch as unknown as typeof fetch,
+      targetIndex: 3,
+    });
+
+    expect(sol.uuid).toBe('art-4');
+    expect(sol.rankIndex).toBe(4);
+    expect(sol.code).toContain('return 4;');
+  });
+
+  it('guarantees different solutions across accounts by prioritizing unused candidates', async () => {
+    const mockFetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(init?.body as string);
+
+      if (body.query.includes('ugcArticleSolutionArticles')) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              ugcArticleSolutionArticles: {
+                totalNum: 3,
+                edges: [
+                  { node: { uuid: 'art-1', title: 'Sol 1', slug: 's1', topicId: 1 } },
+                  { node: { uuid: 'art-2', title: 'Sol 2', slug: 's2', topicId: 2 } },
+                  { node: { uuid: 'art-3', title: 'Sol 3', slug: 's3', topicId: 3 } },
+                ],
+              },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+
+      if (body.query.includes('ugcArticleSolutionArticle')) {
+        const artId = body.variables.articleId;
+        return new Response(
+          JSON.stringify({
+            data: {
+              ugcArticleSolutionArticle: {
+                uuid: artId,
+                title: artId,
+                slug: artId,
+                content: `\`\`\`cpp\nclass Solution {\npublic:\n long long maxAlternatingSum(vector<int>& nums) { return 0; }\n};\n\`\`\``,
+              },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+
+      return new Response('{}', { status: 404 });
+    });
+
+    const usedUuids = new Set<string>();
+
+    // Account 1
+    const sol1 = await fetchCommunitySolution('maximum-alternating-sum-of-squares', mockProblem3727, {
+      fetchFn: mockFetch as unknown as typeof fetch,
+      excludeUuids: usedUuids,
+    });
+    usedUuids.add(sol1.uuid);
+
+    // Account 2
+    const sol2 = await fetchCommunitySolution('maximum-alternating-sum-of-squares', mockProblem3727, {
+      fetchFn: mockFetch as unknown as typeof fetch,
+      excludeUuids: usedUuids,
+    });
+    usedUuids.add(sol2.uuid);
+
+    // Account 3
+    const sol3 = await fetchCommunitySolution('maximum-alternating-sum-of-squares', mockProblem3727, {
+      fetchFn: mockFetch as unknown as typeof fetch,
+      excludeUuids: usedUuids,
+    });
+    usedUuids.add(sol3.uuid);
+
+    // All 3 solutions must be completely distinct
+    expect(sol1.uuid).not.toBe(sol2.uuid);
+    expect(sol2.uuid).not.toBe(sol3.uuid);
+    expect(sol1.uuid).not.toBe(sol3.uuid);
+    expect(usedUuids.size).toBe(3);
   });
 });

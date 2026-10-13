@@ -62,9 +62,11 @@ const envSchema = z.object({
     .default('cpp'),
 
   // --- Solution source -----------------------------------------------------
-  // 'walkccc' (default): fetch the curated C++ solution from walkccc.me —
-  // no LLM key required. 'llm': generate with an LLM (LLM_PROVIDER etc.).
-  SOLUTION_SOURCE: z.enum(['walkccc', 'llm']).default('walkccc'),
+  // 'community' (default): fetch diversified C++ solutions from LeetCode community
+  //   solutions tab with random index per account; falls back to walkccc.
+  // 'walkccc': fetch from walkccc.me; falls back to community.
+  // 'llm': generate with an LLM (LLM_PROVIDER etc.).
+  SOLUTION_SOURCE: z.enum(['community', 'walkccc', 'llm']).default('community'),
   WALKCCC_BASE_URL: z.string().default('https://walkccc.me/LeetCode'),
 
   // --- Transport -----------------------------------------------------------
@@ -130,7 +132,7 @@ export type Config = Readonly<{
     language: 'cpp' | 'javascript' | 'typescript' | 'python3';
   };
   solution: {
-    source: 'walkccc' | 'llm';
+    source: 'community' | 'walkccc' | 'llm';
     walkcccBaseUrl: string;
   };
   transport: 'api' | 'browser';

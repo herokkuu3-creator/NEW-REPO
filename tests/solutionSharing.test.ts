@@ -279,14 +279,13 @@ describe('multi-account run shares one solution', () => {
     expect(h.submit).toHaveBeenCalledTimes(2);
   });
 
-  it('falls back to community solution when walkccc fails, sharing it across accounts', async () => {
-    const { WalkcccError } = await import('../src/solutions/walkccc');
-    h.fetchWalkccc.mockRejectedValue(new WalkcccError('walkccc 404'));
+  it('uses community solution as primary, fetching diverse candidates per account', async () => {
     h.fetchCommunity.mockResolvedValue({
       code: 'class Solution { public: string reverseParentheses(string s) { return s; } };',
       sourceUrl: 'https://leetcode.com/solutions/test',
       title: 'Community Solution',
       uuid: 'comm-123',
+      rankIndex: 1,
     });
     vi.resetModules();
     const { executeDailyRun } = await import('../src/scheduler/dailyWorker');
@@ -295,8 +294,26 @@ describe('multi-account run shares one solution', () => {
 
     expect(report.totals.solved).toBe(3);
     expect(report.accounts.map((a) => a.kind)).toEqual(['solved', 'solved', 'solved']);
-    expect(h.fetchWalkccc).toHaveBeenCalledTimes(3);
-    expect(h.fetchCommunity).toHaveBeenCalledTimes(1);
+    expect(h.fetchCommunity).toHaveBeenCalledTimes(3);
+    expect(h.fetchWalkccc).toHaveBeenCalledTimes(0);
+    expect(h.submit).toHaveBeenCalledTimes(3);
+  });
+
+  it('falls back to walkccc when community solutions fails', async () => {
+    h.fetchCommunity.mockRejectedValue(new Error('no community solution'));
+    h.fetchWalkccc.mockResolvedValue({
+      code: 'class Solution { public: string reverseParentheses(string s) { return s; } };',
+      sourceUrl: 'u',
+    });
+    vi.resetModules();
+    const { executeDailyRun } = await import('../src/scheduler/dailyWorker');
+
+    const report = await executeDailyRun('trigger-submission');
+
+    expect(report.totals.solved).toBe(3);
+    expect(report.accounts.map((a) => a.kind)).toEqual(['solved', 'solved', 'solved']);
+    expect(h.fetchCommunity).toHaveBeenCalledTimes(3);
+    expect(h.fetchWalkccc).toHaveBeenCalledTimes(1); // Cached by walkcccCache!
     expect(h.submit).toHaveBeenCalledTimes(3);
   });
 });

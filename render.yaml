@@ -84,10 +84,10 @@ services:
       - key: LEETCODE_LANGUAGE
         value: cpp
       # --- Solution source ---------------------------------------------------
-      # walkccc (default): fetch curated C++ solutions from walkccc.me — no LLM
-      # key needed. Set to "llm" to generate with an LLM instead.
+      # community (default): fetch diversified C++ solutions from LeetCode community
+      # solutions with random selection per account; falls back to walkccc.
       - key: SOLUTION_SOURCE
-        value: walkccc
+        value: community
       - key: WALKCCC_BASE_URL
         value: https://walkccc.me/LeetCode
       # api = drive LeetCode's GraphQL + submit endpoints (no HTML page loads,

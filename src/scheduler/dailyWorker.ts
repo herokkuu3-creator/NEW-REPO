@@ -210,7 +210,6 @@ export interface DailyRunOptions {
  * fetched ONCE and shared (see SolutionCache for the exact semantics).
  */
 const walkcccCache = new SolutionCache<WalkcccSolution>();
-const communityCache = new SolutionCache<CommunitySolution>();
 const llmCache = new SolutionCache<string>();
 
 /** Thrown inside the LLM cache producer so a failed solve is not cached. */
@@ -263,10 +262,11 @@ export async function executeDailyRun(
 
     const outcomes: AccountOutcome[] = [];
     const renewalTriggered = reason === 'session-renewal';
+    const usedCommunityUuids = new Set<string>();
     for (const account of accounts) {
       const before = outcomes.length;
       try {
-        outcomes.push(await runForAccount(account, today, forceRun, renewalTriggered));
+        outcomes.push(await runForAccount(account, today, forceRun, renewalTriggered, usedCommunityUuids));
       } catch (err) {
         // runForAccount wraps its own pipeline; this is a last-resort guard
         // so one broken account can never abort the whole batch.
@@ -311,6 +311,7 @@ async function runForAccount(
   today: string,
   forceRun: boolean,
   renewalTriggered = false,
+  usedCommunityUuids: Set<string> = new Set(),
 ): Promise<AccountOutcome> {
   const label = account.label;
 
@@ -480,8 +481,8 @@ async function runForAccount(
       throw err;
     }
 
-    // --- 5) Obtain the solution (walkccc fetch by default; LLM on opt-in) --
-    const solution = await obtainSolution(problem, run, account, username);
+    // --- 5) Obtain the solution (community solution by default; walkccc fallback) --
+    const solution = await obtainSolution(problem, run, account, username, usedCommunityUuids);
     if (!solution.ok) return solution.outcome;
     run = await updateRun(run.id, { solution: solution.code });
 
@@ -496,38 +497,66 @@ async function runForAccount(
       problem.slug,
     );
 
-    // If walkccc solution was submitted but rejected at judge (wrong answer, compile error, runtime error),
-    // retry with community solution from LeetCode solutions section!
-    if (outcome.kind !== 'solved' && outcome.kind !== 'skipped' && outcome.kind !== 'expired' && solution.source === 'walkccc') {
-      logger.warn(
-        { label, problem: problem.slug, verdict: outcome.submissionStatus, err: outcome.error },
-        'walkccc solution was rejected by judge; attempting community solution fallback from LeetCode solutions section',
-      );
-      try {
-        const communityKey = {
-          date: run.date,
-          questionId: `${problem.frontendId}:${problem.slug}`,
-          language: config.llm.language,
-          source: 'community',
-        };
-        const commSol = await communityCache.get(communityKey, () =>
-          fetchCommunitySolution(problem.slug, problem, { language: config.llm.language }),
+    // If solution was submitted but rejected at judge (wrong answer, compile error, runtime error),
+    // retry with fallback: if community failed, try walkccc; if walkccc failed, try community!
+    if (outcome.kind !== 'solved' && outcome.kind !== 'skipped' && outcome.kind !== 'expired') {
+      if (solution.source === 'community') {
+        logger.warn(
+          { label, problem: problem.slug, verdict: outcome.submissionStatus, err: outcome.error },
+          'community solution was rejected by judge; attempting walkccc fallback',
         );
-        if (commSol.code && commSol.code !== solution.code) {
-          logger.info({ label, sourceUrl: commSol.sourceUrl }, 'submitting community solution fallback');
-          run = await updateRun(run.id, { solution: commSol.code });
-          outcome = await submitDailySolutionWithCommentFallback(
-            commSol.code,
-            (code) =>
-              config.transport === 'api'
-                ? submitViaApi(account, username, api, problem, code, run)
-                : submitViaBrowser(account, username, activeSession, problem, code, run),
-            label,
-            problem.slug,
-          );
+        try {
+          const walkKey = {
+            date: run.date,
+            questionId: `${problem.frontendId}:${problem.slug}`,
+            language: config.llm.language,
+            source: 'walkccc',
+          };
+          const walkSol = await walkcccCache.get(walkKey, () => fetchWalkcccSolution(problem.frontendId));
+          if (signatureMatchesStarter(walkSol.code, problem) && walkSol.code !== solution.code) {
+            logger.info({ label, sourceUrl: walkSol.sourceUrl }, 'submitting walkccc fallback');
+            run = await updateRun(run.id, { solution: walkSol.code });
+            outcome = await submitDailySolutionWithCommentFallback(
+              walkSol.code,
+              (code) =>
+                config.transport === 'api'
+                  ? submitViaApi(account, username, api, problem, code, run)
+                  : submitViaBrowser(account, username, activeSession, problem, code, run),
+              label,
+              problem.slug,
+            );
+          }
+        } catch (walkErr) {
+          logger.warn({ label, err: walkErr instanceof Error ? walkErr.message : String(walkErr) }, 'walkccc fallback attempt failed');
         }
-      } catch (commErr) {
-        logger.warn({ label, err: commErr instanceof Error ? commErr.message : String(commErr) }, 'community fallback attempt failed');
+      } else if (solution.source === 'walkccc') {
+        logger.warn(
+          { label, problem: problem.slug, verdict: outcome.submissionStatus, err: outcome.error },
+          'walkccc solution was rejected by judge; attempting community solution fallback',
+        );
+        try {
+          const commSol = await fetchCommunitySolution(problem.slug, problem, {
+            language: config.llm.language,
+            excludeUuids: usedCommunityUuids,
+            randomize: true,
+          });
+          if (commSol.code && commSol.code !== solution.code) {
+            usedCommunityUuids.add(commSol.uuid);
+            logger.info({ label, sourceUrl: commSol.sourceUrl, rank: commSol.rankIndex }, 'submitting community fallback');
+            run = await updateRun(run.id, { solution: commSol.code });
+            outcome = await submitDailySolutionWithCommentFallback(
+              commSol.code,
+              (code) =>
+                config.transport === 'api'
+                  ? submitViaApi(account, username, api, problem, code, run)
+                  : submitViaBrowser(account, username, activeSession, problem, code, run),
+              label,
+              problem.slug,
+            );
+          }
+        } catch (commErr) {
+          logger.warn({ label, err: commErr instanceof Error ? commErr.message : String(commErr) }, 'community fallback attempt failed');
+        }
       }
     }
 
@@ -590,7 +619,7 @@ async function submitDailySolutionWithCommentFallback(
 // ---------------------------------------------------------------------------
 
 type SolutionResult =
-  | { ok: true; code: string; source: 'walkccc' | 'community' | 'llm' }
+  | { ok: true; code: string; source: 'walkccc' | 'community' | 'llm'; uuid?: string; rankIndex?: number }
   | { ok: false; outcome: AccountOutcome };
 
 async function obtainSolution(
@@ -598,6 +627,7 @@ async function obtainSolution(
   run: DailyRunRecord,
   account: AccountRecord,
   username: string,
+  usedCommunityUuids: Set<string> = new Set(),
 ): Promise<SolutionResult> {
   const cacheKey = {
     date: run.date,
@@ -606,56 +636,58 @@ async function obtainSolution(
     source: config.solution.source,
   };
 
-  if (config.solution.source === 'walkccc') {
-    let walkcccFailedReason: string | null = null;
+  if (config.solution.source !== 'llm') {
+    // 1. PRIMARY: LeetCode Community Solutions with random 1..10 selection per account
+    let communityFailedReason: string | null = null;
     try {
-      const sol = await walkcccCache.get(cacheKey, () => fetchWalkcccSolution(problem.frontendId));
-      // Guard: walkccc's method name must match LeetCode's C++ starter, or the
-      // submission is a guaranteed compile error.
-      if (signatureMatchesStarter(sol.code, problem)) {
-        logger.info({ label: account.label, sourceUrl: sol.sourceUrl }, 'solution obtained from walkccc');
-        return { ok: true, code: sol.code, source: 'walkccc' };
-      }
-      walkcccFailedReason =
-        'walkccc solution signature does not match the LeetCode C++ starter for this problem — falling back to community solutions';
-      logger.warn({ label: account.label, sourceUrl: sol.sourceUrl }, walkcccFailedReason);
-    } catch (err) {
-      if (err instanceof WalkcccError) {
-        walkcccFailedReason = err.message;
-        logger.warn(
-          { label: account.label, err: err.message },
-          'walkccc solution unavailable — falling back to LeetCode community solutions',
-        );
-      } else {
-        throw err;
-      }
+      const commSol = await fetchCommunitySolution(problem.slug, problem, {
+        language: config.llm.language,
+        excludeUuids: usedCommunityUuids,
+        randomize: true,
+      });
+      usedCommunityUuids.add(commSol.uuid);
+      logger.info(
+        {
+          label: account.label,
+          rank: commSol.rankIndex,
+          sourceUrl: commSol.sourceUrl,
+          title: commSol.title,
+          uuid: commSol.uuid,
+        },
+        'solution obtained from LeetCode community solutions (random candidate)',
+      );
+      return {
+        ok: true,
+        code: commSol.code,
+        source: 'community',
+        uuid: commSol.uuid,
+        rankIndex: commSol.rankIndex,
+      };
+    } catch (commErr) {
+      communityFailedReason = commErr instanceof Error ? commErr.message : String(commErr);
+      logger.warn(
+        { label: account.label, err: communityFailedReason },
+        'LeetCode community solution unavailable — falling back to walkccc',
+      );
     }
 
-    // Community solutions fallback (LeetCode UI / Solutions section)
+    // 2. FALLBACK: Walkccc
+    const walkCacheKey = {
+      ...cacheKey,
+      source: 'walkccc',
+    };
     try {
-      const communityKey = {
-        date: run.date,
-        questionId: `${problem.frontendId}:${problem.slug}`,
-        language: config.llm.language,
-        source: 'community',
-      };
-      const commSol = await communityCache.get(communityKey, () =>
-        fetchCommunitySolution(problem.slug, problem, { language: config.llm.language }),
-      );
-      logger.info(
-        { label: account.label, sourceUrl: commSol.sourceUrl, title: commSol.title },
-        'solution obtained from LeetCode community solutions fallback',
-      );
-      return { ok: true, code: commSol.code, source: 'community' };
-    } catch (commErr) {
-      const detail = commErr instanceof Error ? commErr.message : String(commErr);
-      logger.error(
-        { label: account.label, err: detail, walkcccFailedReason },
-        'community solution fallback also failed',
-      );
-      const reportedError = walkcccFailedReason
-        ? `${walkcccFailedReason}; community fallback failed: ${detail}`
-        : detail;
+      const sol = await walkcccCache.get(walkCacheKey, () => fetchWalkcccSolution(problem.frontendId));
+      if (signatureMatchesStarter(sol.code, problem)) {
+        logger.info({ label: account.label, sourceUrl: sol.sourceUrl }, 'solution obtained from walkccc fallback');
+        return { ok: true, code: sol.code, source: 'walkccc' };
+      }
+      const walkcccFailedReason =
+        'walkccc solution signature does not match the LeetCode C++ starter for this problem';
+      logger.warn({ label: account.label, sourceUrl: sol.sourceUrl }, walkcccFailedReason);
+      const reportedError = communityFailedReason
+        ? `Community solution failed: ${communityFailedReason}; Walkccc fallback failed: ${walkcccFailedReason}`
+        : walkcccFailedReason;
       await finishRun(account, username, run, RunState.SOLUTION_VALIDATION_FAILED, { error: reportedError });
       return {
         ok: false,
@@ -667,6 +699,25 @@ async function obtainSolution(
           error: reportedError,
         },
       };
+    } catch (err) {
+      if (err instanceof WalkcccError) {
+        const reportedError = communityFailedReason
+          ? `Community solution failed: ${communityFailedReason}; Walkccc fallback failed: ${err.message}`
+          : err.message;
+        logger.error({ label: account.label, err: reportedError }, 'both community solution and walkccc fallback failed');
+        await finishRun(account, username, run, RunState.SOLUTION_VALIDATION_FAILED, { error: reportedError });
+        return {
+          ok: false,
+          outcome: {
+            label: account.label,
+            username,
+            kind: 'failed',
+            state: RunState.SOLUTION_VALIDATION_FAILED,
+            error: reportedError,
+          },
+        };
+      }
+      throw err;
     }
   }
 
