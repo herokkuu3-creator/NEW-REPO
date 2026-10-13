@@ -400,6 +400,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   let nextExecuteAt = startedAt + 5_000;
   const MAX_EXECUTE_RETRIES = 4;
   let apiScriptInjected = false;
+  let apiScriptInjection = 'not-attempted';
   let widgetRendered = false;
   let renderAttempt = '';
   let executeAttempt = '';
@@ -420,11 +421,23 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     }
 
     if (!apiScriptInjected && Date.now() - startedAt >= 1_000) {
-      apiScriptInjected = true;
       const hasApi = await page.evaluate(() => typeof (window as any).turnstile !== 'undefined').catch(() => false);
-      if (!hasApi) {
-        await page.addScriptTag({ url: 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit' }).catch(() => {});
+      if (hasApi) {
+        apiScriptInjection = 'already-present';
+      } else {
+        try {
+          await page.addScriptTag({ url: 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit' });
+          apiScriptInjection = await page.evaluate(() => typeof (window as any).turnstile !== 'undefined')
+            ? 'loaded'
+            : 'loaded-without-api';
+        } catch (err) {
+          // Keep the page untouched and log only the error category, never a
+          // URL, response body, cookie, or verification token.
+          apiScriptInjection = `failed:${err instanceof Error ? err.name : 'unknown'}`;
+          logWarn({ apiScriptInjection }, 'Turnstile API script failed to load on the submit form');
+        }
       }
+      apiScriptInjected = true;
     }
 
     if (!widgetRendered && Date.now() - startedAt >= 1_500) {
@@ -511,9 +524,9 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
     responseInputPresent: !!document.querySelector('form:has(textarea[name="source"]) input[name="cf-turnstile-response"]'),
     widgetId: (document.querySelector('form:has(textarea[name="source"]) .cf-turnstile') as HTMLElement | null)?.dataset.widgetId ?? null,
   }));
-  logWarn({ ...diagnostics, timeoutMs, renderAttempt, executeAttempt, executeCount }, 'form verification ended without a token; no submission sent');
+  logWarn({ ...diagnostics, timeoutMs, apiScriptInjection, renderAttempt, executeAttempt, executeCount }, 'form verification ended without a token; no submission sent');
   throw new BrowserFormError(
-    `Codeforces Turnstile did not issue a token within ${timeoutMs}ms (${JSON.stringify({ ...diagnostics, renderAttempt, executeAttempt, executeCount })}). ` +
+    `Codeforces Turnstile did not issue a token within ${timeoutMs}ms (${JSON.stringify({ ...diagnostics, apiScriptInjection, renderAttempt, executeAttempt, executeCount })}). ` +
     'No submission was sent. Complete verification in a supported browser or use an accessible submitter connection.',
     'blocked',
     { turnstile: false, interactive: diagnostics.iframePresent },

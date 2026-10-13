@@ -9,6 +9,7 @@ export function collectVerificationInventory(selectedSitekey: string | null) {
     form: form?.querySelectorAll(selector).length ?? 0,
   });
   const frames = Array.from(document.querySelectorAll('iframe'));
+  const scripts = Array.from(document.scripts);
   const frameOrigins = frames.slice(0, 20).map(frame => {
     let origin = 'unavailable';
     try { origin = new URL(frame.getAttribute('src') ?? '', document.baseURI).origin; } catch {}
@@ -31,6 +32,12 @@ export function collectVerificationInventory(selectedSitekey: string | null) {
     frameCount: frames.length,
     framesTruncated: frames.length > 20,
     frameOrigins,
+    scriptOrigins: scripts.slice(0, 20).map(script => {
+      const src = script.getAttribute('src');
+      if (!src) return 'inline';
+      try { return new URL(src, document.baseURI).origin; } catch { return 'unavailable'; }
+    }),
+    scriptsTruncated: scripts.length > 20,
     selectedKeyPresent: !!selectedSitekey,
     selectedKeyMatchesInForm: matches.filter(el => form?.contains(el)).length,
     selectedKeyMatchesOutsideForm: matches.filter(el => !form?.contains(el)).length,

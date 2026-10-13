@@ -22,6 +22,7 @@ it('distinguishes mixed markers inside/outside the form without exposing keys or
   expect(result.selectedKeyMatchesInForm).toBe(0);
   expect(result.selectedKeyMatchesOutsideForm).toBe(1);
   expect(result.frameOrigins).toEqual([{ origin: 'https://example.invalid', inForm: true }]);
+  expect(result.scriptOrigins).toEqual([]);
   expect(JSON.stringify(result)).not.toContain('PRIVATE_');
   expect(await page.content()).toBe(before);
   await page.close();
