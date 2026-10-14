@@ -114,6 +114,8 @@ export {
 import {
   solveTurnstileOrchestrated,
   solveCloudflareOrchestrated,
+  solveTurnstileWithCapzy,
+  solveCloudflareWithCapzy,
 } from './captchaSolver';
 
 async function injectTurnstileToken(form: ReturnType<Page['locator']>, token: string, callbackName?: string | null): Promise<void> {
@@ -349,6 +351,38 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
           await injectTurnstileToken(form, solution.token!, info.callback);
           return;
         }
+
+        // Direct Capzy fallback if orchestrated solver didn't yield a token
+        log({}, 'ensureFormTurnstile: orchestrated solver did not yield a token; invoking direct Capzy fallback');
+        const capzySolution = await solveTurnstileWithCapzy(
+          page.url(),
+          info.sitekey,
+          proxyUrl,
+          userAgent,
+          timeoutMs,
+          info.action ?? undefined,
+          info.cdata ?? undefined,
+          overrideKeys,
+        );
+        if (capzySolution?.cookies) {
+          const cookieList = Object.entries(capzySolution.cookies)
+            .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+            .map(([name, value]) => ({
+              name,
+              value,
+              domain: '.codeforces.com',
+              path: '/',
+            }));
+          if (cookieList.length > 0) {
+            log({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'ensureFormTurnstile: injecting direct Capzy clearance cookies');
+            await page.context().addCookies(cookieList).catch(() => {});
+          }
+        }
+        if (capzySolution?.token) {
+          log({ tokenLength: capzySolution.token.length }, 'ensureFormTurnstile: direct Capzy solved Turnstile, injecting token');
+          await injectTurnstileToken(form, capzySolution.token, info.callback);
+          return;
+        }
       } else {
         const cloudflareSol = await solveCloudflareOrchestrated({
           websiteURL: page.url(),
@@ -379,6 +413,38 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         if (hasCfSolToken) {
           log({ tokenLength: cloudflareSol.token!.length, source: cloudflareSol.source }, 'ensureFormTurnstile: injecting Cloudflare token');
           await injectTurnstileToken(form, cloudflareSol.token!, info.callback);
+          return;
+        }
+
+        // Direct Capzy fallback
+        log({}, 'ensureFormTurnstile: orchestrated Cloudflare solver did not yield a token; invoking direct Capzy fallback');
+        const capzySol = await solveCloudflareWithCapzy(
+          page.url(),
+          proxyUrl,
+          userAgent,
+          timeoutMs,
+          undefined,
+          undefined,
+          undefined,
+          overrideKeys,
+        );
+        if (capzySol?.cookies) {
+          const cookieList = Object.entries(capzySol.cookies)
+            .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+            .map(([name, value]) => ({
+              name,
+              value,
+              domain: '.codeforces.com',
+              path: '/',
+            }));
+          if (cookieList.length > 0) {
+            log({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'ensureFormTurnstile: injecting direct Capzy clearance cookies');
+            await page.context().addCookies(cookieList).catch(() => {});
+          }
+        }
+        if (capzySol?.token) {
+          log({ tokenLength: capzySol.token.length }, 'ensureFormTurnstile: direct Capzy solved Cloudflare, injecting token');
+          await injectTurnstileToken(form, capzySol.token, info.callback);
           return;
         }
       }
@@ -503,6 +569,42 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   await awaitSolver();
   if (await hasToken()) {
     return { turnstile: true, interactive: false };
+  }
+
+  // Emergency final Capzy solve attempt before declaring verification failure
+  if (!await hasToken() && widgetInfo.sitekey) {
+    log({}, 'ensureFormTurnstile: final emergency Capzy Turnstile solve attempt');
+    const emergencySol = await solveTurnstileWithCapzy(
+      page.url(),
+      widgetInfo.sitekey,
+      proxyUrl,
+      await page.evaluate(() => navigator.userAgent).catch(() => undefined),
+      35_000,
+      widgetInfo.action ?? undefined,
+      widgetInfo.cdata ?? undefined,
+      overrideKeys,
+    ).catch(() => null);
+
+    if (emergencySol?.cookies) {
+      const cookieList = Object.entries(emergencySol.cookies)
+        .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+        .map(([name, value]) => ({
+          name,
+          value,
+          domain: '.codeforces.com',
+          path: '/',
+        }));
+      if (cookieList.length > 0) {
+        await page.context().addCookies(cookieList).catch(() => {});
+      }
+    }
+    if (emergencySol?.token) {
+      log({ tokenLength: emergencySol.token.length }, 'ensureFormTurnstile: emergency Capzy solved Turnstile, injecting token');
+      await injectTurnstileToken(form, emergencySol.token, widgetInfo.callback);
+      if (await hasToken()) {
+        return { turnstile: true, interactive: false };
+      }
+    }
   }
 
   // If no Turnstile widget is present on the form, but clearance cookies are present and submit button is enabled,

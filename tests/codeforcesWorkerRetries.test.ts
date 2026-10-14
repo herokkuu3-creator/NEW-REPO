@@ -65,7 +65,7 @@ it('ends after three failed attempts, reports the final failure and preserves th
   expect(mocks.outcomes.mock.calls[1][0]).toMatchObject({ label: 'second', kind: 'failed', performed: false, error: 'Runner unavailable before opening browser (GitHub browser)' });
 });
 
-it('pauses a challenged account at its first failure without skipping its source or stopping other accounts', async () => {
+it('retries a challenged account automatically with solver clearance and never sends manual submission documents', async () => {
   vi.useFakeTimers();
   mocks.post.mockResolvedValueOnce({ ...blocked, error: 'Codeforces Turnstile did not issue a token within 35000ms' })
     .mockResolvedValue(posted);
@@ -73,12 +73,8 @@ it('pauses a challenged account at its first failure without skipping its source
   await vi.runAllTimersAsync();
   const report = await run;
   const { sendTelegramDocument } = await import('../src/notifications/telegram');
-  expect(mocks.post.mock.calls.map(call => call[1])).toEqual(['first', 'second', 'second', 'second']);
-  expect(mocks.complete.mock.calls.every(([id]) => id === 'a2')).toBe(true);
-  expect(sendTelegramDocument).toHaveBeenCalledWith('8B.cpp', 'int main() {return 0;}', expect.stringContaining('https://codeforces.com/problemset/submit/8/B'));
-  expect(mocks.outcomes.mock.calls[0][0]).toMatchObject({ kind: 'pending', performed: false, note: expect.stringContaining('source file') });
-  expect(mocks.outcomes).toHaveBeenCalledTimes(4);
-  expect(report?.totals).toMatchObject({ solved: 3, failed: 0, pending: 1 });
+  expect(sendTelegramDocument).not.toHaveBeenCalled();
+  expect(report?.totals).toMatchObject({ solved: 6, failed: 0 });
 });
 
 it('never marks an unsubmitted source completed after repeated transport failures in a batch', async () => {

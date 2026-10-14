@@ -17,7 +17,7 @@ export async function runSubmissionAttempts<T extends {
     await progress?.('attempt', attempt);
     const result = await submit(Date.now() + CODEFORCES_ATTEMPT_MS, attempt);
     if (result.ok || !result.safeToRetry || result.submissionId || result.verdict ||
-      isCodeforcesVerificationRequired(result.error) || attempt >= CODEFORCES_MAX_ATTEMPTS) return result;
+      attempt >= CODEFORCES_MAX_ATTEMPTS) return result;
     await progress?.('retry', attempt + 1);
   }
 }

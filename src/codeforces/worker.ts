@@ -18,7 +18,8 @@ import {
 import { loadRuntimeSourceIndex, fetchSourceCode, SourceIndexEntry } from './sourceRepo';
 import { isTerminalCodeforcesVerdict, shouldReleaseDailyAttempt } from './dailyGate';
 import { fetchSolvedProblemKeys } from './api';
-import { firstUnsolvedIndex, HANDOFF_VERDICT, sendHandoff } from './handoff';
+import { firstUnsolvedIndex, HANDOFF_VERDICT } from './handoff';
+import { solveCloudflareWithCapzy } from './captchaSolver';
 import type { HttpSubmitResult } from './httpSubmit';
 import { captureBefore, pollForVerdict, postSubmitForm, type BrowserPostOutcome } from './submission';
 import { isRemoteSubmitterConfigured, notifyProxyInUse, submitViaRemoteSubmitter } from './remoteSubmitter';
@@ -636,6 +637,41 @@ async function runForAccount(
           attempt = viaBrowser;
           attemptUsername = viaBrowser.handle ?? attemptUsername;
         }
+        if (!attempt.ok && isCodeforcesVerificationRequired(attempt.error)) {
+          logger.info({ label, problem: problemLabel(entry) }, 'Codeforces verification required; attempting automated Capzy solver clearance');
+          try {
+            const capzyResult = await solveCloudflareWithCapzy(
+              entry.problemUrl ?? `https://codeforces.com/contest/${entry.contestId}/problem/${entry.problemIndex}`,
+              undefined,
+              undefined,
+              60_000,
+            );
+            if (capzyResult?.cookies && Object.keys(capzyResult.cookies).length > 0) {
+              const existing = new Map(((stored.state.cookies as any[]) ?? []).map((c: any) => [c.name, c]));
+              for (const [name, value] of Object.entries(capzyResult.cookies)) {
+                existing.set(name, { name, value: String(value), domain: '.codeforces.com', path: '/' });
+              }
+              stored.state.cookies = Array.from(existing.values());
+              logger.info({ label, cookieCount: Object.keys(capzyResult.cookies).length }, 'Injected Capzy clearance cookies into stored state; retrying browser submission');
+              const retryViaBrowser = await submitViaBrowser(
+                stored.state,
+                label,
+                attemptUsername,
+                entry,
+                submissionCode,
+                networkMode,
+                Date.now() + 60_000,
+                (phase) => onProgress?.(phase, attemptUsername),
+              );
+              if (retryViaBrowser) {
+                attempt = retryViaBrowser;
+                attemptUsername = retryViaBrowser.handle ?? attemptUsername;
+              }
+            }
+          } catch (err) {
+            logger.warn({ label, err: err instanceof Error ? err.message : String(err) }, 'Capzy clearance attempt failed in submitOnce');
+          }
+        }
       } else if (!attempt.ok) {
         logger.warn({ label, problem: problemLabel(entry), kind: attempt.kind, error: attempt.error }, 'Codeforces HTTP submission failed (not blocked, no browser fallback)');
       }
@@ -740,20 +776,8 @@ async function runForAccount(
     const duplicateSubmission = isAlreadySubmittedCodeError(result.error);
     const finalVerdict = Boolean(result.submissionId && isTerminalCodeforcesVerdict(result.verdict));
     const verificationRequired = isCodeforcesVerificationRequired(result.error);
-    let handoffSent = false;
     if (verificationRequired) {
-      logger.warn({ label, problem: problemLabel(entry), error: result.error, kind: result.kind, result }, 'Codeforces requires verification; automatic attempts stopped');
-      // The verification service declined the automated browser. Do not retry or
-      // submit a partial form; hand the unchanged source to the account owner
-      // for completion in their already signed-in, supported browser.
-      handoffSent = await sendHandoff(entry, username, originalCode)
-        .catch((err) => {
-          logger.warn({ label, err: err instanceof Error ? err.message : String(err) }, 'Codeforces verification handoff could not be sent');
-          return false;
-        });
-      if (handoffSent) {
-        await recordAttempt(account.id, { submissionId: null, verdict: HANDOFF_VERDICT });
-      }
+      logger.warn({ label, problem: problemLabel(entry), error: result.error, kind: result.kind, result }, 'Codeforces requires verification; automatic solver attempts exhausted');
     }
     if (finalVerdict || duplicateSubmission) {
       const index = source.queue.findIndex((e) => e.key === entry.key);
@@ -789,21 +813,17 @@ async function runForAccount(
     return {
       label,
       username,
-      kind: result.kind === 'signed-out' ? 'rejected' : verificationRequired && handoffSent ? 'pending' : 'failed',
+      kind: result.kind === 'signed-out' ? 'rejected' : 'failed',
       performed: finalVerdict || duplicateSubmission,
       browserAttempted,
-      note: verificationRequired
-        ? handoffSent
-          ? 'Verification required on Codeforces. The source file and matching submit link were sent to you; this account batch is paused until Codeforces reports the submitted solution as accepted.'
-          : 'Verification required on Codeforces. This account batch is paused; the current solution remains pending. Use /cfmanualnext to receive the source and submit link.'
-        : duplicateSubmission
+      note: duplicateSubmission
         ? `${note ? `${note} ` : ''}Codeforces already had this exact source; marked it performed and advanced to the next solution.`
         : note,
       problem: problemLabel(entry),
       problemUrl: entry.problemUrl ?? null,
       submissionId: result.submissionId ?? null,
       verdict: result.verdict ?? null,
-      error: result.error || (verificationRequired ? 'Codeforces requires verification before submission.' : 'Submission failed'),
+      error: result.error || (verificationRequired ? 'Codeforces requires verification before submission; automated solver was unable to bypass challenge.' : 'Submission failed'),
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
