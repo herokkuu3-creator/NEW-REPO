@@ -1,8 +1,14 @@
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import { buildLaunchArgs } from '../browser/playwright';
 import { applyStealthScripts, getRandomDesktopViewport } from '../browser/stealth';
+import {
+  solveCloudflareOrchestrated,
+  solveTurnstileOrchestrated,
+  CLOUDFLARE_UNIVERSAL_SITEKEY,
+  LEETCODE_TURNSTILE_SITEKEY,
+  getLastCapzyError,
+} from '../codeforces/captchaSolver';
 import { DEFAULT_DESKTOP_CHROME_USER_AGENT } from '../codeforces/browserForm';
-import { solveCloudflareOrchestrated, LEETCODE_TURNSTILE_SITEKEY, getLastCapzyError } from '../codeforces/captchaSolver';
 import { StorageStateShape } from '../browser/cookiePayload';
 import { logger } from '../logger';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
@@ -110,26 +116,19 @@ export async function loginToLeetCode(
       return { ok: false, error: `LeetCode login page returned HTTP ${gotoRes.status()}` };
     }
 
-    // Wait for initial render
-    await new Promise((r) => setTimeout(r, 2000));
-
-    // Check for Cloudflare Turnstile or Managed Challenge on page
-    const turnstileFrame = page.locator('iframe[src*="challenges.cloudflare.com"]');
-    const hasTurnstile = (await turnstileFrame.count().catch(() => 0)) > 0;
-    const isCloudflareChallenge =
+    // Phase 1: Check for full-page Cloudflare interstitial ("Just a moment...")
+    const isCloudflareInterstitial =
       (await page.title().catch(() => '')).toLowerCase().includes('just a moment') ||
-      (await page.locator('text=/just a moment|checking your browser|verify you are human/i').count().catch(() => 0)) > 0 ||
-      (await page.locator('input[name="cf-turnstile-response"]').count().catch(() => 0)) > 0;
+      (await page.locator('text=/just a moment|checking your browser|verify you are human/i').count().catch(() => 0)) > 0;
 
-    if (hasTurnstile || isCloudflareChallenge) {
-      await notify('🧩 Detected Cloudflare Turnstile verification. Solving…');
-      logger.info('Cloudflare Turnstile detected on LeetCode login page; solving via orchestrated solver');
-      const sitekey = await extractTurnstileSitekey(page);
+    if (isCloudflareInterstitial) {
+      await notify('🧩 Detected Cloudflare verification challenge. Solving…');
+      logger.info('Cloudflare interstitial detected on LeetCode login page; solving via orchestrated solver');
 
       const currentCookies = await context.cookies('https://leetcode.com').catch(() => []);
       const solved = await solveCloudflareOrchestrated({
         websiteURL: page.url(),
-        sitekey,
+        sitekey: CLOUDFLARE_UNIVERSAL_SITEKEY,
         proxyUrl: options?.proxyUrl,
         userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
         cookies: currentCookies,
@@ -146,49 +145,19 @@ export async function loginToLeetCode(
         await context.addCookies(newCookies).catch(() => {});
       }
 
-      if (solved?.token) {
-        try {
-          if (!page.isClosed()) {
-            await page.evaluate((token) => {
-              const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], input[name="turnstileToken"]');
-              for (const input of Array.from(inputs)) {
-                (input as HTMLInputElement).value = token;
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-            }, solved.token).catch(() => null);
-          }
-        } catch {}
-      }
-
-      // If Turnstile was required and solver failed to return a token or clearance cookies,
-      // abort immediately with explicit diagnostic message rather than failing 40s later on submit.
-      if (!solved?.token && !solved?.cookies && !solved?.cfClearance) {
-        const capzyErr = getLastCapzyError();
-        const errDetail = capzyErr ? `: ${capzyErr}` : '';
-        return {
-          ok: false,
-          error: `Cloudflare Turnstile verification challenge could not be solved${errDetail}. Please add a funded API key via /addcapzy <key>.`,
-        };
-      }
-
-      // ONLY reload the page if this was a full Cloudflare interstitial "Just a moment..." challenge.
-      // Do NOT reload for regular embedded Turnstile on the login form, as reloading clears the injected token!
-      if (isCloudflareChallenge) {
-        page = await ensureHealthyPage(context, page, 'https://leetcode.com/accounts/login/');
-        await notify('🔄 Reloading LeetCode login page with clearance cookies…');
-        await page.goto('https://leetcode.com/accounts/login/', {
-          waitUntil: 'domcontentloaded',
-          timeout: 30_000,
-        }).catch(async () => {
-          page = await context.newPage();
-          await page.goto('https://leetcode.com/accounts/login/', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
-        });
-        await new Promise((r) => setTimeout(r, 2000));
-      }
+      page = await ensureHealthyPage(context, page, 'https://leetcode.com/accounts/login/');
+      await notify('🔄 Reloading LeetCode login page with clearance cookies…');
+      await page.goto('https://leetcode.com/accounts/login/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 30_000,
+      }).catch(async () => {
+        page = await context.newPage();
+        await page.goto('https://leetcode.com/accounts/login/', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
+      });
+      await new Promise((r) => setTimeout(r, 2000));
     }
 
-    // Locate login inputs with robust multi-selector support
+    // Phase 2: Locate login inputs with robust multi-selector support
     const usernameSelector = 'input#id_login, input[name="username"], input[name="login"], input[placeholder*="Username" i], input[placeholder*="E-mail" i], input[autocomplete="username"]';
     const passwordSelector = 'input#id_password, input[name="password"], input[type="password"], input[autocomplete="current-password"]';
     const submitSelector = 'button#signin_btn, button[type="submit"], button:has-text("Sign In"), button:has-text("Log In"), input[type="submit"]';
@@ -222,6 +191,76 @@ export async function loginToLeetCode(
     await passwordInputEl.dispatchEvent('blur').catch(() => null);
     await new Promise((r) => setTimeout(r, 500));
 
+    // Phase 3: Mandatory Cloudflare Turnstile Solve & Token Injection
+    // Check if the page has already acquired a valid Turnstile token
+    let existingToken = await page.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"], input[name="turnstileToken"]')) as HTMLInputElement[];
+      for (const input of inputs) {
+        if (input.value && input.value.trim().length > 20) {
+          return input.value.trim();
+        }
+      }
+      return null;
+    }).catch(() => null);
+
+    if (!existingToken) {
+      await notify('🧩 Solving Cloudflare Turnstile verification…');
+      logger.info('Solving Cloudflare Turnstile verification before submitting LeetCode credentials');
+      const sitekey = await extractTurnstileSitekey(page);
+
+      const solved = await solveTurnstileOrchestrated({
+        siteurl: page.url(),
+        sitekey: sitekey || CLOUDFLARE_UNIVERSAL_SITEKEY,
+        proxyUrl: options?.proxyUrl,
+        userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
+        timeoutMs: Math.min(timeoutMs, 45_000),
+      });
+
+      if (solved?.cookies) {
+        const newCookies = Object.entries(solved.cookies).map(([name, value]) => ({
+          name,
+          value,
+          domain: '.leetcode.com',
+          path: '/',
+        }));
+        await context.addCookies(newCookies).catch(() => {});
+      }
+
+      if (solved?.token) {
+        existingToken = solved.token;
+        await page.evaluate((token) => {
+          let injected = false;
+          const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], input[name="turnstileToken"]');
+          for (const input of Array.from(inputs)) {
+            (input as HTMLInputElement).value = token;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            injected = true;
+          }
+          if (!injected) {
+            const hidden = document.createElement('input');
+            hidden.type = 'hidden';
+            hidden.name = 'cf-turnstile-response';
+            hidden.value = token;
+            const container = document.querySelector('form') || document.body;
+            container.appendChild(hidden);
+          }
+        }, solved.token).catch(() => null);
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
+      // If Turnstile failed to produce a token or cookies, abort immediately with explicit diagnostic message
+      if (!existingToken && !solved?.cookies && !solved?.cfClearance) {
+        const capzyErr = getLastCapzyError();
+        const errDetail = capzyErr ? `: ${capzyErr}` : '';
+        return {
+          ok: false,
+          error: `Cloudflare Turnstile verification could not be solved${errDetail}. Please add a funded API key via /addcapzy <key>.`,
+        };
+      }
+    }
+
+    // Phase 4: Submit login form
     // Listen for login response to capture immediate error messages from LeetCode backend
     let loginHttpError: string | null = null;
     const onLoginResponse = async (res: any) => {
