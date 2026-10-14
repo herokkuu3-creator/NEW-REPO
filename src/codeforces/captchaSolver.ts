@@ -829,7 +829,7 @@ export async function solveCloudflareOrchestrated(params: {
       solverHost = new URL(solverUrl).host;
     } catch {}
 
-    const maxTries = 3;
+    const maxTries = Math.max(1, parseInt(process.env.CPSOLVER_MAX_TRIES || '3', 10));
     log({ solverUrl, maxTries, url: params.websiteURL }, 'Starting Cloudflare clearance solve with local CPSolver');
 
     for (let attempt = 1; attempt <= maxTries; attempt++) {
@@ -860,6 +860,15 @@ export async function solveCloudflareOrchestrated(params: {
           source: 'cpsolver',
           durationMs: res.durationMs,
         };
+      }
+
+      const isDeclined = Boolean((res as { verificationRequired?: boolean }).verificationRequired);
+      if (isDeclined) {
+        logWarn({ attempt, error: res.error }, 'CPSolver challenge verification declined; falling back to CapSolver / Capzy');
+        await sendSolverTelegramNotification(
+          '⚠️ <b>CPSolver challenge declined. Falling back to CapSolver / Capzy...</b>',
+        ).catch(() => undefined);
+        break;
       }
 
       const errBrief = res.error ? ` (${res.error.slice(0, 100)})` : '';

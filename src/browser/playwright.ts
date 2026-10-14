@@ -65,18 +65,26 @@ export function buildLaunchArgs(headless = config.browser.headless): string[] {
     '--disable-blink-features=AutomationControlled',
     '--disable-dev-shm-usage', // small /dev/shm in containers
     '--no-sandbox', // required in most container environments
+    '--disable-setuid-sandbox',
     '--disable-gpu',
+    '--disable-software-rasterizer',
     '--disable-extensions',
     '--disable-background-networking',
     '--disable-background-timer-throttling',
     '--disable-renderer-backgrounding',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-breakpad',
+    '--disable-component-update',
+    '--disable-domain-reliability',
+    '--disable-sync',
+    '--disable-features=Translate,OptimizationHints,MediaRouter',
+    '--mute-audio',
     '--no-first-run',
-    '--js-flags=--max-old-space-size=256', // cap V8 heap for 512MB instances
+    '--no-default-browser-check',
+    '--no-zygote',
+    '--single-process',
+    '--js-flags=--max-old-space-size=128', // cap V8 heap to 128MB for 512MB instances
   ];
-  if (headless) {
-    args.unshift('--headless=new');
-  }
-  if (config.browser.chromiumSingleProcess) args.push('--single-process');
   return args;
 }
 
@@ -96,7 +104,7 @@ export async function launchWithPersistentProfile(): Promise<BrowserSession | nu
   try {
     const isHeadless = config.browser.headless;
     const context = await chromium.launchPersistentContext(profilePath, {
-      headless: isHeadless ? false : false,
+      headless: isHeadless,
       args: buildLaunchArgs(isHeadless),
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
@@ -137,7 +145,7 @@ export async function launchWithStorageState(): Promise<BrowserSession | null> {
   try {
     const isHeadless = config.browser.headless;
     const browser = await chromium.launch({
-      headless: isHeadless ? false : false,
+      headless: isHeadless,
       args: buildLaunchArgs(isHeadless),
     });
     const context = await browser.newContext({
@@ -184,7 +192,7 @@ export async function launchWithStorageStateObject(
   try {
     const isHeadless = config.browser.headless;
     const browser = await chromium.launch({
-      headless: isHeadless ? false : false,
+      headless: isHeadless,
       args: buildLaunchArgs(isHeadless),
     });
     const context = await browser.newContext({

@@ -89,6 +89,8 @@ export async function loginToCodeforces(
       if (
         parsed.hostname === 'challenges.cloudflare.com' ||
         parsed.hostname.includes('codeforces.com') ||
+        parsed.hostname.includes('codeforces.net') ||
+        parsed.hostname.includes('codeforces.org') ||
         parsed.pathname.startsWith('/cdn-cgi/')
       ) {
         return route.continue();
@@ -115,6 +117,10 @@ export async function loginToCodeforces(
       return { ok: false, error: `Codeforces enter page returned HTTP ${gotoRes.status()}` };
     }
 
+    await page.waitForFunction(
+      () => !document.title.toLowerCase().startsWith('loading'),
+      { timeout: 15_000 }
+    ).catch(() => null);
     await page.waitForTimeout(2000);
 
     // Check for Cloudflare challenge / Turnstile on enter page
@@ -131,9 +137,9 @@ export async function loginToCodeforces(
       const sitekey = await page.evaluate(() => {
         const el = document.querySelector('[data-sitekey]');
         return el ? el.getAttribute('data-sitekey') : null;
-      });
+      }).catch(() => null);
 
-      const currentCookies = await context.cookies('https://codeforces.com');
+      const currentCookies = await context.cookies('https://codeforces.com').catch(() => []);
       const solved = await solveCloudflareOrchestrated({
         websiteURL: page.url(),
         sitekey: sitekey || undefined,
@@ -142,13 +148,6 @@ export async function loginToCodeforces(
         cookies: currentCookies,
       });
 
-      if (solved?.token) {
-        await page.evaluate((token) => {
-          const input = document.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement;
-          if (input) input.value = token;
-        }, solved.token);
-      }
-
       if (solved?.cookies) {
         const newCookies = Object.entries(solved.cookies).map(([name, value]) => ({
           name,
@@ -156,15 +155,27 @@ export async function loginToCodeforces(
           domain: '.codeforces.com',
           path: '/',
         }));
-        await context.addCookies(newCookies);
+        await context.addCookies(newCookies).catch(() => {});
       }
+
+      if (solved?.token) {
+        await page.evaluate((token) => {
+          const input = document.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement;
+          if (input) input.value = token;
+        }, solved.token).catch(() => null);
+      }
+
+      // Reload the enter page now that clearance cookies are in the context
+      await notify('🔄 Reloading Codeforces enter page with clearance cookies…');
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
+      await page.waitForTimeout(2000);
     }
 
     // Locate form fields
     const handleInput = page.locator('input#handleOrEmail, input[name="handleOrEmail"]').first();
     const passwordInputEl = page.locator('input#password, input[name="password"]').first();
 
-    const handleVisible = await handleInput.isVisible({ timeout: 15_000 }).catch(() => false);
+    const handleVisible = await handleInput.waitFor({ state: 'visible', timeout: 25_000 }).then(() => true).catch(() => false);
     if (!handleVisible) {
       // Check if already signed in
       const cookies = await context.cookies('https://codeforces.com');
@@ -218,7 +229,7 @@ export async function loginToCodeforces(
           if (t.length > 3) return t;
         }
         return null;
-      });
+      }).catch(() => null);
 
       if (errorMsg && /\/enter(?:[/?#]|$)/i.test(curUrl)) {
         logger.warn({ errorMsg }, 'Codeforces login returned error on page');
