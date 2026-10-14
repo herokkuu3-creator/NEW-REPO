@@ -41,6 +41,8 @@ export interface KeyBalanceResult {
 let inMemoryKeys: string[] = [];
 let inMemoryActiveIndex = 0;
 
+export const MIN_USABLE_CAPZY_BALANCE = 0.0012;
+
 export function maskApiKey(key: string): string {
   const trimmed = (key || '').trim();
   if (!trimmed) return '(empty)';
@@ -151,6 +153,17 @@ export async function checkCapzyKeyBalance(clientKey: string): Promise<KeyBalanc
         balance,
         errorId: 0,
         error: 'Zero balance (no credits)',
+      };
+    }
+
+    if (balance < MIN_USABLE_CAPZY_BALANCE) {
+      return {
+        key: clientKey,
+        masked,
+        ok: false,
+        balance,
+        errorId: 0,
+        error: `Insufficient balance ($${balance.toFixed(4)} < $${MIN_USABLE_CAPZY_BALANCE} min required)`,
       };
     }
 
@@ -359,9 +372,9 @@ export async function addCapzyApiKeys(
     currentActiveIdx < 0 ||
     currentActiveIdx >= mergedKeys.length ||
     !balances[currentActiveIdx]?.ok ||
-    (balances[currentActiveIdx]?.balance ?? 0) <= 0
+    (balances[currentActiveIdx]?.balance ?? 0) < MIN_USABLE_CAPZY_BALANCE
   ) {
-    const firstFundedIdx = balances.findIndex((b) => b.ok && b.balance > 0);
+    const firstFundedIdx = balances.findIndex((b) => b.ok && b.balance >= MIN_USABLE_CAPZY_BALANCE);
     targetActiveIdx = firstFundedIdx >= 0 ? firstFundedIdx : 0;
   }
 

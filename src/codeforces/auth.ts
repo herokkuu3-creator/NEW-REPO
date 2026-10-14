@@ -2,7 +2,7 @@ import { chromium, type BrowserContext, type Page } from 'playwright';
 import { buildLaunchArgs } from '../browser/playwright';
 import { applyStealthScripts, getRandomDesktopViewport } from '../browser/stealth';
 import { DEFAULT_DESKTOP_CHROME_USER_AGENT } from './browserForm';
-import { solveCloudflareOrchestrated } from './captchaSolver';
+import { solveCloudflareOrchestrated, getLastCapzyError } from './captchaSolver';
 import { getPreferredProxy } from './proxyManager';
 import { toPlaywrightProxy } from './proxyRotator';
 import { StorageStateShape } from '../browser/cookiePayload';
@@ -167,6 +167,17 @@ export async function loginToCodeforces(
         } catch {}
       }
 
+      // If Turnstile was required and solver failed to return a token or clearance cookies,
+      // abort immediately with explicit diagnostic message.
+      if (!solved?.token && !solved?.cookies && !solved?.cfClearance) {
+        const capzyErr = getLastCapzyError();
+        const errDetail = capzyErr ? `: ${capzyErr}` : '';
+        return {
+          ok: false,
+          error: `Codeforces Cloudflare challenge could not be solved${errDetail}. Please add a funded API key via /addcapzy <key>.`,
+        };
+      }
+
       page = await ensureHealthyPage(context, page, 'https://codeforces.com/enter');
 
       // Reload the enter page now that clearance cookies are in the context
@@ -178,10 +189,15 @@ export async function loginToCodeforces(
         page = await context.newPage();
         await page.goto('https://codeforces.com/enter', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
       });
-      await page.waitForFunction(
-        () => !document.title.toLowerCase().startsWith('loading'),
-        { timeout: 15_000 }
-      ).catch(() => null);
+      page = await ensureHealthyPage(context, page, 'https://codeforces.com/enter');
+      try {
+        if (!page.isClosed()) {
+          await page.waitForFunction(
+            () => !document.title.toLowerCase().startsWith('loading'),
+            { timeout: 15_000 }
+          ).catch(() => null);
+        }
+      } catch {}
       await new Promise((r) => setTimeout(r, 2000));
     }
 

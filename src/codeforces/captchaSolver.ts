@@ -35,6 +35,19 @@ export function getDefaultUserAgent(engine: 'chromium' | 'firefox' = 'chromium')
   return engine === 'firefox' ? DEFAULT_DESKTOP_FIREFOX_USER_AGENT : DEFAULT_DESKTOP_CHROME_USER_AGENT;
 }
 
+export const LEETCODE_TURNSTILE_SITEKEY = '0x4AAAAAAAQrSHUTor4iGTpW';
+export const CLOUDFLARE_UNIVERSAL_SITEKEY = '0x4AAAAAAADnPIDROrmt1Wwj';
+
+let lastCapzyError: string | null = null;
+
+export function getLastCapzyError(): string | null {
+  return lastCapzyError;
+}
+
+export function setLastCapzyError(err: string | null): void {
+  lastCapzyError = err;
+}
+
 let inMemoryCPSolverUrl = '';
 let inMemoryTelegramBotToken = '';
 let inMemoryTelegramChatId = '';
@@ -379,6 +392,7 @@ export async function solveTurnstileWithCapzy(
 
   const candidateKeys = await getCandidateCapzyKeys(overrideKeys);
   if (candidateKeys.length === 0) {
+    setLastCapzyError('No Capzy/CapSolver API keys configured');
     logWarn({}, 'Capzy solver skipped: no Capzy/CapSolver API keys configured');
     return null;
   }
@@ -444,12 +458,16 @@ export async function solveTurnstileWithCapzy(
       });
 
       if (!init.ok && (init.status === 401 || init.status === 402 || init.status === 403)) {
+        const desc = `HTTP ${init.status} (${init.status === 402 ? 'Insufficient balance / payment required' : 'Unauthorized key'})`;
+        setLastCapzyError(desc);
         logWarn({ status: init.status, key: maskApiKey(apiKey) }, 'Capzy createTask returned unauthorized/unfunded HTTP status');
         return { result: null, isKeyError: true };
       }
 
       const data = (await init.json()) as { errorId?: number; errorCode?: string; taskId?: string; errorDescription?: string };
       if (data?.errorId && data.errorId !== 0) {
+        const desc = data.errorDescription || data.errorCode || 'createTask rejected';
+        setLastCapzyError(desc);
         const keyError = isCapzyKeyError(data.errorId, data.errorCode, data.errorDescription);
         logWarn({ errorId: data.errorId, desc: data.errorDescription, code: data.errorCode, keyError, key: maskApiKey(apiKey) }, 'Capzy createTask failed');
         return { result: null, isKeyError: keyError };
@@ -489,6 +507,8 @@ export async function solveTurnstileWithCapzy(
           };
         }
         if (res?.errorId && res.errorId !== 0) {
+          const desc = res.errorDescription || res.errorCode || 'getTaskResult reported error';
+          setLastCapzyError(desc);
           const keyError = isCapzyKeyError(res.errorId, res.errorCode, res.errorDescription);
           logWarn({ taskId: data.taskId, errorId: res.errorId, code: res.errorCode, desc: res.errorDescription, status: res.status, keyError, key: maskApiKey(apiKey) }, 'Capzy getTaskResult reported error');
           return { result: null, isKeyError: keyError };
@@ -496,7 +516,9 @@ export async function solveTurnstileWithCapzy(
       }
     } catch (err) {
       throwIfAttemptAborted();
-      logWarn({ err: err instanceof Error ? err.message : String(err), key: maskApiKey(apiKey) }, 'Capzy task execution threw');
+      const msg = err instanceof Error ? err.message : String(err);
+      setLastCapzyError(msg);
+      logWarn({ err: msg, key: maskApiKey(apiKey) }, 'Capzy task execution threw');
     }
     return { result: null, isKeyError: false };
   };
@@ -538,7 +560,7 @@ export async function solveCloudflareWithCapzy(
   overrideKeys?: string[],
 ): Promise<SolverResult | null> {
   const resolvedSitekey = sitekey || (
-    websiteURL.includes('leetcode.com') ? '0x4AAAAAAADnPIDROrmt1Wwj' : undefined
+    websiteURL.includes('leetcode.com') ? LEETCODE_TURNSTILE_SITEKEY : undefined
   );
   if (resolvedSitekey) {
     return solveTurnstileWithCapzy(websiteURL, resolvedSitekey, proxyUrl, userAgent, timeoutMs, action, cdata, overrideKeys);
@@ -546,6 +568,7 @@ export async function solveCloudflareWithCapzy(
 
   const candidateKeys = await getCandidateCapzyKeys(overrideKeys);
   if (candidateKeys.length === 0) {
+    setLastCapzyError('No Capzy/CapSolver API keys configured');
     logWarn({}, 'Capzy solver skipped: no Capzy/CapSolver API keys configured');
     return null;
   }
@@ -581,14 +604,18 @@ export async function solveCloudflareWithCapzy(
       });
 
       if (!init.ok && (init.status === 401 || init.status === 402 || init.status === 403)) {
+        const desc = `HTTP ${init.status} (${init.status === 402 ? 'Insufficient balance / payment required' : 'Unauthorized key'})`;
+        setLastCapzyError(desc);
         await rotateToNextCapzyKey(apiKey, `HTTP ${init.status} on createTask`, overrideKeys);
         continue;
       }
 
       const data = (await init.json()) as { errorId?: number; errorCode?: string; errorDescription?: string; taskId?: string };
       if (data?.errorId && data.errorId !== 0) {
+        const desc = data.errorDescription || data.errorCode || 'Key error on createTask';
+        setLastCapzyError(desc);
         if (isCapzyKeyError(data.errorId, data.errorCode, data.errorDescription)) {
-          await rotateToNextCapzyKey(apiKey, data.errorDescription || data.errorCode || 'Key error on createTask', overrideKeys);
+          await rotateToNextCapzyKey(apiKey, desc, overrideKeys);
           continue;
         }
         return null;
@@ -624,9 +651,11 @@ export async function solveCloudflareWithCapzy(
           };
         }
         if (res?.errorId && res.errorId !== 0) {
+          const desc = res.errorDescription || res.errorCode || 'Key error during poll';
+          setLastCapzyError(desc);
           logWarn({ taskId: data.taskId, errorId: res.errorId, status: res.status, raw: res }, 'Capzy solve reported error');
           if (isCapzyKeyError(res.errorId, res.errorCode, res.errorDescription)) {
-            await rotateToNextCapzyKey(apiKey, res.errorDescription || res.errorCode || 'Key error during poll', overrideKeys);
+            await rotateToNextCapzyKey(apiKey, desc, overrideKeys);
             rotatedDuringPoll = true;
           }
           break;
@@ -635,15 +664,17 @@ export async function solveCloudflareWithCapzy(
       if (rotatedDuringPoll) continue;
     } catch (err) {
       throwIfAttemptAborted();
-      logWarn({ err: err instanceof Error ? err.message : String(err), key: maskApiKey(apiKey) }, 'Capzy solveCloudflare threw');
+      const msg = err instanceof Error ? err.message : String(err);
+      setLastCapzyError(msg);
+      logWarn({ err: msg, key: maskApiKey(apiKey) }, 'Capzy solveCloudflare threw');
     }
   }
 
   // If AntiCloudflareTask failed to yield a token or cookies, fall back to solving Turnstile
-  // with universal interstitial sitekey
+  // with site-appropriate sitekey
   return solveTurnstileWithCapzy(
     websiteURL,
-    '0x4AAAAAAADnPIDROrmt1Wwj',
+    websiteURL.includes('leetcode.com') ? LEETCODE_TURNSTILE_SITEKEY : CLOUDFLARE_UNIVERSAL_SITEKEY,
     proxyUrl,
     userAgent,
     timeoutMs,
@@ -785,6 +816,7 @@ export async function solveTurnstileOrchestrated(params: {
   throwIfAttemptAborted();
 
   if (capzySol && (capzySol.token || capzySol.cookies || capzySol.cfClearance)) {
+    setLastCapzyError(null);
     const successNotice = `✅ <b>Turnstile solved via CapSolver / Capzy!</b>`;
     await sendSolverTelegramNotification(successNotice).catch(() => undefined);
     return {
@@ -793,7 +825,11 @@ export async function solveTurnstileOrchestrated(params: {
     };
   }
 
-  const failNotice = `❌ <b>CapSolver / Capzy also failed to solve Turnstile.</b>`;
+  const capzyErrDetail = getLastCapzyError() ? `: <i>${getLastCapzyError()}</i>` : '';
+  const tip = getLastCapzyError() && /balance|credit|unauthorized|exist|invalid/i.test(getLastCapzyError()!)
+    ? `\n💡 <i>Please update your API key using <code>/addcapzy &lt;key&gt;</code> or <code>/capsolver &lt;key&gt;</code></i>`
+    : '';
+  const failNotice = `❌ <b>CapSolver / Capzy also failed to solve Turnstile${capzyErrDetail}.</b>${tip}`;
   await sendSolverTelegramNotification(failNotice).catch(() => undefined);
   return null;
 }
@@ -819,7 +855,7 @@ export async function solveCloudflareOrchestrated(params: {
   overrideKeys?: string[];
 }): Promise<SolverResult | null> {
   const resolvedSitekey = params.sitekey || (
-    params.websiteURL.includes('leetcode.com') ? '0x4AAAAAAADnPIDROrmt1Wwj' : undefined
+    params.websiteURL.includes('leetcode.com') ? LEETCODE_TURNSTILE_SITEKEY : undefined
   );
   if (resolvedSitekey) {
     return solveTurnstileOrchestrated({
@@ -921,6 +957,7 @@ export async function solveCloudflareOrchestrated(params: {
   throwIfAttemptAborted();
 
   if (capzySol && (capzySol.token || capzySol.cookies)) {
+    setLastCapzyError(null);
     const successNotice = `✅ <b>Cloudflare Challenge cleared via CapSolver / Capzy!</b>`;
     await sendSolverTelegramNotification(successNotice).catch(() => undefined);
     return {
@@ -929,7 +966,11 @@ export async function solveCloudflareOrchestrated(params: {
     };
   }
 
-  const failNotice = `❌ <b>CapSolver / Capzy also failed to clear Cloudflare Challenge.</b>`;
+  const capzyErrDetail = getLastCapzyError() ? `: <i>${getLastCapzyError()}</i>` : '';
+  const tip = getLastCapzyError() && /balance|credit|unauthorized|exist|invalid/i.test(getLastCapzyError()!)
+    ? `\n💡 <i>Please update your API key using <code>/addcapzy &lt;key&gt;</code> or <code>/capsolver &lt;key&gt;</code></i>`
+    : '';
+  const failNotice = `❌ <b>CapSolver / Capzy also failed to clear Cloudflare Challenge${capzyErrDetail}.</b>${tip}`;
   await sendSolverTelegramNotification(failNotice).catch(() => undefined);
   return null;
 }

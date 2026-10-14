@@ -2,7 +2,7 @@ import { chromium, type BrowserContext, type Page } from 'playwright';
 import { buildLaunchArgs } from '../browser/playwright';
 import { applyStealthScripts, getRandomDesktopViewport } from '../browser/stealth';
 import { DEFAULT_DESKTOP_CHROME_USER_AGENT } from '../codeforces/browserForm';
-import { solveCloudflareOrchestrated } from '../codeforces/captchaSolver';
+import { solveCloudflareOrchestrated, LEETCODE_TURNSTILE_SITEKEY, getLastCapzyError } from '../codeforces/captchaSolver';
 import { StorageStateShape } from '../browser/cookiePayload';
 import { logger } from '../logger';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
@@ -133,7 +133,7 @@ export async function loginToLeetCode(
         proxyUrl: options?.proxyUrl,
         userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
         cookies: currentCookies,
-        timeoutMs: Math.min(timeoutMs, 35_000),
+        timeoutMs: Math.min(timeoutMs, 45_000),
       });
 
       if (solved?.cookies) {
@@ -150,24 +150,42 @@ export async function loginToLeetCode(
         try {
           if (!page.isClosed()) {
             await page.evaluate((token) => {
-              const input = document.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement;
-              if (input) input.value = token;
+              const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], input[name="turnstileToken"]');
+              for (const input of Array.from(inputs)) {
+                (input as HTMLInputElement).value = token;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+              }
             }, solved.token).catch(() => null);
           }
         } catch {}
       }
 
-      page = await ensureHealthyPage(context, page, 'https://leetcode.com/accounts/login/');
+      // If Turnstile was required and solver failed to return a token or clearance cookies,
+      // abort immediately with explicit diagnostic message rather than failing 40s later on submit.
+      if (!solved?.token && !solved?.cookies && !solved?.cfClearance) {
+        const capzyErr = getLastCapzyError();
+        const errDetail = capzyErr ? `: ${capzyErr}` : '';
+        return {
+          ok: false,
+          error: `Cloudflare Turnstile verification challenge could not be solved${errDetail}. Please add a funded API key via /addcapzy <key>.`,
+        };
+      }
 
-      await notify('🔄 Reloading LeetCode login page with clearance cookies…');
-      await page.goto('https://leetcode.com/accounts/login/', {
-        waitUntil: 'domcontentloaded',
-        timeout: 30_000,
-      }).catch(async () => {
-        page = await context.newPage();
-        await page.goto('https://leetcode.com/accounts/login/', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
-      });
-      await new Promise((r) => setTimeout(r, 2000));
+      // ONLY reload the page if this was a full Cloudflare interstitial "Just a moment..." challenge.
+      // Do NOT reload for regular embedded Turnstile on the login form, as reloading clears the injected token!
+      if (isCloudflareChallenge) {
+        page = await ensureHealthyPage(context, page, 'https://leetcode.com/accounts/login/');
+        await notify('🔄 Reloading LeetCode login page with clearance cookies…');
+        await page.goto('https://leetcode.com/accounts/login/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 30_000,
+        }).catch(async () => {
+          page = await context.newPage();
+          await page.goto('https://leetcode.com/accounts/login/', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
+        });
+        await new Promise((r) => setTimeout(r, 2000));
+      }
     }
 
     // Locate login inputs with robust multi-selector support
@@ -193,11 +211,59 @@ export async function loginToLeetCode(
 
     await notify('📝 Entering credentials…');
     await usernameInput.fill(username);
+    await usernameInput.dispatchEvent('input').catch(() => null);
+    await usernameInput.dispatchEvent('change').catch(() => null);
+    await usernameInput.dispatchEvent('blur').catch(() => null);
     await new Promise((r) => setTimeout(r, 300));
+
     await passwordInputEl.fill(password);
+    await passwordInputEl.dispatchEvent('input').catch(() => null);
+    await passwordInputEl.dispatchEvent('change').catch(() => null);
+    await passwordInputEl.dispatchEvent('blur').catch(() => null);
     await new Promise((r) => setTimeout(r, 500));
 
+    // Listen for login response to capture immediate error messages from LeetCode backend
+    let loginHttpError: string | null = null;
+    const onLoginResponse = async (res: any) => {
+      try {
+        const u = res.url();
+        if (u.includes('/accounts/login') && res.request().method() === 'POST') {
+          const status = res.status();
+          if (status >= 400) {
+            let detail = `HTTP ${status}`;
+            try {
+              const body = await res.json();
+              if (body?.recaptcha?.error) detail = body.recaptcha.error;
+              else if (body?.form?.errors) detail = Array.isArray(body.form.errors) ? body.form.errors.join(', ') : JSON.stringify(body.form.errors);
+              else if (body?.error) detail = body.error;
+            } catch {
+              try {
+                const txt = await res.text();
+                if (txt && txt.length < 200) detail = txt;
+              } catch {}
+            }
+            loginHttpError = detail;
+          }
+        }
+      } catch {}
+    };
+    page.on('response', onLoginResponse);
+
     await notify('🚀 Submitting login form…');
+    // Ensure button is not disabled in DOM and trigger form submit event
+    await page.evaluate(() => {
+      const form = document.querySelector('form');
+      if (form) {
+        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      }
+      const btn = document.querySelector('button#signin_btn, button[type="submit"]') as HTMLButtonElement | null;
+      if (btn) {
+        btn.removeAttribute('disabled');
+        btn.disabled = false;
+        btn.click();
+      }
+    }).catch(() => null);
+
     await submitBtn.click({ timeout: 4000, force: true }).catch(async () => {
       await page.keyboard.press('Enter').catch(() => null);
     });
@@ -208,6 +274,11 @@ export async function loginToLeetCode(
     let authenticatedUser: string | null = null;
 
     while (Date.now() < deadline) {
+      if (loginHttpError) {
+        page.off('response', onLoginResponse);
+        return { ok: false, error: `LeetCode rejected login: ${loginHttpError}` };
+      }
+
       await new Promise((r) => setTimeout(r, 2000));
 
       // 1. Check cookies for LEETCODE_SESSION
@@ -238,6 +309,7 @@ export async function loginToLeetCode(
       }).catch(() => null);
 
       if (errorMsg) {
+        page.off('response', onLoginResponse);
         logger.warn({ errorMsg }, 'LeetCode login returned error on page');
         return { ok: false, error: `Login failed: ${errorMsg}` };
       }
@@ -252,6 +324,7 @@ export async function loginToLeetCode(
         break;
       }
     }
+    page.off('response', onLoginResponse);
 
     if (!authenticatedUser) {
       const cookies = await context.cookies('https://leetcode.com').catch(() => []);
@@ -311,7 +384,7 @@ async function checkSignedInUser(page: Page): Promise<string | null> {
 }
 
 async function extractTurnstileSitekey(page: Page): Promise<string> {
-  const fallbackKey = '0x4AAAAAAADnPIDROrmt1Wwj';
+  const fallbackKey = LEETCODE_TURNSTILE_SITEKEY;
   if (!page || page.isClosed()) return fallbackKey;
   try {
     const extracted = await page.evaluate(() => {

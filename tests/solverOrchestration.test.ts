@@ -487,7 +487,48 @@ describe('Solver Orchestration & Fallback Engine', () => {
     expect(result?.token).toBe('leetcode_turnstile_auto_token');
     expect(capturedTask).not.toBeNull();
     expect((capturedTask as any)?.websiteURL).toBe('https://leetcode.com/accounts/login/');
-    expect((capturedTask as any)?.websiteKey).toBe('0x4AAAAAAADnPIDROrmt1Wwj');
+    expect((capturedTask as any)?.websiteKey).toBe('0x4AAAAAAAQrSHUTor4iGTpW');
+  });
+
+  it('captures Capzy Insufficient Balance error and surfaces helpful /addcapzy guidance in Telegram', async () => {
+    delete process.env.CPSOLVER_URL;
+    process.env.TELEGRAM_BOT_TOKEN = '123456:test_token';
+    process.env.TELEGRAM_CHAT_ID = '987654321';
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const urlStr = String(url);
+      if (urlStr.includes('api.telegram.org')) {
+        const body = JSON.parse(String(init?.body || '{}'));
+        if (body.text) sentTelegramMessages.push(body.text);
+        return { ok: true, status: 200, json: async () => ({ ok: true }) } as Response;
+      }
+      if (urlStr.includes('api.capzy.ai/createTask')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            errorId: 1,
+            errorCode: 'ERROR_ZERO_BALANCE',
+            errorDescription: 'Insufficient balance. Need $0.0012, have $0.0004',
+          }),
+        } as Response;
+      }
+      return { ok: false, status: 500 } as Response;
+    }));
+
+    const result = await solveTurnstileOrchestrated({
+      siteurl: 'https://leetcode.com/accounts/login/',
+      sitekey: '0x4AAAAAAAQrSHUTor4iGTpW',
+      overrideKeys: ['capzy_depleted_key_1234567890abcdef'],
+      timeoutMs: 3000,
+    });
+
+    expect(result).toBeNull();
+    const failMsg = sentTelegramMessages.find((m) => m.includes('CapSolver / Capzy also failed'));
+    expect(failMsg).toBeDefined();
+    expect(failMsg).toContain('Insufficient balance. Need $0.0012, have $0.0004');
+    expect(failMsg).toContain('/addcapzy');
   });
 });
+
 
