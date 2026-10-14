@@ -697,10 +697,12 @@ export async function solveTurnstileOrchestrated(params: {
       });
       throwIfAttemptAborted();
 
-      if (res.verificationRequired) {
-        logWarn({ attempt, durationMs: res.durationMs }, 'CPSolver Turnstile verification timed out or declined; falling back to CapSolver / Capzy');
+      const isConnectionTimeout = res.error ? /aborted due to timeout|TimeoutError/i.test(res.error) : false;
+      if (res.verificationRequired || isConnectionTimeout) {
+        const reason = res.verificationRequired ? 'verification declined' : 'connection timed out (service unresponsive)';
+        logWarn({ attempt, durationMs: res.durationMs, reason }, `CPSolver Turnstile ${reason}; falling back to CapSolver / Capzy`);
         await sendSolverTelegramNotification(
-          '⚠️ <b>CPSolver could not solve Turnstile challenge. Falling back to CapSolver / Capzy...</b>',
+          `⚠️ <b>CPSolver Turnstile ${reason}. Falling back to CapSolver / Capzy...</b>`,
         ).catch(() => undefined);
         break;
       }
@@ -863,10 +865,12 @@ export async function solveCloudflareOrchestrated(params: {
       }
 
       const isDeclined = Boolean((res as { verificationRequired?: boolean }).verificationRequired);
-      if (isDeclined) {
-        logWarn({ attempt, error: res.error }, 'CPSolver challenge verification declined; falling back to CapSolver / Capzy');
+      const isConnectionTimeout = res.error ? /aborted due to timeout|TimeoutError/i.test(res.error) : false;
+      if (isDeclined || isConnectionTimeout) {
+        const reason = isDeclined ? 'challenge declined' : 'connection timed out (service unresponsive)';
+        logWarn({ attempt, error: res.error, reason }, `CPSolver ${reason}; falling back to CapSolver / Capzy`);
         await sendSolverTelegramNotification(
-          '⚠️ <b>CPSolver challenge declined. Falling back to CapSolver / Capzy...</b>',
+          `⚠️ <b>CPSolver ${reason}. Falling back to CapSolver / Capzy...</b>`,
         ).catch(() => undefined);
         break;
       }

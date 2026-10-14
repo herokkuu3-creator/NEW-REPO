@@ -95,7 +95,7 @@ export async function loginToLeetCode(
       return route.continue();
     });
 
-    const page: Page = await context.newPage();
+    let page: Page = await context.newPage();
 
     await notify('🌐 Navigating to LeetCode login page…');
     const gotoRes = await page.goto('https://leetcode.com/accounts/login/', {
@@ -136,6 +136,7 @@ export async function loginToLeetCode(
         proxyUrl: options?.proxyUrl,
         userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
         cookies: currentCookies,
+        timeoutMs: Math.min(timeoutMs, 35_000),
       });
 
       if (solved?.cookies) {
@@ -148,15 +149,29 @@ export async function loginToLeetCode(
         await context.addCookies(newCookies).catch(() => {});
       }
 
-      if (solved?.token) {
+      if (solved?.token && !page.isClosed()) {
         await page.evaluate((token) => {
           const input = document.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement;
           if (input) input.value = token;
         }, solved.token).catch(() => null);
       }
 
+      // Check if page closed or crashed during the solve wait; recreate if needed
+      if (page.isClosed()) {
+        logger.warn('Page closed or crashed during Cloudflare solve; creating fresh page with clearance cookies');
+        page = await context.newPage();
+      }
+
       await notify('🔄 Reloading LeetCode login page with clearance cookies…');
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
+      await page.goto('https://leetcode.com/accounts/login/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 30_000,
+      }).catch(async () => {
+        if (page.isClosed()) {
+          page = await context.newPage();
+          await page.goto('https://leetcode.com/accounts/login/', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
+        }
+      });
       await page.waitForTimeout(2000);
     }
 
@@ -258,12 +273,19 @@ export async function loginToLeetCode(
       username: authenticatedUser,
       storageState,
     };
+  } catch (err) {
+    logger.error({ err }, 'LeetCode login error encountered during browser interaction');
+    return {
+      ok: false,
+      error: `Login Error: ${err instanceof Error ? err.message : String(err)}`,
+    };
   } finally {
     await browser.close().catch(() => undefined);
   }
 }
 
 async function checkSignedInUser(page: Page): Promise<string | null> {
+  if (!page || page.isClosed()) return null;
   return page.evaluate(async () => {
     try {
       const res = await fetch('https://leetcode.com/graphql', {
