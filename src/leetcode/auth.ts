@@ -198,33 +198,38 @@ export async function loginToLeetCode(
 
     await notify('📝 Entering credentials…');
     await usernameInput.fill(username);
-    await page.waitForTimeout(300);
+    await new Promise((r) => setTimeout(r, 300));
     await passwordInputEl.fill(password);
-    await page.waitForTimeout(500);
+    await new Promise((r) => setTimeout(r, 500));
 
     await notify('🚀 Submitting login form…');
-    await submitBtn.click().catch(async () => {
-      await page.keyboard.press('Enter');
+    await submitBtn.click({ timeout: 4000, force: true }).catch(async () => {
+      await page.keyboard.press('Enter').catch(() => null);
     });
+    await passwordInputEl.press('Enter').catch(() => null);
 
     await notify('⏳ Waiting for authentication…');
     const deadline = Date.now() + Math.min(timeoutMs, 40_000);
     let authenticatedUser: string | null = null;
 
     while (Date.now() < deadline) {
-      await page.waitForTimeout(2000);
+      await new Promise((r) => setTimeout(r, 2000));
 
       // 1. Check cookies for LEETCODE_SESSION
-      const cookies = await context.cookies('https://leetcode.com');
+      const cookies = await context.cookies('https://leetcode.com').catch(() => []);
       const sessionCookie = cookies.find((c) => c.name === 'LEETCODE_SESSION' && c.value.length > 5);
 
       if (sessionCookie) {
-        // Confirm userStatus via GraphQL
-        authenticatedUser = await checkSignedInUser(page).catch(() => null);
-        if (authenticatedUser || !page.url().includes('/accounts/login/')) {
-          authenticatedUser = authenticatedUser ?? username;
-          break;
+        if (!page.isClosed()) {
+          authenticatedUser = await checkSignedInUser(page).catch(() => null);
         }
+        authenticatedUser = authenticatedUser ?? username;
+        break;
+      }
+
+      if (page.isClosed()) {
+        logger.warn('Page closed during authentication wait; re-checking context cookies');
+        break;
       }
 
       // 2. Check for explicit error messages on page
@@ -245,14 +250,16 @@ export async function loginToLeetCode(
       // 3. Check if redirected to home / problemset
       const curUrl = page.url();
       if (!curUrl.includes('/accounts/login/') && (curUrl.includes('/problemset') || curUrl.endsWith('leetcode.com/'))) {
-        authenticatedUser = await checkSignedInUser(page).catch(() => null);
+        if (!page.isClosed()) {
+          authenticatedUser = await checkSignedInUser(page).catch(() => null);
+        }
         authenticatedUser = authenticatedUser ?? username;
         break;
       }
     }
 
     if (!authenticatedUser) {
-      const cookies = await context.cookies('https://leetcode.com');
+      const cookies = await context.cookies('https://leetcode.com').catch(() => []);
       const sessionCookie = cookies.find((c) => c.name === 'LEETCODE_SESSION' && c.value.length > 5);
       if (sessionCookie) {
         authenticatedUser = username;

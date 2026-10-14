@@ -81,9 +81,8 @@ export function buildLaunchArgs(headless = config.browser.headless): string[] {
     '--mute-audio',
     '--no-first-run',
     '--no-default-browser-check',
-    '--no-zygote',
     ...(config.browser.chromiumSingleProcess ? ['--single-process'] : []),
-    '--js-flags=--max-old-space-size=128', // cap V8 heap to 128MB for 512MB instances
+    '--js-flags=--max-old-space-size=256', // cap V8 heap to 256MB for 512MB instances
   ];
   return args;
 }

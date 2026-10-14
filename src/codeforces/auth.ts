@@ -221,52 +221,60 @@ export async function loginToCodeforces(
 
     const submitBtn = page.locator('input[type="submit"].submit, input.submit, button[type="submit"], input[type="submit"]').first();
     await notify('🚀 Submitting login form…');
-    await submitBtn.click().catch(async () => {
-      await page.keyboard.press('Enter');
+    await submitBtn.click({ timeout: 4000, force: true }).catch(async () => {
+      await page.keyboard.press('Enter').catch(() => null);
     });
+    await passwordInputEl.press('Enter').catch(() => null);
 
     await notify('⏳ Waiting for authentication…');
     const deadline = Date.now() + Math.min(timeoutMs, 40_000);
     let authenticatedHandle: string | null = null;
 
     while (Date.now() < deadline) {
-      await page.waitForTimeout(2000);
+      await new Promise((r) => setTimeout(r, 2000));
 
-      // Check if redirected away from /enter
-      const curUrl = page.url();
-      const detected = await detectCodeforcesHandle(page);
-      if (detected) {
-        authenticatedHandle = detected;
-        break;
-      }
+      const cookies = await context.cookies('https://codeforces.com').catch(() => []);
+      const hasSession = cookies.some((c) => (c.name === 'JSESSIONID' || c.name === '39ce7') && c.value.length > 5);
 
-      // Check for error text on page
-      const errorMsg = await page.evaluate(() => {
-        const errEl = document.querySelector('.error.for__password, .error.for__handleOrEmail, span.error, div.error');
-        if (errEl && errEl.textContent) {
-          const t = errEl.textContent.trim();
-          if (t.length > 3) return t;
+      if (!page.isClosed()) {
+        const detected = await detectCodeforcesHandle(page);
+        if (detected) {
+          authenticatedHandle = detected;
+          break;
         }
-        return null;
-      }).catch(() => null);
 
-      if (errorMsg && /\/enter(?:[/?#]|$)/i.test(curUrl)) {
-        logger.warn({ errorMsg }, 'Codeforces login returned error on page');
-        return { ok: false, error: `Login failed: ${errorMsg}` };
-      }
+        const curUrl = page.url();
+        // Check for error text on page
+        const errorMsg = await page.evaluate(() => {
+          const errEl = document.querySelector('.error.for__password, .error.for__handleOrEmail, span.error, div.error');
+          if (errEl && errEl.textContent) {
+            const t = errEl.textContent.trim();
+            if (t.length > 3) return t;
+          }
+          return null;
+        }).catch(() => null);
 
-      if (!/\/enter(?:[/?#]|$)/i.test(curUrl) && (curUrl.includes('codeforces.com') || curUrl.endsWith('/'))) {
-        const cookies = await context.cookies('https://codeforces.com');
-        const hasSession = cookies.some((c) => (c.name === 'JSESSIONID' || c.name === '39ce7') && c.value.length > 5);
+        if (errorMsg && /\/enter(?:[/?#]|$)/i.test(curUrl)) {
+          logger.warn({ errorMsg }, 'Codeforces login returned error on page');
+          return { ok: false, error: `Login failed: ${errorMsg}` };
+        }
+
+        if (!/\/enter(?:[/?#]|$)/i.test(curUrl) && (curUrl.includes('codeforces.com') || curUrl.endsWith('/'))) {
+          if (hasSession) {
+            authenticatedHandle = detected || handleOrEmail;
+            break;
+          }
+        }
+      } else {
         if (hasSession) {
-          authenticatedHandle = detected || handleOrEmail;
+          authenticatedHandle = handleOrEmail;
           break;
         }
       }
     }
 
     if (!authenticatedHandle) {
-      const cookies = await context.cookies('https://codeforces.com');
+      const cookies = await context.cookies('https://codeforces.com').catch(() => []);
       const hasSession = cookies.some((c) => (c.name === 'JSESSIONID' || c.name === '39ce7') && c.value.length > 5);
       if (hasSession) {
         authenticatedHandle = handleOrEmail;
