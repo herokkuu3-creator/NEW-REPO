@@ -81,9 +81,11 @@ import {
   addCapzyApiKeys,
   getCapzyApiKeys,
   getActiveCapzyKeyIndex,
+  setActiveCapzyKeyIndex,
   checkCapzyKeyBalance,
   maskApiKey,
   isLikelyCapzyKey,
+  MIN_USABLE_CAPZY_BALANCE,
   type KeyBalanceResult,
 } from '../codeforces/capzyKeyManager';
 import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver';
@@ -2683,7 +2685,29 @@ export async function formatCapzyStatusMessage(): Promise<string> {
     lines.push('⚠️ <i>No CapSolver/Capzy API keys configured in database.</i>');
     lines.push('To configure API key(s), run: <code>/capsolver &lt;key1, key2, ...&gt;</code>');
   } else {
-    const activeIdx = await getActiveCapzyKeyIndex();
+    const balances: KeyBalanceResult[] = [];
+    for (let i = 0; i < keys.length; i++) {
+      balances.push(await checkCapzyKeyBalance(keys[i]!));
+    }
+
+    let activeIdx = await getActiveCapzyKeyIndex();
+    // Auto-heal: If active key is out of bounds or current active key has insufficient balance,
+    // automatically promote the first funded key in the pool.
+    if (
+      activeIdx >= keys.length ||
+      !balances[activeIdx]?.ok ||
+      (balances[activeIdx]?.balance ?? 0) < MIN_USABLE_CAPZY_BALANCE
+    ) {
+      const firstFunded = balances.findIndex((b) => b.ok && b.balance >= MIN_USABLE_CAPZY_BALANCE);
+      if (firstFunded >= 0) {
+        activeIdx = firstFunded;
+        await setActiveCapzyKeyIndex(activeIdx);
+      } else if (activeIdx >= keys.length) {
+        activeIdx = 0;
+        await setActiveCapzyKeyIndex(0);
+      }
+    }
+
     lines.push(`Total configured keys: <b>${keys.length}</b>`);
     lines.push(`Active key: <b>#${activeIdx + 1} (${escapeHtml(maskApiKey(keys[activeIdx] ?? ''))})</b>`);
     lines.push('');
@@ -2693,8 +2717,11 @@ export async function formatCapzyStatusMessage(): Promise<string> {
       const key = keys[i]!;
       const masked = maskApiKey(key);
       const isActive = i === activeIdx;
-      const bal = await checkCapzyKeyBalance(key);
-      const tag = isActive ? ' <b>[ACTIVE]</b>' : (i < activeIdx ? ' <i>(exhausted/prior)</i>' : '');
+      const bal = balances[i]!;
+      const isFunded = bal.ok && bal.balance >= MIN_USABLE_CAPZY_BALANCE;
+      const tag = isActive
+        ? ' <b>[ACTIVE]</b>'
+        : (!isFunded ? ' <i>(exhausted/prior)</i>' : '');
       if (bal.ok && bal.balance > 0) {
         lines.push(`├ Key #${i + 1}: <code>${escapeHtml(masked)}</code> — ✅ $${bal.balance.toFixed(4)}${tag}`);
       } else {

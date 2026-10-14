@@ -487,7 +487,7 @@ describe('Solver Orchestration & Fallback Engine', () => {
     expect(result?.token).toBe('leetcode_turnstile_auto_token');
     expect(capturedTask).not.toBeNull();
     expect((capturedTask as any)?.websiteURL).toBe('https://leetcode.com/accounts/login/');
-    expect((capturedTask as any)?.websiteKey).toBe('0x4AAAAAAAQrSHUTor4iGTpW');
+    expect((capturedTask as any)?.websiteKey).toBe('0x4AAAAAAADnPIDROrmt1Wwj');
   });
 
   it('captures Capzy Insufficient Balance error and surfaces helpful /addcapzy guidance in Telegram', async () => {
@@ -518,7 +518,7 @@ describe('Solver Orchestration & Fallback Engine', () => {
 
     const result = await solveTurnstileOrchestrated({
       siteurl: 'https://leetcode.com/accounts/login/',
-      sitekey: '0x4AAAAAAAQrSHUTor4iGTpW',
+      sitekey: '0x4AAAAAAADnPIDROrmt1Wwj',
       overrideKeys: ['capzy_depleted_key_1234567890abcdef'],
       timeoutMs: 3000,
     });
@@ -528,6 +528,72 @@ describe('Solver Orchestration & Fallback Engine', () => {
     expect(failMsg).toBeDefined();
     expect(failMsg).toContain('Insufficient balance. Need $0.0012, have $0.0004');
     expect(failMsg).toContain('/addcapzy');
+  });
+
+  it('does NOT treat "(No credits were deducted.)" or unregistered sitekeys as key errors', async () => {
+    const { isCapzyKeyError } = await import('../src/codeforces/capzyKeyManager');
+    expect(isCapzyKeyError(
+      1,
+      'ERROR_WRONG_TASK_TYPE',
+      'This sitekey is not registered for AntiTurnstileTaskProxyLess. Use  instead. (No credits were deducted.).',
+    )).toBe(false);
+  });
+
+  it('retries with universal Cloudflare Turnstile sitekey when Capzy rejects custom sitekey as not registered', async () => {
+    delete process.env.CPSOLVER_URL;
+    let attempts: any[] = [];
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const urlStr = String(url);
+      if (urlStr.includes('api.telegram.org')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true }) } as Response;
+      }
+      if (urlStr.includes('api.capzy.ai/createTask')) {
+        const body = JSON.parse(String(init?.body || '{}'));
+        attempts.push(body.task);
+        if (body.task.websiteKey === '0x4CustomUnsupportedSitekey123') {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              errorId: 1,
+              errorCode: 'ERROR_WRONG_TASK_TYPE',
+              errorDescription: 'This sitekey is not registered for AntiTurnstileTaskProxyLess. Use  instead. (No credits were deducted.).',
+            }),
+          } as Response;
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ errorId: 0, taskId: 'retry-universal-task-id' }),
+        } as Response;
+      }
+      if (urlStr.includes('api.capzy.ai/getTaskResult')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            errorId: 0,
+            status: 'ready',
+            solution: { token: 'universal_sitekey_solved_token' },
+          }),
+        } as Response;
+      }
+      return { ok: false, status: 500 } as Response;
+    }));
+
+    const result = await solveTurnstileOrchestrated({
+      siteurl: 'https://leetcode.com/accounts/login/',
+      sitekey: '0x4CustomUnsupportedSitekey123',
+      overrideKeys: ['capzy_funded_key_1234567890abcdef'],
+      timeoutMs: 5000,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result?.token).toBe('universal_sitekey_solved_token');
+    expect(attempts.length).toBe(2);
+    expect(attempts[0].websiteKey).toBe('0x4CustomUnsupportedSitekey123');
+    expect(attempts[1].websiteKey).toBe('0x4AAAAAAADnPIDROrmt1Wwj');
   });
 });
 

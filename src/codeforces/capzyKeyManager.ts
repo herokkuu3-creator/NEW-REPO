@@ -88,24 +88,39 @@ export function isCapzyKeyError(
   if (errorId === 0 && !errorCode && !errorDescription) return false;
   const code = (errorCode || '').toUpperCase();
   const desc = (errorDescription || '').toLowerCase();
+
+  // If the error message indicates a task/sitekey mismatch (e.g. not registered for AntiTurnstileTaskProxyLess)
+  // or explicitly notes "(No credits were deducted.)", it is NOT a depleted API key or unauthorized user error!
+  if (
+    code.includes('WRONG_TASK_TYPE') ||
+    code.includes('TASK_TYPE_NOT_SUPPORTED') ||
+    desc.includes('not registered') ||
+    desc.includes('wrong task') ||
+    desc.includes('no credits were deducted')
+  ) {
+    return false;
+  }
+
   return (
     code.includes('KEY_DOES_NOT_EXIST') ||
     code.includes('WRONG_USER_KEY') ||
     code.includes('ZERO_BALANCE') ||
+    code.includes('INSUFFICIENT_BALANCE') ||
     code.includes('CREDIT') ||
     code.includes('BALANCE') ||
     code.includes('PAYMENT') ||
     code.includes('UNAUTHORIZED') ||
     code.includes('FORBIDDEN') ||
     desc.includes('invalid api key') ||
+    desc.includes('zero balance') ||
+    desc.includes('insufficient') ||
     desc.includes('balance') ||
     desc.includes('credit') ||
+    desc.includes('need $') ||
     desc.includes('expired') ||
-    desc.includes('funds') ||
-    desc.includes('insufficient') ||
     desc.includes('unauthorized') ||
     desc.includes('does not exist') ||
-    desc.includes('no credit')
+    desc.includes('no funds')
   );
 }
 

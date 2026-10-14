@@ -35,8 +35,8 @@ export function getDefaultUserAgent(engine: 'chromium' | 'firefox' = 'chromium')
   return engine === 'firefox' ? DEFAULT_DESKTOP_FIREFOX_USER_AGENT : DEFAULT_DESKTOP_CHROME_USER_AGENT;
 }
 
-export const LEETCODE_TURNSTILE_SITEKEY = '0x4AAAAAAAQrSHUTor4iGTpW';
 export const CLOUDFLARE_UNIVERSAL_SITEKEY = '0x4AAAAAAADnPIDROrmt1Wwj';
+export const LEETCODE_TURNSTILE_SITEKEY = CLOUDFLARE_UNIVERSAL_SITEKEY;
 
 let lastCapzyError: string | null = null;
 
@@ -540,6 +540,25 @@ export async function solveTurnstileWithCapzy(
     if (isKeyError) {
       await rotateToNextCapzyKey(apiKey, 'Key invalid or zero balance during proxyless task', overrideKeys);
       continue;
+    }
+
+    // If Capzy reported that the sitekey is not registered for AntiTurnstileTaskProxyLess,
+    // immediately retry with the universal Cloudflare Turnstile sitekey using the same API key.
+    if (
+      sitekey !== CLOUDFLARE_UNIVERSAL_SITEKEY &&
+      getLastCapzyError() &&
+      /not registered/i.test(getLastCapzyError()!)
+    ) {
+      log(
+        { sitekey, fallbackKey: CLOUDFLARE_UNIVERSAL_SITEKEY },
+        'Capzy rejected sitekey as not registered; retrying with universal Cloudflare Turnstile sitekey',
+      );
+      const fallbackTask = {
+        ...proxylessTask,
+        websiteKey: CLOUDFLARE_UNIVERSAL_SITEKEY,
+      };
+      const fallbackRun = await runCapzyTask(apiKey, fallbackTask, timeoutMs);
+      if (fallbackRun.result?.token) return fallbackRun.result;
     }
   }
 
