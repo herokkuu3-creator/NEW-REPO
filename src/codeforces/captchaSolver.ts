@@ -385,15 +385,12 @@ export async function solveTurnstileWithCapzy(
 
   const proxy =
     proxyUrl ||
-    process.env.CODEFORCES_PROXY?.trim() ||
-    'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
+    (websiteURL.includes('codeforces.com') ? process.env.CODEFORCES_PROXY?.trim() : undefined) ||
+    undefined;
   const ua = userAgent || DEFAULT_DESKTOP_CHROME_USER_AGENT;
 
-  let targetUrl = websiteURL;
-  try {
-    const parsed = new URL(websiteURL);
-    targetUrl = parsed.origin;
-  } catch {}
+  // Retain the full target URL (stripping only hash) so Capzy loads the exact page hosting the widget
+  const targetUrl = websiteURL.split('#')[0];
 
   const isRefusingProxy = !!proxy && (proxy.includes('joyproxy.com') || proxy.includes('busyip.com'));
 
@@ -540,8 +537,11 @@ export async function solveCloudflareWithCapzy(
   cdata?: string,
   overrideKeys?: string[],
 ): Promise<SolverResult | null> {
-  if (sitekey) {
-    return solveTurnstileWithCapzy(websiteURL, sitekey, proxyUrl, userAgent, timeoutMs, action, cdata, overrideKeys);
+  const resolvedSitekey = sitekey || (
+    websiteURL.includes('leetcode.com') ? '0x4AAAAAAADnPIDROrmt1Wwj' : undefined
+  );
+  if (resolvedSitekey) {
+    return solveTurnstileWithCapzy(websiteURL, resolvedSitekey, proxyUrl, userAgent, timeoutMs, action, cdata, overrideKeys);
   }
 
   const candidateKeys = await getCandidateCapzyKeys(overrideKeys);
@@ -639,7 +639,18 @@ export async function solveCloudflareWithCapzy(
     }
   }
 
-  return null;
+  // If AntiCloudflareTask failed to yield a token or cookies, fall back to solving Turnstile
+  // with universal interstitial sitekey
+  return solveTurnstileWithCapzy(
+    websiteURL,
+    '0x4AAAAAAADnPIDROrmt1Wwj',
+    proxyUrl,
+    userAgent,
+    timeoutMs,
+    action,
+    cdata,
+    overrideKeys,
+  );
 }
 
 /**
@@ -773,7 +784,7 @@ export async function solveTurnstileOrchestrated(params: {
   );
   throwIfAttemptAborted();
 
-  if (capzySol?.token) {
+  if (capzySol && (capzySol.token || capzySol.cookies || capzySol.cfClearance)) {
     const successNotice = `✅ <b>Turnstile solved via CapSolver / Capzy!</b>`;
     await sendSolverTelegramNotification(successNotice).catch(() => undefined);
     return {
@@ -807,10 +818,13 @@ export async function solveCloudflareOrchestrated(params: {
   cdata?: string;
   overrideKeys?: string[];
 }): Promise<SolverResult | null> {
-  if (params.sitekey) {
+  const resolvedSitekey = params.sitekey || (
+    params.websiteURL.includes('leetcode.com') ? '0x4AAAAAAADnPIDROrmt1Wwj' : undefined
+  );
+  if (resolvedSitekey) {
     return solveTurnstileOrchestrated({
       siteurl: params.websiteURL,
-      sitekey: params.sitekey,
+      sitekey: resolvedSitekey,
       action: params.action,
       cdata: params.cdata,
       proxyUrl: params.proxyUrl,

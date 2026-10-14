@@ -398,5 +398,96 @@ describe('Solver Orchestration & Fallback Engine', () => {
     keys = await getCapzyApiKeys();
     expect(keys).toEqual(['existing_key_1', 'existing_key_2', 'new_key_3', 'new_key_4']);
   });
+
+  it('preserves the full URL path in Capzy Turnstile task without stripping to origin', async () => {
+    delete process.env.CPSOLVER_URL;
+    let capturedTask: Record<string, unknown> | null = null;
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const urlStr = String(url);
+      if (urlStr.includes('api.telegram.org')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true }) } as Response;
+      }
+      if (urlStr.includes('api.capzy.ai/createTask')) {
+        const body = JSON.parse(String(init?.body || '{}'));
+        capturedTask = body.task as Record<string, unknown>;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ errorId: 0, taskId: 'task_turnstile_full_url' }),
+        } as Response;
+      }
+      if (urlStr.includes('api.capzy.ai/getTaskResult')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            errorId: 0,
+            status: 'ready',
+            solution: { token: 'solved_turnstile_token_123' },
+          }),
+        } as Response;
+      }
+      return { ok: false, status: 500 } as Response;
+    }));
+
+    const result = await solveTurnstileOrchestrated({
+      siteurl: 'https://leetcode.com/accounts/login/',
+      sitekey: '0x4AAAAAAADnPIDROrmt1Wwj',
+      overrideKeys: ['capzy_valid_key_1234567890abcdef1234567890'],
+      timeoutMs: 5000,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result?.token).toBe('solved_turnstile_token_123');
+    expect(capturedTask).not.toBeNull();
+    expect((capturedTask as any)?.websiteURL).toBe('https://leetcode.com/accounts/login/');
+    expect((capturedTask as any)?.websiteKey).toBe('0x4AAAAAAADnPIDROrmt1Wwj');
+  });
+
+  it('automatically routes LeetCode login URL to Turnstile solver with universal sitekey in solveCloudflareOrchestrated', async () => {
+    delete process.env.CPSOLVER_URL;
+    let capturedTask: Record<string, unknown> | null = null;
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const urlStr = String(url);
+      if (urlStr.includes('api.telegram.org')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true }) } as Response;
+      }
+      if (urlStr.includes('api.capzy.ai/createTask')) {
+        const body = JSON.parse(String(init?.body || '{}'));
+        capturedTask = body.task as Record<string, unknown>;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ errorId: 0, taskId: 'task_leetcode_auto_turnstile' }),
+        } as Response;
+      }
+      if (urlStr.includes('api.capzy.ai/getTaskResult')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            errorId: 0,
+            status: 'ready',
+            solution: { token: 'leetcode_turnstile_auto_token' },
+          }),
+        } as Response;
+      }
+      return { ok: false, status: 500 } as Response;
+    }));
+
+    const result = await solveCloudflareOrchestrated({
+      websiteURL: 'https://leetcode.com/accounts/login/',
+      overrideKeys: ['capzy_valid_key_1234567890abcdef1234567890'],
+      timeoutMs: 5000,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result?.token).toBe('leetcode_turnstile_auto_token');
+    expect(capturedTask).not.toBeNull();
+    expect((capturedTask as any)?.websiteURL).toBe('https://leetcode.com/accounts/login/');
+    expect((capturedTask as any)?.websiteKey).toBe('0x4AAAAAAADnPIDROrmt1Wwj');
+  });
 });
 

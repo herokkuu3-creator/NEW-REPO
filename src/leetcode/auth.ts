@@ -111,7 +111,7 @@ export async function loginToLeetCode(
     }
 
     // Wait for initial render
-    await page.waitForTimeout(2000);
+    await new Promise((r) => setTimeout(r, 2000));
 
     // Check for Cloudflare Turnstile or Managed Challenge on page
     const turnstileFrame = page.locator('iframe[src*="challenges.cloudflare.com"]');
@@ -124,15 +124,12 @@ export async function loginToLeetCode(
     if (hasTurnstile || isCloudflareChallenge) {
       await notify('🧩 Detected Cloudflare Turnstile verification. Solving…');
       logger.info('Cloudflare Turnstile detected on LeetCode login page; solving via orchestrated solver');
-      const sitekey = await page.evaluate(() => {
-        const el = document.querySelector('[data-sitekey]');
-        return el ? el.getAttribute('data-sitekey') : null;
-      }).catch(() => null);
+      const sitekey = await extractTurnstileSitekey(page);
 
       const currentCookies = await context.cookies('https://leetcode.com').catch(() => []);
       const solved = await solveCloudflareOrchestrated({
         websiteURL: page.url(),
-        sitekey: sitekey || undefined,
+        sitekey,
         proxyUrl: options?.proxyUrl,
         userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
         cookies: currentCookies,
@@ -149,30 +146,28 @@ export async function loginToLeetCode(
         await context.addCookies(newCookies).catch(() => {});
       }
 
-      if (solved?.token && !page.isClosed()) {
-        await page.evaluate((token) => {
-          const input = document.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement;
-          if (input) input.value = token;
-        }, solved.token).catch(() => null);
+      if (solved?.token) {
+        try {
+          if (!page.isClosed()) {
+            await page.evaluate((token) => {
+              const input = document.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement;
+              if (input) input.value = token;
+            }, solved.token).catch(() => null);
+          }
+        } catch {}
       }
 
-      // Check if page closed or crashed during the solve wait; recreate if needed
-      if (page.isClosed()) {
-        logger.warn('Page closed or crashed during Cloudflare solve; creating fresh page with clearance cookies');
-        page = await context.newPage();
-      }
+      page = await ensureHealthyPage(context, page, 'https://leetcode.com/accounts/login/');
 
       await notify('🔄 Reloading LeetCode login page with clearance cookies…');
       await page.goto('https://leetcode.com/accounts/login/', {
         waitUntil: 'domcontentloaded',
         timeout: 30_000,
       }).catch(async () => {
-        if (page.isClosed()) {
-          page = await context.newPage();
-          await page.goto('https://leetcode.com/accounts/login/', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
-        }
+        page = await context.newPage();
+        await page.goto('https://leetcode.com/accounts/login/', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
       });
-      await page.waitForTimeout(2000);
+      await new Promise((r) => setTimeout(r, 2000));
     }
 
     // Locate login inputs with robust multi-selector support
@@ -313,4 +308,61 @@ async function checkSignedInUser(page: Page): Promise<string | null> {
       return null;
     }
   }).catch(() => null);
+}
+
+async function extractTurnstileSitekey(page: Page): Promise<string> {
+  const fallbackKey = '0x4AAAAAAADnPIDROrmt1Wwj';
+  if (!page || page.isClosed()) return fallbackKey;
+  try {
+    const extracted = await page.evaluate(() => {
+      const win = window as any;
+      const el = document.querySelector('.cf-turnstile, [data-sitekey], [data-key]');
+      let key = win.__turnstileSitekey || el?.getAttribute('data-sitekey') || el?.getAttribute('data-key') || (el as HTMLElement | null)?.dataset?.sitekey || null;
+      if (!key) {
+        const iframes = Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="cloudflare.com"]')) as HTMLIFrameElement[];
+        for (const iframe of iframes) {
+          if (iframe?.src) {
+            const match = /(0x4[a-zA-Z0-9_-]{18,})/i.exec(iframe.src);
+            if (match?.[1]) { key = match[1]; break; }
+            try {
+              const u = new URL(iframe.src);
+              key = u.searchParams.get('sitekey') || u.searchParams.get('key') || /\/([0-9a-zA-Z_-]{20,})\//.exec(u.pathname)?.[1] || null;
+              if (key) break;
+            } catch {}
+          }
+        }
+      }
+      if (!key) {
+        const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
+        key = /["']?sitekey["']?\s*[:=]\s*["']([^"']+)["']/i.exec(inline)?.[1] ??
+              /(0x4[a-zA-Z0-9_-]{18,})/i.exec(inline)?.[1] ?? null;
+      }
+      return key;
+    }).catch(() => null);
+    return extracted || fallbackKey;
+  } catch {
+    return fallbackKey;
+  }
+}
+
+async function ensureHealthyPage(context: BrowserContext, page: Page, fallbackUrl: string): Promise<Page> {
+  let healthy = false;
+  if (!page.isClosed()) {
+    try {
+      await page.evaluate(() => 1);
+      healthy = true;
+    } catch {
+      healthy = false;
+    }
+  }
+  if (!healthy) {
+    logger.warn({ fallbackUrl }, 'Target page was closed or crashed; creating fresh page');
+    try {
+      await page.close().catch(() => {});
+    } catch {}
+    const newPage = await context.newPage();
+    await newPage.goto(fallbackUrl, { waitUntil: 'domcontentloaded', timeout: 35_000 }).catch(() => null);
+    return newPage;
+  }
+  return page;
 }
