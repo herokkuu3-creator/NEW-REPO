@@ -33,6 +33,7 @@ import {
   formatCodeforcesReport,
 } from './report';
 import { sendTelegramMessage } from '../notifications/telegram';
+import { refreshCodeforcesAccount } from '../security/sessionAutoRefresh';
 
 const CODEFORCES_LAST_REPORT_KEY = 'codeforcesLastReport';
 let runInProgress = false;
@@ -290,6 +291,22 @@ export async function executeCodeforcesRun(
       await sendTelegramMessage('🚀 <b>Starting daily submission for Codeforces…</b>', { parseMode: 'HTML' }).catch(() => undefined);
     }
 
+    // Auto-refresh any expired or rejected sessions if credentials exist in DB
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i];
+      if (!acc) continue;
+      if (acc.status === CodeforcesAccountStatus.EXPIRED || acc.status === CodeforcesAccountStatus.REJECTED) {
+        try {
+          const outcome = await refreshCodeforcesAccount(acc);
+          if (outcome.status === 'refreshed') {
+            const updatedList = await listCodeforcesAccounts();
+            const updated = updatedList.find((a) => a.id === acc.id);
+            if (updated) accounts[i] = updated;
+          }
+        } catch {}
+      }
+    }
+
     for (const [accIndex, account] of accounts.entries()) {
       if (signal.aborted) break;
 
@@ -487,10 +504,21 @@ async function runForAccount(
   onProgress?: (phase: 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict' | 'attempt' | 'retry' | 'queued' | 'running', username: string | null, attempt?: number) => Promise<void> | void,
 ): Promise<CodeforcesAccountOutcome> {
   const label = account.label;
-  const stored = parseStoredCodeforcesState(account.storageState);
+  let stored = parseStoredCodeforcesState(account.storageState);
   if (!stored.ok) {
-    await patchCodeforcesAccount(account.id, { status: CodeforcesAccountStatus.UNKNOWN, lastError: stored.error, checked: true });
-    return { label, username: account.username, kind: 'failed', error: stored.error };
+    const refreshed = await refreshCodeforcesAccount(account).catch(() => null);
+    if (refreshed?.status === 'refreshed') {
+      const updatedList = await listCodeforcesAccounts();
+      const updated = updatedList.find((a) => a.id === account.id);
+      if (updated) {
+        account = updated;
+        stored = parseStoredCodeforcesState(account.storageState);
+      }
+    }
+    if (!stored.ok) {
+      await patchCodeforcesAccount(account.id, { status: CodeforcesAccountStatus.UNKNOWN, lastError: stored.error, checked: true });
+      return { label, username: account.username, kind: 'failed', error: stored.error };
+    }
   }
 
   let progress = await getCodeforcesProgress(account.id);
@@ -735,6 +763,12 @@ async function runForAccount(
         submissionId: result.submissionId ?? null,
         verdict: duplicateSubmission ? 'DUPLICATE_CODE' : verdictCode,
       });
+    }
+    if (result.kind === 'signed-out') {
+      const refreshed = await refreshCodeforcesAccount(account).catch(() => null);
+      if (refreshed?.status === 'refreshed') {
+        logger.info({ label }, 'Codeforces session auto-refreshed via credentials');
+      }
     }
     await patchCodeforcesAccount(account.id, {
       status:

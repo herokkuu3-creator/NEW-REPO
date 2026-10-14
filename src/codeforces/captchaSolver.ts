@@ -698,11 +698,11 @@ export async function solveTurnstileOrchestrated(params: {
       throwIfAttemptAborted();
 
       if (res.verificationRequired) {
-        logWarn({ attempt, durationMs: res.durationMs }, 'Turnstile verification required; automatic solver attempts stopped');
+        logWarn({ attempt, durationMs: res.durationMs }, 'CPSolver Turnstile verification timed out or declined; falling back to CapSolver / Capzy');
         await sendSolverTelegramNotification(
-          '⚠️ <b>Verification required on Codeforces.</b> No token was issued. Automatic solver attempts stopped; complete verification in a supported browser.',
+          '⚠️ <b>CPSolver could not solve Turnstile challenge. Falling back to CapSolver / Capzy...</b>',
         ).catch(() => undefined);
-        return null;
+        break;
       }
 
       const isInterstitialKey = params.sitekey === '0x4AAAAAAADnPIDROrmt1Wwj';

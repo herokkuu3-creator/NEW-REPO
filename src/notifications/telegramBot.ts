@@ -1,4 +1,4 @@
-import { AccountStatus } from '@prisma/client';
+import { AccountStatus, CodeforcesAccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
 import { sendTelegramMessage } from './telegram';
@@ -20,7 +20,12 @@ import {
   getAccountById,
   listAccounts,
   listEnabledAccounts,
+  saveAccount,
 } from '../database/accounts';
+import { saveEncryptedCredentials } from '../security/credentialStore';
+import { loginToLeetCode } from '../leetcode/auth';
+import { loginToCodeforces } from '../codeforces/auth';
+import { verifyAndRefreshAllSessions } from '../security/sessionAutoRefresh';
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
@@ -49,6 +54,7 @@ import {
   getCodeforcesProgress,
   listCodeforcesAccounts,
   listAllUsernameProgress,
+  saveCodeforcesAccount,
   saveUsernameProgress,
 } from '../codeforces/storage';
 import { formatCodeforcesAccountMessage, summarizeCodeforcesReport } from '../codeforces/report';
@@ -266,6 +272,9 @@ export const HELP_TEXT = [
   '└ /ccaccounts — View CodeChef accounts &amp; queue progress',
   '',
   '<b>🍪 𝗦𝗘𝗦𝗦𝗜𝗢𝗡 𝗠𝗔𝗡𝗔𝗚𝗘𝗠𝗘𝗡𝗧</b>',
+  '├ /lclogin [label] — Interactive LeetCode login (auto-solves Turnstile)',
+  '├ /cflogin [label] — Interactive Codeforces login (auto-solves Turnstile)',
+  '├ /checksessions — Inspect all sessions &amp; auto-refresh expired accounts',
   '├ /renew — Session renewal guide &amp; instructions (supports label)',
   '├ /removesession — Remove a single account session',
   '└ /removeallsessions — Purge all stored accounts',
@@ -484,6 +493,53 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     }
   }
 
+  // Handle active interactive login prompt (/lclogin or /cflogin)
+  if (activeLoginPrompt) {
+    if (text === '/cancel' || lowerText === 'cancel') {
+      activeLoginPrompt = null;
+      await reply('✖️ Login process cancelled.');
+      return;
+    }
+
+    if (activeLoginPrompt.step === 'awaiting_identifier') {
+      const identifier = text.trim();
+      if (!identifier || identifier.startsWith('/')) {
+        await reply('⚠️ Please send a valid username or email address (not a command), or /cancel to abort.');
+        return;
+      }
+      activeLoginPrompt.identifier = identifier;
+      if (!activeLoginPrompt.label) {
+        activeLoginPrompt.label = identifier.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 32) || 'account';
+      }
+      activeLoginPrompt.step = 'awaiting_password';
+      await replyHtml(
+        `🔑 Identifier recorded: <code>${escapeHtml(identifier)}</code>\n` +
+        `Now please enter your <b>password</b>:\n\n` +
+        `<i>🔒 Your password message will be immediately deleted from Telegram chat history for privacy.</i>`,
+      );
+      return;
+    }
+
+    if (activeLoginPrompt.step === 'awaiting_password') {
+      // Immediately delete the user's password message for privacy
+      if (msg.message_id) {
+        await tgApi('deleteMessage', {
+          chat_id: msg.chat.id,
+          message_id: msg.message_id,
+        }).catch((err) => {
+          logger.warn({ err: errText(err) }, 'Could not delete password message from Telegram chat');
+        });
+      }
+
+      const { site, label, identifier } = activeLoginPrompt;
+      const password = text;
+      activeLoginPrompt = null;
+
+      await handleExecuteLogin(site, label || identifier || 'account', identifier || '', password);
+      return;
+    }
+  }
+
   // Handle active queue prompt
   if (pendingQueuePrompt) {
     if (text === '/cancel' || lowerText === 'cancel') {
@@ -533,6 +589,48 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/start':
       case '/help':
         await replyHtml(HELP_TEXT);
+        return;
+      case '/lclogin':
+      case '/lc_login':
+      case '/leetcodelogin':
+      case '/leetcode_login': {
+        const label = commandArg ? commandArg.trim() : undefined;
+        activeLoginPrompt = {
+          site: 'leetcode',
+          step: 'awaiting_identifier',
+          label,
+        };
+        const labelNote = label ? ` for account <code>${escapeHtml(label)}</code>` : '';
+        await replyHtml(
+          `🔐 <b>LeetCode Interactive Login</b>${labelNote}\n\n` +
+          `Please reply with your LeetCode <b>username or email address</b>:\n` +
+          `<i>(Send /cancel anytime to abort)</i>`,
+        );
+        return;
+      }
+      case '/cflogin':
+      case '/cf_login':
+      case '/codeforceslogin':
+      case '/codeforces_login': {
+        const label = commandArg ? commandArg.trim() : undefined;
+        activeLoginPrompt = {
+          site: 'codeforces',
+          step: 'awaiting_identifier',
+          label,
+        };
+        const labelNote = label ? ` for account <code>${escapeHtml(label)}</code>` : '';
+        await replyHtml(
+          `🔐 <b>Codeforces Interactive Login</b>${labelNote}\n\n` +
+          `Please reply with your Codeforces <b>handle or email address</b>:\n` +
+          `<i>(Send /cancel anytime to abort)</i>`,
+        );
+        return;
+      }
+      case '/checksessions':
+      case '/check_sessions':
+      case '/sessioncheck':
+      case '/session_check':
+        await handleCheckSessionsCommand();
         return;
       case '/renew': {
         if (!commandArg) {
@@ -841,6 +939,11 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         pendingRenewalLabel = undefined;
         pendingRangePrompt = false;
         pendingPromptType = null;
+        if (activeLoginPrompt) {
+          activeLoginPrompt = null;
+          await reply('✖️ Login process cancelled.');
+          return;
+        }
         if (pendingCapzyPrompt) {
           pendingCapzyPrompt = false;
           await reply('✖️ CapSolver key setup cancelled.');
@@ -866,7 +969,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
         );
         return;
       default:
-        await reply('🤔 Unknown command. Available: /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /capsolver, /capsolverstatus, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /startqueue, /queuestatus, /clearqueue, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /lclogin, /cflogin, /checksessions, /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /capsolver, /capsolverstatus, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /startqueue, /queuestatus, /clearqueue, /cancel, /help');
         return;
     }
   }
@@ -4647,6 +4750,166 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
 
 /** Pending /renew <label> target — consumed by the next cookie payload. */
 let pendingRenewalLabel: string | undefined;
+
+export interface PendingLoginState {
+  site: 'leetcode' | 'codeforces';
+  step: 'awaiting_identifier' | 'awaiting_password';
+  label?: string;
+  identifier?: string;
+}
+
+let activeLoginPrompt: PendingLoginState | null = null;
+
+export function getActiveLoginPrompt(): PendingLoginState | null {
+  return activeLoginPrompt;
+}
+
+export function setActiveLoginPrompt(state: PendingLoginState | null): void {
+  activeLoginPrompt = state;
+}
+
+async function handleExecuteLogin(
+  site: 'leetcode' | 'codeforces',
+  label: string,
+  identifier: string,
+  password: string,
+  replyFunc: (text: string) => Promise<void> = replyHtml,
+): Promise<void> {
+  const siteName = site === 'leetcode' ? 'LeetCode' : 'Codeforces';
+  await replyFunc(
+    `🔄 <b>Logging in to ${siteName}...</b>\n` +
+    `• Account label: <code>${escapeHtml(label)}</code>\n` +
+    `• Identifier: <code>${escapeHtml(identifier)}</code>\n\n` +
+    `<i>Solving Turnstile verification challenge with local CPSolver (with Capzy/CapSolver fallback)...</i>`,
+  );
+
+  try {
+    if (site === 'leetcode') {
+      const res = await loginToLeetCode(identifier, password, {
+        onProgress: async (msg) => {
+          await sendTelegramMessage(msg).catch(() => undefined);
+        },
+      });
+
+      if (!res.ok || !res.storageState) {
+        await replyFunc(
+          `❌ <b>LeetCode Login Failed:</b>\n` +
+          `<i>${escapeHtml(res.error || 'Authentication timed out or failed.')}</i>\n\n` +
+          `Please check your username/password and try again with <code>/lclogin</code>.`,
+        );
+        return;
+      }
+
+      const username = res.username || identifier;
+      await saveEncryptedCredentials('leetcode', label, {
+        username,
+        password,
+        label,
+      });
+
+      await saveAccount(label, JSON.stringify(res.storageState), {
+        username,
+        status: AccountStatus.ACTIVE,
+      });
+
+      await replyFunc(
+        `✅ <b>LeetCode Login Successful!</b>\n` +
+        `• Authenticated as: <code>${escapeHtml(username)}</code>\n` +
+        `• Account label: <code>${escapeHtml(label)}</code>\n` +
+        `• Active session cookies saved to database.\n` +
+        `• Credentials encrypted with AES-256-GCM and stored for automated daily re-login.`,
+      );
+    } else {
+      const res = await loginToCodeforces(identifier, password, {
+        onProgress: async (msg) => {
+          await sendTelegramMessage(msg).catch(() => undefined);
+        },
+      });
+
+      if (!res.ok || !res.storageState) {
+        await replyFunc(
+          `❌ <b>Codeforces Login Failed:</b>\n` +
+          `<i>${escapeHtml(res.error || 'Authentication timed out or failed.')}</i>\n\n` +
+          `Please check your handle/password and try again with <code>/cflogin</code>.`,
+        );
+        return;
+      }
+
+      const handle = res.handle || identifier;
+      await saveEncryptedCredentials('codeforces', label, {
+        username: handle,
+        password,
+        label,
+      });
+
+      await saveCodeforcesAccount(label, JSON.stringify(res.storageState), {
+        username: handle,
+        status: CodeforcesAccountStatus.ACTIVE,
+      });
+
+      await replyFunc(
+        `✅ <b>Codeforces Login Successful!</b>\n` +
+        `• Authenticated handle: <code>${escapeHtml(handle)}</code>\n` +
+        `• Account label: <code>${escapeHtml(label)}</code>\n` +
+        `• Active session cookies saved to database.\n` +
+        `• Credentials encrypted with AES-256-GCM and stored for automated daily re-login.`,
+      );
+    }
+  } catch (err) {
+    logger.error({ site, label, err: errText(err) }, 'Error during interactive login execution');
+    await replyFunc(`❌ <b>Login Error:</b> ${escapeHtml(errText(err))}`);
+  }
+}
+
+async function handleCheckSessionsCommand(): Promise<void> {
+  await replyHtml(
+    '🔍 <b>Verifying Account Sessions...</b>\n' +
+    'Checking all LeetCode & Codeforces accounts. If any session has expired and stored credentials exist, automatic re-login will run.',
+  );
+  try {
+    const summary = await verifyAndRefreshAllSessions({ notifyTelegram: false });
+    const lines: string[] = [
+      '<b>📋 Session Verification Summary</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+      `• Total LeetCode accounts: <b>${summary.totalLeetCode}</b>`,
+      `• Total Codeforces accounts: <b>${summary.totalCodeforces}</b>`,
+      `• ✅ Active & valid: <b>${summary.valid}</b>`,
+      `• 🔄 Auto-refreshed: <b>${summary.refreshed}</b>`,
+      `• ⚠️ Expired (no credentials): <b>${summary.expiredWithoutCreds}</b>`,
+      `• ❌ Failed: <b>${summary.failed}</b>`,
+      '',
+    ];
+
+    if (summary.outcomes.length > 0) {
+      lines.push('<b>Account Status:</b>');
+      for (const o of summary.outcomes) {
+        const icon =
+          o.status === 'valid'
+            ? '✅'
+            : o.status === 'refreshed'
+            ? '🔄'
+            : o.status === 'missing-credentials'
+            ? '⚠️'
+            : '❌';
+        const siteTag = o.site === 'leetcode' ? 'LeetCode' : 'Codeforces';
+        const userStr = o.username ? ` (${escapeHtml(o.username)})` : '';
+        const statusNote =
+          o.status === 'valid'
+            ? 'Active'
+            : o.status === 'refreshed'
+            ? 'Auto-refreshed via credentials'
+            : o.status === 'missing-credentials'
+            ? 'Expired — no creds stored'
+            : `Failed: ${escapeHtml((o.error || '').slice(0, 50))}`;
+        lines.push(`${icon} [${siteTag}] <code>${escapeHtml(o.label)}</code>${userStr} — <i>${statusNote}</i>`);
+      }
+    }
+
+    await replyHtml(lines.join('\n'));
+  } catch (err) {
+    await replyHtml(`❌ Session verification error: ${escapeHtml(errText(err))}`);
+  }
+}
 
 async function accountsText(): Promise<string> {
   const [accounts, codeforces, codechefs] = await Promise.all([

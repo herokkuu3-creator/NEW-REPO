@@ -12,6 +12,7 @@ import { startHealthServer } from './api/health';
 import { startTelegramBot } from './notifications/telegramBot';
 import { startCodeforcesScheduler, triggerCodeforcesRun } from './codeforces/worker';
 import { startCodeChefScheduler } from './codechef/worker';
+import { startMorningSessionCheckScheduler } from './security/sessionAutoRefresh';
 
 /**
  * Entry point. The process is a long-lived Background Worker:
@@ -54,6 +55,7 @@ async function main(): Promise<void> {
   const stopTelegramBot = startTelegramBot();
   const stopCodeforcesScheduler = startCodeforcesScheduler();
   const stopCodeChefScheduler = startCodeChefScheduler();
+  const stopMorningSessionCheck = startMorningSessionCheckScheduler();
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'shutting down');
@@ -61,6 +63,7 @@ async function main(): Promise<void> {
     stopTelegramBot();
     stopCodeforcesScheduler();
     stopCodeChefScheduler();
+    stopMorningSessionCheck();
     await app.close().catch(() => undefined);
     await disconnectDatabase().catch(() => undefined);
     process.exit(0);

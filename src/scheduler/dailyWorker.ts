@@ -16,10 +16,12 @@ import {
 import {
   AccountRecord,
   ensureAccountsSeeded,
+  getAccountById,
   listEnabledAccounts,
   parseStoredStorageState,
   patchAccount,
 } from '../database/accounts';
+import { refreshLeetCodeAccount } from '../security/sessionAutoRefresh';
 import { AccountOutcome, buildReport, RunReport, summarizeReport } from './report';
 import { BrowserSession, launchWithStorageStateObject } from '../browser/playwright';
 import { claimContestReward } from '../leetcode/contestReward';
@@ -242,6 +244,22 @@ export async function executeDailyRun(
 
     const today = leetcodeDayKey();
     const accounts = await listEnabledAccounts();
+
+    // Auto-refresh any expired or rejected sessions if credentials exist in DB
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i];
+      if (!acc) continue;
+      if (acc.status === AccountStatus.EXPIRED || acc.status === AccountStatus.REJECTED) {
+        try {
+          const outcome = await refreshLeetCodeAccount(acc);
+          if (outcome.status === 'refreshed') {
+            const updated = await getAccountById(acc.id);
+            if (updated) accounts[i] = updated;
+          }
+        } catch {}
+      }
+    }
+
     logger.info(
       { today, reason, accounts: accounts.length, transport: config.transport, forceRun },
       'multi-account daily run starting',
@@ -345,6 +363,15 @@ async function runForAccount(
 
     if (!check.authenticated) {
       if (check.cause === 'signed-out') {
+        const refreshOutcome = await refreshLeetCodeAccount(account).catch(() => null);
+        if (refreshOutcome?.status === 'refreshed') {
+          logger.info({ label }, 'account session auto-refreshed via credentials — retrying');
+          const updated = await getAccountById(account.id);
+          if (updated) {
+            await session.close().catch(() => undefined);
+            return runForAccount(updated, today, forceRun, renewalTriggered, usedCommunityUuids);
+          }
+        }
         // A live "signed out" response from the agent server proves only that
         // LeetCode rejected this transferred session there. It does NOT prove
         // that the token itself has expired, so keep the cookies and classify
