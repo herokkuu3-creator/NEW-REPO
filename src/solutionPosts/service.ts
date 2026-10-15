@@ -11,10 +11,15 @@ import { AIModelRouter, RoutingError } from './router';
 import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext } from './article';
 import { ensurePost, move } from './store';
 import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
-import { loadSolutionKeyPool, rotateSolutionApiKey } from './keyPool';
+import { loadSolutionKeyPool, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 
 export class PostError extends Error {
   constructor(public readonly code: string) { super(code); }
+}
+
+/** Keys before activeIndex were exhausted this month and must not be retried. */
+export function activeSolutionApiKeys(pool: Pick<SolutionKeyPool, 'keys' | 'activeIndex'>): string[] {
+  return pool.keys.slice(Math.max(0, pool.activeIndex));
 }
 
 /** A normal isolated browser context. No shared profile, solver, credential forwarding, or challenge bypass. */
@@ -61,8 +66,9 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
 
 export async function createPostRouter(): Promise<AIModelRouter> {
   const pool = await loadSolutionKeyPool();
-  if (!pool.keys.length) throw new PostError('AI_CONFIGURATION_REQUIRED');
-  return new AIModelRouter({ ...config.solutionPosts, apiKeys: pool.keys }, undefined, undefined,
+  const activeKeys = activeSolutionApiKeys(pool);
+  if (!activeKeys.length) throw new PostError('AI_CONFIGURATION_REQUIRED');
+  return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys }, undefined, undefined,
     attempt => logger.info({ attempt }, 'solution article AI attempt finished'),
     async (failedKey, reason) => {
       const advanced = await rotateSolutionApiKey(failedKey);

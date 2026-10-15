@@ -28,7 +28,7 @@ vi.mock('playwright', () => ({ chromium: { launch: h.launch } }));
 vi.mock('../src/browser/sessionCheck', () => ({ checkSession: h.checkSession }));
 vi.mock('../src/leetcode/apiClient', () => ({ LeetCodeApi: class { awaitSubmission = h.verdict; } }));
 vi.mock('../src/leetcode/dailyChallenge', () => ({ fetchQuestionData: h.question, fetchDailyChallenge: vi.fn() }));
-import { generateForRun, generatePost, loadContext, withAccount } from '../src/solutionPosts/service';
+import { activeSolutionApiKeys, generateForRun, generatePost, loadContext, withAccount } from '../src/solutionPosts/service';
 import { assertTransition, approvePost, move } from '../src/solutionPosts/store';
 import { ArticleReviewError, contextSchema, hash } from '../src/solutionPosts/article';
 import { RoutingError } from '../src/solutionPosts/router';
@@ -50,6 +50,10 @@ beforeEach(() => {
 });
 
 describe('solution workflow and persistence', () => {
+  it('does not retry keys already advanced past for the current month', () => {
+    expect(activeSolutionApiKeys({ keys: ['spent', 'usable-a', 'usable-b'], activeIndex: 1 })).toEqual(['usable-a', 'usable-b']);
+    expect(activeSolutionApiKeys({ keys: ['spent'], activeIndex: 1 })).toEqual([]);
+  });
   it('turns an existing accepted run into an awaiting-review draft and reuses it', async () => {
     const loaded = await loadContext('a', 'run1');
     expect(loaded.code).toBe(context.code);
