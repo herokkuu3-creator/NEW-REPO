@@ -120,6 +120,13 @@ export async function appendSolutionApiKeys(raw: string | string[]): Promise<{
   return { pool, added: newKeys.length, duplicates: additions.length - newKeys.length };
 }
 
+/** Explicit operator action: discard stale/exhausted slots and start a fresh pool at key one. */
+export async function replaceSolutionApiKeys(raw: string | string[]): Promise<SolutionKeyPool> {
+  const keys = parseSolutionApiKeys(raw);
+  if (!keys.length) throw new Error('NO_API_KEYS');
+  return persist({ keys, activeIndex: 0, activePeriod: solutionKeyPeriod(), stored: true });
+}
+
 /** Advance only after an explicit key quota/credential failure. No round-robin on ordinary rate limits. */
 export async function rotateSolutionApiKey(failedKey: string): Promise<SolutionKeyPool> {
   const current = await loadSolutionKeyPool();

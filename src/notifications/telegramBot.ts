@@ -89,7 +89,7 @@ import {
   type KeyBalanceResult,
 } from '../codeforces/capzyKeyManager';
 import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver';
-import { appendSolutionApiKeys, solutionKeyPoolStatus } from '../solutionPosts/keyPool';
+import { appendSolutionApiKeys, replaceSolutionApiKeys, solutionKeyPoolStatus } from '../solutionPosts/keyPool';
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
 
 import {
@@ -272,6 +272,7 @@ export const HELP_TEXT = [
   '├ /dailysolution — Choose cached accounts for 6 AM daily submit + article',
   '├ /manualsolution — Run the selected accounts for daily or one question number',
   '├ /addsolutionkeys &lt;key1,key2&gt; — Append CodeCraft API keys',
+  '├ /setsolutionkeys &lt;key1,key2&gt; — Replace/reset CodeCraft API key pool',
   '└ /solutionkeystatus — Show masked article-generation key pool',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
@@ -622,6 +623,12 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/solutionkey':
         await deleteSensitiveTelegramMessage(msg);
         await handleAddSolutionApiKeys(commandArg);
+        return;
+      case '/setsolutionkeys':
+      case '/replacesolutionkeys':
+      case '/resetsolutionkeys':
+        await deleteSensitiveTelegramMessage(msg);
+        await handleReplaceSolutionApiKeys(commandArg);
         return;
       case '/solutionkeystatus':
       case '/solutionkey_status':
@@ -3193,6 +3200,25 @@ export async function handleAddSolutionApiKeys(commandArg?: string): Promise<voi
     ].join('\n'));
   } catch (error) {
     await replyHtml(`❌ <b>Could not save article API keys:</b> ${escapeHtml(error instanceof Error ? error.message : 'invalid input')}`);
+  }
+}
+
+/** Explicitly reactivates a replacement pool without reviving a key by surprise. */
+export async function handleReplaceSolutionApiKeys(commandArg?: string): Promise<void> {
+  const raw = (commandArg ?? '').trim();
+  if (!raw) {
+    await replyHtml('⚠️ Usage: <code>/setsolutionkeys key1,key2</code>\nThis securely replaces the saved article key pool and activates key #1.');
+    return;
+  }
+  try {
+    const pool = await replaceSolutionApiKeys(raw);
+    await replyHtml([
+      '✅ <b>Article API key pool replaced</b>',
+      `Stored <b>${pool.keys.length}</b> key(s); active key: <b>#1</b>.`,
+      'The supplied command message was deleted. Run <code>/manualsolution</code> to test from Render.',
+    ].join('\n'));
+  } catch (error) {
+    await replyHtml(`❌ <b>Could not replace article API keys:</b> ${escapeHtml(error instanceof Error ? error.message : 'invalid input')}`);
   }
 }
 

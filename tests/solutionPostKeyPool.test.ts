@@ -9,7 +9,7 @@ vi.mock('../src/database/models', () => ({
 }));
 
 import { appendSolutionApiKeys, loadSolutionKeyPool, maskSolutionApiKey, parseSolutionApiKeys,
-  rotateSolutionApiKey, solutionKeyPoolStatus, solutionKeyPeriod } from '../src/solutionPosts/keyPool';
+  replaceSolutionApiKeys, rotateSolutionApiKey, solutionKeyPoolStatus, solutionKeyPeriod } from '../src/solutionPosts/keyPool';
 
 describe('solution article API key pool', () => {
   beforeEach(() => { db.value = null; });
@@ -33,6 +33,14 @@ describe('solution article API key pool', () => {
     expect(status).toMatchObject({ total: 3, active: 2, source: 'database' });
     expect(status.keys[1]).toMatchObject({ position: 2, active: true });
     expect(JSON.stringify(status)).not.toContain('env_backup_0002');
+  });
+  it('replaces a stale pool and explicitly restores key one as active', async () => {
+    await appendSolutionApiKeys('key_three_0003');
+    await rotateSolutionApiKey('env_primary_0001');
+    const pool = await replaceSolutionApiKeys('fresh_key_0001,fresh_key_0002');
+    expect(pool.keys).toEqual(['fresh_key_0001', 'fresh_key_0002']);
+    expect(pool.activeIndex).toBe(0);
+    expect((await solutionKeyPoolStatus()).active).toBe(1);
   });
 
   it('keeps an exhausted key skipped within its month and restores key one in the next month', async () => {
