@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { config } from '../config';
 import { prisma } from '../database/prisma';
 import { generateForRun, retryPost, PostError } from './service';
 import { approvePost } from './store';
@@ -35,7 +36,8 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       } },
     }));
     scoped.get('/admin/solutions/schedule', async () => ({ cron: POST_CRON, timezone: POST_TIMEZONE,
-      publishing: 'review-required', accounts: await prisma.solutionPostPreference.findMany({ where: { enabled: true } }) }));
+      publishing: config.solutionPosts.autoPublish ? 'automatic' : 'review-required',
+      accounts: await prisma.solutionPostPreference.findMany({ where: { enabled: true } }) }));
     scoped.put('/admin/solutions/schedule', async req => {
       const body = z.object({ accountIds: z.array(z.string().min(1)).max(100) }).strict().parse(req.body);
       return setSelectedAccounts(body.accountIds);

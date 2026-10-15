@@ -1,17 +1,33 @@
 import cron from 'node-cron';
 import { randomUUID } from 'node:crypto';
-import { Prisma } from '@prisma/client';
+import { Prisma, SolutionPost } from '@prisma/client';
 import { config } from '../config';
 import { prisma } from '../database/prisma';
 import { logger } from '../logger';
 import { generateForRun, resolveCurrentDaily, retryPost, PostError } from './service';
-import { recoverGeneration } from './store';
+import { approvePost, recoverGeneration } from './store';
+import { publishPost } from './publisher';
 
 export const POST_CRON = '0 6 * * *';
 export const POST_TIMEZONE = 'Asia/Kolkata';
 export function afterPostSchedule(now: Date): boolean {
   const parts = new Intl.DateTimeFormat('en-US', { timeZone: POST_TIMEZONE, hour: '2-digit', hourCycle: 'h23' }).formatToParts(now);
   return Number(parts.find(p => p.type === 'hour')?.value) >= 6;
+}
+
+/**
+ * Publication remains idempotent: completed posts return immediately, and an
+ * uncertain POST click remains PUBLISHING for reconciliation rather than a
+ * second click. This scheduler is the only automatic publication entry point.
+ */
+async function publishGeneratedPost(post: SolutionPost): Promise<SolutionPost> {
+  let ready = post;
+  if (ready.status === 'AWAITING_APPROVAL') {
+    if (!ready.contentHash) throw new PostError('CONTENT_HASH_MISSING');
+    ready = await approvePost(ready.id, ready.contentHash);
+  }
+  if (ready.status === 'DRAFT_READY') return publishPost(ready.id);
+  return ready;
 }
 
 /** A database CAS lease serializes combined runs across replicas and scheduler restarts. */
@@ -74,8 +90,9 @@ export async function runCombined(accountIds: string[], now = new Date()) {
         accountId_problemSlug_intent: { accountId: account.id, problemSlug: daily.slug, intent: 'community-solution' },
       } });
       // Never resubmit accepted code for generation retries. Uncertain publications are left for reconciliation.
-      const post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status) ?
+      let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status) ?
         await retryPost(existing.id) : await generateForRun(account.id, run.id);
+      if (config.solutionPosts.autoPublish) post = await publishGeneratedPost(post);
       results.push({ accountId: account.id, postId: post.id, status: post.status });
     } catch (error) {
       results.push({ accountId: account.id, status: 'FAILED', error: error instanceof PostError ? error.code : 'COMBINED_WORKFLOW_FAILED' });
@@ -84,7 +101,7 @@ export async function runCombined(accountIds: string[], now = new Date()) {
   return results;
 }
 
-/** Explicitly replaces selections. An empty list clears scheduling; publishing is always separately reviewed. */
+/** Explicitly replaces selections. An empty list clears scheduling. */
 export async function setSelectedAccounts(accountIds: string[]) {
   const unique = [...new Set(accountIds)];
   const count = await prisma.account.count({ where: { id: { in: unique }, status: { not: 'DISABLED' } } });
@@ -94,7 +111,8 @@ export async function setSelectedAccounts(accountIds: string[]) {
     for (const accountId of unique) await tx.solutionPostPreference.upsert({ where: { accountId },
       create: { accountId, enabled: true }, update: { enabled: true } });
   });
-  return { accountIds: unique, cron: POST_CRON, timezone: POST_TIMEZONE, publishing: 'review-required' };
+  return { accountIds: unique, cron: POST_CRON, timezone: POST_TIMEZONE,
+    publishing: config.solutionPosts.autoPublish ? 'automatic' : 'review-required' };
 }
 
 export function startSolutionPostScheduler(): () => void {
@@ -118,7 +136,7 @@ export function startSolutionPostScheduler(): () => void {
       for (const id of eligibleIds) if (await reserveScheduledAttempt(id, today)) pendingIds.push(id);
       if (!pendingIds.length) return;
       const results = await runCombined(pendingIds);
-      logger.info({ results, timezone: POST_TIMEZONE }, 'daily solution draft workflow finished');
+      logger.info({ results, timezone: POST_TIMEZONE, autoPublish: config.solutionPosts.autoPublish }, 'daily solution article workflow finished');
     } catch { logger.warn('solution draft scheduler failed; inspect solution history'); }
     finally { running = false; }
   };

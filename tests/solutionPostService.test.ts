@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-const h = vi.hoisted(() => ({ row: null as any, rows: [] as any[], generation: vi.fn(),
+const h = vi.hoisted(() => ({ row: null as any, rows: [] as any[], generation: vi.fn(), verifyVisuals: vi.fn(),
   checkSession: vi.fn(), launch: vi.fn(), browser: { newContext: vi.fn(), close: vi.fn() },
   question: vi.fn(), verdict: vi.fn(), run: null as any, account: null as any }));
 vi.mock('../src/database/prisma', () => ({ prisma: {
@@ -23,6 +23,7 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
   systemState: { findUnique: vi.fn(async () => null), upsert: vi.fn(async () => ({})) },
 } }));
 vi.mock('../src/solutionPosts/article', async orig => ({ ...(await orig() as object), generateArticle: h.generation }));
+vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn(), verifyHostedVisualAssets: h.verifyVisuals }));
 vi.mock('playwright', () => ({ chromium: { launch: h.launch } }));
 vi.mock('../src/browser/sessionCheck', () => ({ checkSession: h.checkSession }));
 vi.mock('../src/leetcode/apiClient', () => ({ LeetCodeApi: class { awaitSubmission = h.verdict; } }));
@@ -33,10 +34,12 @@ import { ArticleReviewError, contextSchema, hash } from '../src/solutionPosts/ar
 import { RoutingError } from '../src/solutionPosts/router';
 const context = contextSchema.parse({ accountId: 'a', username: 'alice', problemId: '1', slug: 'example',
   title: 'Example', difficulty: 'Easy', problem: 'An example problem', submissionId: '123', language: 'cpp', code: 'source\r\n', challengeDate: '2026-10-15' });
-const output = { title: 'Example title', markdown: 'verified exact source\r\n', model: 'terra', reviewModel: 'luna', style: 'visual storytelling', attempts: [] };
+const output = { title: 'Example title', markdown: 'verified exact source\r\n', model: 'terra', reviewModel: 'luna', style: 'visual storytelling',
+  attempts: [], visuals: [{ id: 'visual-1' }, { id: 'visual-2' }], assets: [{ id: 'visual-1' }, { id: 'visual-2' }], visualFallback: false };
 beforeEach(() => {
   vi.clearAllMocks(); h.row = null; h.rows = [];
   h.generation.mockResolvedValue(output);
+  h.verifyVisuals.mockResolvedValue(true);
   h.account = { id: 'a', username: 'alice', status: 'ACTIVE', storageState: '{"cookies":[{"name":"fake"}],"origins":[]}' };
   h.run = { id: 'run1', accountId: 'a', state: 'SUCCESS', solution: context.code, submissionId: '123', submissionStatus: 'Accepted',
     problemSlug: 'example', title: 'Example', difficulty: 'Easy', language: 'cpp', date: '2026-10-15' };
@@ -61,6 +64,11 @@ describe('solution workflow and persistence', () => {
     const post = await generatePost(context, {} as never);
     expect(post.status).toBe('FAILED'); expect(post.lastError).toBe('AI_MODELS_EXHAUSTED');
     expect(post.attempts).toContain('TIMEOUT'); expect(h.run.state).toBe('SUCCESS'); expect(h.run.submissionId).toBe('123');
+  });
+  it('refuses a public post when either mandatory GIF cannot be verified', async () => {
+    h.verifyVisuals.mockResolvedValue(false);
+    const post = await generatePost(context, {} as never);
+    expect(post.status).toBe('FAILED'); expect(post.lastError).toBe('TWO_PUBLIC_GIFS_REQUIRED');
   });
   it('persists missing AI configuration as a retryable failure with source context', async () => {
     const post = await generatePost(context);

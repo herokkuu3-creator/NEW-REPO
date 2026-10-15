@@ -10,7 +10,7 @@ import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallen
 import { AIModelRouter, RoutingError } from './router';
 import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext } from './article';
 import { ensurePost, move } from './store';
-import { storeVisualAssets } from './visualStore';
+import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, rotateSolutionApiKey } from './keyPool';
 
 export class PostError extends Error {
@@ -85,6 +85,13 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     const article = await generateArticle(activeRouter, savedContext,
       recent.map(r => ({ style: r.style ?? '', title: r.title ?? '' })),
       plans => storeVisualAssets(plans, config.api.publicUrl));
+    // Public posts must contain the two independently generated, durable GIFs.
+    // Never degrade a scheduled post to trace tables: that makes a successful
+    // generation look complete while silently dropping the required visuals.
+    if (article.visualFallback || article.visuals.length !== 2 || article.assets.length !== 2 ||
+      !await verifyHostedVisualAssets(article.assets, config.api.publicUrl)) {
+      throw new PostError('TWO_PUBLIC_GIFS_REQUIRED');
+    }
     post = await move(post, 'VALIDATING', { title: article.title, markdown: article.markdown,
       style: article.style, model: article.model, reviewModel: article.reviewModel,
       attempts: JSON.stringify(article.attempts), contentHash: hash(`${article.title}\n${article.markdown}`), approvedHash: null });

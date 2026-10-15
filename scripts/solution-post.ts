@@ -68,7 +68,7 @@ async function main() {
       if (indexes.some(i => !Number.isInteger(i) || !accounts[i])) throw new Error('Invalid account selection');
       ids = [...new Set(indexes.map(i => accounts[i]!.id))];
     }
-    console.log(`${action}: ${ids.length} accounts; schedule 06:00 Asia/Kolkata; generate drafts for review. Public posting requires approve + publish.`);
+    console.log(`${action}: ${ids.length} accounts; schedule 06:00 Asia/Kolkata; generate, validate, and publish when SOLUTION_POST_AUTO_PUBLISH=true.`);
     if ((await rl.question('Apply this selection? Type yes: ')).trim() !== 'yes') return;
     console.log(action === 'schedule' ? await setSelectedAccounts(ids) : await runCombined(ids));
   } finally { rl.close(); }

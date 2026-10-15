@@ -15,6 +15,15 @@ export const visualPlanSchema = z.object({
   for (const [i, frame] of plan.frames.entries()) if (frame.active.some(n => n >= frame.items.length)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['frames', i, 'active'], message: 'Active index is outside the diagram' });
   }
+  // A multi-frame GIF must teach a changing state, rather than looping the same
+  // screenshot. State and metric are rendered on the card, so they count as a
+  // visible change along with the highlighted values.
+  const snapshots = new Set(plan.frames.map(frame => JSON.stringify({
+    items: frame.items, active: frame.active, state: frame.state, metric: frame.metric,
+  })));
+  if (snapshots.size < 2) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['frames'], message: 'Animation frames must show a state change' });
+  }
 });
 export type VisualPlan = z.infer<typeof visualPlanSchema>;
 export interface VisualAsset { id: string; url: string; alt: string }

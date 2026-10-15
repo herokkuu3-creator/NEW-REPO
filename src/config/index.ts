@@ -11,6 +11,11 @@ const boolFromString = z
   .optional()
   .transform((v) => (v ?? '').toLowerCase() === 'true');
 
+const enabledByDefault = z
+  .string()
+  .optional()
+  .transform((v) => v === undefined ? true : v.toLowerCase() === 'true');
+
 const intFromString = (fallback: number) =>
   z
     .string()
@@ -78,6 +83,10 @@ const envSchema = z.object({
   SOLUTION_POST_TIMEOUT_MS: intFromString(90000).pipe(z.number().min(1000).max(300000)),
   SOLUTION_POST_RETRIES: intFromString(1).pipe(z.number().min(0).max(3)),
   SOLUTION_POST_MAX_TOKENS: intFromString(8192).pipe(z.number().min(2048).max(32768)),
+  // Scheduled articles are published once the generated content and the accepted
+  // submission have both passed the existing source, identity, and post checks.
+  // Set false only when drafts should remain queued for a manual review.
+  SOLUTION_POST_AUTO_PUBLISH: enabledByDefault,
   SOLUTION_POST_MODEL_TIMEOUTS: z.string().default('{}').transform((value, ctx) => {
     try { return z.record(z.number().int().min(1000).max(300000)).parse(JSON.parse(value)); }
     catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Expected JSON object of model IDs and timeout milliseconds' }); return z.NEVER; }
@@ -152,7 +161,7 @@ export type Config = Readonly<{
   transport: 'api' | 'browser';
   solutionPosts: {
     apiKey: string; apiKeys: string[]; baseUrl: string; models: string[]; timeoutMs: number; retries: number; maxTokens: number;
-    modelTimeoutMs: Record<string, number>;
+    autoPublish: boolean; modelTimeoutMs: Record<string, number>;
   };
   telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean };
   api: { port: number; setupToken: string; publicUrl: string };
@@ -214,6 +223,7 @@ function loadConfig(): Config {
       timeoutMs: env.SOLUTION_POST_TIMEOUT_MS,
       retries: env.SOLUTION_POST_RETRIES,
       maxTokens: env.SOLUTION_POST_MAX_TOKENS,
+      autoPublish: env.SOLUTION_POST_AUTO_PUBLISH,
       modelTimeoutMs: env.SOLUTION_POST_MODEL_TIMEOUTS,
     },
     telegram: {

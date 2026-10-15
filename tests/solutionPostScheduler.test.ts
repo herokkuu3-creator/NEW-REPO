@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ accounts: [] as any[], runs: new Map<string, any>(), daily: vi.fn(), generate: vi.fn(),
-  submit: vi.fn(), preferences: [] as any[], locks: new Map<string, string>(), calls: [] as any[],
+  submit: vi.fn(), approve: vi.fn(), publish: vi.fn(), preferences: [] as any[], locks: new Map<string, string>(), calls: [] as any[],
   timers: [] as Array<() => void> }));
 vi.mock('node-cron', () => ({ default: { schedule: vi.fn((_expr, callback) => {
   h.timers.push(callback); return { stop: vi.fn() };
@@ -29,7 +29,8 @@ vi.mock('../src/database/prisma', () => {
 });
 vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error { code: string; constructor(code: string) { super(code); this.code = code; } },
   generateForRun: h.generate, resolveCurrentDaily: h.daily, retryPost: vi.fn() }));
-vi.mock('../src/solutionPosts/store', () => ({ recoverGeneration: vi.fn() }));
+vi.mock('../src/solutionPosts/store', () => ({ recoverGeneration: vi.fn(), approvePost: h.approve }));
+vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: h.publish }));
 vi.mock('../src/scheduler/dailyWorker', () => ({ runSubmissionNow: h.submit }));
 import { afterPostSchedule, POST_CRON, POST_TIMEZONE, runCombined, setSelectedAccounts, startSolutionPostScheduler } from '../src/solutionPosts/scheduler';
 beforeEach(() => {
@@ -37,7 +38,9 @@ beforeEach(() => {
   h.accounts = ['a', 'b', 'c', 'd', 'e'].map(id => ({ id, status: 'ACTIVE' }));
   for (const a of h.accounts) h.runs.set(a.id, { id: 'run-' + a.id, problemSlug: 'today', state: 'SUCCESS', submissionId: '123', submissionStatus: 'Accepted' });
   h.daily.mockResolvedValue({ date: '2026-10-15', slug: 'today' });
-  h.generate.mockImplementation(async (id: string) => ({ id: 'post-' + id, status: 'AWAITING_APPROVAL' }));
+  h.generate.mockImplementation(async (id: string) => ({ id: 'post-' + id, status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) }));
+  h.approve.mockImplementation(async (id: string) => ({ id, status: 'DRAFT_READY', contentHash: 'a'.repeat(64) }));
+  h.publish.mockImplementation(async (id: string) => ({ id, status: 'PUBLISHED', contentHash: 'a'.repeat(64) }));
   h.submit.mockImplementation(async (_reason, options) => {
     h.calls.push(options); const id = options.accountIds[0]; h.runs.set(id,
       { id: 'run-' + id, problemSlug: 'today', state: 'SUCCESS', submissionId: '124', submissionStatus: 'Accepted' });
@@ -50,10 +53,11 @@ describe('daily AI drafts', () => {
     expect(afterPostSchedule(new Date('2026-10-15T00:29:59Z'))).toBe(false);
     expect(afterPostSchedule(new Date('2026-10-15T00:30:00Z'))).toBe(true);
   });
-  it('reuses accepted submissions for five selected accounts', async () => {
+  it('reuses accepted submissions and automatically publishes five generated articles', async () => {
     const results = await runCombined(h.accounts.map(a => a.id), new Date('2026-10-15T00:30:00Z'));
-    expect(results.every(r => r.status === 'AWAITING_APPROVAL')).toBe(true);
+    expect(results.every(r => r.status === 'PUBLISHED')).toBe(true);
     expect(h.submit).not.toHaveBeenCalled(); expect(h.locks.size).toBe(0);
+    expect(h.approve).toHaveBeenCalledTimes(5); expect(h.publish).toHaveBeenCalledTimes(5);
   });
   it('runs the existing submission workflow only for a missing accepted submission', async () => {
     h.runs.delete('c'); await runCombined(h.accounts.map(a => a.id), new Date('2026-10-15T00:30:00Z'));
@@ -61,9 +65,9 @@ describe('daily AI drafts', () => {
     expect(h.calls[0]).toEqual({ accountIds: ['c'], expectedChallengeDate: '2026-10-15' });
   });
   it('continues the other four accounts after one account fails', async () => {
-    h.generate.mockImplementation(async (id: string) => { if (id === 'b') throw new Error('failure'); return { id, status: 'AWAITING_APPROVAL' }; });
+    h.generate.mockImplementation(async (id: string) => { if (id === 'b') throw new Error('failure'); return { id, status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) }; });
     const results = await runCombined(h.accounts.map(a => a.id), new Date('2026-10-15T00:30:00Z'));
-    expect(results.filter(r => r.status === 'AWAITING_APPROVAL')).toHaveLength(4);
+    expect(results.filter(r => r.status === 'PUBLISHED')).toHaveLength(4);
     expect(results.filter(r => r.status === 'FAILED')).toHaveLength(1); expect(h.locks.size).toBe(0);
   });
   it('does not submit if challenge discovery fails or the pointer is stale', async () => {
@@ -75,7 +79,7 @@ describe('daily AI drafts', () => {
     await expect(runCombined([])).rejects.toThrow('SELECT_ACCOUNTS_REQUIRED');
     await expect(runCombined(['a', 'a'])).rejects.toThrow('SELECT_ACCOUNTS_REQUIRED');
   });
-  it('sets per-account schedule preferences explicitly, without publishing', async () => {
+  it('sets per-account schedule preferences explicitly, without starting a job', async () => {
     const result = await setSelectedAccounts(h.accounts.map(a => a.id));
     expect(result.timezone).toBe('Asia/Kolkata'); expect(h.preferences).toHaveLength(5);
     expect(h.submit).not.toHaveBeenCalled(); expect(h.generate).not.toHaveBeenCalled();

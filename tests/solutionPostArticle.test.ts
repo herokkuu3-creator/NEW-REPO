@@ -6,11 +6,22 @@ import { articleSchema, contextSchema, generateArticle, renderArticle, selectSty
 export const context = contextSchema.parse({ accountId: 'a', username: 'alice', problemId: '1', slug: 'example',
   title: 'Distinct squares', difficulty: 'Easy', problem: 'Sum squares of distinct counts of all subarrays.',
   submissionId: '123', language: 'cpp', code: 'class Solution {\r\n// exact\r\n};\r\n', challengeDate: '2026-10-15' });
+const mandatoryVisuals = [
+  { id: 'visual-1', after: 'intuition', title: 'Each interval grows a set', caption: 'Watch a new value increase the distinct count.', theme: 'aurora', frames: [
+    { label: 'Start', items: ['1', '2'], active: [0], state: 'set={1}', metric: 'distinct = 1', note: 'The first value starts the set.' },
+    { label: 'Extend', items: ['1', '2'], active: [0, 1], state: 'set={1,2}', metric: 'distinct = 2', note: 'A new value grows the contribution.' },
+  ] },
+  { id: 'visual-2', after: 'dryRun', title: 'Square the live count', caption: 'The running answer receives each interval contribution.', theme: 'ocean', frames: [
+    { label: 'First interval', items: ['1', '2'], active: [0], state: 'answer = 1', metric: '+1', note: 'One distinct value contributes one.' },
+    { label: 'Second interval', items: ['1', '2'], active: [0, 1], state: 'answer = 5', metric: '+4', note: 'Two distinct values contribute four.' },
+  ] },
+];
 export const article = articleSchema.parse({ title: '✨ Count Once, Square It! | A Simple Set Walkthrough',
   sections: ['intuition', 'approach', 'correctness', 'dryRun', 'takeaways'].map(kind => ({ kind, heading: `${kind} explained`,
     markdown: 'Fix the left boundary. Extend the right boundary and insert each value into a fresh set. Square its size for each interval.' })),
   time: { bound: 'O(n^2)', reason: 'There are n(n+1)/2 intervals. Hash insertion takes expected constant time for each interval.' },
-  space: { bound: 'O(n)', reason: 'The set holds at most n distinct input values for one left boundary at a time.' } });
+  space: { bound: 'O(n)', reason: 'The set holds at most n distinct input values for one left boundary at a time.' },
+  visuals: mandatoryVisuals });
 const options = { apiKey: 'secret-test-key', baseUrl: 'https://example.test/v1', models: ['terra', 'luna'], timeoutMs: 1000, retries: 1, maxTokens: 4096 };
 const complete = (content: string, finish_reason = 'stop') => ({ choices: [{ message: { content }, finish_reason }], usage: { total_tokens: 20 } });
 function client() { return { models: { list: vi.fn(async () => ({ data: [{ id: 'terra' }, { id: 'luna' }] })) },
@@ -35,6 +46,14 @@ describe('solution articles', () => {
     const copy = structuredClone(article); copy.sections[0]!.kind = 'approach';
     expect(() => validateArticle(JSON.stringify(copy), context)).toThrow();
     expect(() => articleSchema.parse({ ...article, time: { bound: 'fast', reason: 'a'.repeat(50) } })).toThrow();
+  });
+  it('requires two distinct, moving GIF plans in the required explanatory positions', () => {
+    const none = structuredClone(article); none.visuals = [];
+    expect(() => validateArticle(JSON.stringify(none), context)).toThrow('TWO_GIFS_REQUIRED');
+    const misplaced = structuredClone(article); misplaced.visuals[1]!.after = 'approach';
+    expect(() => validateArticle(JSON.stringify(misplaced), context)).toThrow('GIF_PLACEMENT_REQUIRED');
+    const staticFrames = structuredClone(article); staticFrames.visuals[0]!.frames[1] = structuredClone(staticFrames.visuals[0]!.frames[0]!);
+    expect(() => validateArticle(JSON.stringify(staticFrames), context)).toThrow('Animation frames must show a state change');
   });
   it('accepts qualified expected/worst-case complexity without losing either bound', () => {
     const copy = structuredClone(article); copy.time.bound = 'O(n²) expected, O(n³) worst-case';
@@ -132,25 +151,22 @@ describe('AI model routing', () => {
     await expect(generateArticle(new AIModelRouter(options, api as never), context, [])).rejects.toBeInstanceOf(RoutingError);
     expect(api.chat.completions.create).toHaveBeenCalledTimes(3);
   });
-  it.each([false, true])('resolves visuals after review and retains readable traces on host failure: %s', async hostFails => {
+  it.each([false, true])('resolves both GIFs after review and keeps trace tables only for offline fallback: %s', async hostFails => {
     const draft = structuredClone(article);
-    draft.visuals = [{ id: 'visual-1', after: 'intuition', title: 'A growing set', caption: 'The second value grows the set.', theme: 'aurora', frames: [
-      { label: 'First value', items: ['1', '2'], active: [0], state: 'set={1}', metric: '1', note: 'Insert 1.' },
-      { label: 'Next value', items: ['1', '2'], active: [0, 1], state: 'set={1,2}', metric: '4', note: 'Insert 2.' },
-    ] }];
     const api = client();
     api.chat.completions.create.mockResolvedValueOnce(complete(JSON.stringify(draft)))
       .mockResolvedValueOnce(complete('{"approved":true,"issues":[]}'));
     const resolve = vi.fn(async () => {
       expect(api.chat.completions.create).toHaveBeenCalledTimes(2);
       if (hostFails) throw new Error('Host unavailable');
-      return [{ id: 'visual-1', url: 'https://assets.example.test/a.gif', alt: draft.visuals[0]!.caption }];
+      return draft.visuals.map((visual, index) => ({ id: visual.id, url: `https://assets.example.test/${index}.gif`, alt: visual.caption }));
     });
     const result = await generateArticle(new AIModelRouter(options, api as never), context, [], resolve);
     expect(resolve).toHaveBeenCalledWith(draft.visuals);
     expect(result.visualFallback).toBe(hostFails);
-    expect(result.markdown).toContain(hostFails ? '| Step | State | Result |' : 'https://assets.example.test/a.gif');
+    expect(result.markdown).toContain(hostFails ? '| Step | State | Result |' : 'https://assets.example.test/0.gif');
+    expect(result.assets).toHaveLength(hostFails ? 0 : 2);
     const request = api.chat.completions.create.mock.calls[1]![0] as { messages: { content: string }[] };
-    expect(request.messages[1]!.content).toContain('Next value');
+    expect(request.messages[1]!.content).toContain('Second interval');
   });
 });

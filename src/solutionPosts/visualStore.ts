@@ -27,6 +27,33 @@ export async function storeVisualAssets(plans: VisualPlan[], baseUrl: string): P
   return assets;
 }
 
+/**
+ * Checks the exact URLs that will be inserted into a public article.  Storing a
+ * GIF is not enough: a bad public URL, route, proxy, or deployment can still
+ * leave readers with broken media.  Publication calls this before it clicks
+ * LeetCode's Post button.
+ */
+export async function verifyHostedVisualAssets(assets: VisualAsset[], baseUrl: string,
+  fetcher: typeof fetch = globalThis.fetch): Promise<boolean> {
+  const origin = publicVisualOrigin(baseUrl);
+  if (!origin || assets.length !== 2 || new Set(assets.map(asset => asset.id)).size !== 2) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12_000);
+  try {
+    for (const asset of assets) {
+      let parsed: URL;
+      try { parsed = new URL(asset.url); } catch { return false; }
+      if (parsed.origin !== origin || !/^\/solution-assets\/[a-f0-9]{64}\.gif$/.test(parsed.pathname)) return false;
+      let response: Response;
+      try { response = await fetcher(asset.url, { redirect: 'error', signal: controller.signal }); } catch { return false; }
+      if (!response.ok || !response.headers.get('content-type')?.toLowerCase().includes('image/gif')) return false;
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (bytes.length < 32 || !['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString())) return false;
+    }
+    return true;
+  } finally { clearTimeout(timer); }
+}
+
 export function registerVisualAssetRoutes(app: FastifyInstance) {
   app.get('/solution-assets/:file', async (req, reply) => {
     const { file } = req.params as { file: string };

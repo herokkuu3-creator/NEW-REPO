@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 const db = vi.hoisted(() => ({ findUnique: vi.fn(), upsert: vi.fn() }));
 vi.mock('../src/database/prisma', () => ({ prisma: { systemState: db } }));
 import { visualPlanSchema, renderVisualFallback, renderVisualFrame, renderVisualGif } from '../src/solutionPosts/visuals';
-import { publicVisualOrigin, registerVisualAssetRoutes, storeVisualAssets } from '../src/solutionPosts/visualStore';
+import { publicVisualOrigin, registerVisualAssetRoutes, storeVisualAssets, verifyHostedVisualAssets } from '../src/solutionPosts/visualStore';
 import { articleSchema, contextSchema, renderArticle } from '../src/solutionPosts/article';
 
 const context = contextSchema.parse({ accountId: 'a', username: 'alice', problemId: '1', slug: 'example',
@@ -80,5 +80,23 @@ describe('original solution animations', () => {
       expect(publicVisualOrigin(url)).toBeNull(); expect(await storeVisualAssets([plan], url)).toEqual([]);
     }
     expect(db.upsert).not.toHaveBeenCalled();
+  });
+  it('requires exactly two publicly reachable GIF assets before publication', async () => {
+    const second = visualPlanSchema.parse({ ...plan, id: 'visual-2', after: 'dryRun', title: 'The contribution joins the total', frames: [
+      { ...plan.frames[0]!, state: 'answer=1', metric: '+1' },
+      { ...plan.frames[1]!, state: 'answer=5', metric: '+4' },
+    ] });
+    const firstBytes = await renderVisualGif(plan); const secondBytes = await renderVisualGif(second);
+    const firstHash = createHash('sha256').update(firstBytes).digest('hex');
+    const secondHash = createHash('sha256').update(secondBytes).digest('hex');
+    const assets = [
+      { id: 'visual-1', url: `https://app.example.test/solution-assets/${firstHash}.gif`, alt: plan.caption },
+      { id: 'visual-2', url: `https://app.example.test/solution-assets/${secondHash}.gif`, alt: second.caption },
+    ];
+    const fetcher = vi.fn(async (url: string) => new Response(url.includes(secondHash) ? secondBytes : firstBytes,
+      { status: 200, headers: { 'content-type': 'image/gif' } }));
+    await expect(verifyHostedVisualAssets(assets, 'https://app.example.test', fetcher)).resolves.toBe(true);
+    await expect(verifyHostedVisualAssets([assets[0]!], 'https://app.example.test', fetcher)).resolves.toBe(false);
+    await expect(verifyHostedVisualAssets([{ ...assets[0]!, url: 'https://other.example.test/a.gif' }, assets[1]!], 'https://app.example.test', fetcher)).resolves.toBe(false);
   });
 });

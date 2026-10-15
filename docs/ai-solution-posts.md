@@ -12,9 +12,9 @@ The AI router discovers exact available model IDs before generation, then tries 
 
 Presentation selection considers difficulty and source patterns, avoids the two most recent suitable styles, and sends recent titles to the generator. Emoji titles use a concrete hook and the actual technique; unmeasured “fastest” claims are rejected. Prose targets 120–170 words, with hard limits of 220/280/360 words for Easy/Medium/Hard and 45 words per paragraph. Correctness and takeaways are brief callouts, followed by one compact complexity table and exactly one unchanged source block.
 
-Stateful algorithms include up to two original GIFs interleaved with the short explanation. The model supplies bounded trace data, and a separate request reviews every state transition; application code draws the diagrams and encodes delayed, looping frames. Model text cannot inject executable SVG or external image URLs. Generated media is stored by content hash in the existing PostgreSQL `SystemState` table and served at `/solution-assets/<sha256>.gif`. Set `PUBLIC_URL` to a stable public HTTPS origin; Render's `RENDER_EXTERNAL_URL` is used automatically. No new media migration is required. When a public host is unavailable or rendering/storage fails, readable trace tables replace the images. Local sample generation uses these tables and does not publish assets.
+Every article contains exactly two original GIFs interleaved with the short explanation: one for the core idea and one for a concrete dry run. The model supplies bounded trace data, and a separate request reviews every state transition; application code draws the diagrams and encodes delayed, looping frames. Model text cannot inject executable SVG or external image URLs. Generated media is stored by content hash in the existing PostgreSQL `SystemState` table and served at `/solution-assets/<sha256>.gif`. Set `PUBLIC_URL` to a stable public HTTPS origin; Render's `RENDER_EXTERNAL_URL` is used automatically. No new media migration is required. Before public publication, the worker fetches and validates both exact HTTPS GIF URLs (route, content type, and GIF signature). If either asset cannot be rendered, stored, or fetched, the post fails with `TWO_PUBLIC_GIFS_REQUIRED`; it is never auto-published with a trace-table substitute. Local sample generation can still use trace tables as an offline preview and does not publish assets.
 
-Deterministic validation checks structure, required concepts, code duplication, supported markup, complexity notation, incomplete content, and repeated titles. A separate AI request checks the algorithm, trace, invariants, and complexity. This is useful review, not a correctness proof. A human must still review and approve the exact content hash before publication.
+Deterministic validation checks structure, required concepts, code duplication, supported markup, complexity notation, incomplete content, and repeated titles. A separate AI request checks the algorithm, trace, invariants, and complexity. This is useful review, not a correctness proof. Scheduled publication uses those checks, an accepted-submission recheck, exact-source comparison, duplicate detection, and post-publication verification. Set `SOLUTION_POST_AUTO_PUBLISH=false` to retain the previous human approval gate.
 
 ## Setup
 
@@ -28,6 +28,7 @@ SOLUTION_POST_TIMEOUT_MS=90000
 SOLUTION_POST_MODEL_TIMEOUTS={}
 SOLUTION_POST_RETRIES=1
 SOLUTION_POST_MAX_TOKENS=8192
+SOLUTION_POST_AUTO_PUBLISH=true
 ```
 
 `SOLUTION_POST_API_KEY` remains supported as a one-key bootstrap option. `SOLUTION_POST_API_KEYS` accepts a comma-separated pool. Keys added through the Telegram command bot are encrypted using the existing `SETUP_TOKEN` secret and persisted in PostgreSQL, so they survive restarts. Use `/addsolutionkeys key-1,key-2` to append without removing the existing pool, or `/solutionkeystatus` to view only masked slots and the active position. The service advances to the next saved key after a quota, billing, payment, invalid-key, or forbidden response; ordinary temporary rate limits and timeouts do not consume a new key. There is no provider-neutral way to measure remaining monthly quota ahead of a request.
@@ -93,7 +94,7 @@ Long generation requests are synchronous. Use a client/proxy timeout that covers
 
 ## Scheduling and recovery
 
-The new article cron is `0 6 * * *`, explicitly interpreted in `Asia/Kolkata`. Recovery checks every ten minutes after 06:00 IST and on startup. They process only explicitly selected accounts whose current UTC challenge day has no completed draft. They do not publish automatically.
+The new article cron is `0 6 * * *`, explicitly interpreted in `Asia/Kolkata`. Recovery checks every ten minutes after 06:00 IST and on startup. They process only explicitly selected accounts whose current UTC challenge day has no completed article. With the default `SOLUTION_POST_AUTO_PUBLISH=true`, a successfully generated and independently reviewed article is automatically approved and posted through LeetCode's visible solution editor. Set the flag to `false` to retain drafts for manual approval.
 
 Each account authenticates independently and checks LeetCode's challenge date and slug. A stale pointer gets three bounded checks. Before invoking the existing submission worker, combined mode supplies the expected challenge date and selected account IDs; the worker checks the date again before submitting. An existing local accepted run is reused. One failed account does not stop the others.
 
@@ -101,7 +102,7 @@ Generation has a maximum of four job attempts, including the original attempt. S
 
 ## Publishing and limits
 
-The publisher uses LeetCode's visible `post-solution/?submissionId=...` editor, requires the selected account's accepted submission and the exact prepopulated source, and verifies the entered Markdown before clicking Post. It uses the existing community GraphQL queries to detect an existing post by the account. The scan is bounded; an incomplete scan blocks publication.
+The publisher uses LeetCode's visible `post-solution/?submissionId=...` editor, requires the selected account's accepted submission and the exact prepopulated source, and verifies the entered Markdown before clicking Post. It uses the existing community GraphQL queries to detect an existing post by the account. The scan is bounded; an incomplete scan blocks publication. Generated GIF URLs are served from the durable `/solution-assets/<sha256>.gif` endpoint. Both must be reachable as valid GIFs from the configured public HTTPS origin before any Markdown can be posted.
 
 After clicking Post, the job remains `PUBLISHING` until the returned solution URL, exact article Markdown/title, and author are positively verified. Timeouts preserve the draft and require reconciliation, never another blind click. A candidate URL can be reconciled through the API or CLI. It is not possible to reset an uncertain publication to a publishable state through these commands.
 
