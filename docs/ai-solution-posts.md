@@ -62,6 +62,8 @@ npm run solution:post -- reconcile <postId> <publishedURL>
 
 `daily` runs once for explicitly selected accounts. `schedule` shows all eligible accounts and accepts comma-separated numbers, `all`, or `clear`, then displays the selection and asks the operator to apply it. Clearing the schedule disables all article preferences. Existing submission schedules are unchanged.
 
+In Telegram, `/dailysolution` opens the same durable account selection used by the 06:00 IST schedule. It preselects the accounts saved on the previous use, so accounts can be added or removed before saving or running the combined daily submission and article workflow immediately. `/manualsolution` uses that saved selection and offers either the daily problem or one LeetCode question number (for example, `3820`). For a manual question, the worker submits it, retains the exact accepted source under a namespaced non-daily run key, then generates and publishes the article through the same verified-GIF path. It never overwrites the calendar-day daily run.
+
 For provider-only testing without a database mutation or public post:
 
 ```sh

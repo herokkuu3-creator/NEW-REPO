@@ -90,6 +90,7 @@ import {
 } from '../codeforces/capzyKeyManager';
 import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver';
 import { appendSolutionApiKeys, solutionKeyPoolStatus } from '../solutionPosts/keyPool';
+import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
 
 import {
   isRunInProgress,
@@ -172,7 +173,7 @@ interface TgUpdate {
 
 export type InlineButton = { text: string; callback_data: string };
 
-export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | 'capzy' | 'addcapzy' | 'solutionkeys' | null;
+export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | 'capzy' | 'addcapzy' | 'solutionkeys' | 'solutionquestion' | null;
 let pendingPromptType: PendingPromptType = null;
 let pendingRangePrompt = false;
 let pendingQueuePrompt = false;
@@ -268,6 +269,8 @@ export const HELP_TEXT = [
   '└ /capsolverstatus — Check current solver API keys &amp; balances',
   '',
   '<b>✨ 𝗔𝗜 𝗦𝗢𝗟𝗨𝗧𝗜𝗢𝗡 𝗔𝗥𝗧𝗜𝗖𝗟𝗘𝗦</b>',
+  '├ /dailysolution — Choose cached accounts for 6 AM daily submit + article',
+  '├ /manualsolution — Run the selected accounts for daily or one question number',
   '├ /addsolutionkeys &lt;key1,key2&gt; — Append CodeCraft API keys',
   '└ /solutionkeystatus — Show masked article-generation key pool',
   '',
@@ -885,6 +888,14 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/trigger_submission':
         await handleTriggerSubmission();
         return;
+      case '/dailysolution':
+      case '/daily_solution':
+        await sendDailySolutionPicker();
+        return;
+      case '/manualsolution':
+      case '/manual_solution':
+        await handleManualSolutionCommand(commandArg);
+        return;
       case '/claimcoins':
       case '/claim_coins':
       case '/claimoffer':
@@ -1010,6 +1021,11 @@ async function handleMessage(msg: TgMessage): Promise<void> {
   }
 
   // Text replies to interactive prompts (when not a document and starts with a digit/hash):
+  if (!msg.document && pendingPromptType === 'solutionquestion' && /^\s*#?\d{1,5}\s*$/.test(text)) {
+    pendingPromptType = null;
+    await startDailySolutionWorkflow(await selectedAccountIds(), Number(text.trim().replace(/^#/, '')));
+    return;
+  }
   if (!msg.document && /^\s*#?\d/.test(text)) {
     if (pendingPromptType === 'codeforces') {
       pendingPromptType = null;
@@ -1665,6 +1681,100 @@ export async function handleTriggerSubmission(
   // Wrapped in an object: returning the promise itself from an async function
   // would make the caller wait for the whole run and block the poll loop.
   return { done };
+}
+
+// ---------------------------------------------------------------------------
+// Daily submit + article picker (/dailysolution, /manualsolution)
+// ---------------------------------------------------------------------------
+
+const dailySolutionSelections = new Map<string, Set<string>>();
+
+export function buildDailySolutionPicker(accounts: AccountRecord[], selected: ReadonlySet<string>) {
+  const allSelected = accounts.length > 0 && accounts.every(account => selected.has(account.id));
+  const buttons: InlineButton[][] = accounts.map(account => [{
+    text: `${selected.has(account.id) ? '✅' : '▫️'} ${accountName(account)}`.slice(0, 60),
+    callback_data: `lcsol:a:${account.id}`,
+  }]);
+  buttons.push([{ text: `${allSelected ? '✅' : '👥'} All accounts (${accounts.length})`, callback_data: 'lcsol:all' }]);
+  buttons.push([
+    { text: `💾 Save daily selection (${selected.size})`, callback_data: 'lcsol:save' },
+    { text: '🚀 Run daily now', callback_data: 'lcsol:daily' },
+  ]);
+  buttons.push([{ text: '✖️ Cancel', callback_data: 'lcsol:x' }]);
+  return {
+    text: ['📅 <b>Daily submission + solution article</b>', '',
+      'Select the LeetCode accounts for the 06:00 IST daily workflow.',
+      'The same saved selection is preloaded the next time you open this command.',
+      'Each selected account submits the daily problem, generates two verified GIFs, and posts its article.',
+      '', `Selected: <b>${selected.size}/${accounts.length}</b>`].join('\n'), buttons,
+  };
+}
+
+async function sendDailySolutionPicker(): Promise<void> {
+  const accounts = await listEnabledAccounts();
+  if (!accounts.length) { await reply('📭 No active LeetCode accounts are configured.'); return; }
+  const selected = new Set(await selectedAccountIds());
+  dailySolutionSelections.set(String(config.telegram.chatId), selected);
+  const picker = buildDailySolutionPicker(accounts, selected);
+  await defaultCoinClaimUiDeps.send(picker.text, picker.buttons);
+}
+
+async function startDailySolutionWorkflow(accountIds: string[], questionNumber?: number): Promise<void> {
+  if (!accountIds.length) { await reply('⚠️ Select at least one account first with /dailysolution.'); return; }
+  const description = questionNumber ? `question #${questionNumber}` : 'today’s daily question';
+  await reply(`🚀 Starting ${description} for ${accountIds.length} selected account(s). Accepted submissions will generate and publish their GIF article.`);
+  void (async () => {
+    const results = questionNumber ? await runManualQuestion(questionNumber, accountIds) : await runCombined(accountIds);
+    const done = results.filter(result => result.status === 'PUBLISHED').length;
+    const failed = results.filter(result => result.status === 'FAILED').length;
+    await reply(`🏁 ${questionNumber ? `Question #${questionNumber}` : 'Daily workflow'} finished: ${done} published · ${failed} failed.`);
+  })().catch(async error => {
+    await reply(`⚠️ Daily solution workflow failed: ${errText(error)}`).catch(() => undefined);
+  });
+}
+
+async function handleDailySolutionButton(chatId: number | string, messageId: number, callbackId: string, data: string): Promise<void> {
+  const accounts = await listEnabledAccounts();
+  const key = String(chatId);
+  const selected = dailySolutionSelections.get(key) ?? new Set(await selectedAccountIds());
+  if (data === 'lcsol:x') {
+    dailySolutionSelections.delete(key); await defaultCoinClaimUiDeps.answer(callbackId, 'Cancelled');
+    await defaultCoinClaimUiDeps.edit(chatId, messageId, '✖️ Daily solution selection cancelled. Saved accounts were not changed.'); return;
+  }
+  if (data === 'lcsol:all') {
+    const all = accounts.length > 0 && accounts.every(account => selected.has(account.id));
+    if (all) selected.clear(); else accounts.forEach(account => selected.add(account.id));
+    dailySolutionSelections.set(key, selected); await defaultCoinClaimUiDeps.answer(callbackId, all ? 'Cleared all' : 'All accounts selected');
+  } else if (data.startsWith('lcsol:a:')) {
+    const id = data.slice('lcsol:a:'.length);
+    if (!accounts.some(account => account.id === id)) { await defaultCoinClaimUiDeps.answer(callbackId, 'Account no longer available'); return; }
+    if (selected.has(id)) selected.delete(id); else selected.add(id);
+    dailySolutionSelections.set(key, selected); await defaultCoinClaimUiDeps.answer(callbackId, selected.has(id) ? 'Selected' : 'Unselected');
+  } else if (data === 'lcsol:save' || data === 'lcsol:daily') {
+    if (!selected.size) { await defaultCoinClaimUiDeps.answer(callbackId, 'Select at least one account'); return; }
+    await setSelectedAccounts([...selected]); dailySolutionSelections.delete(key);
+    await defaultCoinClaimUiDeps.answer(callbackId, data === 'lcsol:daily' ? 'Starting daily workflow' : 'Saved');
+    if (data === 'lcsol:daily') {
+      await defaultCoinClaimUiDeps.edit(chatId, messageId, '🚀 Saved selection. The daily submit + verified-GIF article workflow is starting.');
+      await startDailySolutionWorkflow([...selected]); return;
+    }
+  } else { await defaultCoinClaimUiDeps.answer(callbackId); return; }
+  const picker = buildDailySolutionPicker(accounts, selected);
+  await defaultCoinClaimUiDeps.edit(chatId, messageId, picker.text, picker.buttons);
+}
+
+async function handleManualSolutionCommand(argument: string): Promise<void> {
+  const selected = await selectedAccountIds();
+  if (!selected.length) { await reply('⚠️ Choose the account set first with /dailysolution.'); return; }
+  const raw = argument.trim().toLowerCase();
+  if (raw === 'daily') { await startDailySolutionWorkflow(selected); return; }
+  if (/^#?\d{1,5}$/.test(raw)) { await startDailySolutionWorkflow(selected, Number(raw.replace('#', ''))); return; }
+  pendingPromptType = 'solutionquestion';
+  await defaultCoinClaimUiDeps.send('🛠️ <b>Manual solution submission</b>\n\nUse the saved account selection. Choose the daily problem or send a LeetCode question number.', [
+    [{ text: '📅 Submit daily + post article', callback_data: 'lcsol:m:daily' }],
+    [{ text: '🔢 Enter question number', callback_data: 'lcsol:m:question' }],
+    [{ text: '✖️ Cancel', callback_data: 'lcsol:m:x' }],
+  ]);
 }
 
 /** /submitnextsolution — run the next queued Codeforces source solution once per account. */
@@ -3704,6 +3814,27 @@ export async function handleCallbackQuery(
     return;
   }
   const data = q.data ?? '';
+
+  if (data.startsWith('lcsol:')) {
+    if (data === 'lcsol:m:daily') {
+      const selected = await selectedAccountIds();
+      await deps.answer(q.id, 'Starting daily workflow');
+      await deps.edit(chatId, messageId, '🚀 Starting the saved accounts for today’s daily problem and solution article.');
+      pendingPromptType = null;
+      await startDailySolutionWorkflow(selected);
+      return;
+    }
+    if (data === 'lcsol:m:question') {
+      pendingPromptType = 'solutionquestion'; await deps.answer(q.id, 'Send a question number');
+      await deps.edit(chatId, messageId, '🔢 Send one LeetCode question number, for example <code>3820</code>.'); return;
+    }
+    if (data === 'lcsol:m:x') {
+      pendingPromptType = null; await deps.answer(q.id, 'Cancelled');
+      await deps.edit(chatId, messageId, '✖️ Manual solution submission cancelled.'); return;
+    }
+    await handleDailySolutionButton(chatId, messageId, q.id, data);
+    return;
+  }
 
   if (data.startsWith('qr:')) {
     await handleRangeButton(chatId, messageId, q.id, data, deps, ui);

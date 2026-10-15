@@ -5,6 +5,7 @@ import { config } from '../config';
 import { prisma } from '../database/prisma';
 import { logger } from '../logger';
 import { generateForRun, resolveCurrentDaily, retryPost, PostError } from './service';
+import { startRangeJob } from '../scheduler/rangeSubmission';
 import { approvePost, recoverGeneration } from './store';
 import { publishPost } from './publisher';
 
@@ -20,7 +21,7 @@ export function afterPostSchedule(now: Date): boolean {
  * uncertain POST click remains PUBLISHING for reconciliation rather than a
  * second click. This scheduler is the only automatic publication entry point.
  */
-async function publishGeneratedPost(post: SolutionPost): Promise<SolutionPost> {
+export async function publishGeneratedPost(post: SolutionPost): Promise<SolutionPost> {
   let ready = post;
   if (ready.status === 'AWAITING_APPROVAL') {
     if (!ready.contentHash) throw new PostError('CONTENT_HASH_MISSING');
@@ -28,6 +29,49 @@ async function publishGeneratedPost(post: SolutionPost): Promise<SolutionPost> {
   }
   if (ready.status === 'DRAFT_READY') return publishPost(ready.id);
   return ready;
+}
+
+/** The durable list shared by the 06:00 scheduler and the Telegram picker. */
+export async function selectedAccountIds(): Promise<string[]> {
+  const selected = await prisma.solutionPostPreference.findMany({ where: { enabled: true }, orderBy: { accountId: 'asc' } });
+  return selected.map(item => item.accountId);
+}
+
+/**
+ * Submit one explicitly requested public question for selected accounts, then
+ * create and publish the same reviewed article used by the daily workflow.
+ * Manual runs use a non-daily key so they cannot overwrite or suppress the
+ * actual DailyRun for the calendar day.
+ */
+export async function runManualQuestion(questionNumber: number, accountIds: string[], now = new Date()) {
+  if (!Number.isInteger(questionNumber) || questionNumber < 1 || questionNumber > 9999) throw new PostError('INVALID_QUESTION_NUMBER');
+  if (!accountIds.length || new Set(accountIds).size !== accountIds.length) throw new PostError('SELECT_ACCOUNTS_REQUIRED');
+  const accounts = await prisma.account.findMany({ where: { id: { in: accountIds }, status: { not: 'DISABLED' } } });
+  if (accounts.length !== accountIds.length) throw new PostError('ACCOUNT_UNAVAILABLE');
+  const results: Array<{ accountId: string; postId?: string; status: string; error?: string }> = [];
+  for (const account of accounts) {
+    try {
+      const job = await startRangeJob({ from: questionNumber, to: questionNumber }, account.id);
+      if (!('done' in job)) throw new PostError(job.reason === 'no-accounts' ? 'SELECT_ACCOUNTS_REQUIRED' : 'ACCOUNT_UNAVAILABLE');
+      const rangeResults = await job.done;
+      const accepted = rangeResults[0]?.results.find(result => result.status === 'accepted' && result.capture);
+      if (!accepted?.capture || !accepted.submissionId) throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
+      const capture = accepted.capture;
+      const date = `manual:${questionNumber}:${now.toISOString().slice(0, 10)}`;
+      const run = await prisma.dailyRun.upsert({ where: { accountId_date: { accountId: account.id, date } },
+        create: { accountId: account.id, date, problemSlug: capture.slug, title: capture.title, difficulty: capture.difficulty,
+          language: capture.language, solution: capture.code, submissionId: accepted.submissionId, submissionStatus: 'Accepted', state: 'SUCCESS' },
+        update: { problemSlug: capture.slug, title: capture.title, difficulty: capture.difficulty, language: capture.language,
+          solution: capture.code, submissionId: accepted.submissionId, submissionStatus: 'Accepted', state: 'SUCCESS', error: null },
+      });
+      let post = await generateForRun(account.id, run.id);
+      if (config.solutionPosts.autoPublish) post = await publishGeneratedPost(post);
+      results.push({ accountId: account.id, postId: post.id, status: post.status });
+    } catch (error) {
+      results.push({ accountId: account.id, status: 'FAILED', error: error instanceof PostError ? error.code : 'MANUAL_WORKFLOW_FAILED' });
+    }
+  }
+  return results;
 }
 
 /** A database CAS lease serializes combined runs across replicas and scheduler restarts. */

@@ -59,6 +59,11 @@ describe('solution workflow and persistence', () => {
     expect(again.id).toBe(first.id); expect(h.generation).toHaveBeenCalledTimes(1);
     expect(h.verdict).toHaveBeenCalledTimes(1);
   });
+  it('normalizes the namespaced manual-run key to an ISO article date', async () => {
+    h.run.date = 'manual:3820:2026-10-15';
+    const loaded = await loadContext('a', 'run1');
+    expect(loaded.challengeDate).toBe('2026-10-15');
+  });
   it('persists all-model failure without changing the accepted run', async () => {
     h.generation.mockRejectedValue(new RoutingError([{ model: 'terra', attempt: 1, outcome: 'TIMEOUT', elapsedMs: 1000 }]));
     const post = await generatePost(context, {} as never);

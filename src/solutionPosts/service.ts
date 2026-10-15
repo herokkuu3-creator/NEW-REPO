@@ -41,6 +41,11 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
   if (run.accountId !== accountId || run.state !== 'SUCCESS' || !run.solution || !run.submissionId ||
     run.submissionStatus !== 'Accepted') throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
   const account = await prisma.account.findUniqueOrThrow({ where: { id: accountId } });
+  // Manual question submissions use a namespaced DailyRun key so they never
+  // collide with the real calendar-day run. The article context still needs a
+  // normal ISO challenge date for validation and presentation.
+  const contextDate = /^\d{4}-\d{2}-\d{2}$/.test(run.date) ? run.date :
+    /^manual:\d+:(\d{4}-\d{2}-\d{2})$/.exec(run.date)?.[1] ?? new Date().toISOString().slice(0, 10);
   return withAccount(account, async (api, _page, username) => {
     const verdict = await api.awaitSubmission(run.submissionId!, run.problemSlug, 30000, { firstPollDelayMs: 0 });
     if (verdict.classification !== 'ACCEPTED') throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
@@ -50,7 +55,7 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
     }
     return contextSchema.parse({ accountId, username, problemId: question.questionId, slug: run.problemSlug,
       title: run.title, difficulty: run.difficulty, problem: question.contentHtml,
-      submissionId: run.submissionId, language: run.language, code: run.solution, challengeDate: run.date });
+      submissionId: run.submissionId, language: run.language, code: run.solution, challengeDate: contextDate });
   });
 }
 

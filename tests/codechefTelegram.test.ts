@@ -13,8 +13,24 @@ import {
   handleCodeChefRangePrompt,
   handleCodeChefRangeButton,
   CodeChefUiDeps,
+  buildDailySolutionPicker,
   handleCallbackQuery,
 } from '../src/notifications/telegramBot';
+
+describe('daily solution account picker', () => {
+  it('renders saved accounts as selected and exposes save plus immediate daily-run actions', () => {
+    const picker = buildDailySolutionPicker([
+      { id: 'a', label: 'alpha', username: 'alice', status: 'ACTIVE' },
+      { id: 'b', label: 'beta', username: 'bob', status: 'ACTIVE' },
+    ] as never, new Set(['a']));
+    expect(picker.text).toContain('preloaded');
+    expect(picker.text).toContain('1/2');
+    expect(picker.buttons).toContainEqual([{ text: '✅ alpha (alice)', callback_data: 'lcsol:a:a' }]);
+    expect(picker.buttons).toContainEqual([{ text: '▫️ beta (bob)', callback_data: 'lcsol:a:b' }]);
+    expect(picker.buttons.flat()).toContainEqual({ text: '💾 Save daily selection (1)', callback_data: 'lcsol:save' });
+    expect(picker.buttons.flat()).toContainEqual({ text: '🚀 Run daily now', callback_data: 'lcsol:daily' });
+  });
+});
 
 describe('/codechef manual trigger', () => {
   it('starts the real runner asynchronously rather than returning the old placeholder', async () => {

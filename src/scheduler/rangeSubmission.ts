@@ -90,6 +90,8 @@ export interface QuestionResult {
   /** Judge verdict (failed) or short reason (error). */
   detail?: string;
   submissionId?: string;
+  /** Exact accepted source retained only for the manual article workflow. */
+  capture?: { slug: string; title: string; difficulty: string; language: 'cpp'; code: string };
 }
 
 export interface AccountRangeResult {
@@ -859,13 +861,13 @@ async function solveOne(
         );
         const retrySubId = await api.submit({ slug: slug!, questionId, lang: 'cpp', code });
         verdict = await api.awaitResult(retrySubId, slug!);
-        return { verdict, submissionId: retrySubId };
+        return { verdict, submissionId: retrySubId, code };
       }
 
-      return { verdict, submissionId: subId };
+      return { verdict, submissionId: subId, code };
     };
 
-    let { verdict, submissionId } = await submitCode(solutionCode);
+    let { verdict, submissionId, code: acceptedCode } = await submitCode(solutionCode);
 
     // If verdict was rejected (wrong answer, compile error, runtime error) and we have a walkccc fallback:
     if (
@@ -898,13 +900,15 @@ async function solveOne(
             });
           }
           return {
-            outcome: { number: n, status: 'accepted', submissionId: fallbackRes.submissionId },
+            outcome: { number: n, status: 'accepted', submissionId: fallbackRes.submissionId,
+              capture: { slug: slug!, title: questionTitle!, difficulty: q.difficulty, language: 'cpp', code: fallbackRes.code } },
             touchedLeetCode: true,
             blocked: false,
           };
         }
         verdict = fallbackRes.verdict;
         submissionId = fallbackRes.submissionId;
+        acceptedCode = fallbackRes.code;
       } catch (fbErr) {
         logger.warn({ question: n, slug, err: shortErr(fbErr) }, 'walkccc fallback submission failed');
       }
@@ -927,7 +931,8 @@ async function solveOne(
           submissionId,
         });
       }
-      return { outcome: { number: n, status: 'accepted', submissionId }, touchedLeetCode: true, blocked: false };
+      return { outcome: { number: n, status: 'accepted', submissionId,
+        capture: { slug, title: questionTitle!, difficulty: q.difficulty, language: 'cpp', code: acceptedCode } }, touchedLeetCode: true, blocked: false };
     }
     if (verdict.classification === 'UNKNOWN') {
       if (progressCtx) {

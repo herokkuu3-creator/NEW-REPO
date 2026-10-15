@@ -1,14 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ accounts: [] as any[], runs: new Map<string, any>(), daily: vi.fn(), generate: vi.fn(),
   submit: vi.fn(), approve: vi.fn(), publish: vi.fn(), preferences: [] as any[], locks: new Map<string, string>(), calls: [] as any[],
-  timers: [] as Array<() => void> }));
+  timers: [] as Array<() => void>, range: vi.fn() }));
 vi.mock('node-cron', () => ({ default: { schedule: vi.fn((_expr, callback) => {
   h.timers.push(callback); return { stop: vi.fn() };
 }) } }));
 vi.mock('../src/database/prisma', () => {
   const tx = {
     account: { findMany: vi.fn(async () => h.accounts), count: vi.fn(async () => h.accounts.length) },
-    dailyRun: { findUnique: vi.fn(async ({ where }: any) => h.runs.get(where.accountId_date.accountId) ?? null) },
+    dailyRun: { findUnique: vi.fn(async ({ where }: any) => h.runs.get(where.accountId_date.accountId) ?? null),
+      upsert: vi.fn(async ({ create }: any) => ({ id: `manual-${create.accountId}`, ...create })) },
     solutionPost: { findUnique: vi.fn(async () => null), findMany: vi.fn(async () => []) },
     solutionPostPreference: {
       updateMany: vi.fn(async () => { h.preferences = []; }),
@@ -32,7 +33,8 @@ vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error 
 vi.mock('../src/solutionPosts/store', () => ({ recoverGeneration: vi.fn(), approvePost: h.approve }));
 vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: h.publish }));
 vi.mock('../src/scheduler/dailyWorker', () => ({ runSubmissionNow: h.submit }));
-import { afterPostSchedule, POST_CRON, POST_TIMEZONE, runCombined, setSelectedAccounts, startSolutionPostScheduler } from '../src/solutionPosts/scheduler';
+vi.mock('../src/scheduler/rangeSubmission', () => ({ startRangeJob: h.range }));
+import { afterPostSchedule, POST_CRON, POST_TIMEZONE, runCombined, runManualQuestion, setSelectedAccounts, startSolutionPostScheduler } from '../src/solutionPosts/scheduler';
 beforeEach(() => {
   vi.clearAllMocks(); h.locks.clear(); h.preferences = []; h.runs.clear(); h.calls = []; h.timers = [];
   h.accounts = ['a', 'b', 'c', 'd', 'e'].map(id => ({ id, status: 'ACTIVE' }));
@@ -41,6 +43,8 @@ beforeEach(() => {
   h.generate.mockImplementation(async (id: string) => ({ id: 'post-' + id, status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) }));
   h.approve.mockImplementation(async (id: string) => ({ id, status: 'DRAFT_READY', contentHash: 'a'.repeat(64) }));
   h.publish.mockImplementation(async (id: string) => ({ id, status: 'PUBLISHED', contentHash: 'a'.repeat(64) }));
+  h.range.mockResolvedValue({ started: true, done: Promise.resolve([{ results: [{ status: 'accepted', submissionId: '456',
+    capture: { slug: 'manual-question', title: 'Manual question', difficulty: 'Easy', language: 'cpp', code: 'class Solution {}' } }] }]) });
   h.submit.mockImplementation(async (_reason, options) => {
     h.calls.push(options); const id = options.accountIds[0]; h.runs.set(id,
       { id: 'run-' + id, problemSlug: 'today', state: 'SUCCESS', submissionId: '124', submissionStatus: 'Accepted' });
@@ -83,6 +87,13 @@ describe('daily AI drafts', () => {
     const result = await setSelectedAccounts(h.accounts.map(a => a.id));
     expect(result.timezone).toBe('Asia/Kolkata'); expect(h.preferences).toHaveLength(5);
     expect(h.submit).not.toHaveBeenCalled(); expect(h.generate).not.toHaveBeenCalled();
+  });
+  it('turns a selected manual question into an accepted source-backed article post', async () => {
+    h.accounts = [h.accounts[0]];
+    const results = await runManualQuestion(3820, ['a'], new Date('2026-10-15T00:30:00Z'));
+    expect(h.range).toHaveBeenCalledWith({ from: 3820, to: 3820 }, 'a');
+    expect(results).toEqual([{ accountId: 'a', postId: 'post-a', status: 'PUBLISHED' }]);
+    expect(h.generate).toHaveBeenCalledWith('a', 'manual-a');
   });
   it('bounds restart/recovery retries per account and day in durable state', async () => {
     vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-10-15T00:30:00Z'));
