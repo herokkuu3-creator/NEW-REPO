@@ -1,0 +1,37 @@
+{
+  "date": "2026-10-16",
+  "timezone": "Asia/Kolkata",
+  "browser": "Codex In-app Browser",
+  "username": "loserr_69",
+  "problemSlug": "subarrays-distinct-element-sum-of-squares-i",
+  "submissionId": "2173331524",
+  "submissionUrl": "https://leetcode.com/problems/subarrays-distinct-element-sum-of-squares-i/submissions/2173331524/",
+  "judgeStatus": "Accepted",
+  "judgePassed": 707,
+  "judgeTotal": 707,
+  "customCases": 8,
+  "customOutputs": [
+    15,
+    3,
+    1,
+    20,
+    1,
+    28,
+    5050,
+    8670850
+  ],
+  "articleTitle": "🧠 Duplicates? Count Them Once! | Simple C++ + Visuals",
+  "articleUrl": "https://leetcode.com/problems/subarrays-distinct-element-sum-of-squares-i/solutions/8574392/squaring-distinct-counts-by-expanding-ev-rjog/",
+  "publicationVerifiedAfterReload": true,
+  "codePreserved": true,
+  "publicationAttempts": 1,
+  "revision": {
+    "editedExistingPost": true,
+    "updateClicks": 1,
+    "publicationVerifiedAfterReload": true,
+    "sourceBlocks": 1,
+    "exactCode": true,
+    "loadedGifCount": 2,
+    "proseWords": 101
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "title": "🧠 Duplicates? Count Them Once! | Simple C++ + Visuals",
+  "revision": "concise visual editorial",
+  "authorship": "Rewritten and checked directly by Codex; no successful new CodeCraft generation.",
+  "proseWords": 101,
+  "visuals": [
+    {
+      "id": "visual-1",
+      "url": "https://assets.leetcode.com/users/images/0f2640f0-810a-43ff-b895-4e55e45ec2e3_1792092446.6012304.gif"
+    },
+    {
+      "id": "visual-2",
+      "url": "https://assets.leetcode.com/users/images/14481b50-91dd-4d7f-a46b-88fd75239121_1792092457.7041261.gif"
+    }
+  ],
+  "providerAttempts": [
+    {
+      "model": "gpt-5.6-luna",
+      "outcome": "TIMEOUT",
+      "elapsedMs": 90017
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "outcome": "TIMEOUT",
+      "elapsedMs": 90007
+    },
+    {
+      "model": "gemini-3.7-flash",
+      "outcome": "TIMEOUT",
+      "elapsedMs": 90004
+    }
+  ],
+  "sourceSubmissionId": "2173331524",
+  "sourcePreserved": true,
+  "publishedUrl": "https://leetcode.com/problems/subarrays-distinct-element-sum-of-squares-i/solutions/8574392/squaring-distinct-counts-by-expanding-ev-rjog/",
+  "originalArticleProvenance": {
+    "title": "Squaring Distinct Counts by Expanding Every Start",
+    "style": "step-by-step simulation",
+    "model": "gpt-5.6-luna",
+    "attempts": [
+      {
+        "model": "gpt-5.6-luna",
+        "attempt": 1,
+        "elapsedMs": 63481,
+        "outcome": "SUCCESS_AFTER_VALIDATOR_FIX",
+        "usage": {
+          "prompt_tokens": 757,
+          "completion_tokens": 3653,
+          "total_tokens": 4410
+        }
+      },
+      {
+        "model": "gpt-5.6-luna",
+        "attempt": 1,
+        "elapsedMs": 29857,
+        "outcome": "SUCCESS",
+        "usage": {
+          "completion_tokens": 1719,
+          "completion_tokens_details": {
+            "reasoning_tokens": 1701
+          },
+          "prompt_tokens": 2425,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 4144
+        }
+      }
+    ],
+    "reviewModel": "gpt-5.6-luna",
+    "manualReview": "Clarified that the C++ standard does not require identity hashing, and used nums.size() when defining n. Original accepted code preserved; preview only, no public post."
+  }
+}

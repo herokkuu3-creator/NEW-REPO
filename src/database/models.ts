@@ -135,6 +135,6 @@ export async function getSystemState(key: string): Promise<string | null> {
 }
 
 export async function getAllSystemState(): Promise<Record<string, string>> {
-  const rows = await prisma.systemState.findMany();
+  const rows = await prisma.systemState.findMany({ where: { NOT: { key: { startsWith: 'solution-visual:' } } } });
   return Object.fromEntries(rows.map((r) => [r.key, r.value]));
 }

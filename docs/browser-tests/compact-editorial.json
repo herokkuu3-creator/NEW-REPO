@@ -1,0 +1,204 @@
+{
+  "context": {
+    "accountId": "browser-session",
+    "username": "loserr_69",
+    "problemId": "2913",
+    "slug": "subarrays-distinct-element-sum-of-squares-i",
+    "title": "Subarrays Distinct Element Sum of Squares I",
+    "difficulty": "Easy",
+    "problem": "Given an integer array nums, return the sum of the squares of the number of distinct values in every nonempty contiguous subarray. Example: nums=[1,2,1] gives 15. Constraints: 1 <= nums.length <= 100, 1 <= nums[i] <= 100.",
+    "submissionId": "2173331524",
+    "language": "cpp",
+    "code": "class Solution {\npublic:\n    int sumCounts(vector<int>& nums) {\n        int n = nums.size();\n        int ans = 0;\n\n        for (int i = 0; i < n; i++) {\n            unordered_set<int> st;\n\n            for (int j = i; j < n; j++) {\n                st.insert(nums[j]);\n\n                int distinct = st.size();\n                ans += distinct * distinct;\n            }\n        }\n\n        return ans;\n    }\n};",
+    "challengeDate": "2026-10-15"
+  },
+  "article": {
+    "title": "🧠 Duplicates? Count Them Once! | Simple C++ + Visuals",
+    "sections": [
+      {
+        "kind": "intuition",
+        "heading": "💡 The tiny trick",
+        "markdown": "**A longer subarray doesn’t always have more distinct values.**\n\nFor `[1,2,1]`, adding the last `1` changes nothing in the set. The contribution stays `2² = 4`."
+      },
+      {
+        "kind": "approach",
+        "heading": "🎯 Three moves",
+        "markdown": "- Fix `i` and start with an empty set.\n- Extend `j`, inserting `nums[j]`.\n- Add `st.size()²` to `ans`."
+      },
+      {
+        "kind": "correctness",
+        "heading": "Why it works",
+        "markdown": "**Why it works:** after each insert, `st` contains exactly the values in `nums[i..j]`; the loops visit every subarray once."
+      },
+      {
+        "kind": "dryRun",
+        "heading": "🎬 Watch the answer grow",
+        "markdown": "`nums = [1,2,1]` → six subarrays, six contributions.\n\n**1 + 4 + 4 + 1 + 4 + 1 = 15**"
+      },
+      {
+        "kind": "takeaways",
+        "heading": "Remember this",
+        "markdown": "**Remember:** reset the set when the left boundary moves. Reuse it while the right boundary grows."
+      }
+    ],
+    "time": {
+      "bound": "O(n²) expected, O(n³) worst-case",
+      "reason": "n = nums.size(); O(n²) inserts, expected O(1) each. Hash collisions can degrade insertion; size() stays O(1)."
+    },
+    "space": {
+      "bound": "O(n)",
+      "reason": "One set holds at most n distinct values."
+    },
+    "visuals": [
+      {
+        "id": "visual-1",
+        "after": "intuition",
+        "title": "Longer window. Same distinct count.",
+        "caption": "The repeated 1 adds no new value to the set.",
+        "frames": [
+          {
+            "label": "Start i=0 | Extend to j=0",
+            "items": [
+              "1",
+              "2",
+              "1"
+            ],
+            "active": [
+              0
+            ],
+            "state": "Unique values: {1}",
+            "metric": "Contribution: 1 x 1 = 1",
+            "note": "New start: begin with an empty set."
+          },
+          {
+            "label": "Start i=0 | Extend to j=1",
+            "items": [
+              "1",
+              "2",
+              "1"
+            ],
+            "active": [
+              0,
+              1
+            ],
+            "state": "Unique values: {1, 2}",
+            "metric": "Contribution: 2 x 2 = 4",
+            "note": "A new value increases the distinct count."
+          },
+          {
+            "label": "Start i=0 | Extend to j=2",
+            "items": [
+              "1",
+              "2",
+              "1"
+            ],
+            "active": [
+              0,
+              1,
+              2
+            ],
+            "state": "Unique values: {1, 2}",
+            "metric": "Contribution: 2 x 2 = 4",
+            "note": "Duplicate 1: longer window, same count."
+          }
+        ]
+      },
+      {
+        "id": "visual-2",
+        "after": "dryRun",
+        "title": "Six subarrays. Watch the total.",
+        "caption": "Reset for each start, then grow right: the total reaches 15.",
+        "frames": [
+          {
+            "label": "Subarray nums[0..0]",
+            "items": [
+              "1",
+              "2",
+              "1"
+            ],
+            "active": [
+              0
+            ],
+            "state": "Set: {1} | distinct: 1",
+            "metric": "+ 1   ->   answer = 1",
+            "note": "New start: begin with an empty set."
+          },
+          {
+            "label": "Subarray nums[0..1]",
+            "items": [
+              "1",
+              "2",
+              "1"
+            ],
+            "active": [
+              0,
+              1
+            ],
+            "state": "Set: {1, 2} | distinct: 2",
+            "metric": "+ 4   ->   answer = 5",
+            "note": "A new value increases the distinct count."
+          },
+          {
+            "label": "Subarray nums[0..2]",
+            "items": [
+              "1",
+              "2",
+              "1"
+            ],
+            "active": [
+              0,
+              1,
+              2
+            ],
+            "state": "Set: {1, 2} | distinct: 2",
+            "metric": "+ 4   ->   answer = 9",
+            "note": "Duplicate 1: longer window, same count."
+          },
+          {
+            "label": "Subarray nums[1..1]",
+            "items": [
+              "1",
+              "2",
+              "1"
+            ],
+            "active": [
+              1
+            ],
+            "state": "Set: {2} | distinct: 1",
+            "metric": "+ 1   ->   answer = 10",
+            "note": "Move the start; reset the set first."
+          },
+          {
+            "label": "Subarray nums[1..2]",
+            "items": [
+              "1",
+              "2",
+              "1"
+            ],
+            "active": [
+              1,
+              2
+            ],
+            "state": "Set: {1, 2} | distinct: 2",
+            "metric": "+ 4   ->   answer = 14",
+            "note": "Extend right and add the next square."
+          },
+          {
+            "label": "Subarray nums[2..2]",
+            "items": [
+              "1",
+              "2",
+              "1"
+            ],
+            "active": [
+              2
+            ],
+            "state": "Set: {1} | distinct: 1",
+            "metric": "+ 1   ->   answer = 15",
+            "note": "Last start: all six subarrays are counted."
+          }
+        ]
+      }
+    ]
+  }
+}

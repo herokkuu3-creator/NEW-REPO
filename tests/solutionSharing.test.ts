@@ -316,4 +316,22 @@ describe('multi-account run shares one solution', () => {
     expect(h.fetchWalkccc).toHaveBeenCalledTimes(1); // Cached by walkcccCache!
     expect(h.submit).toHaveBeenCalledTimes(3);
   });
+
+  it('restricts a combined workflow to explicitly selected accounts', async () => {
+    h.fetchWalkccc.mockResolvedValue({ code: 'class Solution {};', sourceUrl: 'u' });
+    const { executeDailyRun } = await import('../src/scheduler/dailyWorker');
+    const report = await executeDailyRun('solution-post-combined', { accountIds: ['id-a2'] });
+    expect(report.accounts.map(a => a.label)).toEqual(['a2']);
+    expect(h.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a stale daily pointer before combined-mode code submission', async () => {
+    const { executeDailyRun } = await import('../src/scheduler/dailyWorker');
+    const report = await executeDailyRun('solution-post-combined', {
+      accountIds: ['id-a1'], expectedChallengeDate: '2099-01-01',
+    });
+    expect(report.accounts[0]?.kind).toBe('failed');
+    expect(report.accounts[0]?.error).toContain('has not refreshed');
+    expect(h.submit).not.toHaveBeenCalled();
+  });
 });

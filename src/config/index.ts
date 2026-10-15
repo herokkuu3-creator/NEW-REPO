@@ -69,6 +69,20 @@ const envSchema = z.object({
   SOLUTION_SOURCE: z.enum(['community', 'walkccc', 'llm']).default('community'),
   WALKCCC_BASE_URL: z.string().default('https://walkccc.me/LeetCode'),
 
+  // SOLUTION_POST_API_KEYS is a comma-separated failover pool. The singular
+  // name remains a backwards-compatible one-key bootstrap option.
+  SOLUTION_POST_API_KEY: z.string().default(''),
+  SOLUTION_POST_API_KEYS: z.string().default(''),
+  SOLUTION_POST_BASE_URL: z.string().url().default('https://codecraftapi.com/v1'),
+  SOLUTION_POST_MODELS: z.string().default('gpt-5.6-terra,gpt-5.6-luna,gemini-3.7-flash'),
+  SOLUTION_POST_TIMEOUT_MS: intFromString(90000).pipe(z.number().min(1000).max(300000)),
+  SOLUTION_POST_RETRIES: intFromString(1).pipe(z.number().min(0).max(3)),
+  SOLUTION_POST_MAX_TOKENS: intFromString(8192).pipe(z.number().min(2048).max(32768)),
+  SOLUTION_POST_MODEL_TIMEOUTS: z.string().default('{}').transform((value, ctx) => {
+    try { return z.record(z.number().int().min(1000).max(300000)).parse(JSON.parse(value)); }
+    catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Expected JSON object of model IDs and timeout milliseconds' }); return z.NEVER; }
+  }),
+
   // --- Transport -----------------------------------------------------------
   // 'api' (default): drive LeetCode's own GraphQL/submit endpoints through the
   //   browser context's request API. Never loads an HTML page, which is what
@@ -136,6 +150,10 @@ export type Config = Readonly<{
     walkcccBaseUrl: string;
   };
   transport: 'api' | 'browser';
+  solutionPosts: {
+    apiKey: string; apiKeys: string[]; baseUrl: string; models: string[]; timeoutMs: number; retries: number; maxTokens: number;
+    modelTimeoutMs: Record<string, number>;
+  };
   telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean };
   api: { port: number; setupToken: string; publicUrl: string };
   solver: { cpsolverUrl: string };
@@ -187,6 +205,17 @@ function loadConfig(): Config {
       walkcccBaseUrl: env.WALKCCC_BASE_URL,
     },
     transport: env.TRANSPORT,
+    solutionPosts: {
+      apiKey: env.SOLUTION_POST_API_KEY,
+      apiKeys: [...new Set((env.SOLUTION_POST_API_KEYS || env.SOLUTION_POST_API_KEY).split(',')
+        .map(s => s.trim()).filter(Boolean))],
+      baseUrl: env.SOLUTION_POST_BASE_URL,
+      models: validateSolutionPostModels(env.SOLUTION_POST_MODELS),
+      timeoutMs: env.SOLUTION_POST_TIMEOUT_MS,
+      retries: env.SOLUTION_POST_RETRIES,
+      maxTokens: env.SOLUTION_POST_MAX_TOKENS,
+      modelTimeoutMs: env.SOLUTION_POST_MODEL_TIMEOUTS,
+    },
     telegram: {
       botToken: env.TELEGRAM_BOT_TOKEN,
       chatId: env.TELEGRAM_CHAT_ID,
@@ -204,6 +233,16 @@ function loadConfig(): Config {
     },
     logLevel: env.LOG_LEVEL,
   });
+}
+
+/** Keep article generation on the user-approved economical model families. */
+function validateSolutionPostModels(raw: string): string[] {
+  const models = [...new Set(raw.split(',').map(s => s.trim()).filter(Boolean))];
+  const allowed = /^(?:gpt-5\.6-(?:terra|luna)|gemini-3\.(?:7|8)-flash|qwen[\w.-]*)$/i;
+  if (models.some(model => !allowed.test(model))) {
+    throw new Error('SOLUTION_POST_MODELS only supports gpt-5.6-terra, gpt-5.6-luna, gemini-3.7/3.8-flash, or Qwen models');
+  }
+  return models;
 }
 
 export const config = loadConfig();

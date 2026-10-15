@@ -24,6 +24,8 @@ model Account {
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
   runs          DailyRun[]
+  solutionPosts SolutionPost[]
+  solutionPreference SolutionPostPreference?
 
   @@index([status])
 }
@@ -62,6 +64,45 @@ model DailyRun {
 model SystemState {
   key       String   @id
   value     String   @db.Text
+  updatedAt DateTime @updatedAt
+}
+
+/// Submission and article outcomes are independent. One publication intent per account/problem.
+model SolutionPost {
+  id String @id @default(cuid())
+  accountId String
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  problemSlug String
+  submissionId String
+  intent String @default("community-solution")
+  context String @db.Text
+  codeHash String
+  status String @default("PENDING")
+  title String?
+  markdown String? @db.Text
+  style String?
+  model String?
+  reviewModel String?
+  attempts String? @db.Text
+  contentHash String?
+  approvedHash String?
+  publishedUrl String?
+  lastError String?
+  retryCount Int @default(0)
+  leaseUntil DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  publishedAt DateTime?
+
+  @@unique([accountId, problemSlug, intent])
+  @@index([status, updatedAt])
+}
+
+/// Explicit account opt-in. Existing accounts do not acquire a schedule.
+model SolutionPostPreference {
+  accountId String @id
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  enabled Boolean @default(false)
   updatedAt DateTime @updatedAt
 }
 

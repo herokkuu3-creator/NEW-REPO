@@ -203,6 +203,10 @@ export async function runSubmissionNow(
 }
 
 export interface DailyRunOptions {
+  /** Restricts an explicitly selected combined workflow; omitted preserves the existing all-account flow. */
+  accountIds?: readonly string[];
+  /** Combined AI workflow must refuse a stale daily pointer before submitting. */
+  expectedChallengeDate?: string;
   /** Called right after EACH account finishes (index is 1-based). Errors are ignored. */
   onAccountOutcome?: (outcome: AccountOutcome, index: number, total: number) => Promise<void> | void;
 }
@@ -243,7 +247,7 @@ export async function executeDailyRun(
     await ensureAccountsSeeded();
 
     const today = leetcodeDayKey();
-    const accounts = await listEnabledAccounts();
+    const accounts = (await listEnabledAccounts()).filter(a => !options.accountIds || options.accountIds.includes(a.id));
 
     // Auto-refresh any expired or rejected sessions if credentials exist in DB
     for (let i = 0; i < accounts.length; i++) {
@@ -284,7 +288,7 @@ export async function executeDailyRun(
     for (const account of accounts) {
       const before = outcomes.length;
       try {
-        outcomes.push(await runForAccount(account, today, forceRun, renewalTriggered, usedCommunityUuids));
+        outcomes.push(await runForAccount(account, today, forceRun, renewalTriggered, usedCommunityUuids, options.expectedChallengeDate));
       } catch (err) {
         // runForAccount wraps its own pipeline; this is a last-resort guard
         // so one broken account can never abort the whole batch.
@@ -330,6 +334,7 @@ async function runForAccount(
   forceRun: boolean,
   renewalTriggered = false,
   usedCommunityUuids: Set<string> = new Set(),
+  expectedChallengeDate?: string,
 ): Promise<AccountOutcome> {
   const label = account.label;
 
@@ -437,6 +442,10 @@ async function runForAccount(
         );
       }
       throw err;
+    }
+
+    if (expectedChallengeDate && daily.date !== expectedChallengeDate) {
+      return { label, username, kind: 'failed', error: 'Daily challenge date has not refreshed; no code submitted' };
     }
 
     // --- 3) Proof-based duplicate guard ------------------------------------

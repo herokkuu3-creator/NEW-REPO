@@ -27,6 +27,8 @@ import { ingestCookiePayload } from '../accounts/ingest';
 import { RunReport, summarizeReport } from '../scheduler/report';
 import { isoLocal } from '../time';
 import { PIN_COOKIE, PinGate, pinPage, readPinFromEnv, safeNext } from './pinGate';
+import { registerSolutionPostRoutes } from '../solutionPosts/routes';
+import { registerVisualAssetRoutes } from '../solutionPosts/visualStore';
 
 /**
  * Health + minimal admin API.
@@ -178,6 +180,9 @@ export async function startHealthServer(
 
   const requireAdmin = (authorization: string | undefined): boolean =>
     authorization === `Bearer ${config.api.setupToken}`;
+
+  registerSolutionPostRoutes(app, requireAdmin);
+  registerVisualAssetRoutes(app);
 
   app.get('/health', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');

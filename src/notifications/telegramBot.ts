@@ -89,6 +89,7 @@ import {
   type KeyBalanceResult,
 } from '../codeforces/capzyKeyManager';
 import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver';
+import { appendSolutionApiKeys, solutionKeyPoolStatus } from '../solutionPosts/keyPool';
 
 import {
   isRunInProgress,
@@ -171,12 +172,13 @@ interface TgUpdate {
 
 export type InlineButton = { text: string; callback_data: string };
 
-export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | 'capzy' | 'addcapzy' | null;
+export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | 'capzy' | 'addcapzy' | 'solutionkeys' | null;
 let pendingPromptType: PendingPromptType = null;
 let pendingRangePrompt = false;
 let pendingQueuePrompt = false;
 let pendingCapzyPrompt = false;
 let pendingAddCapzyPrompt = false;
+let pendingSolutionKeysPrompt = false;
 
 export function getPendingPromptType(): PendingPromptType {
   return pendingPromptType;
@@ -264,6 +266,10 @@ export const HELP_TEXT = [
   '├ /addcapsolver &lt;key&gt; — Append new Capzy/CapSolver API key(s) (preserves existing)',
   '├ /capsolver &lt;key&gt; — Replace Capzy/CapSolver API keys',
   '└ /capsolverstatus — Check current solver API keys &amp; balances',
+  '',
+  '<b>✨ 𝗔𝗜 𝗦𝗢𝗟𝗨𝗧𝗜𝗢𝗡 𝗔𝗥𝗧𝗜𝗖𝗟𝗘𝗦</b>',
+  '├ /addsolutionkeys &lt;key1,key2&gt; — Append CodeCraft API keys',
+  '└ /solutionkeystatus — Show masked article-generation key pool',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ /codechef — Run daily CodeChef submission',
@@ -585,12 +591,39 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     return;
   }
 
+  // API keys are append-only. The prompt remains available even after the pool already has keys.
+  if (pendingSolutionKeysPrompt) {
+    if (text === '/cancel' || lowerText === 'cancel') {
+      pendingSolutionKeysPrompt = false;
+      pendingPromptType = null;
+      await reply('✖️ Article API-key setup cancelled.');
+      return;
+    }
+    await deleteSensitiveTelegramMessage(msg);
+    await handleAddSolutionApiKeys(text);
+    return;
+  }
+
   if (text.startsWith('/')) {
     const { command: cmd, arg: commandArg } = extractTelegramCommand(text);
     switch (cmd) {
       case '/start':
       case '/help':
         await replyHtml(HELP_TEXT);
+        return;
+      case '/addsolutionkeys':
+      case '/addsolutionkey':
+      case '/addarticlekeys':
+      case '/addarticlekey':
+      case '/solutionkeys':
+      case '/solutionkey':
+        await deleteSensitiveTelegramMessage(msg);
+        await handleAddSolutionApiKeys(commandArg);
+        return;
+      case '/solutionkeystatus':
+      case '/solutionkey_status':
+      case '/articlekeystatus':
+        await replyHtml(await formatSolutionKeyStatus());
         return;
       case '/lclogin':
       case '/lc_login':
@@ -2884,6 +2917,56 @@ export async function handleAddCapSolverCommand(commandArg?: string): Promise<vo
   await replyHtml(promptMsg);
 }
 
+export async function formatSolutionKeyStatus(): Promise<string> {
+  const status = await solutionKeyPoolStatus();
+  const lines = [
+    '✨ <b>Article-generation API key pool</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    `Stored keys: <b>${status.total}</b>`,
+    `Source: <b>${escapeHtml(status.source)}</b>`,
+    status.active ? `Active key: <b>#${status.active}</b>` : 'Active key: <b>none</b>',
+    '',
+  ];
+  if (!status.keys.length) lines.push('No article-generation API keys are configured.');
+  else for (const key of status.keys) lines.push(`├ Key #${key.position}: <code>${escapeHtml(key.masked)}</code>${key.active ? ' <b>[ACTIVE]</b>' : ''}`);
+  lines.push('');
+  lines.push('💡 <i>/addsolutionkeys accepts one key or comma-separated keys and appends them. Quota/credential exhaustion advances to the next saved key; short rate limits do not rotate the pool.</i>');
+  return lines.join('\n');
+}
+
+export async function handleAddSolutionApiKeys(commandArg?: string): Promise<void> {
+  const raw = (commandArg ?? '').trim();
+  if (!raw) {
+    pendingSolutionKeysPrompt = true;
+    pendingPromptType = 'solutionkeys';
+    pendingCapzyPrompt = false;
+    pendingAddCapzyPrompt = false;
+    pendingQueuePrompt = false;
+    await replyHtml([
+      await formatSolutionKeyStatus(), '', '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+      '➕ <b>Add CodeCraft API key(s)</b>', '',
+      'Send one key or a comma-separated list in your next message. Existing keys stay in order; new keys are appended after them.',
+      'The bot attempts to delete your message after it stores the key. Send /cancel to abort.',
+    ].join('\n'));
+    return;
+  }
+  pendingSolutionKeysPrompt = false;
+  pendingPromptType = null;
+  try {
+    const result = await appendSolutionApiKeys(raw);
+    const status = await solutionKeyPoolStatus();
+    await replyHtml([
+      '✅ <b>Article API key(s) saved</b>',
+      `<b>${result.added}</b> added; <b>${result.duplicates}</b> already present.`,
+      `Pool size: <b>${status.total}</b>. ${status.active ? `Active: <b>#${status.active}</b>.` : 'No active key.'}`,
+      '',
+      'Keys are encrypted in the bot database and never shown in full. A quota/payment/invalid-key response advances to the next saved key for future article generation.',
+    ].join('\n'));
+  } catch (error) {
+    await replyHtml(`❌ <b>Could not save article API keys:</b> ${escapeHtml(error instanceof Error ? error.message : 'invalid input')}`);
+  }
+}
+
 /** One account per button, followed by the explicit all-accounts choice. */
 export function buildCodeforcesSubmitPicker(
   accounts: Awaited<ReturnType<typeof listCodeforcesAccounts>>,
@@ -5161,6 +5244,16 @@ async function reply(text: string): Promise<void> {
 
 async function replyHtml(text: string): Promise<void> {
   await sendTelegramMessage(text, { parseMode: 'HTML', disableWebPagePreview: true });
+}
+
+/** Best effort only: a bot needs Telegram delete permission in groups. Never include the key in a log if this fails. */
+async function deleteSensitiveTelegramMessage(msg: TgMessage): Promise<void> {
+  if (!msg.message_id) return;
+  try {
+    await tgApi('deleteMessage', { chat_id: msg.chat.id, message_id: msg.message_id });
+  } catch {
+    logger.warn('telegram: could not delete an article API-key message');
+  }
 }
 
 async function tgApi<T = unknown>(
