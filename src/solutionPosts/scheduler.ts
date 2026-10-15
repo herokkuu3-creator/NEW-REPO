@@ -37,13 +37,48 @@ export async function selectedAccountIds(): Promise<string[]> {
   return selected.map(item => item.accountId);
 }
 
+export type SolutionWorkflowStage =
+  | 'starting'
+  | 'resolving_daily'
+  | 'submitting'
+  | 'accepted'
+  | 'generating_article'
+  | 'publishing_article'
+  | 'published'
+  | 'article_ready'
+  | 'failed'
+  | 'skipped';
+
+export interface SolutionWorkflowProgress {
+  accountId: string;
+  stage: SolutionWorkflowStage;
+  questionNumber?: number;
+  submissionId?: string;
+  postId?: string;
+  status?: string;
+  error?: string;
+}
+
+type ProgressReporter = (event: SolutionWorkflowProgress) => void | Promise<void>;
+
+async function reportProgress(reporter: ProgressReporter | undefined, event: SolutionWorkflowProgress): Promise<void> {
+  logger.info({ workflow: 'solution-post', ...event }, 'solution workflow progress');
+  if (!reporter) return;
+  try { await reporter(event); }
+  catch (error) { logger.warn({ accountId: event.accountId, stage: event.stage, err: error }, 'solution workflow progress reporter failed'); }
+}
+
+function errorCode(error: unknown, fallback: string): string {
+  return error instanceof PostError ? error.code : fallback;
+}
+
 /**
  * Submit one explicitly requested public question for selected accounts, then
  * create and publish the same reviewed article used by the daily workflow.
  * Manual runs use a non-daily key so they cannot overwrite or suppress the
  * actual DailyRun for the calendar day.
  */
-export async function runManualQuestion(questionNumber: number, accountIds: string[], now = new Date()) {
+export async function runManualQuestion(questionNumber: number, accountIds: string[], now = new Date(), onProgress?: ProgressReporter) {
   if (!Number.isInteger(questionNumber) || questionNumber < 1 || questionNumber > 9999) throw new PostError('INVALID_QUESTION_NUMBER');
   if (!accountIds.length || new Set(accountIds).size !== accountIds.length) throw new PostError('SELECT_ACCOUNTS_REQUIRED');
   const accounts = await prisma.account.findMany({ where: { id: { in: accountIds }, status: { not: 'DISABLED' } } });
@@ -51,12 +86,15 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
   const results: Array<{ accountId: string; postId?: string; status: string; error?: string }> = [];
   for (const account of accounts) {
     try {
+      await reportProgress(onProgress, { accountId: account.id, stage: 'starting', questionNumber });
+      await reportProgress(onProgress, { accountId: account.id, stage: 'submitting', questionNumber });
       const job = await startRangeJob({ from: questionNumber, to: questionNumber }, account.id);
       if (!('done' in job)) throw new PostError(job.reason === 'no-accounts' ? 'SELECT_ACCOUNTS_REQUIRED' : 'ACCOUNT_UNAVAILABLE');
       const rangeResults = await job.done;
       const accepted = rangeResults[0]?.results.find(result => result.status === 'accepted' && result.capture);
       if (!accepted?.capture || !accepted.submissionId) throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
       const capture = accepted.capture;
+      await reportProgress(onProgress, { accountId: account.id, stage: 'accepted', questionNumber, submissionId: accepted.submissionId });
       const date = `manual:${questionNumber}:${now.toISOString().slice(0, 10)}`;
       const run = await prisma.dailyRun.upsert({ where: { accountId_date: { accountId: account.id, date } },
         create: { accountId: account.id, date, problemSlug: capture.slug, title: capture.title, difficulty: capture.difficulty,
@@ -64,11 +102,25 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
         update: { problemSlug: capture.slug, title: capture.title, difficulty: capture.difficulty, language: capture.language,
           solution: capture.code, submissionId: accepted.submissionId, submissionStatus: 'Accepted', state: 'SUCCESS', error: null },
       });
+      await reportProgress(onProgress, { accountId: account.id, stage: 'generating_article', questionNumber, submissionId: accepted.submissionId });
       let post = await generateForRun(account.id, run.id);
-      if (config.solutionPosts.autoPublish) post = await publishGeneratedPost(post);
+      if (post.status === 'FAILED') {
+        const error = post.lastError || 'GENERATION_FAILED';
+        results.push({ accountId: account.id, postId: post.id, status: 'FAILED', error });
+        await reportProgress(onProgress, { accountId: account.id, stage: 'failed', questionNumber, submissionId: accepted.submissionId, postId: post.id, error });
+        continue;
+      }
+      if (config.solutionPosts.autoPublish) {
+        await reportProgress(onProgress, { accountId: account.id, stage: 'publishing_article', questionNumber, submissionId: accepted.submissionId, postId: post.id });
+        post = await publishGeneratedPost(post);
+      }
       results.push({ accountId: account.id, postId: post.id, status: post.status });
+      await reportProgress(onProgress, { accountId: account.id, stage: post.status === 'PUBLISHED' ? 'published' : 'article_ready', questionNumber,
+        submissionId: accepted.submissionId, postId: post.id, status: post.status });
     } catch (error) {
-      results.push({ accountId: account.id, status: 'FAILED', error: error instanceof PostError ? error.code : 'MANUAL_WORKFLOW_FAILED' });
+      const code = errorCode(error, 'MANUAL_WORKFLOW_FAILED');
+      results.push({ accountId: account.id, status: 'FAILED', error: code });
+      await reportProgress(onProgress, { accountId: account.id, stage: 'failed', questionNumber, error: code });
     }
   }
   return results;
@@ -110,7 +162,7 @@ async function reserveScheduledAttempt(accountId: string, date: string): Promise
 }
 
 /** Each selected account is independent. Existing daily worker handles code submission unchanged. */
-export async function runCombined(accountIds: string[], now = new Date()) {
+export async function runCombined(accountIds: string[], now = new Date(), onProgress?: ProgressReporter) {
   if (!accountIds.length || new Set(accountIds).size !== accountIds.length) throw new PostError('SELECT_ACCOUNTS_REQUIRED');
   const accounts = await prisma.account.findMany({ where: { id: { in: accountIds }, status: { not: 'DISABLED' } } });
   if (accounts.length !== accountIds.length) throw new PostError('ACCOUNT_UNAVAILABLE');
@@ -118,28 +170,50 @@ export async function runCombined(accountIds: string[], now = new Date()) {
   for (const account of accounts) {
     let release: (() => Promise<void>) | null = null;
     try {
+      await reportProgress(onProgress, { accountId: account.id, stage: 'starting' });
       release = await acquireDailyLease(account.id, now.toISOString().slice(0, 10));
-      if (!release) { results.push({ accountId: account.id, status: 'SKIPPED', error: 'ACCOUNT_JOB_IN_PROGRESS' }); continue; }
+      if (!release) {
+        results.push({ accountId: account.id, status: 'SKIPPED', error: 'ACCOUNT_JOB_IN_PROGRESS' });
+        await reportProgress(onProgress, { accountId: account.id, stage: 'skipped', error: 'ACCOUNT_JOB_IN_PROGRESS' });
+        continue;
+      }
+      await reportProgress(onProgress, { accountId: account.id, stage: 'resolving_daily' });
       const daily = await resolveCurrentDaily(account, now);
       let run = await prisma.dailyRun.findUnique({ where: { accountId_date: { accountId: account.id, date: daily.date } } });
       if (!run || run.problemSlug !== daily.slug || run.state !== 'SUCCESS' || !run.submissionId || run.submissionStatus !== 'Accepted') {
         // Lazy import avoids loading the submission stack for draft-only commands.
         const { runSubmissionNow } = await import('../scheduler/dailyWorker');
+        await reportProgress(onProgress, { accountId: account.id, stage: 'submitting' });
         const report = await runSubmissionNow('solution-post-combined', { accountIds: [account.id], expectedChallengeDate: daily.date });
         if (!report) throw new PostError('SUBMISSION_WORKER_BUSY');
         run = await prisma.dailyRun.findUnique({ where: { accountId_date: { accountId: account.id, date: daily.date } } });
       }
       if (!run || run.problemSlug !== daily.slug) throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
+      await reportProgress(onProgress, { accountId: account.id, stage: 'accepted', submissionId: run.submissionId ?? undefined });
       const existing = await prisma.solutionPost.findUnique({ where: {
         accountId_problemSlug_intent: { accountId: account.id, problemSlug: daily.slug, intent: 'community-solution' },
       } });
       // Never resubmit accepted code for generation retries. Uncertain publications are left for reconciliation.
+      await reportProgress(onProgress, { accountId: account.id, stage: 'generating_article', submissionId: run.submissionId ?? undefined });
       let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status) ?
         await retryPost(existing.id) : await generateForRun(account.id, run.id);
-      if (config.solutionPosts.autoPublish) post = await publishGeneratedPost(post);
+      if (post.status === 'FAILED') {
+        const error = post.lastError || 'GENERATION_FAILED';
+        results.push({ accountId: account.id, postId: post.id, status: 'FAILED', error });
+        await reportProgress(onProgress, { accountId: account.id, stage: 'failed', submissionId: run.submissionId ?? undefined, postId: post.id, error });
+        continue;
+      }
+      if (config.solutionPosts.autoPublish) {
+        await reportProgress(onProgress, { accountId: account.id, stage: 'publishing_article', submissionId: run.submissionId ?? undefined, postId: post.id });
+        post = await publishGeneratedPost(post);
+      }
       results.push({ accountId: account.id, postId: post.id, status: post.status });
+      await reportProgress(onProgress, { accountId: account.id, stage: post.status === 'PUBLISHED' ? 'published' : 'article_ready',
+        submissionId: run.submissionId ?? undefined, postId: post.id, status: post.status });
     } catch (error) {
-      results.push({ accountId: account.id, status: 'FAILED', error: error instanceof PostError ? error.code : 'COMBINED_WORKFLOW_FAILED' });
+      const code = errorCode(error, 'COMBINED_WORKFLOW_FAILED');
+      results.push({ accountId: account.id, status: 'FAILED', error: code });
+      await reportProgress(onProgress, { accountId: account.id, stage: 'failed', error: code });
     } finally { if (release) await release().catch(() => undefined); }
   }
   return results;

@@ -1023,7 +1023,10 @@ async function handleMessage(msg: TgMessage): Promise<void> {
   // Text replies to interactive prompts (when not a document and starts with a digit/hash):
   if (!msg.document && pendingPromptType === 'solutionquestion' && /^\s*#?\d{1,5}\s*$/.test(text)) {
     pendingPromptType = null;
-    await startDailySolutionWorkflow(await selectedAccountIds(), Number(text.trim().replace(/^#/, '')));
+    const key = String(msg.chat.id);
+    const selected = [...(manualSolutionSelections.get(key) ?? new Set<string>())];
+    manualSolutionSelections.delete(key);
+    await startDailySolutionWorkflow(selected, Number(text.trim().replace(/^#/, '')));
     return;
   }
   if (!msg.document && /^\s*#?\d/.test(text)) {
@@ -1688,6 +1691,9 @@ export async function handleTriggerSubmission(
 // ---------------------------------------------------------------------------
 
 const dailySolutionSelections = new Map<string, Set<string>>();
+// Manual choices intentionally live only for the current Telegram interaction.
+// They never change the durable 06:00 schedule selection.
+const manualSolutionSelections = new Map<string, Set<string>>();
 
 export function buildDailySolutionPicker(accounts: AccountRecord[], selected: ReadonlySet<string>) {
   const allSelected = accounts.length > 0 && accounts.every(account => selected.has(account.id));
@@ -1719,15 +1725,72 @@ async function sendDailySolutionPicker(): Promise<void> {
   await defaultCoinClaimUiDeps.send(picker.text, picker.buttons);
 }
 
+function solutionStageText(stage: string, error?: string): string {
+  switch (stage) {
+    case 'starting': return '⏳ Starting…';
+    case 'resolving_daily': return '🔎 Finding today’s problem…';
+    case 'submitting': return '📤 Submitting solution…';
+    case 'accepted': return '✅ Solution accepted; preparing article…';
+    case 'generating_article': return '✍️ Generating verified-GIF article…';
+    case 'publishing_article': return '📮 Posting article to LeetCode…';
+    case 'published': return '✅ Solution and article published';
+    case 'article_ready': return '📝 Article generated and awaiting review';
+    case 'skipped': return `⏭️ Skipped: ${error ?? 'already in progress'}`;
+    case 'failed': return `❌ ${error ?? 'workflow failed'}`;
+    default: return '⏳ Queued…';
+  }
+}
+
+function renderSolutionWorkflowProgress(
+  title: string,
+  accounts: AccountRecord[],
+  states: ReadonlyMap<string, { stage: string; error?: string }>,
+): string {
+  const lines = [`🏆 <b>${title}</b>`, '<code>━━━━━━━━━━━━━━━━━━━━</code>', ''];
+  accounts.forEach((account, index) => {
+    const state = states.get(account.id);
+    lines.push(`👤 <b>Account ${index + 1}/${accounts.length} · ${escapeHtml(accountName(account))}</b>`);
+    lines.push(`└ ${solutionStageText(state?.stage ?? 'queued', state?.error)}`);
+  });
+  return lines.join('\n').slice(0, 3900);
+}
+
 async function startDailySolutionWorkflow(accountIds: string[], questionNumber?: number): Promise<void> {
-  if (!accountIds.length) { await reply('⚠️ Select at least one account first with /dailysolution.'); return; }
+  if (!accountIds.length) { await reply('⚠️ Select at least one account for this workflow.'); return; }
   const description = questionNumber ? `question #${questionNumber}` : 'today’s daily question';
-  await reply(`🚀 Starting ${description} for ${accountIds.length} selected account(s). Accepted submissions will generate and publish their GIF article.`);
+  const accounts = (await listEnabledAccounts()).filter(account => accountIds.includes(account.id));
+  if (accounts.length !== accountIds.length) { await reply('⚠️ One or more selected accounts are no longer available. Open the picker again.'); return; }
+  const states = new Map<string, { stage: string; error?: string }>(accounts.map(account => [account.id, { stage: 'queued' }]));
+  const title = questionNumber ? `QUESTION #${questionNumber} + SOLUTION ARTICLE` : 'DAILY SUBMISSION + SOLUTION ARTICLE';
+  let rendered = renderSolutionWorkflowProgress(title, accounts, states);
+  let messageId: number | undefined;
+  try {
+    const sent = await tgApi<{ message_id: number }>('sendMessage', {
+      chat_id: config.telegram.chatId, text: rendered, parse_mode: 'HTML', disable_web_page_preview: true,
+    });
+    messageId = sent.message_id;
+  } catch {
+    await reply(`🚀 Starting ${description} for ${accountIds.length} selected account(s). Progress updates will be logged.`);
+  }
+  const update = async (event: { accountId: string; stage: string; error?: string }) => {
+    states.set(event.accountId, { stage: event.stage, error: event.error });
+    const next = renderSolutionWorkflowProgress(title, accounts, states);
+    if (!messageId || next === rendered) return;
+    rendered = next;
+    try {
+      await tgApi('editMessageText', { chat_id: config.telegram.chatId, message_id: messageId, text: next,
+        parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: { inline_keyboard: [] } });
+    } catch (error) {
+      // Progress delivery must never interrupt the submit/article transaction.
+      logger.warn({ err: errText(error), stage: event.stage }, 'telegram solution workflow progress edit failed');
+    }
+  };
   void (async () => {
-    const results = questionNumber ? await runManualQuestion(questionNumber, accountIds) : await runCombined(accountIds);
+    const results = questionNumber ? await runManualQuestion(questionNumber, accountIds, new Date(), update) : await runCombined(accountIds, new Date(), update);
     const done = results.filter(result => result.status === 'PUBLISHED').length;
     const failed = results.filter(result => result.status === 'FAILED').length;
-    await reply(`🏁 ${questionNumber ? `Question #${questionNumber}` : 'Daily workflow'} finished: ${done} published · ${failed} failed.`);
+    const acceptedArticleFailed = results.filter(result => result.status === 'FAILED' && result.error === 'AI_MODELS_EXHAUSTED').length;
+    await reply(`🏁 ${questionNumber ? `Question #${questionNumber}` : 'Daily workflow'} finished: ${done} published · ${failed} article/workflow failed.${acceptedArticleFailed ? ` ${acceptedArticleFailed} stopped at article generation; accepted code was retained.` : ''}`);
   })().catch(async error => {
     await reply(`⚠️ Daily solution workflow failed: ${errText(error)}`).catch(() => undefined);
   });
@@ -1764,17 +1827,73 @@ async function handleDailySolutionButton(chatId: number | string, messageId: num
 }
 
 async function handleManualSolutionCommand(argument: string): Promise<void> {
-  const selected = await selectedAccountIds();
-  if (!selected.length) { await reply('⚠️ Choose the account set first with /dailysolution.'); return; }
-  const raw = argument.trim().toLowerCase();
-  if (raw === 'daily') { await startDailySolutionWorkflow(selected); return; }
-  if (/^#?\d{1,5}$/.test(raw)) { await startDailySolutionWorkflow(selected, Number(raw.replace('#', ''))); return; }
-  pendingPromptType = 'solutionquestion';
-  await defaultCoinClaimUiDeps.send('🛠️ <b>Manual solution submission</b>\n\nUse the saved account selection. Choose the daily problem or send a LeetCode question number.', [
-    [{ text: '📅 Submit daily + post article', callback_data: 'lcsol:m:daily' }],
-    [{ text: '🔢 Enter question number', callback_data: 'lcsol:m:question' }],
-    [{ text: '✖️ Cancel', callback_data: 'lcsol:m:x' }],
+  const accounts = await listEnabledAccounts();
+  if (!accounts.length) { await reply('📭 No active LeetCode accounts are configured.'); return; }
+  const key = String(config.telegram.chatId);
+  // A number supplied with the command is only a convenience; the user still
+  // chooses the accounts for this one-time manual run.
+  const raw = argument.trim();
+  const question = /^#?\d{1,5}$/.test(raw) ? Number(raw.replace('#', '')) : undefined;
+  manualSolutionSelections.set(key, new Set());
+  const picker = buildManualSolutionPicker(accounts, new Set(), question);
+  await defaultCoinClaimUiDeps.send(picker.text, picker.buttons);
+}
+
+export function buildManualSolutionPicker(accounts: AccountRecord[], selected: ReadonlySet<string>, questionNumber?: number) {
+  const allSelected = accounts.length > 0 && accounts.every(account => selected.has(account.id));
+  const buttons: InlineButton[][] = accounts.map(account => [{
+    text: `${selected.has(account.id) ? '✅' : '▫️'} ${accountName(account)}`.slice(0, 60), callback_data: `lcsol:m:a:${account.id}`,
+  }]);
+  buttons.push([{ text: `${allSelected ? '✅' : '👥'} All accounts (${accounts.length})`, callback_data: 'lcsol:m:all' }]);
+  buttons.push([
+    { text: '📅 Run daily now', callback_data: 'lcsol:m:daily' },
+    { text: questionNumber ? `🚀 Submit #${questionNumber}` : '🔢 Enter question number', callback_data: questionNumber ? `lcsol:m:n:${questionNumber}` : 'lcsol:m:question' },
   ]);
+  buttons.push([{ text: '✖️ Cancel', callback_data: 'lcsol:m:x' }]);
+  return { text: ['🛠️ <b>Manual submission + solution article</b>', '',
+    'Choose accounts for this one-time run. These choices do not alter the 06:00 IST daily schedule.',
+    'Then choose <b>Run daily now</b> or enter a LeetCode question number.', '',
+    `Selected: <b>${selected.size}/${accounts.length}</b>`].join('\n'), buttons };
+}
+
+async function handleManualSolutionButton(chatId: number | string, messageId: number, callbackId: string, data: string): Promise<void> {
+  const accounts = await listEnabledAccounts();
+  const key = String(chatId);
+  const selected = manualSolutionSelections.get(key) ?? new Set<string>();
+  if (data === 'lcsol:m:x') {
+    manualSolutionSelections.delete(key); pendingPromptType = null;
+    await defaultCoinClaimUiDeps.answer(callbackId, 'Cancelled');
+    await defaultCoinClaimUiDeps.edit(chatId, messageId, '✖️ Manual solution submission cancelled.');
+    return;
+  }
+  if (data === 'lcsol:m:all') {
+    const all = accounts.length > 0 && accounts.every(account => selected.has(account.id));
+    if (all) selected.clear(); else accounts.forEach(account => selected.add(account.id));
+    manualSolutionSelections.set(key, selected);
+    await defaultCoinClaimUiDeps.answer(callbackId, all ? 'Cleared all' : 'All accounts selected');
+  } else if (data.startsWith('lcsol:m:a:')) {
+    const id = data.slice('lcsol:m:a:'.length);
+    if (!accounts.some(account => account.id === id)) { await defaultCoinClaimUiDeps.answer(callbackId, 'Account no longer available'); return; }
+    if (selected.has(id)) selected.delete(id); else selected.add(id);
+    manualSolutionSelections.set(key, selected);
+    await defaultCoinClaimUiDeps.answer(callbackId, selected.has(id) ? 'Selected' : 'Unselected');
+  } else if (data === 'lcsol:m:question') {
+    if (!selected.size) { await defaultCoinClaimUiDeps.answer(callbackId, 'Select at least one account'); return; }
+    manualSolutionSelections.set(key, selected); pendingPromptType = 'solutionquestion';
+    await defaultCoinClaimUiDeps.answer(callbackId, 'Send a question number');
+    await defaultCoinClaimUiDeps.edit(chatId, messageId, '🔢 Send one LeetCode question number, for example <code>3820</code>. Your manual account selection is retained.');
+    return;
+  } else if (data === 'lcsol:m:daily' || data.startsWith('lcsol:m:n:')) {
+    if (!selected.size) { await defaultCoinClaimUiDeps.answer(callbackId, 'Select at least one account'); return; }
+    const question = data.startsWith('lcsol:m:n:') ? Number(data.slice('lcsol:m:n:'.length)) : undefined;
+    manualSolutionSelections.delete(key); pendingPromptType = null;
+    await defaultCoinClaimUiDeps.answer(callbackId, 'Starting manual workflow');
+    await defaultCoinClaimUiDeps.edit(chatId, messageId, `🚀 Starting the selected accounts for ${question ? `question #${question}` : 'today’s daily problem'}.`);
+    await startDailySolutionWorkflow([...selected], question);
+    return;
+  } else { await defaultCoinClaimUiDeps.answer(callbackId); return; }
+  const picker = buildManualSolutionPicker(accounts, selected);
+  await defaultCoinClaimUiDeps.edit(chatId, messageId, picker.text, picker.buttons);
 }
 
 /** /submitnextsolution — run the next queued Codeforces source solution once per account. */
@@ -3816,22 +3935,7 @@ export async function handleCallbackQuery(
   const data = q.data ?? '';
 
   if (data.startsWith('lcsol:')) {
-    if (data === 'lcsol:m:daily') {
-      const selected = await selectedAccountIds();
-      await deps.answer(q.id, 'Starting daily workflow');
-      await deps.edit(chatId, messageId, '🚀 Starting the saved accounts for today’s daily problem and solution article.');
-      pendingPromptType = null;
-      await startDailySolutionWorkflow(selected);
-      return;
-    }
-    if (data === 'lcsol:m:question') {
-      pendingPromptType = 'solutionquestion'; await deps.answer(q.id, 'Send a question number');
-      await deps.edit(chatId, messageId, '🔢 Send one LeetCode question number, for example <code>3820</code>.'); return;
-    }
-    if (data === 'lcsol:m:x') {
-      pendingPromptType = null; await deps.answer(q.id, 'Cancelled');
-      await deps.edit(chatId, messageId, '✖️ Manual solution submission cancelled.'); return;
-    }
+    if (data.startsWith('lcsol:m:')) { await handleManualSolutionButton(chatId, messageId, q.id, data); return; }
     await handleDailySolutionButton(chatId, messageId, q.id, data);
     return;
   }

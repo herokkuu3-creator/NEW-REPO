@@ -74,6 +74,15 @@ describe('daily AI drafts', () => {
     expect(results.filter(r => r.status === 'PUBLISHED')).toHaveLength(4);
     expect(results.filter(r => r.status === 'FAILED')).toHaveLength(1); expect(h.locks.size).toBe(0);
   });
+  it('preserves an accepted submission and reports the stored article failure reason', async () => {
+    h.accounts = [h.accounts[0]];
+    h.generate.mockResolvedValue({ id: 'post-a', status: 'FAILED', lastError: 'AI_MODELS_EXHAUSTED' });
+    const progress: any[] = [];
+    const results = await runCombined(['a'], new Date('2026-10-15T00:30:00Z'), event => { progress.push(event); });
+    expect(results).toEqual([{ accountId: 'a', postId: 'post-a', status: 'FAILED', error: 'AI_MODELS_EXHAUSTED' }]);
+    expect(h.publish).not.toHaveBeenCalled();
+    expect(progress.at(-1)).toMatchObject({ accountId: 'a', stage: 'failed', error: 'AI_MODELS_EXHAUSTED' });
+  });
   it('does not submit if challenge discovery fails or the pointer is stale', async () => {
     h.daily.mockRejectedValue(new Error('DAILY_CHALLENGE_NOT_REFRESHED'));
     const results = await runCombined(h.accounts.map(a => a.id), new Date('2026-10-15T00:30:00Z'));

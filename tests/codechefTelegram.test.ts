@@ -14,6 +14,7 @@ import {
   handleCodeChefRangeButton,
   CodeChefUiDeps,
   buildDailySolutionPicker,
+  buildManualSolutionPicker,
   handleCallbackQuery,
 } from '../src/notifications/telegramBot';
 
@@ -29,6 +30,20 @@ describe('daily solution account picker', () => {
     expect(picker.buttons).toContainEqual([{ text: '▫️ beta (bob)', callback_data: 'lcsol:a:b' }]);
     expect(picker.buttons.flat()).toContainEqual({ text: '💾 Save daily selection (1)', callback_data: 'lcsol:save' });
     expect(picker.buttons.flat()).toContainEqual({ text: '🚀 Run daily now', callback_data: 'lcsol:daily' });
+  });
+});
+
+describe('manual solution account picker', () => {
+  it('uses its own one-time selections and offers either the daily or numbered workflow', () => {
+    const picker = buildManualSolutionPicker([
+      { id: 'a', label: 'alpha', username: 'alice', status: 'ACTIVE' },
+      { id: 'b', label: 'beta', username: 'bob', status: 'ACTIVE' },
+    ] as never, new Set(['b']));
+    expect(picker.text).toContain('do not alter the 06:00 IST daily schedule');
+    expect(picker.buttons).toContainEqual([{ text: '▫️ alpha (alice)', callback_data: 'lcsol:m:a:a' }]);
+    expect(picker.buttons).toContainEqual([{ text: '✅ beta (bob)', callback_data: 'lcsol:m:a:b' }]);
+    expect(picker.buttons.flat()).toContainEqual({ text: '📅 Run daily now', callback_data: 'lcsol:m:daily' });
+    expect(picker.buttons.flat()).toContainEqual({ text: '🔢 Enter question number', callback_data: 'lcsol:m:question' });
   });
 });
 
