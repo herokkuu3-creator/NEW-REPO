@@ -144,6 +144,16 @@ describe('AI model routing', () => {
     await expect(new AIModelRouter(options, api as never).generate([], s => s)).rejects.toBeInstanceOf(RoutingError);
     expect(api.chat.completions.create).not.toHaveBeenCalled();
   });
+  it('uses the configured allow-list when model discovery lacks models:read scope', async () => {
+    const api = client();
+    api.models.list.mockRejectedValue(new OpenAI.PermissionDeniedError(403,
+      { code: 'insufficient_scope' }, 'models:read is required', new Headers()));
+    api.chat.completions.create.mockResolvedValue(complete('ok'));
+    const result = await new AIModelRouter(options, api as never).generate([], value => value);
+    expect(result.model).toBe('terra');
+    expect(result.attempts[0]).toMatchObject({ model: 'discovery', outcome: 'MODELS_READ_FORBIDDEN' });
+    expect(api.chat.completions.create).toHaveBeenCalledWith(expect.objectContaining({ model: 'terra' }), expect.any(Object));
+  });
   it('requires a separate successful technical review', async () => {
     const api = client(); api.chat.completions.create.mockResolvedValueOnce(complete(JSON.stringify(article)))
       .mockResolvedValueOnce(complete('{"approved":false,"issues":["wrong complexity"]}'))

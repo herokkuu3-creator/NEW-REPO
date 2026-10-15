@@ -57,10 +57,20 @@ export class AIModelRouter {
         const list = await client.models.list({ timeout: this.options.timeoutMs });
         available = new Set(list.data.map(m => m.id));
       } catch (error) {
-        const record = { model: 'discovery', attempt: 1, keySlot: keyIndex + 1, elapsedMs: 0, outcome: safeOutcome(error) };
+        const discoveryForbidden = isModelDiscoveryForbidden(error);
+        const record = { model: 'discovery', attempt: 1, keySlot: keyIndex + 1, elapsedMs: 0,
+          outcome: discoveryForbidden ? 'MODELS_READ_FORBIDDEN' : safeOutcome(error) };
         attempts.push(record); this.onAttempt(record);
-        if (isKeyExhausted(error)) { await this.markExhausted(key, record.outcome); continue; }
-        throw new RoutingError(attempts);
+        // CodeCraft separates `models:read` from `inference`. A restricted key
+        // can legitimately reject GET /models while still being authorized for
+        // POST /chat/completions. The configured allow-list is sufficient for
+        // that case; never infer arbitrary provider models.
+        if (discoveryForbidden) {
+          available = new Set(this.options.models);
+        } else {
+          if (isKeyExhausted(error)) { await this.markExhausted(key, record.outcome); continue; }
+          throw new RoutingError(attempts);
+        }
       }
       let exhausted = false;
       for (const model of [...new Set(this.options.models)]) {
@@ -126,9 +136,14 @@ function safeOutcome(error: unknown): string {
 export function isKeyExhausted(error: unknown): boolean {
   const api = error instanceof OpenAI.APIError ? error : undefined;
   const status = api?.status;
-  if (status === 401 || status === 402 || status === 403) return true;
+  if (status === 401 || status === 402) return true;
   if (status !== 429) return false;
   const candidate = error as { code?: unknown; type?: unknown; message?: unknown };
   const detail = [candidate.code, candidate.type, candidate.message].filter(v => typeof v === 'string').join(' ').toLowerCase();
   return /quota|credit|balance|billing|payment|monthly|insufficient|exceed/.test(detail);
+}
+
+/** A CodeCraft key may intentionally omit models:read while retaining inference. */
+function isModelDiscoveryForbidden(error: unknown): boolean {
+  return error instanceof OpenAI.APIError && error.status === 403;
 }
