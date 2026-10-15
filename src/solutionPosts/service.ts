@@ -11,7 +11,7 @@ import { AIModelRouter, RoutingError } from './router';
 import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext } from './article';
 import { ensurePost, move } from './store';
 import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
-import { loadSolutionKeyPool, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
+import { loadSolutionKeyPool, maskSolutionApiKey, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 
 export class PostError extends Error {
   constructor(public readonly code: string) { super(code); }
@@ -67,6 +67,8 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
 export async function createPostRouter(): Promise<AIModelRouter> {
   const pool = await loadSolutionKeyPool();
   const activeKeys = activeSolutionApiKeys(pool);
+  logger.info({ keyPool: { total: pool.keys.length, activeIndex: pool.activeIndex + 1,
+    activeKey: activeKeys[0] ? maskSolutionApiKey(activeKeys[0]) : null, stored: pool.stored } }, 'solution article router configured');
   if (!activeKeys.length) throw new PostError('AI_CONFIGURATION_REQUIRED');
   return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys }, undefined, undefined,
     attempt => logger.info({ attempt }, 'solution article AI attempt finished'),
