@@ -103,7 +103,12 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
           solution: capture.code, submissionId: accepted.submissionId, submissionStatus: 'Accepted', state: 'SUCCESS', error: null },
       });
       await reportProgress(onProgress, { accountId: account.id, stage: 'generating_article', questionNumber, submissionId: accepted.submissionId });
-      let post = await generateForRun(account.id, run.id);
+      const existing = await prisma.solutionPost.findUnique({ where: {
+        accountId_problemSlug_intent: { accountId: account.id, problemSlug: capture.slug, intent: 'community-solution' },
+      } });
+      let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status)
+        ? await retryPost(existing.id, true)
+        : await generateForRun(account.id, run.id);
       if (post.status === 'FAILED') {
         const error = post.lastError || 'GENERATION_FAILED';
         results.push({ accountId: account.id, postId: post.id, status: 'FAILED', error });
@@ -196,7 +201,7 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
       // Never resubmit accepted code for generation retries. Uncertain publications are left for reconciliation.
       await reportProgress(onProgress, { accountId: account.id, stage: 'generating_article', submissionId: run.submissionId ?? undefined });
       let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status) ?
-        await retryPost(existing.id) : await generateForRun(account.id, run.id);
+        await retryPost(existing.id, true) : await generateForRun(account.id, run.id, true);
       if (post.status === 'FAILED') {
         const error = post.lastError || 'GENERATION_FAILED';
         results.push({ accountId: account.id, postId: post.id, status: 'FAILED', error });

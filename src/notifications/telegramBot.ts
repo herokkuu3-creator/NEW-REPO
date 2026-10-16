@@ -89,8 +89,9 @@ import {
   type KeyBalanceResult,
 } from '../codeforces/capzyKeyManager';
 import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver';
-import { appendSolutionApiKeys, replaceSolutionApiKeys, solutionKeyPoolStatus } from '../solutionPosts/keyPool';
+import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool, solutionKeyPoolStatus, testSolutionApiKey } from '../solutionPosts/keyPool';
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
+import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
 
 import {
   isRunInProgress,
@@ -273,6 +274,8 @@ export const HELP_TEXT = [
   '├ /manualsolution — Run the selected accounts for daily or one question number',
   '├ /addsolutionkeys &lt;key1,key2&gt; — Append CodeCraft API keys',
   '├ /setsolutionkeys &lt;key1,key2&gt; — Replace/reset CodeCraft API key pool',
+  '├ /resetsolutionkeys — Reset active key to #1 &amp; clear retry limits',
+  '├ /testsolkey [key] — Test CodeCraft API key &amp; inference diagnostics',
   '└ /solutionkeystatus — Show masked article-generation key pool',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
@@ -629,6 +632,13 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/resetsolutionkeys':
         await deleteSensitiveTelegramMessage(msg);
         await handleReplaceSolutionApiKeys(commandArg);
+        return;
+      case '/testsolkey':
+      case '/testsolkeys':
+      case '/testkey':
+      case '/checksolkey':
+        await deleteSensitiveTelegramMessage(msg);
+        await handleTestSolutionApiKey(commandArg);
         return;
       case '/solutionkeystatus':
       case '/solutionkey_status':
@@ -1743,7 +1753,19 @@ function solutionStageText(stage: string, error?: string): string {
     case 'published': return '✅ Solution and article published';
     case 'article_ready': return '📝 Article generated and awaiting review';
     case 'skipped': return `⏭️ Skipped: ${error ?? 'already in progress'}`;
-    case 'failed': return `❌ ${error ?? 'workflow failed'}`;
+    case 'failed': {
+      if (!error) return '❌ workflow failed';
+      if (error === 'GENERATION_RETRY_LIMIT') return '❌ Retry limit reached (4 failed attempts). Use /resetsolutionkeys to reset.';
+      if (error === 'AI_CONFIGURATION_REQUIRED') return '❌ No active AI keys. Use /setsolutionkeys to add a CodeCraft key.';
+      if (error.startsWith('AI_ERROR:')) {
+        const detail = error.slice('AI_ERROR:'.length).trim();
+        return `❌ ${escapeHtml(detail.slice(0, 140))}`;
+      }
+      if (error === 'AI_MODELS_EXHAUSTED') {
+        return '❌ AI models exhausted or billing verification required. Run /testsolkey to check.';
+      }
+      return `❌ ${escapeHtml(error.slice(0, 140))}`;
+    }
     default: return '⏳ Queued…';
   }
 }
@@ -3207,19 +3229,71 @@ export async function handleAddSolutionApiKeys(commandArg?: string): Promise<voi
 export async function handleReplaceSolutionApiKeys(commandArg?: string): Promise<void> {
   const raw = (commandArg ?? '').trim();
   if (!raw) {
-    await replyHtml('⚠️ Usage: <code>/setsolutionkeys key1,key2</code>\nThis securely replaces the saved article key pool and activates key #1.');
-    return;
+    try {
+      const pool = await resetSolutionApiKeyPool();
+      const cleared = await resetFailedSolutionPostRetries();
+      await replyHtml([
+        '🔄 <b>Article API key pool reset</b>',
+        `Active key reset to <b>#1</b> (of ${pool.keys.length}).`,
+        cleared > 0 ? `Cleared retry limit on <b>${cleared}</b> failed solution article(s).` : 'No locked solution articles.',
+        'Run <code>/manualsolution</code> to test from Render, or <code>/testsolkey</code> to verify key status.',
+      ].join('\n'));
+      return;
+    } catch {
+      await replyHtml('⚠️ Usage: <code>/setsolutionkeys key1,key2</code>\nOr send <code>/resetsolutionkeys</code> to reset the existing pool to key #1.');
+      return;
+    }
   }
   try {
     const pool = await replaceSolutionApiKeys(raw);
+    const cleared = await resetFailedSolutionPostRetries();
     await replyHtml([
       '✅ <b>Article API key pool replaced</b>',
       `Stored <b>${pool.keys.length}</b> key(s); active key: <b>#1</b>.`,
+      cleared > 0 ? `Cleared retry limit on <b>${cleared}</b> failed solution article(s).` : '',
       'The supplied command message was deleted. Run <code>/manualsolution</code> to test from Render.',
-    ].join('\n'));
+    ].filter(Boolean).join('\n'));
   } catch (error) {
     await replyHtml(`❌ <b>Could not replace article API keys:</b> ${escapeHtml(error instanceof Error ? error.message : 'invalid input')}`);
   }
+}
+
+export async function handleTestSolutionApiKey(commandArg?: string): Promise<void> {
+  const arg = (commandArg ?? '').trim();
+  await replyHtml('🔎 <b>Testing CodeCraft API key…</b>\nChecking <code>/v1/models</code> and <code>/v1/chat/completions</code> from this server…');
+  const result = await testSolutionApiKey(arg || undefined);
+  const hostLabel = process.env.RENDER_EXTERNAL_URL ? 'Render Web Service' : (process.env.RENDER_INSTANCE_ID ? 'Render Container' : 'Local Host');
+  const lines = [
+    '🧪 <b>CodeCraft API Key Diagnostics</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    `🔑 <b>Key:</b> <code>${escapeHtml(result.keyMasked)}</code>`,
+    `📍 <b>Execution host:</b> <code>${escapeHtml(hostLabel)}</code>`,
+    '',
+    `• <b>GET /v1/models:</b> ${result.modelsStatus === 200 ? '🟢 HTTP 200 OK' : `🔴 HTTP ${result.modelsStatus}`} (${result.modelsCount} models returned)`,
+  ];
+  if (result.chatStatus) {
+    if (result.chatStatus === 200) {
+      lines.push(`• <b>POST /v1/chat/completions:</b> 🟢 HTTP 200 OK (model: <code>${result.chatModel}</code>)`);
+      lines.push('');
+      lines.push('✅ <b>Inference is fully operational!</b> Articles can be generated.');
+    } else {
+      lines.push(`• <b>POST /v1/chat/completions:</b> 🔴 HTTP ${result.chatStatus} (model: <code>${result.chatModel}</code>)`);
+      if (result.chatError) lines.push(`  └ <b>Error:</b> <code>${escapeHtml(result.chatError)}</code>`);
+      if (result.chatCode) lines.push(`  └ <b>Code:</b> <code>${escapeHtml(result.chatCode)}</code>`);
+      if (result.chatType) lines.push(`  └ <b>Type:</b> <code>${escapeHtml(result.chatType)}</code>`);
+      lines.push('');
+      if (result.chatStatus === 402) {
+        lines.push('⚠️ <b>Cause:</b> CodeCraft rejected inference with <code>Billing verification failed</code>.');
+        lines.push('The key is syntactically valid and recognized by CodeCraft, but the account has not completed billing verification or has insufficient funds.');
+        lines.push('👉 Visit <a href="https://codecraftapi.com">codecraftapi.com</a> to verify billing or attach a payment method.');
+      } else if (result.chatStatus === 401) {
+        lines.push('⚠️ <b>Cause:</b> Invalid or revoked API key.');
+      }
+    }
+  } else if (result.error) {
+    lines.push(`• <b>Inference check skipped:</b> <code>${escapeHtml(result.error)}</code>`);
+  }
+  await replyHtml(lines.join('\n'));
 }
 
 /** One account per button, followed by the explicit all-accounts choice. */

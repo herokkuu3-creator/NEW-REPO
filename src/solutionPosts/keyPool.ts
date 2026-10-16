@@ -127,6 +127,13 @@ export async function replaceSolutionApiKeys(raw: string | string[]): Promise<So
   return persist({ keys, activeIndex: 0, activePeriod: solutionKeyPeriod(), stored: true });
 }
 
+/** Explicit operator action: reset active index to 0 on the existing pool. */
+export async function resetSolutionApiKeyPool(): Promise<SolutionKeyPool> {
+  const current = await loadSolutionKeyPool();
+  if (!current.keys.length) throw new Error('NO_API_KEYS');
+  return persist({ keys: current.keys, activeIndex: 0, activePeriod: solutionKeyPeriod(), stored: true });
+}
+
 /** Advance only after an explicit key quota/credential failure. No round-robin on ordinary rate limits. */
 export async function rotateSolutionApiKey(failedKey: string): Promise<SolutionKeyPool> {
   const current = await loadSolutionKeyPool();
@@ -144,3 +151,89 @@ export async function solutionKeyPoolStatus(): Promise<SolutionKeyPoolStatus> {
     source: pool.keys.length ? (pool.stored ? 'database' : 'environment') : 'empty',
   };
 }
+
+export interface KeyTestResult {
+  ok: boolean;
+  keyMasked: string;
+  modelsStatus: number;
+  modelsCount: number;
+  chatStatus?: number;
+  chatError?: string;
+  chatType?: string;
+  chatCode?: string;
+  chatModel?: string;
+  error?: string;
+}
+
+export async function testSolutionApiKey(candidateKey?: string): Promise<KeyTestResult> {
+  let key = candidateKey?.trim();
+  if (!key) {
+    const pool = await loadSolutionKeyPool();
+    const active = pool.keys.slice(Math.max(0, pool.activeIndex));
+    key = active[0] ?? pool.keys[0];
+  }
+  if (!key) {
+    return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0, error: 'NO_KEY_CONFIGURED' };
+  }
+  const masked = maskSolutionApiKey(key);
+  try {
+    const baseUrl = config.solutionPosts.baseUrl || 'https://codecraftapi.com/v1';
+    const modelsUrl = new URL('models', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+    const modelsRes = await fetch(modelsUrl.href, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+    });
+    if (!modelsRes.ok) {
+      const errText = await modelsRes.text().catch(() => '');
+      return { ok: false, keyMasked: masked, modelsStatus: modelsRes.status, modelsCount: 0, error: errText.slice(0, 300) };
+    }
+    const modelsData = await modelsRes.json() as { data?: Array<{ id: string }> };
+    const modelsCount = Array.isArray(modelsData.data) ? modelsData.data.length : 0;
+
+    const chatUrl = new URL('chat/completions', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+    const testModel = config.solutionPosts.models[0] || 'gpt-5.6-terra';
+    const chatRes = await fetch(chatUrl.href, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: testModel,
+        messages: [{ role: 'user', content: 'ping' }],
+        max_tokens: 5,
+      }),
+    });
+    if (!chatRes.ok) {
+      const chatBody = await chatRes.text().catch(() => '');
+      let parsedMsg = chatBody;
+      let parsedType: string | undefined;
+      let parsedCode: string | undefined;
+      try {
+        const p = JSON.parse(chatBody) as { error?: { message?: string; type?: string; code?: string } };
+        if (p.error?.message) parsedMsg = p.error.message;
+        if (p.error?.type) parsedType = p.error.type;
+        if (p.error?.code) parsedCode = p.error.code;
+      } catch {}
+      return {
+        ok: false,
+        keyMasked: masked,
+        modelsStatus: modelsRes.status,
+        modelsCount,
+        chatStatus: chatRes.status,
+        chatError: parsedMsg.slice(0, 300),
+        chatType: parsedType,
+        chatCode: parsedCode,
+        chatModel: testModel,
+      };
+    }
+    return {
+      ok: true,
+      keyMasked: masked,
+      modelsStatus: modelsRes.status,
+      modelsCount,
+      chatStatus: chatRes.status,
+      chatModel: testModel,
+    };
+  } catch (err) {
+    return { ok: false, keyMasked: masked, modelsStatus: 0, modelsCount: 0, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+

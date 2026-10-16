@@ -9,7 +9,7 @@ vi.mock('../src/database/models', () => ({
 }));
 
 import { appendSolutionApiKeys, loadSolutionKeyPool, maskSolutionApiKey, parseSolutionApiKeys,
-  replaceSolutionApiKeys, rotateSolutionApiKey, solutionKeyPoolStatus, solutionKeyPeriod } from '../src/solutionPosts/keyPool';
+  replaceSolutionApiKeys, resetSolutionApiKeyPool, rotateSolutionApiKey, solutionKeyPoolStatus, solutionKeyPeriod, testSolutionApiKey } from '../src/solutionPosts/keyPool';
 
 describe('solution article API key pool', () => {
   beforeEach(() => { db.value = null; });
@@ -43,6 +43,15 @@ describe('solution article API key pool', () => {
     expect((await solutionKeyPoolStatus()).active).toBe(1);
   });
 
+  it('resets the active pointer to key one on the existing pool', async () => {
+    await appendSolutionApiKeys('key_three_0003');
+    await rotateSolutionApiKey('env_primary_0001');
+    expect((await solutionKeyPoolStatus()).active).toBe(2);
+    const pool = await resetSolutionApiKeyPool();
+    expect(pool.activeIndex).toBe(0);
+    expect((await solutionKeyPoolStatus()).active).toBe(1);
+  });
+
   it('keeps an exhausted key skipped within its month and restores key one in the next month', async () => {
     await appendSolutionApiKeys('key_three_0003');
     expect((await rotateSolutionApiKey('env_primary_0001')).activeIndex).toBe(1);
@@ -51,5 +60,11 @@ describe('solution article API key pool', () => {
     const next = await loadSolutionKeyPool(new Date('2026-11-01T00:00:00Z'));
     expect(next.activeIndex).toBe(0);
     expect(next.activePeriod).toBe(solutionKeyPeriod(new Date('2026-11-01T00:00:00Z')));
+  });
+
+  it('handles testing an API key gracefully when network fails or key is missing', async () => {
+    const res = await testSolutionApiKey('invalid_mock_key');
+    expect(res.keyMasked).toContain('…');
+    expect(typeof res.ok).toBe('boolean');
   });
 });

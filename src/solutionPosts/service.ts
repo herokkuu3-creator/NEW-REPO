@@ -78,10 +78,13 @@ export async function createPostRouter(): Promise<AIModelRouter> {
     });
 }
 
-export async function generatePost(context: SubmissionContext, router?: AIModelRouter): Promise<SolutionPost> {
+export async function generatePost(context: SubmissionContext, router?: AIModelRouter, force = false): Promise<SolutionPost> {
   let post = await ensurePost(context);
   if (!['PENDING', 'RETRY_PENDING'].includes(post.status)) return post;
-  if (post.retryCount >= 4) throw new PostError('GENERATION_RETRY_LIMIT');
+  if (!force && post.retryCount >= 4) throw new PostError('GENERATION_RETRY_LIMIT');
+  if (force && post.retryCount >= 4) {
+    post = await prisma.solutionPost.update({ where: { id: post.id }, data: { retryCount: 0 } });
+  }
   // Use the immutable original snapshot when a later submission for the same problem exists.
   const savedContext = contextSchema.parse(JSON.parse(post.context));
   if (hash(savedContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
@@ -115,7 +118,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     if (['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING'].includes(post.status)) {
       post = await move(post, 'FAILED', { leaseUntil: null,
         lastError: error instanceof ArticleReviewError ? 'TECHNICAL_REVIEW_FAILED' :
-          error instanceof RoutingError ? 'AI_MODELS_EXHAUSTED' :
+          error instanceof RoutingError ? (error.lastFailure ? `AI_ERROR: ${error.lastFailure}` : 'AI_MODELS_EXHAUSTED') :
             error instanceof PostError ? error.code : 'GENERATION_FAILED',
         ...(error instanceof ArticleReviewError ? { ...error.draft,
           contentHash: hash(`${error.draft.title}\n${error.draft.markdown}`), approvedHash: null } : {}),
@@ -125,19 +128,27 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   }
 }
 
-export async function generateForRun(accountId: string, runId: string): Promise<SolutionPost> {
+export async function generateForRun(accountId: string, runId: string, force = false): Promise<SolutionPost> {
   const run = await prisma.dailyRun.findUniqueOrThrow({ where: { id: runId } });
   if (run.accountId !== accountId) throw new PostError('ACCOUNT_IDENTITY_MISMATCH');
   const existing = await prisma.solutionPost.findUnique({ where: { accountId_problemSlug_intent: {
     accountId, problemSlug: run.problemSlug, intent: 'community-solution',
   } } });
-  if (existing && !['PENDING', 'RETRY_PENDING'].includes(existing.status)) return existing;
-  return generatePost(await loadContext(accountId, runId));
+  if (existing && !['PENDING', 'RETRY_PENDING'].includes(existing.status)) {
+    if (force && existing.status === 'FAILED') {
+      return retryPost(existing.id, true);
+    }
+    return existing;
+  }
+  return generatePost(await loadContext(accountId, runId), undefined, force);
 }
 
-export async function retryPost(id: string): Promise<SolutionPost> {
+export async function retryPost(id: string, force = false): Promise<SolutionPost> {
   let post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
-  if (post.retryCount >= 4) throw new PostError('GENERATION_RETRY_LIMIT');
+  if (!force && post.retryCount >= 4) throw new PostError('GENERATION_RETRY_LIMIT');
+  if (force && post.retryCount >= 4) {
+    post = await prisma.solutionPost.update({ where: { id }, data: { retryCount: 0 } });
+  }
   if (post.status === 'FAILED') post = await move(post, 'RETRY_PENDING');
   if (post.status !== 'RETRY_PENDING') throw new PostError('NOT_RETRYABLE');
   const context = contextSchema.parse(JSON.parse(post.context));
@@ -145,7 +156,27 @@ export async function retryPost(id: string): Promise<SolutionPost> {
   if (!run) throw new PostError('SUBMISSION_CONTEXT_MISSING');
   const verified = await loadContext(post.accountId, run.id);
   if (hash(verified.code) !== post.codeHash || verified.slug !== context.slug) throw new PostError('SOURCE_INTEGRITY_FAILED');
-  return generatePost(context);
+  return generatePost(context, undefined, force);
+}
+
+/** When API keys are renewed or reset, unlock any posts stalled on key errors or retry limits. */
+export async function resetFailedSolutionPostRetries(): Promise<number> {
+  const updated = await prisma.solutionPost.updateMany({
+    where: {
+      status: 'FAILED',
+      OR: [
+        { lastError: 'GENERATION_RETRY_LIMIT' },
+        { lastError: 'AI_MODELS_EXHAUSTED' },
+        { lastError: 'AI_CONFIGURATION_REQUIRED' },
+        { lastError: { startsWith: 'AI_ERROR:' } },
+      ],
+    },
+    data: {
+      status: 'RETRY_PENDING',
+      retryCount: 0,
+    },
+  });
+  return updated.count;
 }
 
 export async function resolveCurrentDaily(account: Account, now = new Date()) {
