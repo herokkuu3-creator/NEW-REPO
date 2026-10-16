@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ accounts: [] as any[], runs: new Map<string, any>(), daily: vi.fn(), generate: vi.fn(),
   submit: vi.fn(), approve: vi.fn(), publish: vi.fn(), preferences: [] as any[], locks: new Map<string, string>(), calls: [] as any[],
-  timers: [] as Array<() => void>, range: vi.fn() }));
+  timers: [] as Array<() => void>, submitSingle: vi.fn() }));
 vi.mock('node-cron', () => ({ default: { schedule: vi.fn((_expr, callback) => {
   h.timers.push(callback); return { stop: vi.fn() };
 }) } }));
@@ -33,7 +33,7 @@ vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error 
 vi.mock('../src/solutionPosts/store', () => ({ recoverGeneration: vi.fn(), approvePost: h.approve }));
 vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: h.publish }));
 vi.mock('../src/scheduler/dailyWorker', () => ({ runSubmissionNow: h.submit }));
-vi.mock('../src/scheduler/rangeSubmission', () => ({ startRangeJob: h.range }));
+vi.mock('../src/scheduler/rangeSubmission', () => ({ submitSingleQuestionDirectly: h.submitSingle }));
 import { afterPostSchedule, POST_CRON, POST_TIMEZONE, runCombined, runManualQuestion, setSelectedAccounts, startSolutionPostScheduler } from '../src/solutionPosts/scheduler';
 beforeEach(() => {
   vi.clearAllMocks(); h.locks.clear(); h.preferences = []; h.runs.clear(); h.calls = []; h.timers = [];
@@ -43,8 +43,10 @@ beforeEach(() => {
   h.generate.mockImplementation(async (id: string) => ({ id: 'post-' + id, status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) }));
   h.approve.mockImplementation(async (id: string) => ({ id, status: 'DRAFT_READY', contentHash: 'a'.repeat(64) }));
   h.publish.mockImplementation(async (id: string) => ({ id, status: 'PUBLISHED', contentHash: 'a'.repeat(64) }));
-  h.range.mockResolvedValue({ started: true, done: Promise.resolve([{ results: [{ status: 'accepted', submissionId: '456',
-    capture: { slug: 'manual-question', title: 'Manual question', difficulty: 'Easy', language: 'cpp', code: 'class Solution {}' } }] }]) });
+  h.submitSingle.mockResolvedValue({
+    outcome: { status: 'accepted', submissionId: '456', number: 3820 },
+    capture: { slug: 'manual-question', title: 'Manual question', difficulty: 'Easy', language: 'cpp', code: 'class Solution {}' },
+  });
   h.submit.mockImplementation(async (_reason, options) => {
     h.calls.push(options); const id = options.accountIds[0]; h.runs.set(id,
       { id: 'run-' + id, problemSlug: 'today', state: 'SUCCESS', submissionId: '124', submissionStatus: 'Accepted' });
@@ -100,7 +102,7 @@ describe('daily AI drafts', () => {
   it('turns a selected manual question into an accepted source-backed article post', async () => {
     h.accounts = [h.accounts[0]];
     const results = await runManualQuestion(3820, ['a'], new Date('2026-10-15T00:30:00Z'));
-    expect(h.range).toHaveBeenCalledWith({ from: 3820, to: 3820 }, 'a');
+    expect(h.submitSingle).toHaveBeenCalledWith(expect.objectContaining({ id: 'a' }), 3820);
     expect(results).toEqual([{ accountId: 'a', postId: 'post-a', status: 'PUBLISHED' }]);
     expect(h.generate).toHaveBeenCalledWith('a', 'manual-a');
   });

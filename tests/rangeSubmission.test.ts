@@ -16,6 +16,8 @@ import {
   startRangeJob,
   rangeQueueLength,
   cancelRangeJob,
+  isRangeJobActive,
+  submitSingleQuestionDirectly,
   __resetRangeJobForTests,
 } from '../src/scheduler/rangeSubmission';
 
@@ -330,6 +332,62 @@ describe('range engine', () => {
     expect(results[0]!.results).toEqual([]);
     expect(results[0]!.notAttempted).toEqual([200, 201]);
     expect(log).not.toContain('submit:slug-200');
+  });
+
+  it('auto-refreshes session via credentials when signed out and continues range job', async () => {
+    const log: string[] = [];
+    const session1 = makeSession(() => 'accepted', log);
+    session1.api.checkSession = async () => ({ authenticated: false, cause: 'signed-out' });
+    const session2 = makeSession(() => 'accepted', log);
+    session2.api.checkSession = async () => ({ authenticated: true, username: 'userRefreshed' });
+
+    let opened = 0;
+    const refreshAccount = vi.fn(async () => ({ status: 'refreshed' as const, site: 'leetcode' as const, label: 'a1' }));
+    const { deps } = makeDeps(session1, [acc('a1')], {
+      openSession: async () => {
+        opened++;
+        return opened === 1 ? session1 : session2;
+      },
+      refreshAccount,
+    });
+
+    const r = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
+    const results = await r.done;
+    expect(refreshAccount).toHaveBeenCalledTimes(1);
+    expect(results[0]!.fatal).toBeUndefined();
+    expect(countResults(results[0]!.results)).toEqual({ accepted: 1, failed: 0, error: 0, premium: 0 });
+    expect(log).toContain('submit:slug-200');
+  });
+
+  it('emits error phase with session detail instead of failed phase when session check fails', async () => {
+    const log: string[] = [];
+    const session = makeSession(() => 'accepted', log);
+    session.api.checkSession = async () => ({ authenticated: false, cause: 'signed-out' });
+    const progressEvents: any[] = [];
+    const { deps } = makeDeps(session, [acc('a1')], {
+      onProgress: (ev) => {
+        progressEvents.push(ev);
+      },
+    });
+
+    const r = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
+    await r.done;
+    const errorEv = progressEvents.find((e) => e.phase === 'error');
+    expect(errorEv).toBeDefined();
+    expect(errorEv.detail).toMatch(/signed out/);
+    // Crucial: Must NOT emit phase: 'failed' (which would cause telegramBot to display "Wrong Answer")
+    expect(progressEvents.some((e) => e.phase === 'failed')).toBe(false);
+  });
+
+  it('submitSingleQuestionDirectly runs independently without setting activeJob or queue', async () => {
+    const log: string[] = [];
+    const session = makeSession(() => 'accepted', log);
+    const { deps } = makeDeps(session, [acc('a1')]);
+    const res = await submitSingleQuestionDirectly(acc('a1'), 200, deps);
+    expect(res.outcome.status).toBe('accepted');
+    expect(res.capture?.code).toContain('main');
+    expect(isRangeJobActive()).toBe(false);
+    expect(rangeQueueLength()).toBe(0);
   });
 });
 

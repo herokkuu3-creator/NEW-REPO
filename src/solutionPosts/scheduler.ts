@@ -5,7 +5,8 @@ import { config } from '../config';
 import { prisma } from '../database/prisma';
 import { logger } from '../logger';
 import { generateForRun, resolveCurrentDaily, retryPost, PostError } from './service';
-import { startRangeJob } from '../scheduler/rangeSubmission';
+import { submitSingleQuestionDirectly } from '../scheduler/rangeSubmission';
+import type { AccountRecord } from '../database/accounts';
 import { approvePost, recoverGeneration } from './store';
 import { publishPost } from './publisher';
 
@@ -88,21 +89,21 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
     try {
       await reportProgress(onProgress, { accountId: account.id, stage: 'starting', questionNumber });
       await reportProgress(onProgress, { accountId: account.id, stage: 'submitting', questionNumber });
-      const job = await startRangeJob({ from: questionNumber, to: questionNumber }, account.id);
-      if (!('done' in job)) throw new PostError(job.reason === 'no-accounts' ? 'SELECT_ACCOUNTS_REQUIRED' : 'ACCOUNT_UNAVAILABLE');
-      const rangeResults = await job.done;
-      const accepted = rangeResults[0]?.results.find(result => result.status === 'accepted' && result.capture);
-      if (!accepted?.capture || !accepted.submissionId) throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
-      const capture = accepted.capture;
-      await reportProgress(onProgress, { accountId: account.id, stage: 'accepted', questionNumber, submissionId: accepted.submissionId });
+      const submitRes = await submitSingleQuestionDirectly(account as unknown as AccountRecord, questionNumber);
+      if (submitRes.outcome.status !== 'accepted' || !submitRes.capture || !submitRes.outcome.submissionId) {
+        throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
+      }
+      const capture = submitRes.capture;
+      const submissionId = submitRes.outcome.submissionId;
+      await reportProgress(onProgress, { accountId: account.id, stage: 'accepted', questionNumber, submissionId });
       const date = `manual:${questionNumber}:${now.toISOString().slice(0, 10)}`;
       const run = await prisma.dailyRun.upsert({ where: { accountId_date: { accountId: account.id, date } },
         create: { accountId: account.id, date, problemSlug: capture.slug, title: capture.title, difficulty: capture.difficulty,
-          language: capture.language, solution: capture.code, submissionId: accepted.submissionId, submissionStatus: 'Accepted', state: 'SUCCESS' },
+          language: capture.language, solution: capture.code, submissionId, submissionStatus: 'Accepted', state: 'SUCCESS' },
         update: { problemSlug: capture.slug, title: capture.title, difficulty: capture.difficulty, language: capture.language,
-          solution: capture.code, submissionId: accepted.submissionId, submissionStatus: 'Accepted', state: 'SUCCESS', error: null },
+          solution: capture.code, submissionId, submissionStatus: 'Accepted', state: 'SUCCESS', error: null },
       });
-      await reportProgress(onProgress, { accountId: account.id, stage: 'generating_article', questionNumber, submissionId: accepted.submissionId });
+      await reportProgress(onProgress, { accountId: account.id, stage: 'generating_article', questionNumber, submissionId });
       const existing = await prisma.solutionPost.findUnique({ where: {
         accountId_problemSlug_intent: { accountId: account.id, problemSlug: capture.slug, intent: 'community-solution' },
       } });
@@ -112,16 +113,16 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
       if (post.status === 'FAILED') {
         const error = post.lastError || 'GENERATION_FAILED';
         results.push({ accountId: account.id, postId: post.id, status: 'FAILED', error });
-        await reportProgress(onProgress, { accountId: account.id, stage: 'failed', questionNumber, submissionId: accepted.submissionId, postId: post.id, error });
+        await reportProgress(onProgress, { accountId: account.id, stage: 'failed', questionNumber, submissionId, postId: post.id, error });
         continue;
       }
       if (config.solutionPosts.autoPublish) {
-        await reportProgress(onProgress, { accountId: account.id, stage: 'publishing_article', questionNumber, submissionId: accepted.submissionId, postId: post.id });
+        await reportProgress(onProgress, { accountId: account.id, stage: 'publishing_article', questionNumber, submissionId, postId: post.id });
         post = await publishGeneratedPost(post);
       }
       results.push({ accountId: account.id, postId: post.id, status: post.status });
       await reportProgress(onProgress, { accountId: account.id, stage: post.status === 'PUBLISHED' ? 'published' : 'article_ready', questionNumber,
-        submissionId: accepted.submissionId, postId: post.id, status: post.status });
+        submissionId, postId: post.id, status: post.status });
     } catch (error) {
       const code = errorCode(error, 'MANUAL_WORKFLOW_FAILED');
       results.push({ accountId: account.id, status: 'FAILED', error: code });

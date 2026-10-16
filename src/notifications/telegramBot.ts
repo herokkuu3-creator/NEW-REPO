@@ -4230,7 +4230,7 @@ export function renderRangeProgressSections(
 
       if (sec.activeLine) {
         items.push(sec.activeLine);
-      } else if (sec.accountStatus && items.length === 0) {
+      } else if (sec.accountStatus) {
         items.push(sec.accountStatus);
       }
 
@@ -4397,7 +4397,7 @@ export async function handleQuestionRangeTrigger(
         break;
       }
       case 'failed': {
-        const verdict = escapeHtml(event.verdict ?? 'Wrong Answer');
+        const verdict = escapeHtml(event.verdict ?? event.detail ?? 'Wrong Answer');
         const sub = event.submissionId ? ` · #${escapeHtml(event.submissionId)}` : '';
         sec.completedItems.push(`❌ ${stepPrefix}${qTag} — <b>${verdict}</b>${sub}`);
         sec.activeLine = undefined;
@@ -4409,10 +4409,15 @@ export async function handleQuestionRangeTrigger(
         break;
       }
       case 'error': {
-        const detail = escapeHtml((event.detail ?? 'Error').slice(0, 100));
+        const fullDetail = event.detail ?? 'Error';
         const sub = event.submissionId ? ` · #${escapeHtml(event.submissionId)}` : '';
-        sec.completedItems.push(`⚠️ ${stepPrefix}${qTag} — <i>${detail}</i>${sub}`);
-        sec.activeLine = undefined;
+        if (sec.completedItems.length === 0 && (fullDetail.toLowerCase().includes('session') || fullDetail.toLowerCase().includes('cookie') || fullDetail.toLowerCase().includes('could not open'))) {
+          sec.accountStatus = `⚠️ <b>${escapeHtml(fullDetail.slice(0, 100))}</b>`;
+          sec.activeLine = undefined;
+        } else {
+          sec.completedItems.push(`⚠️ ${stepPrefix}${qTag} — <i>${escapeHtml(fullDetail.slice(0, 100))}</i>${sub}`);
+          sec.activeLine = undefined;
+        }
         break;
       }
       case 'waiting': {
@@ -4459,7 +4464,7 @@ export async function handleQuestionRangeTrigger(
             const c = countResults(r.results);
             sum.accepted += c.accepted;
             sum.failed += c.failed;
-            sum.error += c.error;
+            sum.error += c.error + (r.fatal ? 1 : 0);
             sum.premium += c.premium;
           }
           const summaryText = `\n\n🎯 <b>Finished:</b> ${sum.accepted} accepted · ${sum.failed} failed · ${sum.error} errors${sum.premium ? ` · 🔒 ${sum.premium} premium` : ''}`;
@@ -4498,7 +4503,7 @@ export async function handleQuestionRangeTrigger(
         const c = countResults(r.results);
         sum.accepted += c.accepted;
         sum.failed += c.failed;
-        sum.error += c.error;
+        sum.error += c.error + (r.fatal ? 1 : 0);
         sum.premium += c.premium;
       }
       const summaryText = `\n\n🎯 <b>Finished:</b> ${sum.accepted} accepted · ${sum.failed} failed · ${sum.error} errors${sum.premium ? ` · 🔒 ${sum.premium} premium` : ''}`;

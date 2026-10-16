@@ -15,6 +15,7 @@ import { shouldRetryWithOriginal, stripCppComments } from '../codeforces/codeSan
 import { ParsedProblem } from '../leetcode/parser';
 import { isRunInProgress } from './dailyWorker';
 import { config } from '../config';
+import { refreshLeetCodeAccount, AccountRefreshOutcome } from '../security/sessionAutoRefresh';
 
 /**
  * Question-range submission (Telegram /questionrangesubmission 200-400).
@@ -173,6 +174,7 @@ export interface RangeDeps {
   listAccounts(): Promise<AccountRecord[]>;
   getAccount(id: string): Promise<AccountRecord | null>;
   openSession(account: AccountRecord): Promise<RangeSession>;
+  refreshAccount?(account: AccountRecord): Promise<AccountRefreshOutcome | null>;
   /** The walkccc page for a question number: the slug (and often the solution). */
   getPage(questionNumber: number): Promise<WalkcccPage>;
   /** Direct LeetCode slug resolution by question number when walkccc has no page. */
@@ -441,24 +443,43 @@ async function runAccountRange(
     return result;
   };
 
-  let session: RangeSession;
+  let session!: RangeSession;
   try {
     session = await deps.openSession(account);
   } catch (err) {
-    result.fatal = `could not open a session: ${errText(err)}`;
-    for (let n = range.from; n <= range.to; n++) result.notAttempted.push(n);
-    void deps.onProgress?.({
-      phase: 'failed',
-      label: account.label,
-      username: account.username,
-      accIndex: index - 1,
-      accTotal: total,
-      stepIndex: 1,
-      stepTotal: rangeSize(range),
-      questionNumber: range.from,
-      detail: result.fatal,
-    });
-    return finish();
+    let recovered = false;
+    if (deps.refreshAccount) {
+      logger.warn({ account: account.label, err: errText(err) }, 'could not open session; attempting auto-refresh via credentials');
+      const refreshOutcome = await deps.refreshAccount(account).catch(() => null);
+      if (refreshOutcome?.status === 'refreshed') {
+        const updated = await deps.getAccount(account.id);
+        if (updated) {
+          account = updated;
+          try {
+            session = await deps.openSession(account);
+            recovered = true;
+          } catch {
+            // failed again
+          }
+        }
+      }
+    }
+    if (!recovered) {
+      result.fatal = `could not open a session: ${errText(err)}`;
+      for (let n = range.from; n <= range.to; n++) result.notAttempted.push(n);
+      void deps.onProgress?.({
+        phase: 'error',
+        label: account.label,
+        username: account.username,
+        accIndex: index - 1,
+        accTotal: total,
+        stepIndex: 1,
+        stepTotal: rangeSize(range),
+        questionNumber: range.from,
+        detail: result.fatal,
+      });
+      return finish();
+    }
   }
 
   try {
@@ -473,7 +494,22 @@ async function runAccountRange(
       questionNumber: range.from,
     });
 
-    const check = await session.api.checkSession();
+    let check = await session.api.checkSession();
+    if (!check.authenticated && check.cause === 'signed-out' && deps.refreshAccount) {
+      logger.warn({ account: account.label }, 'LeetCode range check reported signed-out; attempting auto-refresh via credentials');
+      const refreshOutcome = await deps.refreshAccount(account).catch(() => null);
+      if (refreshOutcome?.status === 'refreshed') {
+        logger.info({ account: account.label }, 'LeetCode session auto-refreshed via credentials for range job — retrying session check');
+        const updated = await deps.getAccount(account.id);
+        if (updated) {
+          account = updated;
+          await session.close().catch(() => undefined);
+          session = await deps.openSession(account);
+          check = await session.api.checkSession();
+        }
+      }
+    }
+
     if (!check.authenticated) {
       result.fatal =
         check.cause === 'signed-out'
@@ -481,7 +517,7 @@ async function runAccountRange(
           : 'could not verify the session (LeetCode request failed)';
       for (let n = range.from; n <= range.to; n++) result.notAttempted.push(n);
       void deps.onProgress?.({
-        phase: 'failed',
+        phase: 'error',
         label: account.label,
         username: account.username,
         accIndex: index - 1,
@@ -1223,6 +1259,7 @@ export function defaultRangeDeps(
     listAccounts: listEnabledAccounts,
     getAccount: getAccountById,
     openSession: openRequestSession,
+    refreshAccount: (acc) => refreshLeetCodeAccount(acc).catch(() => null),
     getPage: (n) => sharedCache.get(n),
     resolveSlug: (n) => resolveLeetCodeSlugByNumber(n),
     fetchCommunity: (slug, problem, options) => fetchCommunitySolution(slug, problem, options),
@@ -1252,6 +1289,115 @@ export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
     }
     signal.addEventListener('abort', done, { once: true });
   });
+}
+
+export interface SingleQuestionSubmitResult {
+  outcome: QuestionResult;
+  capture?: {
+    slug: string;
+    title: string;
+    difficulty: string;
+    language: string;
+    code: string;
+  };
+}
+
+/**
+ * Submits a single question directly without queueing or touching the active range job.
+ * This completely isolates solution posts and manual questions from range jobs.
+ */
+export async function submitSingleQuestionDirectly(
+  account: AccountRecord,
+  questionNumber: number,
+  deps: RangeDeps = defaultRangeDeps(),
+): Promise<SingleQuestionSubmitResult> {
+  let session!: RangeSession;
+  try {
+    session = await deps.openSession(account);
+  } catch (err) {
+    let recovered = false;
+    if (deps.refreshAccount) {
+      const refreshOutcome = await deps.refreshAccount(account).catch(() => null);
+      if (refreshOutcome?.status === 'refreshed') {
+        const updated = await deps.getAccount(account.id);
+        if (updated) {
+          account = updated;
+          try {
+            session = await deps.openSession(account);
+            recovered = true;
+          } catch {
+            // failed again
+          }
+        }
+      }
+    }
+    if (!recovered) {
+      return {
+        outcome: {
+          number: questionNumber,
+          status: 'error',
+          detail: `could not open session: ${errText(err)}`,
+        },
+      };
+    }
+  }
+
+  try {
+    let check = await session.api.checkSession();
+    if (!check.authenticated && check.cause === 'signed-out' && deps.refreshAccount) {
+      const refreshOutcome = await deps.refreshAccount(account).catch(() => null);
+      if (refreshOutcome?.status === 'refreshed') {
+        const updated = await deps.getAccount(account.id);
+        if (updated) {
+          account = updated;
+          await session.close().catch(() => undefined);
+          session = await deps.openSession(account);
+          check = await session.api.checkSession();
+        }
+      }
+    }
+
+    if (!check.authenticated) {
+      const detail =
+        check.cause === 'signed-out'
+          ? 'LeetCode rejected this session (signed out) — send fresh cookies'
+          : 'could not verify the session (LeetCode request failed)';
+      return {
+        outcome: {
+          number: questionNumber,
+          status: 'error',
+          detail,
+        },
+      };
+    }
+
+    const usedUuids = new Set<string>();
+    const abort = new AbortController();
+    const { outcome } = await solveOneWithRetries(
+      questionNumber,
+      session.api,
+      deps,
+      abort.signal,
+      usedUuids,
+    );
+
+    if (!outcome) {
+      return {
+        outcome: {
+          number: questionNumber,
+          status: 'error',
+          detail: 'submission aborted',
+        },
+      };
+    }
+
+    return {
+      outcome,
+      capture: outcome.status === 'accepted' ? outcome.capture : undefined,
+    };
+  } finally {
+    await session.close().catch(() => undefined);
+  }
 }
 
 /** Test hook: forget any job (only used by tests). */
