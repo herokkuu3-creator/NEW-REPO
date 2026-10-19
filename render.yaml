@@ -80,7 +80,7 @@ services:
       - key: TIMEZONE
         value: Asia/Kolkata
       - key: RUN_ON_BOOT
-        value: "true" # covers cold starts triggered by an external cron ping
+        value: "false"
       - key: LEETCODE_LANGUAGE
         value: cpp
       # --- Solution source ---------------------------------------------------
@@ -117,6 +117,14 @@ services:
         value: "3"
       - key: LOG_LEVEL
         value: info
+      - key: AUTO_SUBMIT
+        value: "true"
+      - key: CODECHEF_1
+        sync: false
+      - key: CODECHEF_2
+        sync: false
+      - key: CPSOLVER_URL
+        value: https://pk-coder.onrender.com
 
   # ---------------------------------------------------------------------------
   # Isolated Codeforces submitter — its OWN free web service.
@@ -127,7 +135,7 @@ services:
   # Telegram, no scheduler, no LeetCode code. It normally sleeps and wakes only
   # for a submission.
   #
-  # Setup: generate one secret with `openssl rand -base64 32` and set that SAME
+  # Setup: generate one secret with openssl rand -base64 32 and set that SAME
   # value as CODEFORCES_SUBMITTER_TOKEN here and on the main service, then set
   # CODEFORCES_SUBMITTER_URL on the main service to this service's public URL
   # (no trailing slash).
@@ -152,7 +160,7 @@ services:
       # Retained so switching CODEFORCES_RUNNER_MODE back to github needs no
       # repository configuration change.
       - key: CODEFORCES_RUNNER_REPOSITORY
-        value: pateljk479-afk/NEW-REPO
+        value: herokkuu41/NEW-REPO
       # Required: a fine-grained Actions-write token dispatches the browser job.
       # Jobs fail immediately when it is absent instead of waiting indefinitely.
       - key: GITHUB_DISPATCH_TOKEN
@@ -177,8 +185,11 @@ services:
         value: info
       - key: CODEFORCES_BROWSER_MIN_FREE_MB
         value: "120"
+      - key: CPSOLVER_URL
+        value: https://pk-coder.onrender.com
 
 databases:
   - name: leetcode-agent-db
     databaseName: leetcode_agent
+    region: frankfurt
     plan: free # 1 GB, expires 30 days after creation — see DEPLOYMENT.md §13
