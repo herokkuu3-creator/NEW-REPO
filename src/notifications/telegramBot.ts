@@ -104,6 +104,7 @@ import { claimContestRewardForAccount, ContestRewardResult } from '../leetcode/c
 import { humanLocal } from '../time';
 import {
   AccountRangeResult,
+  calculateSafeRangeConcurrency,
   cancelRangeJob,
   countResults,
   currentRangeJob,
@@ -118,6 +119,7 @@ import {
   rangeSize,
   rangeQueueLength,
   startRangeJob,
+  StartRangeOptions,
   StartRangeResult,
 } from '../scheduler/rangeSubmission';
 
@@ -4182,7 +4184,7 @@ const RANGE_GAP_MS = 30_000;
 
 /** Wiring for the range UI — injectable for tests. */
 export interface RangeUiDeps {
-  start: (range: QuestionRange, target: string | 'all') => Promise<StartRangeResult>;
+  start: (range: QuestionRange, target: string | 'all', options?: StartRangeOptions) => Promise<StartRangeResult>;
   current: typeof currentRangeJob;
   cancel: typeof cancelRangeJob;
   now: () => number;
@@ -4262,7 +4264,7 @@ export function renderRangeProgressSections(
 export interface RangeTriggerDeps {
   listAccounts: () => Promise<AccountRecord[]>;
   getAccount: (id: string) => Promise<AccountRecord | null>;
-  startJob: (range: QuestionRange, target: string | 'all', deps: RangeDeps) => Promise<StartRangeResult>;
+  startJob: (range: QuestionRange, target: string | 'all', deps: RangeDeps, options?: StartRangeOptions) => Promise<StartRangeResult>;
   send?: (text: string) => Promise<void>;
   edit?: (chatId: number | string, messageId: number, text: string) => Promise<void>;
 }
@@ -4278,6 +4280,7 @@ export async function handleQuestionRangeTrigger(
   target: string | 'all',
   triggerDeps: RangeTriggerDeps = defaultRangeTriggerDeps,
   chatId: number | string = config.telegram.chatId,
+  options?: StartRangeOptions,
 ): Promise<StartRangeResult> {
   let configuredAccounts: AccountRecord[] = [];
   if (target === 'all') {
@@ -4288,6 +4291,13 @@ export async function handleQuestionRangeTrigger(
     if (!acc) return { started: false, reason: 'account-not-found' };
     configuredAccounts = [acc];
   }
+
+  const mode = options?.mode ?? (target === 'all' && configuredAccounts.length > 1 ? 'parallel' : 'sequential');
+  const budget = calculateSafeRangeConcurrency(configuredAccounts.length, {
+    mode,
+    maxConcurrency: options?.maxConcurrency,
+  });
+  const concurrency = budget.concurrency;
 
   const initialTotalAccounts = Math.max(1, configuredAccounts.length);
   const accountSections = new Map<number, RangeAccountSectionState>();
@@ -4300,11 +4310,14 @@ export async function handleQuestionRangeTrigger(
       label: acc.label,
       username: acc.username,
       completedItems: [],
-      activeLine: i === 0 ? '🔎 Initializing session…' : '⏳ Queued…',
+      activeLine: i < concurrency ? '🔎 Initializing session…' : '⏳ Queued…',
     });
   }
 
-  const title = `🎯 <b>LEETCODE QUESTION RANGE (#${range.from}–#${range.to})</b>`;
+  const modeTag = configuredAccounts.length > 1
+    ? (budget.mode === 'parallel' && concurrency > 1 ? ` · ⚡ Parallel (${concurrency}x)` : ' · 🐢 Sequential')
+    : '';
+  const title = `🎯 <b>LEETCODE QUESTION RANGE (#${range.from}–#${range.to})${modeTag}</b>`;
   const initialSubtitle = `🔎 Initializing range #${range.from}–#${range.to}…\n<i>⏳ 30s pacing between questions · /rangestatus · /cancelrange</i>`;
   const initialBlocks = configuredAccounts.length > 0
     ? renderRangeProgressSections(accountSections, initialTotalAccounts).join('\n\n')
@@ -4328,10 +4341,16 @@ export async function handleQuestionRangeTrigger(
   }
 
   let totalAccounts = initialTotalAccounts;
-  const editProgress = async (extraFooter?: string): Promise<boolean> => {
+  let lastEditTime = 0;
+  let pendingEditTimer: NodeJS.Timeout | null = null;
+  let pendingFooter: string | undefined = undefined;
+  const EDIT_THROTTLE_MS = 1000;
+
+  const performEdit = async (footer?: string): Promise<boolean> => {
+    lastEditTime = Date.now();
     const blocks = renderRangeProgressSections(accountSections, totalAccounts);
     let body = blocks.join('\n\n');
-    if (extraFooter) body += extraFooter;
+    if (footer) body += footer;
     const fullText = `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${body}`;
 
     if (triggerDeps.edit && statusMessageId) {
@@ -4352,6 +4371,34 @@ export async function handleQuestionRangeTrigger(
       return false;
     });
     return updated;
+  };
+
+  const editProgress = async (extraFooter?: string): Promise<boolean> => {
+    if (extraFooter) pendingFooter = extraFooter;
+    if (triggerDeps.edit || extraFooter) {
+      if (pendingEditTimer) {
+        clearTimeout(pendingEditTimer);
+        pendingEditTimer = null;
+      }
+      return performEdit(pendingFooter);
+    }
+
+    const elapsed = Date.now() - lastEditTime;
+    if (elapsed >= EDIT_THROTTLE_MS) {
+      if (pendingEditTimer) {
+        clearTimeout(pendingEditTimer);
+        pendingEditTimer = null;
+      }
+      return performEdit(pendingFooter);
+    }
+
+    if (!pendingEditTimer) {
+      pendingEditTimer = setTimeout(() => {
+        pendingEditTimer = null;
+        void performEdit(pendingFooter);
+      }, EDIT_THROTTLE_MS - elapsed);
+    }
+    return true;
   };
 
   const onProgress = async (event: RangeProgressEvent) => {
@@ -4447,7 +4494,7 @@ export async function handleQuestionRangeTrigger(
 
   const deps: RangeDeps = defaultRangeDeps(async () => undefined, onProgress);
 
-  const res = await triggerDeps.startJob(range, target, deps);
+  const res = await triggerDeps.startJob(range, target, deps, options ?? { mode });
   if (!res.started) {
     if ('queued' in res) {
       const sec = accountSections.get(0);
@@ -4531,14 +4578,14 @@ export async function handleQuestionRangeTrigger(
 }
 
 const defaultRangeUiDeps: RangeUiDeps = {
-  start: (range, target) => handleQuestionRangeTrigger(range, target),
+  start: (range, target, options) => handleQuestionRangeTrigger(range, target, defaultRangeTriggerDeps, config.telegram.chatId, options),
   current: currentRangeJob,
   cancel: cancelRangeJob,
   now: () => Date.now(),
   queueLength: rangeQueueLength,
 };
 
-/** Account picker: one button per account, then "All accounts" and Cancel. */
+/** Account picker: one button per account, then "All accounts" (Parallel / Sequential) and Cancel. */
 export function buildRangePicker(
   range: QuestionRange,
   accounts: AccountRecord[],
@@ -4558,6 +4605,11 @@ export function buildRangePicker(
   const buttons: InlineButton[][] = accounts.map((a) => [
     { text: `👤 ${accountName(a)}`.slice(0, 60), callback_data: `${actionPrefix}${tag}:${a.id}` },
   ]);
+  if (accounts.length > 1) {
+    buttons.push([
+      { text: `⚡ All accounts (${accounts.length}, Parallel - Fast)`, callback_data: `${actionPrefix}${tag}:all:parallel` },
+    ]);
+  }
   buttons.push([{ text: `👥 All accounts (${accounts.length}, one by one)`, callback_data: `${actionPrefix}${tag}:all` }]);
   buttons.push([{ text: '✖️ Cancel', callback_data: 'qr:x' }]);
   return { text, buttons };
@@ -4620,8 +4672,27 @@ export async function handleQuestionRangeCommand(
     return;
   }
   if (tokens.length >= 2 && tokens[1]) {
-    const target = tokens[1];
-    const result = await ui.start(parsed.range, target);
+    let target = tokens[1];
+    let mode: 'parallel' | 'sequential' = 'parallel';
+    if (tokens.length >= 3 && tokens[2]) {
+      const mStr = tokens[2].toLowerCase();
+      if (mStr.startsWith('seq') || mStr === '1by1' || mStr === 'single') {
+        mode = 'sequential';
+      } else if (mStr.startsWith('par') || mStr === 'fast') {
+        mode = 'parallel';
+      }
+    } else if (target === 'all:seq') {
+      target = 'all';
+      mode = 'sequential';
+    } else if (target === 'all:parallel') {
+      target = 'all';
+      mode = 'parallel';
+    } else if (target === 'all') {
+      mode = 'parallel';
+    } else {
+      mode = 'sequential';
+    }
+    const result = await ui.start(parsed.range, target, { mode });
     if (!result.started) {
       if ('queued' in result) {
         await deps.send(`🗂️ Queued: questions #${parsed.range.from}–#${parsed.range.to} (Queue position: ${result.position})`);
@@ -4697,7 +4768,21 @@ export async function handleRangeButton(
     return;
   }
 
-  const result = await ui.start(parsed.range, m[3]!);
+  let target = m[3]!;
+  let mode: 'parallel' | 'sequential' = 'parallel';
+  if (target === 'all:parallel') {
+    target = 'all';
+    mode = 'parallel';
+  } else if (target === 'all:seq') {
+    target = 'all';
+    mode = 'sequential';
+  } else if (target === 'all') {
+    mode = 'sequential';
+  } else {
+    mode = 'sequential';
+  }
+
+  const result = await ui.start(parsed.range, target, { mode });
   if (!result.started) {
     if ('queued' in result) {
       await deps.answer(callbackId, `Queued #${result.position} 🗂️`);
@@ -4707,7 +4792,7 @@ export async function handleRangeButton(
         [
           `🗂️ Queued: questions #${parsed.range.from}–#${parsed.range.to} (${rangeSize(parsed.range)})`,
           `📍 Queue position: ${result.position}`,
-          `👥 ${result.accounts.length === 1 ? `Account: ${result.accounts[0]?.label ?? 'unknown'}` : `Accounts (one by one): ${result.accounts.map((a) => a.label).join(', ')}`}`,
+          `👥 ${result.accounts.length === 1 ? `Account: ${result.accounts[0]?.label ?? 'unknown'}` : `Accounts: ${result.accounts.map((a) => a.label).join(', ')}`}`,
           '',
           '⏳ It will start automatically after the current range job completes or is cancelled.',
           '📍 /rangestatus shows the active job and queue.',
@@ -4727,18 +4812,28 @@ export async function handleRangeButton(
   }
   const { range } = parsed;
   const names = result.accounts.map((a) => accountName(a));
+  const budget = calculateSafeRangeConcurrency(result.accounts.length, { mode });
+  const isParallel = mode === 'parallel' && names.length > 1;
+  const modeStr = isParallel
+    ? ` · ⚡ Parallel (${budget.concurrency}x concurrent)`
+    : (names.length > 1 ? ' · 🐢 Sequential (one by one)' : '');
+  const estMs = isParallel && budget.concurrency > 1
+    ? Math.ceil((estimateAccountMs(range, RANGE_GAP_MS) * names.length) / budget.concurrency)
+    : estimateAccountMs(range, RANGE_GAP_MS) * names.length;
+
   await deps.answer(callbackId, 'Started 🚀');
   await deps.edit(
     chatId,
     messageId,
     [
       `🚀 Started: questions #${range.from}–#${range.to} (${rangeSize(range)})`,
-      `👥 ${names.length === 1 ? `Account: ${names[0]}` : `Accounts (one by one): ${names.join(', ')}`}`,
-      `⏳ ~${formatDuration(estimateAccountMs(range, RANGE_GAP_MS) * names.length)} in total — 30 s break between questions`,
+      `👥 ${names.length === 1 ? `Account: ${names[0]}` : `Accounts: ${names.join(', ')}`}`,
+      modeStr ? `⚙️ Mode:${modeStr}` : '',
+      `⏳ ~${formatDuration(estMs)} in total — 30 s break between questions`,
       '',
       '📬 You get a summary after each account.',
       '📍 /rangestatus shows progress · 🛑 /cancelrange stops it',
-    ].join('\n'),
+    ].filter(Boolean).join('\n'),
   );
 }
 
@@ -5140,9 +5235,22 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
     case '/rangesubmission': {
       const parts = commandArg.trim().split(/\s+/);
       const parsed = parseQuestionRange(parts[0] || '');
-      const accountId = parts[1] || 'all';
+      const rawTarget = parts[1] || 'all';
+      let accountId = rawTarget;
+      let mode: 'parallel' | 'sequential' = 'parallel';
+      if (parts[2]) {
+        const mStr = parts[2].toLowerCase();
+        if (mStr.startsWith('seq') || mStr === '1by1' || mStr === 'single') mode = 'sequential';
+        else if (mStr.startsWith('par') || mStr === 'fast') mode = 'parallel';
+      } else if (rawTarget === 'all:seq') {
+        accountId = 'all';
+        mode = 'sequential';
+      } else if (rawTarget === 'all:parallel') {
+        accountId = 'all';
+        mode = 'parallel';
+      }
       if (parsed.ok) {
-        const res = await handleQuestionRangeTrigger(parsed.range, accountId);
+        const res = await handleQuestionRangeTrigger(parsed.range, accountId, defaultRangeTriggerDeps, config.telegram.chatId, { mode });
         if (res.started || 'queued' in res) {
           await res.done;
         } else if (!res.started && 'reason' in res) {

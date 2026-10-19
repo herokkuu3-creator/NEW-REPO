@@ -1,3 +1,5 @@
+import * as os from 'os';
+import * as fs from 'fs';
 import { request as playwrightRequest } from 'playwright';
 import { logger } from '../logger';
 import { AccountRecord, getAccountById, listEnabledAccounts, parseStoredStorageState } from '../database/accounts';
@@ -209,6 +211,116 @@ export interface RangeDeps {
 }
 
 // ---------------------------------------------------------------------------
+// Concurrency & Memory Budgeting
+// ---------------------------------------------------------------------------
+
+export function getContainerMemoryLimitMb(): number {
+  if (process.env.CONTAINER_MAX_MEMORY_MB) {
+    const parsed = parseInt(process.env.CONTAINER_MAX_MEMORY_MB, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+  // Linux cgroup v2
+  try {
+    if (fs.existsSync('/sys/fs/cgroup/memory.max')) {
+      const val = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+      if (val !== 'max') {
+        const bytes = parseInt(val, 10);
+        if (!isNaN(bytes) && bytes > 0) {
+          return Math.floor(bytes / (1024 * 1024));
+        }
+      }
+    }
+  } catch {}
+  // Linux cgroup v1
+  try {
+    if (fs.existsSync('/sys/fs/cgroup/memory/memory.limit_in_bytes')) {
+      const val = fs.readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim();
+      const bytes = parseInt(val, 10);
+      if (!isNaN(bytes) && bytes > 0 && bytes < 1024 * 1024 * 1024 * 1024) {
+        return Math.floor(bytes / (1024 * 1024));
+      }
+    }
+  } catch {}
+
+  // If deployed on Render free tier (512 MB limit)
+  if (process.env.RENDER || process.env.RENDER_SERVICE_ID) {
+    return 512;
+  }
+
+  // System memory fallback
+  try {
+    const sysMb = Math.floor(os.totalmem() / (1024 * 1024));
+    if (sysMb > 0) return sysMb;
+  } catch {}
+
+  return 512;
+}
+
+export interface RangeConcurrencyOptions {
+  mode?: 'parallel' | 'sequential';
+  maxConcurrency?: number;
+  overrideTotalMb?: number;
+  overrideUsedMb?: number;
+  overrideAvailableMb?: number;
+}
+
+export interface ConcurrencyBudget {
+  concurrency: number;
+  totalLimitMb: number;
+  usedMb: number;
+  availableMb: number;
+  perAccountMb: number;
+  mode: 'parallel' | 'sequential';
+}
+
+export function calculateSafeRangeConcurrency(
+  accountCount: number,
+  options?: RangeConcurrencyOptions,
+): ConcurrencyBudget {
+  const mode = options?.mode ?? 'sequential';
+  const totalLimitMb = options?.overrideTotalMb ?? getContainerMemoryLimitMb();
+  const usedMb = options?.overrideUsedMb ?? Math.floor(process.memoryUsage().rss / (1024 * 1024));
+  const availableMb = options?.overrideAvailableMb ?? Math.max(0, totalLimitMb - usedMb);
+  const perAccountMb = 45;
+
+  if (mode === 'sequential' || accountCount <= 1) {
+    return {
+      concurrency: 1,
+      totalLimitMb,
+      usedMb,
+      availableMb,
+      perAccountMb,
+      mode,
+    };
+  }
+
+  const safetyBufferMb = 120; // reserved for Node runtime, GC headroom & background services
+  const usableMb = Math.max(0, availableMb - safetyBufferMb);
+  const memoryAllowed = Math.floor(usableMb / perAccountMb);
+
+  let envMax = 5;
+  if (process.env.RANGE_MAX_CONCURRENCY) {
+    const parsed = parseInt(process.env.RANGE_MAX_CONCURRENCY, 10);
+    if (!isNaN(parsed) && parsed > 0) envMax = parsed;
+  }
+  const maxCap = options?.maxConcurrency ?? envMax;
+
+  // Safe concurrency: at least 1, at most accountCount, at most maxCap, at most memoryAllowed (fallback 1)
+  const concurrency = Math.max(1, Math.min(accountCount, maxCap, Math.max(1, memoryAllowed)));
+
+  return {
+    concurrency,
+    totalLimitMb,
+    usedMb,
+    availableMb,
+    perAccountMb,
+    mode: 'parallel',
+  };
+}
+
+export interface StartRangeOptions extends RangeConcurrencyOptions {}
+
+// ---------------------------------------------------------------------------
 // The single job
 // ---------------------------------------------------------------------------
 
@@ -223,6 +335,9 @@ export interface RangeJobInfo {
   startedAt: number;
   cancelling: boolean;
   pausedReason: string | null;
+  mode?: 'parallel' | 'sequential';
+  concurrency?: number;
+  activeAccounts?: string[];
 }
 
 interface RangeJob {
@@ -235,6 +350,7 @@ interface QueuedRangeJob {
   range: QuestionRange;
   accounts: AccountRecord[];
   deps: RangeDeps;
+  options?: StartRangeOptions;
   position: number;
   enqueuedAt: number;
   resolve: (results: AccountRangeResult[]) => void;
@@ -284,6 +400,7 @@ export async function startRangeJob(
   range: QuestionRange,
   target: string | 'all',
   deps: RangeDeps = defaultRangeDeps(),
+  options?: StartRangeOptions,
 ): Promise<StartRangeResult> {
   let accounts: AccountRecord[];
   if (target === 'all') {
@@ -299,14 +416,20 @@ export async function startRangeJob(
   // started the active job while this request was resolving its accounts.
   // Also respect any existing queue so a newly-arrived request never jumps
   // ahead of jobs that were already waiting.
-  if (activeJob || queuedJobs.length > 0) return enqueueRangeJob(range, accounts, deps);
+  if (activeJob || queuedJobs.length > 0) return enqueueRangeJob(range, accounts, deps, options);
 
-  const job = createRangeJob(range, accounts, deps);
+  const job = createRangeJob(range, accounts, deps, options);
   return { started: true, accounts, done: job.done };
 }
 
-function createRangeJob(range: QuestionRange, accounts: AccountRecord[], deps: RangeDeps): RangeJob {
+function createRangeJob(
+  range: QuestionRange,
+  accounts: AccountRecord[],
+  deps: RangeDeps,
+  options?: StartRangeOptions,
+): RangeJob {
   const abort = new AbortController();
+  const budget = calculateSafeRangeConcurrency(accounts.length, options);
   const info: RangeJobInfo = {
     range,
     accountLabels: accounts.map((a) => a.label),
@@ -318,10 +441,13 @@ function createRangeJob(range: QuestionRange, accounts: AccountRecord[], deps: R
     startedAt: deps.now(),
     cancelling: false,
     pausedReason: null,
+    mode: budget.mode,
+    concurrency: budget.concurrency,
+    activeAccounts: [],
   };
   const job: RangeJob = { info, abort, done: Promise.resolve([]) };
   activeJob = job;
-  job.done = executeRangeJob(job, range, accounts, deps);
+  job.done = executeRangeJob(job, range, accounts, deps, options);
   return job;
 }
 
@@ -329,6 +455,7 @@ function enqueueRangeJob(
   range: QuestionRange,
   accounts: AccountRecord[],
   deps: RangeDeps,
+  options?: StartRangeOptions,
 ): Extract<StartRangeResult, { queued: true }> {
   let resolve!: (results: AccountRangeResult[]) => void;
   const done = new Promise<AccountRangeResult[]>((res) => {
@@ -338,13 +465,14 @@ function enqueueRangeJob(
     range: { ...range },
     accounts,
     deps,
+    options,
     position: queuedJobs.length + 1,
     enqueuedAt: deps.now(),
     resolve,
   };
   queuedJobs.push(queued);
   logger.info(
-    { position: queued.position, range, accounts: accounts.map((a) => a.label) },
+    { position: queued.position, range, accounts: accounts.map((a) => a.label), mode: options?.mode },
     'range job queued behind active job',
   );
   return { started: false, queued: true, position: queued.position, accounts, done };
@@ -354,7 +482,7 @@ function startNextQueuedRangeJob(): void {
   if (activeJob) return;
   const queued = queuedJobs.shift();
   if (!queued) return;
-  const job = createRangeJob(queued.range, queued.accounts, queued.deps);
+  const job = createRangeJob(queued.range, queued.accounts, queued.deps, queued.options);
   job.done.then(queued.resolve);
 }
 
@@ -363,41 +491,87 @@ async function executeRangeJob(
   range: QuestionRange,
   accounts: AccountRecord[],
   deps: RangeDeps,
+  options?: StartRangeOptions,
 ): Promise<AccountRangeResult[]> {
   const { info, abort } = job;
   const all: AccountRangeResult[] = [];
   const stopKeepAlive = deps.keepAlive();
   const usedCommunityUuidsByQuestion = new Map<number, Set<string>>();
+
+  const budget = calculateSafeRangeConcurrency(accounts.length, options);
+  info.mode = budget.mode;
+  info.concurrency = budget.concurrency;
+  info.activeAccounts = [];
+
+  logger.info(
+    {
+      range,
+      accountCount: accounts.length,
+      mode: budget.mode,
+      concurrency: budget.concurrency,
+      totalLimitMb: budget.totalLimitMb,
+      usedMb: budget.usedMb,
+      availableMb: budget.availableMb,
+    },
+    'starting range job execution',
+  );
+
+  const concurrency = budget.concurrency;
+  const results: AccountRangeResult[] = new Array(accounts.length);
+
   try {
-    for (let i = 0; i < accounts.length; i++) {
-      if (abort.signal.aborted) break;
-      const account = accounts[i]!;
-      info.accountIndex = i + 1;
-      info.currentLabel = account.label;
-      info.currentQuestion = null;
-      info.doneInAccount = 0;
-      info.counts = { accepted: 0, failed: 0, error: 0, premium: 0 };
+    let nextAccountIdx = 0;
 
-      const result = await runAccountRange(
-        account,
-        range,
-        deps,
-        info,
-        abort.signal,
-        i + 1,
-        accounts.length,
-        usedCommunityUuidsByQuestion,
-      );
-      all.push(result);
-      await deps
-        .notify(formatAccountRangeSummary(result, i + 1, accounts.length))
-        .catch((err) => logger.warn({ err: errText(err) }, 'range summary notification failed'));
+    const runWorker = async (_workerId: number): Promise<void> => {
+      while (!abort.signal.aborted) {
+        if (nextAccountIdx >= accounts.length) break;
+        const accountIdx = nextAccountIdx++;
+        const account = accounts[accountIdx]!;
 
-      // Short breather before the next account (skipped when cancelled).
-      if (i < accounts.length - 1 && !abort.signal.aborted) {
-        await deps.sleep(deps.questionGapMs, abort.signal);
+        if (!info.activeAccounts) info.activeAccounts = [];
+        info.activeAccounts.push(account.label);
+        info.currentLabel = info.activeAccounts.join(', ');
+        info.accountIndex = Math.min(accounts.length, info.accountIndex + 1);
+
+        try {
+          const result = await runAccountRange(
+            account,
+            range,
+            deps,
+            info,
+            abort.signal,
+            accountIdx + 1,
+            accounts.length,
+            usedCommunityUuidsByQuestion,
+          );
+          results[accountIdx] = result;
+          await deps
+            .notify(formatAccountRangeSummary(result, accountIdx + 1, accounts.length))
+            .catch((err) => logger.warn({ err: errText(err) }, 'range summary notification failed'));
+        } finally {
+          info.activeAccounts = (info.activeAccounts ?? []).filter((l) => l !== account.label);
+          info.currentLabel = info.activeAccounts.length > 0 ? info.activeAccounts.join(', ') : null;
+        }
+
+        // Short breather before this worker picks up another account
+        if (nextAccountIdx < accounts.length && !abort.signal.aborted) {
+          const gap = concurrency === 1 ? deps.questionGapMs : Math.min(5000, deps.questionGapMs);
+          await deps.sleep(gap, abort.signal);
+        }
       }
+    };
+
+    const workerCount = Math.min(concurrency, accounts.length);
+    const workers: Promise<void>[] = [];
+    for (let w = 0; w < workerCount; w++) {
+      workers.push(runWorker(w));
     }
+    await Promise.all(workers);
+
+    for (const r of results) {
+      if (r) all.push(r);
+    }
+
     await deps
       .notify(formatRangeJobFinished(range, all, accounts.length, abort.signal.aborted, deps.now() - info.startedAt))
       .catch(() => undefined);
@@ -539,6 +713,7 @@ async function runAccountRange(
 
     let blockedStreak = 0;
     let cooledDown = false;
+    let accountDone = 0;
 
     for (let n = range.from; n <= range.to; n++) {
       if (signal.aborted) break;
@@ -571,14 +746,15 @@ async function runAccountRange(
       );
       if (outcome === null) break; // cancelled during a back-off wait
       result.results.push(outcome);
+      accountDone++;
       info.doneInAccount++;
       info.counts[outcome.status]++;
       logger.info({ label: account.label, question: n, status: outcome.status, detail: outcome.detail }, 'range question finished');
 
-      if (deps.progressEvery > 0 && info.doneInAccount % deps.progressEvery === 0 && n < range.to) {
+      if (deps.progressEvery > 0 && accountDone % deps.progressEvery === 0 && n < range.to) {
         const c = info.counts;
         await deps
-          .notify(`📈 ${who(result)}: ${info.doneInAccount}/${rangeSize(range)} done — ✅ ${c.accepted} · ❌ ${c.failed} · ⚠️ ${c.error}`)
+          .notify(`📈 ${who(result)}: ${accountDone}/${rangeSize(range)} done — ✅ ${c.accepted} · ❌ ${c.failed} · ⚠️ ${c.error}`)
           .catch(() => undefined);
       }
 
@@ -1130,10 +1306,18 @@ export function formatRangeJobFinished(
 
 export function formatRangeJobStatus(j: RangeJobInfo, now: number, queuedCount = 0): string {
   const size = rangeSize(j.range);
+  const isParallel = j.mode === 'parallel' && (j.concurrency ?? 1) > 1;
+  const modeStr = isParallel
+    ? ` · ⚡ Parallel (${j.concurrency}x)`
+    : ' · 🐢 Sequential';
   const lines = [
-    `⏳ Question-range job in progress (#${j.range.from}–#${j.range.to})`,
-    `👤 Account ${j.accountIndex}/${j.accountLabels.length}: ${j.currentLabel ?? '—'}`,
-    `📍 ${j.doneInAccount}/${size} done${j.currentQuestion ? ` — now on #${j.currentQuestion}` : ''}`,
+    `⏳ Question-range job in progress (#${j.range.from}–#${j.range.to})${modeStr}`,
+    j.activeAccounts && j.activeAccounts.length > 1
+      ? `👥 Active accounts (${j.activeAccounts.length}/${j.accountLabels.length}): ${j.activeAccounts.join(', ')}`
+      : `👤 Account ${j.accountIndex}/${j.accountLabels.length}: ${j.currentLabel ?? '—'}`,
+    isParallel
+      ? `📍 ${j.doneInAccount}/${size * j.accountLabels.length} submissions done${j.currentQuestion ? ` — latest on #${j.currentQuestion}` : ''}`
+      : `📍 ${j.doneInAccount}/${size} done${j.currentQuestion ? ` — now on #${j.currentQuestion}` : ''}`,
     `✅ ${j.counts.accepted} · ❌ ${j.counts.failed} · ⚠️ ${j.counts.error}${j.counts.premium ? ` · 🔒 ${j.counts.premium}` : ''}`,
     `⏱️ Running for ${formatDuration(now - j.startedAt)}`,
   ];

@@ -4,10 +4,12 @@ import { LeetCodeHttpError } from '../src/leetcode/apiClient';
 import { WalkcccError, WalkcccPage } from '../src/solutions/walkccc';
 import type { CommunitySolution } from '../src/solutions/communitySolutions';
 import {
+  calculateSafeRangeConcurrency,
   countResults,
   estimateAccountMs,
   formatAccountRangeSummary,
   formatDuration,
+  formatRangeJobStatus,
   parseQuestionRange,
   QuestionResult,
   RangeDeps,
@@ -593,5 +595,112 @@ describe('Community solutions and slug resolution in range submission', () => {
 
     expect(callCount).toBe(2);
     expect(results[0]!.results[0]!.status).toBe('accepted');
+  });
+});
+
+describe('calculateSafeRangeConcurrency', () => {
+  it('returns concurrency 1 for single account or sequential mode', () => {
+    const single = calculateSafeRangeConcurrency(1, { mode: 'parallel' });
+    expect(single.concurrency).toBe(1);
+    expect(single.mode).toBe('parallel');
+
+    const seq = calculateSafeRangeConcurrency(10, { mode: 'sequential' });
+    expect(seq.concurrency).toBe(1);
+    expect(seq.mode).toBe('sequential');
+  });
+
+  it('calculates safe concurrency on 512MB container with 180MB used', () => {
+    // 512MB limit, 180MB used => 332MB available => 212MB usable => 4 accounts
+    const budget = calculateSafeRangeConcurrency(16, {
+      mode: 'parallel',
+      overrideTotalMb: 512,
+      overrideUsedMb: 180,
+    });
+    expect(budget.concurrency).toBe(4);
+    expect(budget.availableMb).toBe(332);
+    expect(budget.mode).toBe('parallel');
+  });
+
+  it('caps concurrency at maxCap or maxConcurrency', () => {
+    // High memory available:
+    const budget = calculateSafeRangeConcurrency(16, {
+      mode: 'parallel',
+      overrideTotalMb: 4096,
+      overrideUsedMb: 200,
+      maxConcurrency: 3,
+    });
+    expect(budget.concurrency).toBe(3);
+  });
+
+  it('falls back safely to 1 when available RAM is below the safety buffer', () => {
+    // 512MB limit, 450MB used => 62MB available (< 120MB safety buffer)
+    const budget = calculateSafeRangeConcurrency(10, {
+      mode: 'parallel',
+      overrideTotalMb: 512,
+      overrideUsedMb: 450,
+    });
+    expect(budget.concurrency).toBe(1);
+  });
+});
+
+describe('parallel range submission', () => {
+  it('executes multiple accounts concurrently when mode is parallel', async () => {
+    const activeConcurrentAccounts: number[] = [];
+    let currentConcurrent = 0;
+
+    const session = makeSession(() => 'accepted', []);
+    const accounts = [acc('u1'), acc('u2'), acc('u3'), acc('u4')];
+
+    const { deps } = makeDeps(session, accounts, {
+      sleep: async () => {
+        await new Promise((r) => setTimeout(r, 10));
+      },
+      getPage: async (n) => {
+        currentConcurrent++;
+        activeConcurrentAccounts.push(currentConcurrent);
+        await new Promise((r) => setTimeout(r, 20));
+        currentConcurrent--;
+        return sol(n);
+      },
+    });
+
+    const r = await startRangeJob({ from: 100, to: 100 }, 'all', deps, {
+      mode: 'parallel',
+      maxConcurrency: 4,
+      overrideTotalMb: 1024,
+      overrideUsedMb: 100,
+    });
+
+    const results = await r.done;
+    expect(results).toHaveLength(4);
+    for (const res of results) {
+      expect(res.results[0]!.status).toBe('accepted');
+    }
+    const peak = Math.max(...activeConcurrentAccounts);
+    expect(peak).toBeGreaterThan(1);
+  });
+
+  it('formats range status with parallel badge and active accounts', () => {
+    const status = formatRangeJobStatus(
+      {
+        range: { from: 100, to: 200 },
+        accountLabels: ['a1', 'a2', 'a3'],
+        accountIndex: 2,
+        currentLabel: 'a1, a2',
+        currentQuestion: 105,
+        doneInAccount: 12,
+        counts: { accepted: 10, failed: 1, error: 1, premium: 0 },
+        startedAt: 1000,
+        cancelling: false,
+        pausedReason: null,
+        mode: 'parallel',
+        concurrency: 3,
+        activeAccounts: ['a1', 'a2'],
+      },
+      5000,
+      0,
+    );
+    expect(status).toContain('⚡ Parallel (3x)');
+    expect(status).toContain('Active accounts (2/3): a1, a2');
   });
 });

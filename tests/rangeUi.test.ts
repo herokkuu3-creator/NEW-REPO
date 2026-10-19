@@ -97,6 +97,7 @@ describe('/questionrangesubmission', () => {
     expect(sentViews[0]!.buttons).toEqual([
       [{ text: '👤 a1', callback_data: 'qr:200-400:a1' }],
       [{ text: '👤 dom4429', callback_data: 'qr:200-400:a2' }],
+      [{ text: '⚡ All accounts (2, Parallel - Fast)', callback_data: 'qr:200-400:all:parallel' }],
       [{ text: '👥 All accounts (2, one by one)', callback_data: 'qr:200-400:all' }],
       [{ text: '✖️ Cancel', callback_data: 'qr:x' }],
     ]);

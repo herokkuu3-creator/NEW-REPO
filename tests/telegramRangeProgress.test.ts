@@ -207,4 +207,109 @@ describe('handleQuestionRangeCommand direct target', () => {
       target: 'all',
     });
   });
+
+  it('parses parallel and sequential flags from command text', async () => {
+    const startedCalls: Array<{ range: QuestionRange; target: string; options?: any }> = [];
+    const mockUi: RangeUiDeps = {
+      start: async (range, target, options) => {
+        startedCalls.push({ range, target, options });
+        return {
+          started: true,
+          accounts: [],
+          done: Promise.resolve([]),
+        };
+      },
+      current: () => null,
+      cancel: () => true,
+      now: () => Date.now(),
+    };
+
+    const mockDeps = {
+      listAccounts: async () => [{ id: '1', label: 'acc1', username: 'acc1' } as any],
+      deleteAccountById: async () => true,
+      deleteAllAccounts: async () => 0,
+      clearLegacySession: async () => undefined,
+      isRunInProgress: () => false,
+      send: async () => undefined,
+      edit: async () => undefined,
+      answer: async () => undefined,
+    };
+
+    await handleQuestionRangeCommand('3800-3801 all seq', mockDeps, mockUi);
+    expect(startedCalls.at(-1)?.options?.mode).toBe('sequential');
+
+    await handleQuestionRangeCommand('3800-3801 all parallel', mockDeps, mockUi);
+    expect(startedCalls.at(-1)?.options?.mode).toBe('parallel');
+  });
+
+  it('renders parallel progress tree for multiple accounts simultaneously', async () => {
+    const edits: string[] = [];
+    const sends: string[] = [];
+    let progressCallback: ((event: any) => Promise<void> | void) | undefined;
+
+    const fakeAccounts: AccountRecord[] = [
+      { id: '1', label: 'acc1', username: 'user1' } as any,
+      { id: '2', label: 'acc2', username: 'user2' } as any,
+    ];
+
+    const mockTriggerDeps: RangeTriggerDeps = {
+      listAccounts: async () => fakeAccounts,
+      getAccount: async (id) => fakeAccounts.find((a) => a.id === id) ?? null,
+      send: async (text) => {
+        sends.push(text);
+      },
+      edit: async (_c, _m, text) => {
+        edits.push(text);
+      },
+      startJob: async (range, _target, deps) => {
+        progressCallback = deps.onProgress;
+        return {
+          started: true,
+          accounts: fakeAccounts,
+          done: (async () => {
+            // Both accounts process questions concurrently
+            await progressCallback?.({
+              phase: 'submitting',
+              label: 'acc1',
+              username: 'user1',
+              accIndex: 0,
+              accTotal: 2,
+              stepIndex: 1,
+              stepTotal: 1,
+              questionNumber: 200,
+            });
+            await progressCallback?.({
+              phase: 'processing',
+              label: 'acc2',
+              username: 'user2',
+              accIndex: 1,
+              accTotal: 2,
+              stepIndex: 1,
+              stepTotal: 1,
+              questionNumber: 200,
+            });
+            return [];
+          })(),
+        };
+      },
+    };
+
+    const res = await handleQuestionRangeTrigger(
+      { from: 200, to: 200 },
+      'all',
+      mockTriggerDeps,
+      '555',
+      { mode: 'parallel', maxConcurrency: 2 },
+    );
+    expect(res.started).toBe(true);
+    expect(sends[0]).toContain('⚡ Parallel (2x)');
+
+    if (res.started) {
+      await res.done;
+      const lastEdits = edits.join('\n');
+      expect(lastEdits).toContain('user1');
+      expect(lastEdits).toContain('user2');
+    }
+  });
 });
+
