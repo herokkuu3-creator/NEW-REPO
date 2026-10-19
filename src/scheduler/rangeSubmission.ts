@@ -318,7 +318,9 @@ export function calculateSafeRangeConcurrency(
   };
 }
 
-export interface StartRangeOptions extends RangeConcurrencyOptions {}
+export interface StartRangeOptions extends RangeConcurrencyOptions {
+  accountIds?: readonly string[];
+}
 
 // ---------------------------------------------------------------------------
 // The single job
@@ -398,14 +400,31 @@ export type StartRangeResult =
  */
 export async function startRangeJob(
   range: QuestionRange,
-  target: string | 'all',
+  target: string | 'all' | readonly string[],
   deps: RangeDeps = defaultRangeDeps(),
   options?: StartRangeOptions,
 ): Promise<StartRangeResult> {
   let accounts: AccountRecord[];
   if (target === 'all') {
     accounts = await deps.listAccounts();
+    if (options?.accountIds && options.accountIds.length > 0) {
+      accounts = accounts.filter(
+        (a) =>
+          options.accountIds!.includes(a.id) ||
+          options.accountIds!.includes(a.label) ||
+          (a.username && options.accountIds!.includes(a.username)),
+      );
+    }
     if (accounts.length === 0) return { started: false, reason: 'no-accounts' };
+  } else if (typeof target !== 'string') {
+    const all = await deps.listAccounts();
+    accounts = all.filter(
+      (a) =>
+        target.includes(a.id) ||
+        target.includes(a.label) ||
+        (a.username && target.includes(a.username)),
+    );
+    if (accounts.length === 0) return { started: false, reason: 'account-not-found' };
   } else {
     const account = await deps.getAccount(target);
     if (!account) return { started: false, reason: 'account-not-found' };

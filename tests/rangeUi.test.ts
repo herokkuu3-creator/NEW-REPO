@@ -95,8 +95,9 @@ describe('/questionrangesubmission', () => {
     expect(sentViews[0]!.text).toContain('🎯 Question range #200–#400 (201');
     expect(sentViews[0]!.text).toContain('30 s break');
     expect(sentViews[0]!.buttons).toEqual([
-      [{ text: '👤 a1', callback_data: 'qr:200-400:a1' }],
-      [{ text: '👤 dom4429', callback_data: 'qr:200-400:a2' }],
+      [{ text: '▫️ a1', callback_data: 'qr:200-400:a:a1' }],
+      [{ text: '▫️ dom4429', callback_data: 'qr:200-400:a:a2' }],
+      [{ text: '👥 Select All (2)', callback_data: 'qr:200-400:toggle:all' }],
       [{ text: '⚡ All accounts (2, Parallel - Fast)', callback_data: 'qr:200-400:all:parallel' }],
       [{ text: '👥 All accounts (2, one by one)', callback_data: 'qr:200-400:all' }],
       [{ text: '✖️ Cancel', callback_data: 'qr:x' }],
@@ -202,7 +203,7 @@ describe('range picker buttons', () => {
     expect(answers[0]).toEqual({ id: 'c-quick', text: 'Range #1–#25' });
     expect(edits[0]!.text).toContain('🎯 Question range #1–#25 (25 questions)');
     expect(edits[0]!.buttons).toEqual([
-      [{ text: '👤 a1', callback_data: 'qr:1-25:a1' }],
+      [{ text: '▫️ a1', callback_data: 'qr:1-25:a:a1' }],
       [{ text: '👥 All accounts (1, one by one)', callback_data: 'qr:1-25:all' }],
       [{ text: '✖️ Cancel', callback_data: 'qr:x' }],
     ]);
@@ -219,6 +220,67 @@ describe('range picker buttons', () => {
     const { ui, calls } = makeUi(started(['a1']));
     await handleCallbackQuery({ id: 'c7', data: 'qr:200-400:a1', message: { message_id: 7, chat: { id: '999' } } }, deps, ui);
     expect(calls).toEqual([]);
+  });
+
+  it('toggling account checkboxes and running parallel with selected accounts', async () => {
+    const { deps, edits, answers } = makeDeps([acc('a1'), acc('a2')]);
+    const calls: Array<{ range: QuestionRange; target: string | 'all' | readonly string[]; options?: unknown }> = [];
+    const ui: RangeUiDeps = {
+      start: async (range, target, options) => {
+        calls.push({ range, target, options });
+        return started(['a1', 'a2']);
+      },
+      current: vi.fn(() => null),
+      cancel: vi.fn(() => true),
+      now: () => 1_000_000,
+    };
+
+    // Toggle a1
+    await handleCallbackQuery(
+      { id: 'c-toggle1', data: 'qr:200-400:a:a1', message: { message_id: 7, chat: { id: '555' } } },
+      deps,
+      ui,
+    );
+    expect(answers[0]!.text).toBe('Selected ✅');
+    expect(edits[0]!.buttons).toEqual([
+      [{ text: '✅ a1', callback_data: 'qr:200-400:a:a1' }],
+      [{ text: '▫️ a2', callback_data: 'qr:200-400:a:a2' }],
+      [{ text: '👥 Select All (2)', callback_data: 'qr:200-400:toggle:all' }],
+      [{ text: '🚀 Start (1 account)', callback_data: 'qr:200-400:run:parallel' }],
+      [{ text: '✖️ Cancel', callback_data: 'qr:x' }],
+    ]);
+
+    // Toggle a2
+    await handleCallbackQuery(
+      { id: 'c-toggle2', data: 'qr:200-400:a:a2', message: { message_id: 7, chat: { id: '555' } } },
+      deps,
+      ui,
+    );
+    expect(answers[1]!.text).toBe('Selected ✅');
+    expect(edits[1]!.buttons).toEqual([
+      [{ text: '✅ a1', callback_data: 'qr:200-400:a:a1' }],
+      [{ text: '✅ a2', callback_data: 'qr:200-400:a:a2' }],
+      [{ text: '✅ Select All (2)', callback_data: 'qr:200-400:toggle:all' }],
+      [
+        { text: '⚡ Run Parallel (2)', callback_data: 'qr:200-400:run:parallel' },
+        { text: '🐢 Run Sequential (2)', callback_data: 'qr:200-400:run:seq' },
+      ],
+      [{ text: '✖️ Cancel', callback_data: 'qr:x' }],
+    ]);
+
+    // Run parallel
+    await handleCallbackQuery(
+      { id: 'c-run', data: 'qr:200-400:run:parallel', message: { message_id: 7, chat: { id: '555' } } },
+      deps,
+      ui,
+    );
+    expect(calls).toEqual([
+      {
+        range: { from: 200, to: 400 },
+        target: ['a1', 'a2'],
+        options: { mode: 'parallel' },
+      },
+    ]);
   });
 });
 
@@ -248,7 +310,7 @@ describe('/cancelrange and /rangestatus', () => {
 describe('buildRangePicker', () => {
   it('keeps callback_data within Telegram\'s 64-byte limit', () => {
     const picker = buildRangePicker({ from: 1, to: 9999 }, [acc('cmg3x9k2v0000qz8l5y7abcde')]);
-    expect(picker.buttons[0]![0]!.callback_data).toBe('qr:1-9999:cmg3x9k2v0000qz8l5y7abcde');
+    expect(picker.buttons[0]![0]!.callback_data).toBe('qr:1-9999:a:cmg3x9k2v0000qz8l5y7abcde');
     expect(picker.buttons[1]![0]!.callback_data).toBe('qr:1-9999:all');
     for (const row of picker.buttons) for (const b of row) expect(Buffer.byteLength(b.callback_data)).toBeLessThanOrEqual(64);
   });

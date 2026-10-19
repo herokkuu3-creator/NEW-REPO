@@ -4184,7 +4184,7 @@ const RANGE_GAP_MS = 30_000;
 
 /** Wiring for the range UI — injectable for tests. */
 export interface RangeUiDeps {
-  start: (range: QuestionRange, target: string | 'all', options?: StartRangeOptions) => Promise<StartRangeResult>;
+  start: (range: QuestionRange, target: string | 'all' | readonly string[], options?: StartRangeOptions) => Promise<StartRangeResult>;
   current: typeof currentRangeJob;
   cancel: typeof cancelRangeJob;
   now: () => number;
@@ -4200,6 +4200,36 @@ export interface RangeAccountSectionState {
   accountStatus?: string;
 }
 
+export function truncateHtml(html: string, maxLen = 3800): string {
+  if (html.length <= maxLen) return html;
+  let truncated = html.slice(0, maxLen - 20);
+  const lastLt = truncated.lastIndexOf('<');
+  const lastGt = truncated.lastIndexOf('>');
+  if (lastLt > lastGt) {
+    truncated = truncated.slice(0, lastLt);
+  }
+  const openTags: string[] = [];
+  const tagRe = /<\/?([a-zA-Z0-9]+)(?:\s+[^>]*)?>/g;
+  let match: RegExpExecArray | null;
+  while ((match = tagRe.exec(truncated)) !== null) {
+    const isClosing = match[0].startsWith('</');
+    const tagName = match[1]!.toLowerCase();
+    if (['b', 'i', 'code', 'pre', 'a', 'span', 'strong', 'em'].includes(tagName)) {
+      if (isClosing) {
+        const lastIdx = openTags.lastIndexOf(tagName);
+        if (lastIdx !== -1) openTags.splice(lastIdx, 1);
+      } else {
+        openTags.push(tagName);
+      }
+    }
+  }
+  while (openTags.length > 0) {
+    const tag = openTags.pop();
+    truncated += `</${tag}>`;
+  }
+  return truncated + '\n…';
+}
+
 export function renderRangeProgressSections(
   sections: ReadonlyMap<number, RangeAccountSectionState>,
   totalAccounts: number,
@@ -4212,10 +4242,23 @@ export function renderRangeProgressSections(
   const effectiveTotal = Math.max(totalAccounts, sorted.length);
   const escape = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-  const buildBlocks = (pruneThreshold?: number): string[] => {
+  const buildBlocks = (pruneThreshold?: number, compactMode?: boolean): string[] => {
     return sorted.map((sec) => {
       const accNum = sec.accIndex + 1;
       const name = escape(sec.username ?? sec.label);
+      const isFinished = !sec.activeLine && sec.completedItems.length > 0;
+      const isQueued = (!sec.activeLine || sec.activeLine.includes('Queued')) && sec.completedItems.length === 0;
+
+      if (compactMode) {
+        if (isFinished) {
+          const solved = sec.completedItems.filter((i) => i.includes('Accepted') || i.includes('✅')).length;
+          return `✅ <b>Account ${accNum}/${effectiveTotal} · <code>${name}</code></b>: ${solved} solved · Finished`;
+        }
+        if (isQueued) {
+          return `⏳ <b>Account ${accNum}/${effectiveTotal} · <code>${name}</code></b>: Queued…`;
+        }
+      }
+
       const header = `👤 <b>Account ${accNum}/${effectiveTotal} · <code>${name}</code></b>`;
 
       let completed = sec.completedItems;
@@ -4250,12 +4293,54 @@ export function renderRangeProgressSections(
     });
   };
 
+  const MAX_ALLOWED_LEN = 3300;
   let blocks = buildBlocks();
-  if (blocks.join('\n\n').length > 3400) {
+  if (blocks.join('\n\n').length > MAX_ALLOWED_LEN) {
     blocks = buildBlocks(6);
   }
-  if (blocks.join('\n\n').length > 3400) {
+  if (blocks.join('\n\n').length > MAX_ALLOWED_LEN) {
     blocks = buildBlocks(3);
+  }
+  if (blocks.join('\n\n').length > MAX_ALLOWED_LEN) {
+    blocks = buildBlocks(1);
+  }
+  if (blocks.join('\n\n').length > MAX_ALLOWED_LEN) {
+    blocks = buildBlocks(1, true);
+  }
+  if (blocks.join('\n\n').length > MAX_ALLOWED_LEN) {
+    const activeBlocks: string[] = [];
+    let finishedCount = 0;
+    let queuedCount = 0;
+
+    for (const sec of sorted) {
+      const accNum = sec.accIndex + 1;
+      const name = escape(sec.username ?? sec.label);
+      if (sec.activeLine && !sec.activeLine.includes('Queued')) {
+        const latest = sec.completedItems.slice(-1);
+        const lines = [
+          `👤 <b>Account ${accNum}/${effectiveTotal} · <code>${name}</code></b>`,
+          ...(latest.length > 0 ? [`├ ${latest[0]}`] : []),
+          `└ ${sec.activeLine}`,
+        ];
+        activeBlocks.push(lines.join('\n'));
+      } else if (sec.completedItems.length > 0) {
+        finishedCount++;
+      } else {
+        queuedCount++;
+      }
+    }
+
+    const summaryParts: string[] = [];
+    if (finishedCount > 0) {
+      summaryParts.push(`✅ <b>Finished accounts:</b> ${finishedCount}/${effectiveTotal}`);
+    }
+    if (activeBlocks.length > 0) {
+      summaryParts.push(activeBlocks.join('\n\n'));
+    }
+    if (queuedCount > 0) {
+      summaryParts.push(`⏳ <b>Queued accounts:</b> ${queuedCount}/${effectiveTotal}`);
+    }
+    blocks = [summaryParts.join('\n\n')];
   }
 
   return blocks;
@@ -4264,7 +4349,7 @@ export function renderRangeProgressSections(
 export interface RangeTriggerDeps {
   listAccounts: () => Promise<AccountRecord[]>;
   getAccount: (id: string) => Promise<AccountRecord | null>;
-  startJob: (range: QuestionRange, target: string | 'all', deps: RangeDeps, options?: StartRangeOptions) => Promise<StartRangeResult>;
+  startJob: (range: QuestionRange, target: string | 'all' | readonly string[], deps: RangeDeps, options?: StartRangeOptions) => Promise<StartRangeResult>;
   send?: (text: string) => Promise<void>;
   edit?: (chatId: number | string, messageId: number, text: string) => Promise<void>;
 }
@@ -4277,7 +4362,7 @@ export const defaultRangeTriggerDeps: RangeTriggerDeps = {
 
 export async function handleQuestionRangeTrigger(
   range: QuestionRange,
-  target: string | 'all',
+  target: string | 'all' | readonly string[],
   triggerDeps: RangeTriggerDeps = defaultRangeTriggerDeps,
   chatId: number | string = config.telegram.chatId,
   options?: StartRangeOptions,
@@ -4285,7 +4370,24 @@ export async function handleQuestionRangeTrigger(
   let configuredAccounts: AccountRecord[] = [];
   if (target === 'all') {
     configuredAccounts = await triggerDeps.listAccounts().catch(() => []);
+    if (options?.accountIds && options.accountIds.length > 0) {
+      configuredAccounts = configuredAccounts.filter(
+        (a) =>
+          options.accountIds!.includes(a.id) ||
+          options.accountIds!.includes(a.label) ||
+          (a.username && options.accountIds!.includes(a.username)),
+      );
+    }
     if (configuredAccounts.length === 0) return { started: false, reason: 'no-accounts' };
+  } else if (typeof target !== 'string') {
+    const all = await triggerDeps.listAccounts().catch(() => []);
+    configuredAccounts = all.filter(
+      (a) =>
+        target.includes(a.id) ||
+        target.includes(a.label) ||
+        (a.username && target.includes(a.username)),
+    );
+    if (configuredAccounts.length === 0) return { started: false, reason: 'account-not-found' };
   } else {
     const acc = await triggerDeps.getAccount(target).catch(() => null);
     if (!acc) return { started: false, reason: 'account-not-found' };
@@ -4351,7 +4453,10 @@ export async function handleQuestionRangeTrigger(
     const blocks = renderRangeProgressSections(accountSections, totalAccounts);
     let body = blocks.join('\n\n');
     if (footer) body += footer;
-    const fullText = `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${body}`;
+    let fullText = `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${body}`;
+    if (fullText.length > 3800) {
+      fullText = truncateHtml(fullText, 3800);
+    }
 
     if (triggerDeps.edit && statusMessageId) {
       await triggerDeps.edit(chatId, statusMessageId, fullText).catch(() => undefined);
@@ -4365,9 +4470,26 @@ export async function handleQuestionRangeTrigger(
       text: fullText,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
-    }).then(() => true).catch((err) => {
+    }).then(() => true).catch(async (err) => {
       if (/message is not modified/i.test(errText(err))) return true;
-      logger.warn({ err: errText(err) }, 'could not update LeetCode range progress message');
+      logger.warn({ err: errText(err), textLen: fullText.length }, 'could not update LeetCode range progress message');
+
+      if (/MESSAGE_TOO_LONG/i.test(errText(err)) || /parse entities/i.test(errText(err))) {
+        const activeCount = [...accountSections.values()].filter(s => s.activeLine && !s.activeLine.includes('Queued')).length;
+        const doneCount = [...accountSections.values()].filter(s => !s.activeLine && s.completedItems.length > 0).length;
+        const fallbackText = `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n` +
+          `📊 <b>Progress Update</b>\n` +
+          `⚡ Active: ${activeCount} · ✅ Finished: ${doneCount} · ⏳ Total: ${totalAccounts}\n` +
+          (footer ? `${footer}\n` : '') +
+          `<i>(Detailed tree truncated to fit Telegram limit · See /rangestatus for full details)</i>`;
+        return tgApi('editMessageText', {
+          chat_id: chatId,
+          message_id: statusMessageId,
+          text: fallbackText,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }).then(() => true).catch(() => false);
+      }
       return false;
     });
     return updated;
@@ -4555,6 +4677,16 @@ export async function handleQuestionRangeTrigger(
       }
       const summaryText = `\n\n🎯 <b>Finished:</b> ${sum.accepted} accepted · ${sum.failed} failed · ${sum.error} errors${sum.premium ? ` · 🔒 ${sum.premium} premium` : ''}`;
       await editProgress(summaryText);
+      if (triggerDeps.send) {
+        await triggerDeps.send(`🎯 <b>LeetCode Question Range (#${range.from}–#${range.to}) Finished!</b>\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n✅ ${sum.accepted} accepted · ❌ ${sum.failed} failed · ⚠️ ${sum.error} errors${sum.premium ? ` · 🔒 ${sum.premium} premium` : ''}`).catch(() => undefined);
+      } else {
+        await tgApi('sendMessage', {
+          chat_id: chatId,
+          text: `🎯 <b>LeetCode Question Range (#${range.from}–#${range.to}) Finished!</b>\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n✅ ${sum.accepted} accepted · ❌ ${sum.failed} failed · ⚠️ ${sum.error} errors${sum.premium ? ` · 🔒 ${sum.premium} premium` : ''}`,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }).catch(() => undefined);
+      }
       return results;
     } catch (err) {
       logger.warn({ err: errText(err) }, 'LeetCode range execution error');
@@ -4585,10 +4717,18 @@ const defaultRangeUiDeps: RangeUiDeps = {
   queueLength: rangeQueueLength,
 };
 
-/** Account picker: one button per account, then "All accounts" (Parallel / Sequential) and Cancel. */
+export interface LeetCodeRangeSelectionState {
+  range: QuestionRange;
+  selectedAccountIds: Set<string>;
+}
+
+export const lcRangeSelections = new Map<string, LeetCodeRangeSelectionState>();
+
+/** Account picker: interactive multi-selection account picker with checkboxes and Parallel/Sequential controls. */
 export function buildRangePicker(
   range: QuestionRange,
   accounts: AccountRecord[],
+  selected: ReadonlySet<string> = new Set(),
 ): { text: string; buttons: InlineButton[][] } {
   const size = rangeSize(range);
   const tag = `${range.from}-${range.to}`;
@@ -4596,22 +4736,76 @@ export function buildRangePicker(
   const shouldQueue = isAnyWorkerBusy() || pendingQueuePrompt;
   const actionPrefix = shouldQueue ? 'qr:q:' : 'qr:';
   
-  const text = [
-    shouldQueue ? `📥 <b>Queue Question Range #${range.from}–#${range.to}</b> (${size} question${size === 1 ? '' : 's'})` : `🎯 Question range #${range.from}–#${range.to} (${size} question${size === 1 ? '' : 's'})`,
-    '',
-    '👇 Pick the account to run it on:',
-    `⏳ Estimated ~${formatDuration(estimateAccountMs(range, RANGE_GAP_MS))} per account (30 s break between questions)`,
-  ].join('\n');
+  const allSelected = accounts.length > 0 && accounts.every((a) => selected.has(a.id));
+  const selCount = selected.size;
+
   const buttons: InlineButton[][] = accounts.map((a) => [
-    { text: `👤 ${accountName(a)}`.slice(0, 60), callback_data: `${actionPrefix}${tag}:${a.id}` },
+    {
+      text: `${selected.has(a.id) ? '✅' : '▫️'} ${accountName(a)}`.slice(0, 60),
+      callback_data: `${actionPrefix}${tag}:a:${a.id}`,
+    },
   ]);
+
   if (accounts.length > 1) {
     buttons.push([
-      { text: `⚡ All accounts (${accounts.length}, Parallel - Fast)`, callback_data: `${actionPrefix}${tag}:all:parallel` },
+      {
+        text: `${allSelected ? '✅' : '👥'} Select All (${accounts.length})`,
+        callback_data: `${actionPrefix}${tag}:toggle:all`,
+      },
     ]);
   }
-  buttons.push([{ text: `👥 All accounts (${accounts.length}, one by one)`, callback_data: `${actionPrefix}${tag}:all` }]);
+
+  if (selCount > 1) {
+    buttons.push([
+      {
+        text: shouldQueue ? `📥 Enqueue Parallel (${selCount})` : `⚡ Run Parallel (${selCount})`,
+        callback_data: `${actionPrefix}${tag}:run:parallel`,
+      },
+      {
+        text: shouldQueue ? `📥 Enqueue Sequential (${selCount})` : `🐢 Run Sequential (${selCount})`,
+        callback_data: `${actionPrefix}${tag}:run:seq`,
+      },
+    ]);
+  } else if (selCount === 1) {
+    buttons.push([
+      {
+        text: shouldQueue ? `📥 Enqueue (1 account)` : `🚀 Start (1 account)`,
+        callback_data: `${actionPrefix}${tag}:run:parallel`,
+      },
+    ]);
+  } else {
+    if (accounts.length > 1) {
+      buttons.push([
+        {
+          text: shouldQueue ? `📥 Enqueue All (${accounts.length}, Parallel)` : `⚡ All accounts (${accounts.length}, Parallel - Fast)`,
+          callback_data: `${actionPrefix}${tag}:all:parallel`,
+        },
+      ]);
+    }
+    buttons.push([
+      {
+        text: shouldQueue ? `📥 Enqueue All (${accounts.length}, Sequential)` : `👥 All accounts (${accounts.length}, one by one)`,
+        callback_data: `${actionPrefix}${tag}:all`,
+      },
+    ]);
+  }
+
   buttons.push([{ text: '✖️ Cancel', callback_data: 'qr:x' }]);
+
+  const selectionHint = selCount > 0
+    ? `<i>Selected: ${selCount} of ${accounts.length} account${accounts.length === 1 ? '' : 's'}</i>`
+    : '<i>Tap account(s) to select, or tap All accounts below:</i>';
+
+  const text = [
+    shouldQueue
+      ? `📥 <b>Queue Question Range #${range.from}–#${range.to}</b> (${size} question${size === 1 ? '' : 's'})`
+      : `🎯 Question range #${range.from}–#${range.to} (${size} question${size === 1 ? '' : 's'})`,
+    '',
+    '👇 Pick the account(s) to run it on:',
+    selectionHint,
+    `⏳ Estimated ~${formatDuration(estimateAccountMs(range, RANGE_GAP_MS))} per account (30 s break between questions)`,
+  ].join('\n');
+
   return { text, buttons };
 }
 
@@ -4637,6 +4831,7 @@ export async function handleQuestionRangeCommand(
   arg: string,
   deps: RemovalDeps = defaultRemovalDeps,
   ui: RangeUiDeps = defaultRangeUiDeps,
+  chatId: number | string = config.telegram.chatId,
 ): Promise<void> {
   if (!arg.trim()) {
     const accounts = await deps.listAccounts();
@@ -4672,7 +4867,7 @@ export async function handleQuestionRangeCommand(
     return;
   }
   if (tokens.length >= 2 && tokens[1]) {
-    let target = tokens[1];
+    const rawTarget = tokens[1];
     let mode: 'parallel' | 'sequential' = 'parallel';
     if (tokens.length >= 3 && tokens[2]) {
       const mStr = tokens[2].toLowerCase();
@@ -4681,17 +4876,23 @@ export async function handleQuestionRangeCommand(
       } else if (mStr.startsWith('par') || mStr === 'fast') {
         mode = 'parallel';
       }
-    } else if (target === 'all:seq') {
-      target = 'all';
+    } else if (rawTarget === 'all:seq') {
       mode = 'sequential';
-    } else if (target === 'all:parallel') {
-      target = 'all';
+    } else if (rawTarget === 'all:parallel' || rawTarget === 'all') {
       mode = 'parallel';
-    } else if (target === 'all') {
-      mode = 'parallel';
-    } else {
+    } else if (!rawTarget.includes(',')) {
       mode = 'sequential';
     }
+
+    let target: string | 'all' | string[];
+    if (rawTarget === 'all' || rawTarget === 'all:parallel' || rawTarget === 'all:seq') {
+      target = 'all';
+    } else if (rawTarget.includes(',')) {
+      target = rawTarget.split(',').map((s) => s.trim()).filter(Boolean);
+    } else {
+      target = rawTarget;
+    }
+
     const result = await ui.start(parsed.range, target, { mode });
     if (!result.started) {
       if ('queued' in result) {
@@ -4706,7 +4907,13 @@ export async function handleQuestionRangeCommand(
     }
     return;
   }
-  const picker = buildRangePicker(parsed.range, accounts);
+
+  const sel = new Set<string>();
+  const key = `${chatId}:${parsed.range.from}-${parsed.range.to}`;
+  lcRangeSelections.set(key, { range: parsed.range, selectedAccountIds: sel });
+  lcRangeSelections.set(String(chatId), { range: parsed.range, selectedAccountIds: sel });
+
+  const picker = buildRangePicker(parsed.range, accounts, sel);
   if (ui.current()) {
     picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
   }
@@ -4721,7 +4928,9 @@ export async function handleRangeButton(
   deps: RemovalDeps,
   ui: RangeUiDeps = defaultRangeUiDeps,
 ): Promise<void> {
+  const chatKey = String(chatId);
   if (data === 'qr:x') {
+    lcRangeSelections.delete(chatKey);
     pendingRangePrompt = false;
     pendingPromptType = null;
     await deps.answer(callbackId, 'Cancelled');
@@ -4745,7 +4954,12 @@ export async function handleRangeButton(
     }
     pendingRangePrompt = false;
     pendingPromptType = null;
-    const picker = buildRangePicker(parsedRange.range, accounts);
+    const sel = new Set<string>();
+    const key = `${chatId}:${parsedRange.range.from}-${parsedRange.range.to}`;
+    lcRangeSelections.set(key, { range: parsedRange.range, selectedAccountIds: sel });
+    lcRangeSelections.set(chatKey, { range: parsedRange.range, selectedAccountIds: sel });
+
+    const picker = buildRangePicker(parsedRange.range, accounts, sel);
     if (ui.current()) {
       picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
     }
@@ -4753,33 +4967,103 @@ export async function handleRangeButton(
     await deps.edit(chatId, messageId, picker.text, picker.buttons);
     return;
   }
-  const m = /^qr:(?:q:)?(\d+)-(\d+):(.+)$/.exec(data);
+
+  const isQueuedAction = data.startsWith('qr:q:') || isAnyWorkerBusy() || pendingQueuePrompt;
+  const rawData = data.startsWith('qr:q:') ? data.slice('qr:q:'.length) : (data.startsWith('qr:') ? data.slice('qr:'.length) : data);
+  const m = /^(\d+)-(\d+):(.+)$/.exec(rawData);
   const parsed = m ? parseQuestionRange(`${m[1]}-${m[2]}`) : null;
   if (!m || !parsed || !parsed.ok) {
     await deps.answer(callbackId, 'This button is no longer valid');
     return;
   }
-  
-  if (data.startsWith('qr:q:')) {
-    await deps.answer(callbackId, `Queuing range #${parsed.range.from}-${parsed.range.to} 📥`);
-    await deps.edit(chatId, messageId, `📥 <b>Queued LeetCode Range</b> #${parsed.range.from}-${parsed.range.to}...`);
-    const cmdStr = `/questionrangesubmission ${parsed.range.from}-${parsed.range.to} ${m[3]}`;
-    await handleQueueCommandInput(cmdStr, { notify: async (text, html) => { if (html) await replyHtml(text); else await reply(text); } });
+
+  const fromNum = parsed.range.from;
+  const toNum = parsed.range.to;
+  const tagKey = `${chatId}:${fromNum}-${toNum}`;
+  const action = m[3]!;
+
+  // 1. Checkbox toggle for an account: qr:[q:]from-to:a:<accountId>
+  if (action.startsWith('a:')) {
+    const targetAccountId = action.slice(2);
+    const accounts = await deps.listAccounts();
+    let state = lcRangeSelections.get(tagKey) ?? lcRangeSelections.get(chatKey);
+    if (!state || state.range.from !== fromNum || state.range.to !== toNum) {
+      state = { range: parsed.range, selectedAccountIds: new Set<string>() };
+      lcRangeSelections.set(tagKey, state);
+      lcRangeSelections.set(chatKey, state);
+    }
+    if (state.selectedAccountIds.has(targetAccountId)) {
+      state.selectedAccountIds.delete(targetAccountId);
+    } else {
+      state.selectedAccountIds.add(targetAccountId);
+    }
+    await deps.answer(callbackId, state.selectedAccountIds.has(targetAccountId) ? 'Selected ✅' : 'Unselected ▫️');
+    const picker = buildRangePicker(parsed.range, accounts, state.selectedAccountIds);
+    if (ui.current()) {
+      picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
+    }
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
     return;
   }
 
-  let target = m[3]!;
+  // 2. Select All toggle: qr:[q:]from-to:toggle:all
+  if (action === 'toggle:all') {
+    const accounts = await deps.listAccounts();
+    let state = lcRangeSelections.get(tagKey) ?? lcRangeSelections.get(chatKey);
+    if (!state || state.range.from !== fromNum || state.range.to !== toNum) {
+      state = { range: parsed.range, selectedAccountIds: new Set<string>() };
+      lcRangeSelections.set(tagKey, state);
+      lcRangeSelections.set(chatKey, state);
+    }
+    const allSelected = accounts.length > 0 && accounts.every((a) => state!.selectedAccountIds.has(a.id));
+    state.selectedAccountIds.clear();
+    if (!allSelected) {
+      accounts.forEach((a) => state!.selectedAccountIds.add(a.id));
+    }
+    await deps.answer(callbackId, allSelected ? 'Cleared all' : 'All accounts selected');
+    const picker = buildRangePicker(parsed.range, accounts, state.selectedAccountIds);
+    if (ui.current()) {
+      picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
+    }
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  // 3. Execution (run:parallel, run:seq, all:parallel, all, or single account)
+  let target: string | 'all' | string[];
   let mode: 'parallel' | 'sequential' = 'parallel';
-  if (target === 'all:parallel') {
+
+  if (action === 'run:parallel' || action === 'run:seq') {
+    const state = lcRangeSelections.get(tagKey) ?? lcRangeSelections.get(chatKey);
+    if (!state || state.selectedAccountIds.size === 0) {
+      await deps.answer(callbackId, 'Select at least one account');
+      return;
+    }
+    target = Array.from(state.selectedAccountIds);
+    mode = action === 'run:seq' ? 'sequential' : 'parallel';
+  } else if (action === 'all:parallel') {
     target = 'all';
     mode = 'parallel';
-  } else if (target === 'all:seq') {
+  } else if (action === 'all:seq' || action === 'all') {
     target = 'all';
     mode = 'sequential';
-  } else if (target === 'all') {
-    mode = 'sequential';
   } else {
+    // Legacy single account target (e.g. 'a1')
+    target = action;
     mode = 'sequential';
+  }
+
+  // Clean up selection state
+  lcRangeSelections.delete(tagKey);
+  lcRangeSelections.delete(chatKey);
+
+  if (isQueuedAction) {
+    await deps.answer(callbackId, `Queuing range #${parsed.range.from}-${parsed.range.to} 📥`);
+    await deps.edit(chatId, messageId, `📥 <b>Queued LeetCode Range</b> #${parsed.range.from}-${parsed.range.to}...`);
+    const targetStr = Array.isArray(target) ? target.join(',') : target;
+    const cmdStr = `/questionrangesubmission ${parsed.range.from}-${parsed.range.to} ${targetStr} ${mode}`;
+    await handleQueueCommandInput(cmdStr, { notify: async (text, html) => { if (html) await replyHtml(text); else await reply(text); } });
+    return;
   }
 
   const result = await ui.start(parsed.range, target, { mode });
