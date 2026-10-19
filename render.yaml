@@ -182,3 +182,4 @@ databases:
   - name: leetcode-agent-db
     databaseName: leetcode_agent
     plan: free # 1 GB, expires 30 days after creation — see DEPLOYMENT.md §13
+    region: frankfurt
