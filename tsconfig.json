@@ -19,5 +19,12 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts", "scripts/**/*.ts"],
-  "exclude": ["node_modules", "dist", "tests", "local-auth"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "tests",
+    "local-auth",
+    "scripts/set-github-secret.ts",
+    "scripts/test-proxies-user.ts"
+  ]
 }

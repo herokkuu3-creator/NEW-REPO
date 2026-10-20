@@ -1,6 +1,6 @@
 import sodium from 'libsodium-wrappers';
 
-const GITHUB_TOKEN = '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';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const REPO = 'herokkuu41/NEW-REPO';
 const SECRET_NAME = 'CODEFORCES_RESIDENTIAL_PROXY';
 
