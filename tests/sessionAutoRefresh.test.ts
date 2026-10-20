@@ -63,6 +63,27 @@ describe('Session Auto-Refresh & Verification Engine', () => {
   });
 
   describe('LeetCode Account Auto-Refresh', () => {
+    it('preserves account status and credentials when the session query fails', async () => {
+      vi.mocked(playwright.launchWithStorageStateObject).mockResolvedValue({ context: {}, close: vi.fn() } as any);
+      vi.mocked(sessionCheck.checkSession).mockResolvedValue({ authenticated: false, cause: 'query-failed' });
+      const outcome = await refreshLeetCodeAccount({ id: 'network-failure', label: 'main', username: 'user',
+        storageState: JSON.stringify({ cookies: [], origins: [] }), status: AccountStatus.ACTIVE } as any);
+      expect(outcome.status).toBe('failed');
+      expect(accountsDb.patchAccount).not.toHaveBeenCalled();
+      expect(leetcodeAuth.loginToLeetCode).not.toHaveBeenCalled();
+    });
+
+    it('does not label credentials rejected when a login requires browser verification', async () => {
+      vi.mocked(playwright.launchWithStorageStateObject).mockResolvedValue({ context: {}, close: vi.fn() } as any);
+      vi.mocked(sessionCheck.checkSession).mockResolvedValue({ authenticated: false, cause: 'signed-out' });
+      vi.spyOn(credentialStore, 'findCredentialsForAccount').mockResolvedValue({ username: 'user', password: 'secret' });
+      vi.mocked(leetcodeAuth.loginToLeetCode).mockResolvedValue({ ok: false, code: 'VERIFICATION_REQUIRED', error: 'Use /renew' });
+      await refreshLeetCodeAccount({ id: 'requires-verification', label: 'main', username: 'user',
+        storageState: JSON.stringify({ cookies: [], origins: [] }), status: AccountStatus.ACTIVE } as any);
+      expect(accountsDb.patchAccount).toHaveBeenCalledWith('requires-verification', expect.objectContaining({ status: AccountStatus.EXPIRED }));
+      expect(accountsDb.saveAccount).not.toHaveBeenCalled();
+    });
+
     it('returns status "valid" when active session is authenticated', async () => {
       vi.mocked(playwright.launchWithStorageStateObject).mockResolvedValue({
         context: {} as any,

@@ -138,14 +138,27 @@ export async function fetchRemoteSyncedProxies(): Promise<string[]> {
   }
 }
 
-export const DEFAULT_JOY_PROXY = 'http://customer-jp-lmc6hb64r-cc-in-iptype-residential-sessid-ylvk7rom-sesstime-1-backup-1:kdKWYXp9PFrh@gate.joyproxy.com:9001';
+export const DEFAULT_RESIDENTIAL_PROXIES = [
+  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.244.76:3129',
+  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@151.123.176.240:3129',
+  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@209.50.189.116:3129',
+  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@209.50.186.187:3129',
+  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.253.46:3129',
+  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.246.199:3129',
+  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@104.207.56.101:3129',
+  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.249.242:3129',
+  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@104.207.56.199:3129',
+  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@65.111.22.35:3129',
+];
+
+export const DEFAULT_JOY_PROXY = DEFAULT_RESIDENTIAL_PROXIES[0]!;
 
 export async function getAllConfiguredProxies(envSource?: string): Promise<ManagedProxy[]> {
   const rawEnv = envSource ?? (
     process.env.FALLBACK_CODEFORCES_PROXY ||
     process.env.CODEFORCES_RESIDENTIAL_PROXY ||
     process.env.CODEFORCES_PROXY ||
-    DEFAULT_JOY_PROXY
+    DEFAULT_RESIDENTIAL_PROXIES.join('\n')
   );
 
   const envProxies = parseProxyList(rawEnv);

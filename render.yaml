@@ -125,6 +125,8 @@ services:
         sync: false
       - key: CPSOLVER_URL
         value: https://pk-coder.onrender.com
+      - key: CODEFORCES_RESIDENTIAL_PROXY
+        sync: false
 
   # ---------------------------------------------------------------------------
   # Isolated Codeforces submitter — its OWN free web service.
@@ -187,6 +189,8 @@ services:
         value: "120"
       - key: CPSOLVER_URL
         value: https://pk-coder.onrender.com
+      - key: CODEFORCES_RESIDENTIAL_PROXY
+        sync: false
 
 databases:
   - name: leetcode-agent-db

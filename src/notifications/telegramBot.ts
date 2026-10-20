@@ -289,7 +289,7 @@ export const HELP_TEXT = [
   '└ /ccaccounts — View CodeChef accounts &amp; queue progress',
   '',
   '<b>🍪 𝗦𝗘𝗦𝗦𝗜𝗢𝗡 𝗠𝗔𝗡𝗔𝗚𝗘𝗠𝗘𝗡𝗧</b>',
-  '├ /lclogin [label] — Interactive LeetCode login (auto-solves Turnstile)',
+  '├ /lclogin [label] — LeetCode login; use /renew if browser verification is required',
   '├ /cflogin [label] — Interactive Codeforces login (auto-solves Turnstile)',
   '├ /checksessions — Inspect all sessions &amp; auto-refresh expired accounts',
   '├ /renew — Session renewal guide &amp; instructions (supports label)',
@@ -494,6 +494,12 @@ async function handleMessage(msg: TgMessage): Promise<void> {
   const text = (msg.text ?? '').trim();
   const lowerText = text.toLowerCase();
 
+  if ((text === '/cancel' || lowerText === 'cancel') && activeLeetCodeLogin) {
+    activeLeetCodeLogin.abort();
+    await reply('🛑 Cancelling the active LeetCode login…');
+    return;
+  }
+
   // Support plain text "start queue" / "queue start"
   if (lowerText === 'start queue' || lowerText === 'queue start') {
     pendingQueuePrompt = true;
@@ -538,6 +544,10 @@ async function handleMessage(msg: TgMessage): Promise<void> {
     }
 
     if (activeLoginPrompt.step === 'awaiting_password') {
+      if (!msg.text || !text || text.startsWith('/')) {
+        await reply('Send your password as text, or /cancel to abort. Commands are not treated as passwords.');
+        return;
+      }
       // Immediately delete the user's password message for privacy
       if (msg.message_id) {
         await tgApi('deleteMessage', {
@@ -549,10 +559,13 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       }
 
       const { site, label, identifier } = activeLoginPrompt;
-      const password = text;
+      // Trimming chat input corrupts valid passwords containing boundary spaces.
+      const password = msg.text;
       activeLoginPrompt = null;
 
-      await handleExecuteLogin(site, label || identifier || 'account', identifier || '', password);
+      // Keep the polling loop responsive to /cancel and other commands.
+      void handleExecuteLogin(site, label || identifier || 'account', identifier || '', password)
+        .catch(() => logger.warn({ site }, 'Interactive login task failed'));
       return;
     }
   }
@@ -651,6 +664,7 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/lc_login':
       case '/leetcodelogin':
       case '/leetcode_login': {
+        if (activeLeetCodeLogin) { await reply('A LeetCode login is running. Use /cancel or wait for its result.'); return; }
         const label = commandArg ? commandArg.trim() : undefined;
         activeLoginPrompt = {
           site: 'leetcode',
@@ -5601,6 +5615,7 @@ export interface PendingLoginState {
 }
 
 let activeLoginPrompt: PendingLoginState | null = null;
+let activeLeetCodeLogin: AbortController | null = null;
 
 export function getActiveLoginPrompt(): PendingLoginState | null {
   return activeLoginPrompt;
@@ -5610,26 +5625,33 @@ export function setActiveLoginPrompt(state: PendingLoginState | null): void {
   activeLoginPrompt = state;
 }
 
-async function handleExecuteLogin(
+export async function handleExecuteLogin(
   site: 'leetcode' | 'codeforces',
   label: string,
   identifier: string,
   password: string,
   replyFunc: (text: string) => Promise<void> = replyHtml,
 ): Promise<void> {
+  if (site === 'leetcode' && activeLeetCodeLogin) {
+    await replyFunc('A LeetCode login is already running. Use /cancel or wait for its result.');
+    return;
+  }
+  const controller = site === 'leetcode' ? new AbortController() : null;
+  if (controller) activeLeetCodeLogin = controller;
   const siteName = site === 'leetcode' ? 'LeetCode' : 'Codeforces';
-  await replyFunc(
-    `🔄 <b>Logging in to ${siteName}...</b>\n` +
-    `• Account label: <code>${escapeHtml(label)}</code>\n` +
-    `• Identifier: <code>${escapeHtml(identifier)}</code>\n\n` +
-    `<i>Solving Turnstile verification challenge with local CPSolver (with Capzy/CapSolver fallback)...</i>`,
-  );
-
   try {
+    await replyFunc(
+      `🔄 <b>Logging in to ${siteName}...</b>\n` +
+      `• Account label: <code>${escapeHtml(label)}</code>\n` +
+      `• Identifier: <code>${escapeHtml(identifier)}</code>\n\n` +
+      (site === 'leetcode' ? '<i>Checking the normal login flow. Browser verification may require /renew.</i>' : '<i>Starting account authentication…</i>'),
+    );
+
     if (site === 'leetcode') {
       const res = await loginToLeetCode(identifier, password, {
+        signal: controller!.signal,
         onProgress: async (msg) => {
-          await sendTelegramMessage(msg).catch(() => undefined);
+          await replyFunc(escapeHtml(msg)).catch(() => undefined);
         },
       });
 
@@ -5637,7 +5659,8 @@ async function handleExecuteLogin(
         await replyFunc(
           `❌ <b>LeetCode Login Failed:</b>\n` +
           `<i>${escapeHtml(res.error || 'Authentication timed out or failed.')}</i>\n\n` +
-          `Please check your username/password and try again with <code>/lclogin</code>.`,
+          (res.code === 'VERIFICATION_REQUIRED' ? 'Sign in in your browser and import the session with <code>/renew</code>.' :
+            `Diagnostic: <code>${escapeHtml(res.code ?? 'LOGIN_FAILED')}</code>. Retry <code>/lclogin</code> or use <code>/renew</code>.`),
         );
         return;
       }
@@ -5698,8 +5721,10 @@ async function handleExecuteLogin(
       );
     }
   } catch (err) {
-    logger.error({ site, label, err: errText(err) }, 'Error during interactive login execution');
-    await replyFunc(`❌ <b>Login Error:</b> ${escapeHtml(errText(err))}`);
+    logger.error({ site, label }, 'Error during interactive login execution or session persistence');
+    await replyFunc('❌ Login or session storage failed. Check the server logs for the stage and retry.');
+  } finally {
+    if (controller && activeLeetCodeLogin === controller) activeLeetCodeLogin = null;
   }
 }
 

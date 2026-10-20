@@ -68,6 +68,12 @@ export async function refreshLeetCodeAccount(account: AccountRecord): Promise<Ac
     };
   }
 
+  if (check.cause !== 'signed-out' && check.cause !== 'invalid-storage-state') {
+    logger.warn({ label: account.label, cause: check.cause }, 'Session verification unavailable; preserving account status and skipping re-login');
+    return { site: 'leetcode', label: account.label, username: account.username, status: 'failed',
+      error: 'Session verification unavailable. Existing session retained; retry the check later.' };
+  }
+
   logger.warn({ label: account.label, cause: check.cause }, 'LeetCode session invalid/signed-out; checking for stored credentials');
 
   const creds = await findCredentialsForAccount('leetcode', account);
@@ -105,7 +111,8 @@ export async function refreshLeetCodeAccount(account: AccountRecord): Promise<Ac
 
   const errDetail = loginRes.error ?? 'Auto-relogin failed';
   await patchAccount(account.id, {
-    status: AccountStatus.REJECTED,
+    // Verification/network/browser failures are not rejected credentials.
+    status: loginRes.code === 'LOGIN_REJECTED' ? AccountStatus.REJECTED : AccountStatus.EXPIRED,
     lastError: `Auto-relogin failed: ${errDetail}`,
     checked: true,
   });
