@@ -359,13 +359,31 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
   const abort = new AbortController();
   const instanceId = deps.instanceId ?? `${process.env.RENDER_INSTANCE_ID ?? 'local'}:${process.pid}:${randomUUID()}`;
   const getOwner = deps.getOwner ?? (() => getSystemState(POLLER_OWNER_KEY));
-  const setOwner = deps.setOwner ?? ((id: string) => setSystemState(POLLER_OWNER_KEY, id));
+  const setOwner = deps.setOwner ?? ((id: string) => setSystemState(POLLER_OWNER_KEY, `${id}@${Date.now()}`));
 
-  /** false only when the DB positively says another instance took over. */
+  /** false only when the DB positively says another active instance took over. */
   const stillOwner = async (): Promise<boolean> => {
     try {
-      const owner = await getOwner();
-      return owner === null || owner === instanceId;
+      const raw = await getOwner();
+      if (!raw) return true;
+      const [ownerId, tsStr] = raw.split('@');
+      if (ownerId === instanceId) {
+        return true;
+      }
+      if (tsStr) {
+        const ts = Number(tsStr);
+        if (Number.isFinite(ts) && Date.now() - ts > HANDOVER_GRACE_MS * 2) {
+          logger.info({ staleOwner: ownerId }, 'telegram poller owner key is stale — reclaiming ownership');
+          await setOwner(instanceId).catch(() => null);
+          return true;
+        }
+      } else {
+        // Legacy owner string without timestamp (e.g. from an imported DB backup)
+        logger.info({ legacyOwner: raw }, 'legacy telegram poller owner key detected — reclaiming ownership');
+        await setOwner(instanceId).catch(() => null);
+        return true;
+      }
+      return false;
     } catch {
       return true; // DB hiccup: keep polling rather than going silent
     }
@@ -376,19 +394,24 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
       logger.warn({ err: errText(err) }, 'could not claim the telegram poller slot - polling anyway'),
     );
 
-    // A leftover webhook makes getUpdates fail with HTTP 409 â€” drop it once.
+    // A leftover webhook makes getUpdates fail with HTTP 409 — drop it once.
     await tgApi('deleteWebhook', { drop_pending_updates: true }).catch((err) =>
       logger.warn({ err: errText(err) }, 'Telegram deleteWebhook failed - continuing anyway'),
     );
     logger.info('telegram command bot polling started (/renew, /status, /help)');
 
     const startedAt = Date.now();
+    let lastHeartbeat = Date.now();
     let conflictSince: number | null = null;
     let offset = 0;
     while (!stopped) {
       if (!(await stillOwner())) {
         logger.info('a newer instance took over the telegram bot - this instance stops polling');
         break;
+      }
+      if (Date.now() - lastHeartbeat > 30_000) {
+        await setOwner(instanceId).catch(() => null);
+        lastHeartbeat = Date.now();
       }
       try {
         const updates = await tgApi<TgUpdate[]>(
