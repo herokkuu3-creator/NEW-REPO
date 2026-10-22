@@ -35,4 +35,24 @@ Provider message: “Billing verification failed. Please check your payment meth
 - Provide bounded live server probes, startup diagnostics, durable tick results, and an optional external wake workflow.
 - Bootstrap the supplied key in code as explicitly requested. Environment variables and the encrypted bot pool remain supported. No full key is written to this report, endpoint responses, or logs.
 
-Focused regression suite: 86 tests passed before the final startup-probe additions. Final build/test and deployed-server results are recorded after verification.
+Focused regression suite: **88 tests passed** across article generation, routing, encrypted keys, scheduler recovery, service/session renewal, routes, publishing, and GIFs. The TypeScript build and whitespace checks passed. Broader related suites passed 134 tests with one existing Telegram poller handover failure; the handover test also fails when run separately, and this patch does not change the poller implementation.
+
+Application commits were pushed to both `main` remotes. The deployment repository's credential rejected creating an Actions workflow because it lacks `workflow` scope; the optional external wake remains a setup template under `docs/` instead. The existing in-process schedule was verified firing today.
+
+## Confirmed from the deployed Render container
+
+The deployment of `a34c099` was positively verified through `/admin/solutions/diagnostics`, which returned `executionHost: render` and the exact deployed commit. The supplied key was appended to the encrypted live database as slot #2, preserving the exhausted original slot. The saved four-account schedule and automatic publishing remained enabled.
+
+Both the automatic startup probe and explicit authenticated server probes returned:
+
+| Model | Model list | Inference | Category |
+|---|---|---|---|
+| `gpt-5.6-terra` | HTTP 403 | HTTP 403 | `PROVIDER_ACCESS_BLOCKED` |
+| `gpt-5.6-luna` | HTTP 403 | HTTP 403 | `PROVIDER_ACCESS_BLOCKED` |
+| `gemini-3.7-flash` | HTTP 403 | HTTP 403 | `PROVIDER_ACCESS_BLOCKED` |
+
+The response was Cloudflare HTML titled **“Just a moment…”**, rather than CodeCraft's documented JSON `insufficient_scope` response. Authenticated requests to the bot itself returned HTTP 200, so these are upstream CodeCraft responses. This is an additional provider-side access restriction affecting Render, beyond the local HTTP 402 allowance failure. The provider must permit authenticated API access from this host and restore the account's inference allowance; changing model names or retiring more API keys cannot repair those external restrictions.
+
+A follow-up patch stops immediately on this HTML challenge, preserves the current key slot, and stores `AI_PROVIDER_ACCESS_BLOCKED`. Only an explicit JSON `insufficient_scope` / `models:read` denial permits discovery fallback. Diagnostic results include a provider request ID when supplied, without retaining challenge HTML.
+
+Provider documentation: [authentication and HTTP errors](https://codecraftapi.com/docs/authentication), [documented API endpoint](https://codecraftapi.com/docs/getting-started). The API docs define HTTP 402 as exhaustion of balance and plan allowance, and HTTP 403 scope denials as JSON. No CAPTCHA solver or network identity workaround was used.

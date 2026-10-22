@@ -92,4 +92,13 @@ describe('solution article API key pool', () => {
     await resetSolutionApiKeyPool();
     expect((await solutionKeyPoolStatus()).lastFailure).toBeUndefined();
   });
+  it('classifies the Render-side HTML challenge and captures the provider request ID without logging HTML', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response('challenge', { status: 403 }))
+      .mockResolvedValueOnce(new Response('<html><title>Just a moment...</title></html>', {
+        status: 403, headers: { 'content-type': 'text/html', 'cf-ray': 'example-FRA' },
+      })));
+    const result = await testSolutionApiKey('cc_private_key_0001', 'gpt-5.6-terra');
+    expect(result).toMatchObject({ failureCategory: 'PROVIDER_ACCESS_BLOCKED', providerRequestId: 'example-FRA' });
+    expect(JSON.stringify(result)).not.toContain('<html>');
+  });
 });

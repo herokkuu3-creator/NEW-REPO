@@ -119,7 +119,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     if (['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING'].includes(post.status)) {
       post = await move(post, 'FAILED', { leaseUntil: null,
         lastError: error instanceof ArticleReviewError ? 'TECHNICAL_REVIEW_FAILED' :
-          error instanceof RoutingError ? (error.lastFailure ? `AI_ERROR: ${error.lastFailure}` : 'AI_MODELS_EXHAUSTED') :
+          error instanceof RoutingError ? (error.lastFailure === 'PROVIDER_ACCESS_BLOCKED' ? 'AI_PROVIDER_ACCESS_BLOCKED' :
+            error.lastFailure ? `AI_ERROR: ${error.lastFailure}` : 'AI_MODELS_EXHAUSTED') :
             error instanceof PostError ? error.code : 'GENERATION_FAILED',
         ...(error instanceof ArticleReviewError ? { ...error.draft,
           contentHash: hash(`${error.draft.title}\n${error.draft.markdown}`), approvedHash: null } : {}),
@@ -171,6 +172,7 @@ export async function resetFailedSolutionPostRetries(): Promise<number> {
         { lastError: 'AI_CONFIGURATION_REQUIRED' },
         { lastError: 'AI_BILLING_REQUIRED' },
         { lastError: 'AI_KEYS_EXHAUSTED' },
+        { lastError: 'AI_PROVIDER_ACCESS_BLOCKED' },
         { lastError: { startsWith: 'AI_ERROR:' } },
       ],
     },

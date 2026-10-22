@@ -166,6 +166,14 @@ describe('AI model routing', () => {
     expect(result.attempts[0]).toMatchObject({ model: 'discovery', outcome: 'MODELS_READ_FORBIDDEN' });
     expect(api.chat.completions.create).toHaveBeenCalledWith(expect.objectContaining({ model: 'terra' }), expect.any(Object));
   });
+  it('stops at a provider HTML challenge without rotating keys or guessing model access', async () => {
+    const api = client(); const advanced = vi.fn(async () => {});
+    api.models.list.mockRejectedValue(new OpenAI.PermissionDeniedError(403, undefined,
+      '<!DOCTYPE html><title>Just a moment...</title>', {}));
+    const error = await new AIModelRouter(options, api as never, undefined, undefined, advanced).generate([], value => value).catch(e => e as RoutingError);
+    expect(error.lastFailure).toBe('PROVIDER_ACCESS_BLOCKED');
+    expect(api.chat.completions.create).not.toHaveBeenCalled(); expect(advanced).not.toHaveBeenCalled();
+  });
   it('requires a separate successful technical review', async () => {
     const api = client(); api.chat.completions.create.mockResolvedValueOnce(complete(JSON.stringify(article)))
       .mockResolvedValueOnce(complete('{"approved":false,"issues":["wrong complexity"]}'))

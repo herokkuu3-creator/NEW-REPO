@@ -114,6 +114,7 @@ export class AIModelRouter {
             record.elapsedMs = Date.now() - started;
             attempts.push(record); this.onAttempt(record);
           }
+          if (record.outcome === 'PROVIDER_ACCESS_BLOCKED') throw new RoutingError(attempts, record.outcome);
           if (exhausted || !transient || n === this.options.retries) break;
           await this.sleep(Math.min(1000 * 2 ** n, 8000));
         }
@@ -135,7 +136,10 @@ export class AIModelRouter {
 function safeOutcome(error: unknown): string {
   if (error instanceof OpenAI.APIConnectionTimeoutError) return 'TIMEOUT';
   if (error instanceof OpenAI.APIConnectionError) return 'CONNECTION_ERROR';
-  if (error instanceof OpenAI.APIError) return `HTTP_${error.status ?? 'ERROR'}`;
+  if (error instanceof OpenAI.APIError) {
+    if (error.status === 403 && /<!doctype html|<html|just a moment|cf-chl-/i.test(error.message)) return 'PROVIDER_ACCESS_BLOCKED';
+    return `HTTP_${error.status ?? 'ERROR'}`;
+  }
   if (error instanceof OutputValidationError) return error.category;
   if (error instanceof z.ZodError) return `SCHEMA:${error.issues.map(i => i.path.join('.')).join(',').slice(0,200)}`;
   // Validation messages and provider content can contain secrets: persist categories only.
@@ -155,5 +159,7 @@ export function isKeyExhausted(error: unknown): boolean {
 
 /** A CodeCraft key may intentionally omit models:read while retaining inference. */
 function isModelDiscoveryForbidden(error: unknown): boolean {
-  return error instanceof OpenAI.APIError && error.status === 403;
+  return error instanceof OpenAI.APIError && error.status === 403 &&
+    (error.code === 'insufficient_scope' || /models:read/.test(error.message)) &&
+    !/<!doctype html|<html|just a moment|cf-chl-/i.test(error.message);
 }

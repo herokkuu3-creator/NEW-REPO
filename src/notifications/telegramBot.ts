@@ -3328,6 +3328,8 @@ export async function handleTestSolutionApiKey(commandArg?: string): Promise<voi
         lines.push('Check the plan/allowance with <a href="https://codecraftapi.com">CodeCraft</a>, then use <code>/resetsolutionkeys</code> after the provider resolves it.');
       } else if (result.chatStatus === 401) {
         lines.push('⚠️ <b>Cause:</b> Invalid or revoked API key.');
+      } else if (result.failureCategory === 'PROVIDER_ACCESS_BLOCKED') {
+        lines.push('⚠️ <b>Cause:</b> CodeCraft returned a Cloudflare HTML challenge to this server. Ask CodeCraft to permit authenticated API access from Render; switching models or keys does not resolve this access restriction.');
       }
     }
   } else if (result.error) {

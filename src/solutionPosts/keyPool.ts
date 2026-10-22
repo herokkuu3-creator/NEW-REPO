@@ -183,6 +183,7 @@ export interface KeyTestResult {
   error?: string;
   executionHost?: string;
   failureCategory?: string;
+  providerRequestId?: string;
 }
 
 export async function testSolutionApiKey(candidateKey?: string, model?: string): Promise<KeyTestResult> {
@@ -190,7 +191,7 @@ export async function testSolutionApiKey(candidateKey?: string, model?: string):
   if (!key) {
     const pool = await loadSolutionKeyPool();
     const active = pool.keys.slice(Math.max(0, pool.activeIndex));
-    key = active[0] ?? pool.keys[0];
+    key = active[0] ?? pool.keys.at(-1);
   }
   if (!key) {
     return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0, error: 'NO_KEY_CONFIGURED' };
@@ -243,11 +244,13 @@ export async function testSolutionApiKey(candidateKey?: string, model?: string):
         modelsStatus: modelsRes.status,
         modelsCount,
         chatStatus: chatRes.status,
-        chatError: redact(parsedMsg),
+        chatError: chatRes.status === 403 && chatRes.headers.get('content-type')?.includes('text/html') ?
+          'CodeCraft returned an HTML access challenge to this server; authenticated API access must be allowed by the provider.' : redact(parsedMsg),
         chatType: parsedType ? redact(parsedType) : undefined,
         chatCode: parsedCode ? redact(parsedCode) : undefined,
         chatModel: testModel,
         executionHost,
+        providerRequestId: chatRes.headers.get('cf-ray') ?? undefined,
         failureCategory: chatRes.status === 402 ? 'PROVIDER_BILLING_REQUIRED' : chatRes.status === 401 ? 'INVALID_API_KEY' :
           chatRes.status === 403 ? (chatRes.headers.get('content-type')?.includes('text/html') ? 'PROVIDER_ACCESS_BLOCKED' : 'PROVIDER_PERMISSION_DENIED') :
           chatRes.status === 429 ? 'PROVIDER_RATE_OR_QUOTA_LIMIT' : 'PROVIDER_ERROR',
