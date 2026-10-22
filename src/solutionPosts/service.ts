@@ -69,11 +69,12 @@ export async function createPostRouter(): Promise<AIModelRouter> {
   const activeKeys = activeSolutionApiKeys(pool);
   logger.info({ keyPool: { total: pool.keys.length, activeIndex: pool.activeIndex + 1,
     activeKey: activeKeys[0] ? maskSolutionApiKey(activeKeys[0]) : null, stored: pool.stored } }, 'solution article router configured');
-  if (!activeKeys.length) throw new PostError('AI_CONFIGURATION_REQUIRED');
+  if (!activeKeys.length) throw new PostError(!pool.keys.length ? 'AI_CONFIGURATION_REQUIRED' :
+    pool.lastFailure === 'HTTP_402_BILLING_REQUIRED' ? 'AI_BILLING_REQUIRED' : 'AI_KEYS_EXHAUSTED');
   return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys }, undefined, undefined,
     attempt => logger.info({ attempt }, 'solution article AI attempt finished'),
     async (failedKey, reason) => {
-      const advanced = await rotateSolutionApiKey(failedKey);
+      const advanced = await rotateSolutionApiKey(failedKey, reason);
       logger.warn({ reason, activeKey: advanced.activeIndex + 1, totalKeys: advanced.keys.length }, 'solution article API key advanced');
     });
 }
@@ -168,6 +169,8 @@ export async function resetFailedSolutionPostRetries(): Promise<number> {
         { lastError: 'GENERATION_RETRY_LIMIT' },
         { lastError: 'AI_MODELS_EXHAUSTED' },
         { lastError: 'AI_CONFIGURATION_REQUIRED' },
+        { lastError: 'AI_BILLING_REQUIRED' },
+        { lastError: 'AI_KEYS_EXHAUSTED' },
         { lastError: { startsWith: 'AI_ERROR:' } },
       ],
     },
@@ -176,11 +179,14 @@ export async function resetFailedSolutionPostRetries(): Promise<number> {
       retryCount: 0,
     },
   });
+  // Credentials can be repaired after the four automatic attempts. Reset the
+  // matching scheduler budget too; resetting only posts leaves the schedule stuck.
+  await prisma.systemState.deleteMany({ where: { key: { startsWith: 'solution-post-schedule-budget:' } } });
   return updated.count;
 }
 
 export async function resolveCurrentDaily(account: Account, now = new Date()) {
-  return withAccount(account, async api => {
+  const resolve = (candidate: Account) => withAccount(candidate, async api => {
     for (let n = 0; n < 3; n++) {
       const daily = await fetchDailyChallenge(api);
       if (daily.date === now.toISOString().slice(0, 10)) return daily;
@@ -188,4 +194,14 @@ export async function resolveCurrentDaily(account: Account, now = new Date()) {
     }
     throw new PostError('DAILY_CHALLENGE_NOT_REFRESHED');
   });
+  try { return await resolve(account); }
+  catch (error) {
+    if (!(error instanceof PostError) || !['AUTHENTICATION_REQUIRED', 'ACCOUNT_UNAVAILABLE'].includes(error.code) || account.status === 'DISABLED') throw error;
+    // The article workflow runs at 06:00, before the separate morning session
+    // checker. Give it the same stored-credential renewal as daily submissions.
+    const { refreshLeetCodeAccount } = await import('../security/sessionAutoRefresh');
+    const refreshed = await refreshLeetCodeAccount(account);
+    if (!['valid', 'refreshed'].includes(refreshed.status)) throw new PostError('AUTHENTICATION_REQUIRED');
+    return resolve(await prisma.account.findUniqueOrThrow({ where: { id: account.id } }));
+  }
 }

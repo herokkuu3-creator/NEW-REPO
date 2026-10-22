@@ -11,6 +11,8 @@ export interface SolutionKeyPool {
   activeIndex: number;
   /** Calendar month in which this active position was chosen (Asia/Kolkata by default). */
   activePeriod?: string;
+  lastFailure?: string;
+  environmentFingerprint?: string;
   stored: boolean;
 }
 
@@ -19,6 +21,7 @@ export interface SolutionKeyPoolStatus {
   active: number | null;
   keys: Array<{ position: number; masked: string; active: boolean }>;
   source: 'database' | 'environment' | 'empty';
+  lastFailure?: string;
 }
 
 const keyMaterial = (): Buffer => createHash('sha256')
@@ -64,6 +67,8 @@ function normalise(pool: Partial<SolutionKeyPool>, stored: boolean): SolutionKey
     keys,
     activeIndex: Math.min(Math.max(0, Number.isInteger(pool.activeIndex) ? pool.activeIndex! : 0), keys.length),
     activePeriod: /^\d{4}-\d{2}$/.test(pool.activePeriod ?? '') ? pool.activePeriod : undefined,
+    lastFailure: pool.lastFailure && /^(?:HTTP_\d+(?:_BILLING_REQUIRED)?|KEY_EXHAUSTED)$/.test(pool.lastFailure) ? pool.lastFailure : undefined,
+    environmentFingerprint: pool.environmentFingerprint,
     stored,
   };
 }
@@ -81,13 +86,21 @@ export async function loadSolutionKeyPool(now = new Date()): Promise<SolutionKey
   const saved = await getSystemState(STATE_KEY);
   if (saved) {
     try {
-      const pool = normalise(JSON.parse(open(saved)), true);
+      let pool = normalise(JSON.parse(open(saved)), true);
+      // Newly configured bootstrap keys must not be hidden by an older DB pool.
+      // Preserve every existing slot and its exhaustion pointer.
+      const environmentKeys = parseSolutionApiKeys(config.solutionPosts.apiKeys);
+      const environmentFingerprint = createHash('sha256').update(JSON.stringify(environmentKeys)).digest('hex');
+      if (pool.environmentFingerprint !== environmentFingerprint) {
+        const additions = environmentKeys.filter(key => !pool.keys.includes(key));
+        pool = await persist({ ...pool, keys: [...pool.keys, ...additions], environmentFingerprint });
+      }
       const period = solutionKeyPeriod(now);
       // A previous month's exhausted quota must not permanently strand the
       // earlier keys. Reset only at a calendar-month boundary, never during
       // ordinary retries or short-lived rate limits.
       if (pool.activePeriod !== period) {
-        return persist({ ...pool, activeIndex: 0, activePeriod: period, stored: true });
+        return persist({ ...pool, activeIndex: 0, activePeriod: period, lastFailure: undefined, stored: true });
       }
       return pool;
     } catch {
@@ -101,8 +114,12 @@ export async function loadSolutionKeyPool(now = new Date()): Promise<SolutionKey
 async function persist(pool: SolutionKeyPool): Promise<SolutionKeyPool> {
   const valid = normalise(pool, true);
   const activePeriod = valid.activePeriod ?? solutionKeyPeriod();
-  await setSystemState(STATE_KEY, seal(JSON.stringify({ keys: valid.keys, activeIndex: valid.activeIndex, activePeriod })));
+  const environmentFingerprint = valid.environmentFingerprint ?? createHash('sha256')
+    .update(JSON.stringify(parseSolutionApiKeys(config.solutionPosts.apiKeys))).digest('hex');
+  await setSystemState(STATE_KEY, seal(JSON.stringify({ keys: valid.keys, activeIndex: valid.activeIndex, activePeriod,
+    lastFailure: valid.lastFailure, environmentFingerprint })));
   valid.activePeriod = activePeriod;
+  valid.environmentFingerprint = environmentFingerprint;
   return valid;
 }
 
@@ -116,7 +133,7 @@ export async function appendSolutionApiKeys(raw: string | string[]): Promise<{
   const newKeys = additions.filter(key => !set.has(key));
   const merged = [...existing.keys, ...newKeys];
   if (merged.length > MAX_KEYS) throw new Error(`At most ${MAX_KEYS} API keys may be stored`);
-  const pool = await persist({ keys: merged, activeIndex: existing.activeIndex, activePeriod: existing.activePeriod, stored: true });
+  const pool = await persist({ ...existing, keys: merged, stored: true });
   return { pool, added: newKeys.length, duplicates: additions.length - newKeys.length };
 }
 
@@ -135,11 +152,11 @@ export async function resetSolutionApiKeyPool(): Promise<SolutionKeyPool> {
 }
 
 /** Advance only after an explicit key quota/credential failure. No round-robin on ordinary rate limits. */
-export async function rotateSolutionApiKey(failedKey: string): Promise<SolutionKeyPool> {
+export async function rotateSolutionApiKey(failedKey: string, reason = 'KEY_EXHAUSTED'): Promise<SolutionKeyPool> {
   const current = await loadSolutionKeyPool();
   const position = current.keys.indexOf(failedKey);
   if (position < 0) return current;
-  return persist({ keys: current.keys, activeIndex: Math.max(current.activeIndex, position + 1), activePeriod: current.activePeriod, stored: true });
+  return persist({ keys: current.keys, activeIndex: Math.max(current.activeIndex, position + 1), activePeriod: current.activePeriod, lastFailure: reason, stored: true });
 }
 
 export async function solutionKeyPoolStatus(): Promise<SolutionKeyPoolStatus> {
@@ -149,6 +166,7 @@ export async function solutionKeyPoolStatus(): Promise<SolutionKeyPoolStatus> {
     active: pool.activeIndex < pool.keys.length ? pool.activeIndex + 1 : null,
     keys: pool.keys.map((key, index) => ({ position: index + 1, masked: maskSolutionApiKey(key), active: index === pool.activeIndex })),
     source: pool.keys.length ? (pool.stored ? 'database' : 'environment') : 'empty',
+    lastFailure: pool.lastFailure,
   };
 }
 
@@ -163,9 +181,11 @@ export interface KeyTestResult {
   chatCode?: string;
   chatModel?: string;
   error?: string;
+  executionHost?: string;
+  failureCategory?: string;
 }
 
-export async function testSolutionApiKey(candidateKey?: string): Promise<KeyTestResult> {
+export async function testSolutionApiKey(candidateKey?: string, model?: string): Promise<KeyTestResult> {
   let key = candidateKey?.trim();
   if (!key) {
     const pool = await loadSolutionKeyPool();
@@ -176,30 +196,35 @@ export async function testSolutionApiKey(candidateKey?: string): Promise<KeyTest
     return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0, error: 'NO_KEY_CONFIGURED' };
   }
   const masked = maskSolutionApiKey(key);
+  const testModel = model ?? config.solutionPosts.models?.[0] ?? 'gpt-5.6-terra';
+  const executionHost = process.env.RENDER_INSTANCE_ID ? 'render' : 'local';
+  if (!/^(?:gpt-5\.6-(?:terra|luna)|gemini-3\.(?:7|8)-flash)$/.test(testModel)) {
+    return { ok: false, keyMasked: masked, modelsStatus: 0, modelsCount: 0, error: 'MODEL_NOT_ALLOWED', executionHost };
+  }
+  const redact = (value: string) => value.split(key!).join('[REDACTED]').replace(/cc_[A-Za-z0-9_-]+/g, '[REDACTED]').slice(0, 300);
   try {
     const baseUrl = config.solutionPosts.baseUrl || 'https://codecraftapi.com/v1';
     const modelsUrl = new URL('models', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
     const modelsRes = await fetch(modelsUrl.href, {
       method: 'GET',
       headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(20000),
     });
-    if (!modelsRes.ok) {
-      const errText = await modelsRes.text().catch(() => '');
-      return { ok: false, keyMasked: masked, modelsStatus: modelsRes.status, modelsCount: 0, error: errText.slice(0, 300) };
-    }
-    const modelsData = await modelsRes.json() as { data?: Array<{ id: string }> };
+    // Discovery and inference have separate scopes. Even a 403 here does not
+    // prove the key cannot generate a completion.
+    const modelsData = await modelsRes.json().catch(() => ({})) as { data?: Array<{ id: string }> };
     const modelsCount = Array.isArray(modelsData.data) ? modelsData.data.length : 0;
 
     const chatUrl = new URL('chat/completions', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
-    const testModel = config.solutionPosts.models[0] || 'gpt-5.6-terra';
     const chatRes = await fetch(chatUrl.href, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: testModel,
-        messages: [{ role: 'user', content: 'ping' }],
-        max_tokens: 5,
+        messages: [{ role: 'user', content: 'Reply with only OK.' }],
+        max_tokens: 64,
       }),
+      signal: AbortSignal.timeout(45000),
     });
     if (!chatRes.ok) {
       const chatBody = await chatRes.text().catch(() => '');
@@ -218,22 +243,32 @@ export async function testSolutionApiKey(candidateKey?: string): Promise<KeyTest
         modelsStatus: modelsRes.status,
         modelsCount,
         chatStatus: chatRes.status,
-        chatError: parsedMsg.slice(0, 300),
-        chatType: parsedType,
-        chatCode: parsedCode,
+        chatError: redact(parsedMsg),
+        chatType: parsedType ? redact(parsedType) : undefined,
+        chatCode: parsedCode ? redact(parsedCode) : undefined,
         chatModel: testModel,
+        executionHost,
+        failureCategory: chatRes.status === 402 ? 'PROVIDER_BILLING_REQUIRED' : chatRes.status === 401 ? 'INVALID_API_KEY' :
+          chatRes.status === 403 ? (chatRes.headers.get('content-type')?.includes('text/html') ? 'PROVIDER_ACCESS_BLOCKED' : 'PROVIDER_PERMISSION_DENIED') :
+          chatRes.status === 429 ? 'PROVIDER_RATE_OR_QUOTA_LIMIT' : 'PROVIDER_ERROR',
       };
     }
+    const completion = await chatRes.json() as { choices?: Array<{ message?: { content?: string } }> };
+    const valid = !!completion.choices?.[0]?.message?.content?.trim();
     return {
-      ok: true,
+      ok: valid,
       keyMasked: masked,
       modelsStatus: modelsRes.status,
       modelsCount,
       chatStatus: chatRes.status,
       chatModel: testModel,
+      executionHost,
+      ...(valid ? {} : { failureCategory: 'INVALID_COMPLETION', chatError: 'Provider returned no text' }),
     };
   } catch (err) {
-    return { ok: false, keyMasked: masked, modelsStatus: 0, modelsCount: 0, error: err instanceof Error ? err.message : String(err) };
+    return { ok: false, keyMasked: masked, modelsStatus: 0, modelsCount: 0, executionHost,
+      failureCategory: err instanceof Error && /Timeout|Abort/.test(err.name) ? 'PROVIDER_TIMEOUT' : 'PROVIDER_NETWORK_ERROR',
+      error: 'Provider request did not complete' };
   }
 }
 

@@ -117,3 +117,25 @@ The authenticated submission/editor/publication flow was successfully tested in 
 `src/solutionPosts/{router,article,store,service,publisher,scheduler,routes}.ts` implement model routing, content, persistence, accepted context loading, review-gated UI publication, scheduling, and API integration. `scripts/solution-post.ts` supplies the interactive CLI. Migration `0006_solution_posts` adds article records and account preferences. `src/main.ts`, `src/api/health.ts`, and the optional account/date filters in `dailyWorker.ts` are the existing-system integration points. Configuration lives in `src/config/index.ts` and `.env.example`.
 
 Verification results for this implementation are recorded in `docs/ai-solution-post-verification.md`.
+
+## 06:00 recovery and server diagnostics
+
+The combined workflow completes daily code submissions for **all selected accounts before AI article generation**. Every accepted event requires the matching daily slug, `SUCCESS`, a submission ID, and an `Accepted` verdict. Existing accepted code is reused on article retries. A published manual article cannot suppress the daily code submission. Expired sessions get the same stored-credential refresh as the ordinary daily worker.
+
+Recovery resumes completed `DRAFT_READY` / `AWAITING_APPROVAL` posts when automatic publication is enabled. An uncertain `PUBLISHING` record is never clicked again. Busy workers and active account leases do not consume the four automatic daily attempts. Adding an available key or explicitly resetting the pool resets both failed AI posts and their scheduler budgets; automatic retries no longer force-reset exhausted generation attempts.
+
+`src/config/codecraft.ts` contains the operator-requested deployment bootstrap key. Set `SOLUTION_POST_API_KEY` / `SOLUTION_POST_API_KEYS` to override it, or explicitly set the singular variable to an empty string to disable it. Newly configured environment keys are appended to the encrypted database pool once per configuration change; old exhausted slots retain their positions. Explicit replacement does not silently re-add unchanged bootstrap keys.
+
+On process startup, the server makes one small inference probe per configured Terra/Luna/Gemini model (maximum three). Set `SOLUTION_POST_VERIFY_ON_BOOT=false` to disable probes. Results, execution host, and HTTP failure category are saved under `solution-post-provider:last-check` and logged without full keys. Model-list success alone is not inference success; HTTP 402 is a provider billing/allowance failure. Missing `models:read` permission still permits the inference probe.
+
+Authenticated routes (existing `SETUP_TOKEN` bearer authentication):
+
+| Route | Purpose |
+|---|---|
+| `GET /admin/solutions/diagnostics` | Saved selection, timezone, running state, durable last tick, revision, provider probes, and masked key status |
+| `POST /admin/solutions/scheduled` | Return HTTP 202 and run the saved 06:00 selection asynchronously, subject to the normal clock and idempotency checks |
+| `POST /admin/solutions/api-keys/test` | Body `{"model":"gpt-5.6-terra"}`; optional `apiKey` tests a supplied key without saving it. Only Terra, Luna, and Gemini Flash are allowed. |
+
+Render's free web services sleep after idle time; a process cron cannot wake a sleeping instance. The optional `.github/workflows/daily-solution-wake.yml` supplies a 06:00 IST wake and hourly recovery. Configure repository variable `BOT_SERVER_URL` and secret `BOT_SETUP_TOKEN` before relying on it. Polls keep the service awake during the bounded observation window. GitHub scheduled jobs may be delayed, so use an always-on worker or an external monitor with a suitable service guarantee when exact start time is required. The internal ten-minute recovery and restart catch-up remain active.
+
+Incident evidence and validation are recorded in `docs/daily-solution-incident-2026-10-22.md`.

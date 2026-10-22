@@ -14,6 +14,7 @@ import { startCodeforcesScheduler, triggerCodeforcesRun } from './codeforces/wor
 import { startCodeChefScheduler } from './codechef/worker';
 import { startMorningSessionCheckScheduler } from './security/sessionAutoRefresh';
 import { startSolutionPostScheduler } from './solutionPosts/scheduler';
+import { verifySolutionProviderOnBoot } from './solutionPosts/providerDiagnostics';
 
 /**
  * Entry point. The process is a long-lived Background Worker:
@@ -58,6 +59,7 @@ async function main(): Promise<void> {
   const stopCodeChefScheduler = startCodeChefScheduler();
   const stopMorningSessionCheck = startMorningSessionCheckScheduler();
   const stopSolutionPosts = startSolutionPostScheduler();
+  void verifySolutionProviderOnBoot().catch(() => logger.warn('solution provider startup probe could not complete'));
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'shutting down');

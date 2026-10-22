@@ -132,12 +132,24 @@ describe('AI model routing', () => {
   });
   it('keeps an ordinary 429 on the current key', async () => {
     const api = client(); const advanced = vi.fn(async () => {}); const sleep = vi.fn(async () => {});
-    api.chat.completions.create.mockRejectedValueOnce(new OpenAI.RateLimitError(429, {}, '', undefined)).mockResolvedValueOnce(complete('ok'));
+    api.chat.completions.create.mockRejectedValueOnce(new OpenAI.RateLimitError(429, {}, 'Rate limit exceeded', undefined)).mockResolvedValueOnce(complete('ok'));
     const router = new AIModelRouter({ ...options, apiKeys: ['key_one_0001', 'key_two_0002'], retries: 1 }, api as never,
       sleep, undefined, advanced);
     await router.generate([], value => value);
     expect(advanced).not.toHaveBeenCalled();
     expect(api.chat.completions.create.mock.calls).toHaveLength(2);
+  });
+  it('does not retry the exhausted key during the separate review request or persist raw provider errors', async () => {
+    const first = client(); const second = client();
+    first.chat.completions.create.mockRejectedValue(new OpenAI.APIError(402, {}, 'billing secret-test-key', undefined));
+    second.chat.completions.create.mockResolvedValue(complete('ok'));
+    const router = new AIModelRouter({ ...options, apiKeys: ['secret-test-key', 'key_two_0002'] }, first as never,
+      undefined, undefined, undefined, () => second as never);
+    await router.generate([], value => value); await router.generate([], value => value);
+    expect(first.chat.completions.create).toHaveBeenCalledTimes(1);
+    const api = client(); api.models.list.mockRejectedValue(new OpenAI.APIError(402, {}, 'secret-test-key', undefined));
+    const error = await new AIModelRouter(options, api as never).generate([], value => value).catch(e => e as RoutingError);
+    expect(error.lastFailure).not.toContain('secret-test-key');
   });
   it('never guesses models when discovery fails', async () => {
     const api = client(); api.models.list.mockRejectedValue(new Error('secret'));

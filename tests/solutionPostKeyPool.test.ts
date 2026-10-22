@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const db = vi.hoisted(() => ({ value: null as string | null }));
 vi.mock('../src/config', () => ({ config: { api: { setupToken: 'test-setup-token' },
-  solutionPosts: { apiKeys: ['env_primary_0001', 'env_backup_0002'] } } }));
+  solutionPosts: { apiKeys: ['env_primary_0001', 'env_backup_0002'], baseUrl: 'https://codecraftapi.com/v1', models: ['gpt-5.6-terra'] } } }));
 vi.mock('../src/database/models', () => ({
   getSystemState: vi.fn(async () => db.value),
   setSystemState: vi.fn(async (_key: string, value: string) => { db.value = value; }),
@@ -12,7 +12,8 @@ import { appendSolutionApiKeys, loadSolutionKeyPool, maskSolutionApiKey, parseSo
   replaceSolutionApiKeys, resetSolutionApiKeyPool, rotateSolutionApiKey, solutionKeyPoolStatus, solutionKeyPeriod, testSolutionApiKey } from '../src/solutionPosts/keyPool';
 
 describe('solution article API key pool', () => {
-  beforeEach(() => { db.value = null; });
+  beforeEach(() => { db.value = null; vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-10-16T00:00:00Z')); });
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
   it('accepts comma-separated additions, keeps insertion order, and never persists plaintext', async () => {
     expect(parseSolutionApiKeys(' key_one_0001, key_two_0002, key_one_0001 ')).toEqual(['key_one_0001', 'key_two_0002']);
@@ -62,9 +63,33 @@ describe('solution article API key pool', () => {
     expect(next.activePeriod).toBe(solutionKeyPeriod(new Date('2026-11-01T00:00:00Z')));
   });
 
-  it('handles testing an API key gracefully when network fails or key is missing', async () => {
+  it('handles testing an API key gracefully when the network fails', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network failure')));
     const res = await testSolutionApiKey('invalid_mock_key');
     expect(res.keyMasked).toContain('…');
-    expect(typeof res.ok).toBe('boolean');
+    expect(res).toMatchObject({ ok: false, failureCategory: 'PROVIDER_NETWORK_ERROR' });
+  });
+  it('tests inference even when model listing is forbidden and rejects empty completions', async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(new Response('{}', { status: 403 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: 'OK' } }] })));
+    vi.stubGlobal('fetch', fetcher);
+    expect(await testSolutionApiKey('private_key_0001')).toMatchObject({ ok: true, modelsStatus: 403, chatStatus: 200, chatModel: 'gpt-5.6-terra' });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetcher.mock.calls[1]![1].body).max_tokens).toBe(64);
+  });
+  it('distinguishes billing failure from an access block and redacts provider-echoed secrets', async () => {
+    const key = 'cc_private_key_0001';
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response('{"data":[]}'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'Billing failed ' + key, code: 'insufficient_quota' } }), { status: 402 })));
+    const result = await testSolutionApiKey(key, 'gpt-5.6-luna');
+    expect(result).toMatchObject({ ok: false, failureCategory: 'PROVIDER_BILLING_REQUIRED', modelsStatus: 200, chatStatus: 402 });
+    expect(JSON.stringify(result)).not.toContain(key);
+    expect((await testSolutionApiKey(key, 'gpt-6-sol')).error).toBe('MODEL_NOT_ALLOWED');
+  });
+  it('retains the quota failure reason across restarts', async () => {
+    await rotateSolutionApiKey('env_primary_0001', 'HTTP_402_BILLING_REQUIRED');
+    expect((await solutionKeyPoolStatus()).lastFailure).toBe('HTTP_402_BILLING_REQUIRED');
+    await resetSolutionApiKeyPool();
+    expect((await solutionKeyPoolStatus()).lastFailure).toBeUndefined();
   });
 });

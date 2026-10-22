@@ -1,16 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ accounts: [] as any[], runs: new Map<string, any>(), daily: vi.fn(), generate: vi.fn(),
   submit: vi.fn(), approve: vi.fn(), publish: vi.fn(), preferences: [] as any[], locks: new Map<string, string>(), calls: [] as any[],
-  timers: [] as Array<() => void>, submitSingle: vi.fn() }));
+  timers: [] as Array<() => void>, submitSingle: vi.fn(), posts: [] as any[] }));
 vi.mock('node-cron', () => ({ default: { schedule: vi.fn((_expr, callback) => {
   h.timers.push(callback); return { stop: vi.fn() };
 }) } }));
 vi.mock('../src/database/prisma', () => {
   const tx = {
-    account: { findMany: vi.fn(async () => h.accounts), count: vi.fn(async () => h.accounts.length) },
+    account: { findMany: vi.fn(async ({ where }: any) => h.accounts.filter(a => where.id.in.includes(a.id) && a.status !== 'DISABLED')), count: vi.fn(async () => h.accounts.length) },
     dailyRun: { findUnique: vi.fn(async ({ where }: any) => h.runs.get(where.accountId_date.accountId) ?? null),
+      findMany: vi.fn(async ({ where }: any) => [...h.runs.values()].filter(r => where.accountId.in.includes(r.accountId))),
       upsert: vi.fn(async ({ create }: any) => ({ id: `manual-${create.accountId}`, ...create })) },
-    solutionPost: { findUnique: vi.fn(async () => null), findMany: vi.fn(async () => []) },
+    solutionPost: { findUnique: vi.fn(async ({ where }: any) => h.posts.find(p => p.accountId === where.accountId_problemSlug_intent.accountId) ?? null), findMany: vi.fn(async () => h.posts) },
     solutionPostPreference: {
       updateMany: vi.fn(async () => { h.preferences = []; }),
       upsert: vi.fn(async ({ create }: any) => { h.preferences.push(create); }),
@@ -18,6 +19,7 @@ vi.mock('../src/database/prisma', () => {
     },
     systemState: {
       create: vi.fn(async ({ data }: any) => { h.locks.set(data.key, data.value); }),
+      upsert: vi.fn(async ({ create }: any) => { h.locks.set(create.key, create.value); }),
       findUnique: vi.fn(async ({ where }: any) => h.locks.has(where.key) ? { key: where.key, value: h.locks.get(where.key) } : null),
       updateMany: vi.fn(async ({ where, data }: any) => {
         if (h.locks.get(where.key) !== where.value) return { count: 0 };
@@ -34,11 +36,12 @@ vi.mock('../src/solutionPosts/store', () => ({ recoverGeneration: vi.fn(), appro
 vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: h.publish }));
 vi.mock('../src/scheduler/dailyWorker', () => ({ runSubmissionNow: h.submit }));
 vi.mock('../src/scheduler/rangeSubmission', () => ({ submitSingleQuestionDirectly: h.submitSingle }));
-import { afterPostSchedule, POST_CRON, POST_TIMEZONE, runCombined, runManualQuestion, setSelectedAccounts, startSolutionPostScheduler } from '../src/solutionPosts/scheduler';
+import { afterPostSchedule, POST_CRON, POST_TIMEZONE, runCombined, runManualQuestion, runScheduledSolutionPosts,
+  SCHEDULE_STATE_KEY, setSelectedAccounts, startSolutionPostScheduler } from '../src/solutionPosts/scheduler';
 beforeEach(() => {
-  vi.clearAllMocks(); h.locks.clear(); h.preferences = []; h.runs.clear(); h.calls = []; h.timers = [];
+  vi.clearAllMocks(); h.locks.clear(); h.preferences = []; h.runs.clear(); h.calls = []; h.timers = []; h.posts = [];
   h.accounts = ['a', 'b', 'c', 'd', 'e'].map(id => ({ id, status: 'ACTIVE' }));
-  for (const a of h.accounts) h.runs.set(a.id, { id: 'run-' + a.id, problemSlug: 'today', state: 'SUCCESS', submissionId: '123', submissionStatus: 'Accepted' });
+  for (const a of h.accounts) h.runs.set(a.id, { id: 'run-' + a.id, accountId: a.id, problemSlug: 'today', state: 'SUCCESS', submissionId: '123', submissionStatus: 'Accepted' });
   h.daily.mockResolvedValue({ date: '2026-10-15', slug: 'today' });
   h.generate.mockImplementation(async (id: string) => ({ id: 'post-' + id, status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) }));
   h.approve.mockImplementation(async (id: string) => ({ id, status: 'DRAFT_READY', contentHash: 'a'.repeat(64) }));
@@ -49,7 +52,7 @@ beforeEach(() => {
   });
   h.submit.mockImplementation(async (_reason, options) => {
     h.calls.push(options); const id = options.accountIds[0]; h.runs.set(id,
-      { id: 'run-' + id, problemSlug: 'today', state: 'SUCCESS', submissionId: '124', submissionStatus: 'Accepted' });
+      { id: 'run-' + id, accountId: id, problemSlug: 'today', state: 'SUCCESS', submissionId: '124', submissionStatus: 'Accepted' });
     return {};
   });
 });
@@ -69,6 +72,24 @@ describe('daily AI drafts', () => {
     h.runs.delete('c'); await runCombined(h.accounts.map(a => a.id), new Date('2026-10-15T00:30:00Z'));
     expect(h.submit).toHaveBeenCalledTimes(1);
     expect(h.calls[0]).toEqual({ accountIds: ['c'], expectedChallengeDate: '2026-10-15' });
+  });
+  it('submits every selected daily before the first AI article request', async () => {
+    h.runs.clear();
+    h.generate.mockImplementation(async id => {
+      expect(h.submit).toHaveBeenCalledTimes(5);
+      return { id, status: 'FAILED', lastError: 'AI_ERROR: HTTP_402_BILLING_REQUIRED' };
+    });
+    const results = await runCombined(h.accounts.map(a => a.id), new Date('2026-10-15T00:30:00Z'));
+    expect(results).toHaveLength(5); expect(h.submit).toHaveBeenCalledTimes(5);
+    expect([...h.runs.values()].every(r => r.state === 'SUCCESS')).toBe(true);
+  });
+  it('never reports acceptance or generates an article for a rejected code submission', async () => {
+    h.accounts = [h.accounts[0]]; h.runs.get('a').state = 'SUBMISSION_REJECTED';
+    h.submit.mockResolvedValueOnce({});
+    const events: any[] = [];
+    const results = await runCombined(['a'], new Date('2026-10-15T00:30:00Z'), event => { events.push(event); });
+    expect(results[0]).toMatchObject({ status: 'FAILED', error: 'ACCEPTED_SUBMISSION_REQUIRED' });
+    expect(h.generate).not.toHaveBeenCalled(); expect(events.some(e => e.stage === 'accepted')).toBe(false);
   });
   it('continues the other four accounts after one account fails', async () => {
     h.generate.mockImplementation(async (id: string) => { if (id === 'b') throw new Error('failure'); return { id, status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) }; });
@@ -119,5 +140,34 @@ describe('daily AI drafts', () => {
       expect(h.generate).toHaveBeenCalledTimes(4);
       expect(h.locks.get('solution-post-schedule-budget:a:2026-10-15')).toBe('4');
     } finally { stop(); vi.useRealTimers(); }
+  });
+  it('recovers a completed draft that has not yet been published', async () => {
+    h.accounts = [h.accounts[0]]; h.preferences = [{ accountId: 'a', enabled: true }];
+    h.posts = [{ accountId: 'a', problemSlug: 'today', status: 'DRAFT_READY', retryCount: 1 }];
+    h.generate.mockResolvedValueOnce({ id: 'post-a', status: 'DRAFT_READY', contentHash: 'a'.repeat(64) });
+    const result = await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'));
+    expect(result.status).toBe('FINISHED'); expect(h.publish).toHaveBeenCalledWith('post-a');
+    expect(h.submit).not.toHaveBeenCalled();
+    expect(JSON.parse(h.locks.get(SCHEDULE_STATE_KEY)!)).toMatchObject({ status: 'FINISHED' });
+  });
+  it('does not let an existing published manual article suppress the daily submission', async () => {
+    h.accounts = [h.accounts[0]]; h.preferences = [{ accountId: 'a', enabled: true }]; h.runs.clear();
+    h.posts = [{ accountId: 'a', problemSlug: 'today', status: 'PUBLISHED', retryCount: 1 }];
+    h.generate.mockResolvedValueOnce({ id: 'post-a', status: 'PUBLISHED' });
+    await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'));
+    expect(h.submit).toHaveBeenCalledTimes(1);
+  });
+  it('does not consume scheduled retries while the daily submission worker is busy', async () => {
+    h.accounts = [h.accounts[0]]; h.preferences = [{ accountId: 'a', enabled: true }]; h.runs.clear();
+    h.submit.mockResolvedValueOnce(null);
+    await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'));
+    expect(h.locks.get('solution-post-schedule-budget:a:2026-10-15')).toBe('0');
+    expect(h.generate).not.toHaveBeenCalled();
+  });
+  it('does not republish a completed article or replay an uncertain Post click', async () => {
+    h.accounts = h.accounts.slice(0, 2); h.preferences = h.accounts.map(a => ({ accountId: a.id, enabled: true }));
+    h.posts = h.accounts.map((a, index) => ({ accountId: a.id, problemSlug: 'today', status: index ? 'PUBLISHING' : 'PUBLISHED' }));
+    expect((await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'))).status).toBe('IDLE');
+    expect(h.publish).not.toHaveBeenCalled(); expect(h.generate).not.toHaveBeenCalled();
   });
 });

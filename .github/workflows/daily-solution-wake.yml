@@ -1,0 +1,64 @@
+name: Wake daily submission and solution articles
+
+on:
+  schedule:
+    # 06:00 Asia/Kolkata. GitHub can delay cron delivery; the bot catches up.
+    - cron: '30 0 * * *'
+    # Recovery after a sleeping service, deployment, or transient outage.
+    - cron: '7 1-18 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: daily-solution-wake
+  cancel-in-progress: false
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BOT_SERVER_URL: ${{ vars.BOT_SERVER_URL }}
+      BOT_SETUP_TOKEN: ${{ secrets.BOT_SETUP_TOKEN }}
+    steps:
+      - name: Wake the bot and run its saved 06:00 account selection
+        shell: bash
+        run: |
+          node <<'NODE'
+          const base = process.env.BOT_SERVER_URL?.replace(/\/+$/, '');
+          const token = process.env.BOT_SETUP_TOKEN;
+          if (!base || !token) {
+            console.log('::warning::Set repository variable BOT_SERVER_URL and secret BOT_SETUP_TOKEN to enable external wake-up.');
+            process.exit(0);
+          }
+          const url = new URL(base);
+          if (url.protocol !== 'https:' || url.username || url.password) throw new Error('BOT_SERVER_URL must be a plain HTTPS origin');
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          async function request(path, method = 'GET') {
+            for (let attempt = 0; attempt < 3; attempt++) {
+              try {
+                const response = await fetch(base + path, { method, headers: { Authorization: `Bearer ${token}` },
+                  signal: AbortSignal.timeout(90000) });
+                if (!response.ok) throw new Error(`Bot returned HTTP ${response.status}`);
+                return await response.json();
+              } catch (error) {
+                if (attempt === 2) throw error;
+                await sleep(15000);
+              }
+            }
+          }
+          (async () => {
+            const started = await request('/admin/solutions/scheduled', 'POST');
+            console.log('Scheduled workflow:', started.status);
+            // Inbound polls also keep a free Render service awake during generation.
+            for (let poll = 0; poll < 24; poll++) {
+              await sleep(20000);
+              const diagnostics = await request('/admin/solutions/diagnostics');
+              console.log(JSON.stringify({ running: diagnostics.running, scheduler: diagnostics.scheduler,
+                executionHost: diagnostics.executionHost, revision: diagnostics.revision }));
+              if (!diagnostics.running) return;
+            }
+            console.log('::warning::Workflow is still running. Check bot diagnostics for completion.');
+          })().catch(error => { console.error(error.message); process.exitCode = 1; });
+          NODE

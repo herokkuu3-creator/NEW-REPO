@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DEFAULT_CODECRAFT_API_KEY } from './codecraft';
 
 /**
  * Central configuration. Every environment variable is parsed and validated
@@ -76,7 +77,7 @@ const envSchema = z.object({
 
   // SOLUTION_POST_API_KEYS is a comma-separated failover pool. The singular
   // name remains a backwards-compatible one-key bootstrap option.
-  SOLUTION_POST_API_KEY: z.string().default(''),
+  SOLUTION_POST_API_KEY: z.string().default(DEFAULT_CODECRAFT_API_KEY),
   SOLUTION_POST_API_KEYS: z.string().default(''),
   SOLUTION_POST_BASE_URL: z.string().url().default('https://codecraftapi.com/v1'),
   SOLUTION_POST_MODELS: z.string().default('gpt-5.6-terra,gpt-5.6-luna,gemini-3.7-flash'),

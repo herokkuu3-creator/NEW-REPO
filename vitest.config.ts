@@ -13,6 +13,8 @@ export default defineConfig({
       LLM_PROVIDER: 'gemini',
       LLM_API_KEY: 'test-gemini-key',
       LLM_MODEL: 'gemini-3.5-flash',
+      SOLUTION_POST_API_KEY: '',
+      SOLUTION_POST_API_KEYS: '',
     },
   },
 });

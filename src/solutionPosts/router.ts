@@ -33,6 +33,7 @@ export class OutputValidationError extends Error {
 /** Uses the existing OpenAI SDK/protocol, with one bounded retry owner. Never logs provider bodies. */
 export class AIModelRouter {
   private readonly apiKeys: string[];
+  private readonly exhaustedKeys = new Set<string>();
   private readonly firstClient?: OpenAI;
   constructor(private readonly options: RouterOptions, client?: OpenAI,
     private readonly sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms)),
@@ -52,6 +53,7 @@ export class AIModelRouter {
     let lastFailureReason: string | undefined;
     for (let keyIndex = 0; keyIndex < this.apiKeys.length; keyIndex++) {
       const key = this.apiKeys[keyIndex]!;
+      if (this.exhaustedKeys.has(key)) continue;
       const client = keyIndex === 0 && this.firstClient ? this.firstClient : this.createClient(key);
       let available: Set<string>;
       try {
@@ -69,7 +71,7 @@ export class AIModelRouter {
         if (discoveryForbidden) {
           available = new Set(this.options.models);
         } else {
-          lastFailureReason = error instanceof Error ? error.message : String(error);
+          lastFailureReason = safeOutcome(error);
           if (isKeyExhausted(error)) { await this.markExhausted(key, record.outcome); continue; }
           throw new RoutingError(attempts, lastFailureReason);
         }
@@ -100,18 +102,13 @@ export class AIModelRouter {
           } catch (error) {
             if (isKeyExhausted(error)) {
               const apiErr = error instanceof OpenAI.APIError ? error : undefined;
-              const msg = apiErr?.message || (error as { message?: string })?.message || '';
-              const isBilling = apiErr?.status === 402 || /billing|payment|credit|quota|funds/i.test(msg);
-              const detail = isBilling
-                ? `CodeCraft billing verification failed (HTTP 402)${msg ? `: ${msg}` : ''}`
-                : `AI key exhausted: ${msg || 'quota limit'}`;
               record.outcome = apiErr?.status === 402 ? 'HTTP_402_BILLING_REQUIRED' : 'KEY_EXHAUSTED';
-              lastFailureReason = detail;
+              lastFailureReason = record.outcome;
               exhausted = true;
             } else {
               const status = error instanceof OpenAI.APIError ? error.status : undefined;
               record.outcome = safeOutcome(error);
-              lastFailureReason = error instanceof Error ? error.message : String(error);
+              lastFailureReason = record.outcome;
               transient = status === 429 || (status != null && status >= 500) || error instanceof OpenAI.APIConnectionError;
             }
             record.elapsedMs = Date.now() - started;
@@ -122,7 +119,7 @@ export class AIModelRouter {
         }
         if (exhausted) break;
       }
-      if (exhausted) { await this.markExhausted(key, 'KEY_EXHAUSTED'); continue; }
+      if (exhausted) { await this.markExhausted(key, lastFailureReason ?? 'KEY_EXHAUSTED'); continue; }
       // The provider answered but no configured model produced valid output. A different key cannot fix that.
       break;
     }
@@ -130,6 +127,7 @@ export class AIModelRouter {
   }
 
   private async markExhausted(key: string, reason: string): Promise<void> {
+    this.exhaustedKeys.add(key);
     try { await this.onKeyExhausted(key, reason); } catch { /* use the next in-memory key even if persistence is briefly unavailable */ }
   }
 }
@@ -152,7 +150,7 @@ export function isKeyExhausted(error: unknown): boolean {
   if (status !== 429) return false;
   const candidate = error as { code?: unknown; type?: unknown; message?: unknown };
   const detail = [candidate.code, candidate.type, candidate.message].filter(v => typeof v === 'string').join(' ').toLowerCase();
-  return /quota|credit|balance|billing|payment|monthly|insufficient|exceed/.test(detail);
+  return /quota|credit|balance|billing|payment|monthly|insufficient_funds/.test(detail);
 }
 
 /** A CodeCraft key may intentionally omit models:read while retaining inference. */

@@ -9,9 +9,12 @@ import { submitSingleQuestionDirectly } from '../scheduler/rangeSubmission';
 import type { AccountRecord } from '../database/accounts';
 import { approvePost, recoverGeneration } from './store';
 import { publishPost } from './publisher';
+import { sendTelegramMessage } from '../notifications/telegram';
 
 export const POST_CRON = '0 6 * * *';
 export const POST_TIMEZONE = 'Asia/Kolkata';
+export const SCHEDULE_STATE_KEY = 'solution-post-scheduler:last-tick';
+let scheduledRunInProgress = false;
 export function afterPostSchedule(now: Date): boolean {
   const parts = new Intl.DateTimeFormat('en-US', { timeZone: POST_TIMEZONE, hour: '2-digit', hourCycle: 'h23' }).formatToParts(now);
   return Number(parts.find(p => p.type === 'hour')?.value) >= 6;
@@ -24,7 +27,7 @@ export function afterPostSchedule(now: Date): boolean {
  */
 export async function publishGeneratedPost(post: SolutionPost): Promise<SolutionPost> {
   let ready = post;
-  if (ready.status === 'AWAITING_APPROVAL') {
+  if (ready.status === 'AWAITING_APPROVAL' || (ready.status === 'DRAFT_READY' && ready.approvedHash !== ready.contentHash)) {
     if (!ready.contentHash) throw new PostError('CONTENT_HASH_MISSING');
     ready = await approvePost(ready.id, ready.contentHash);
   }
@@ -71,6 +74,10 @@ async function reportProgress(reporter: ProgressReporter | undefined, event: Sol
 
 function errorCode(error: unknown, fallback: string): string {
   return error instanceof PostError ? error.code : fallback;
+}
+
+function acceptedDailyRun(run: { problemSlug: string; state: string; submissionId: string | null; submissionStatus: string | null } | null, slug: string): boolean {
+  return !!run && run.problemSlug === slug && run.state === 'SUCCESS' && !!run.submissionId && run.submissionStatus === 'Accepted';
 }
 
 /**
@@ -173,6 +180,9 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
   const accounts = await prisma.account.findMany({ where: { id: { in: accountIds }, status: { not: 'DISABLED' } } });
   if (accounts.length !== accountIds.length) throw new PostError('ACCOUNT_UNAVAILABLE');
   const results: Array<{ accountId: string; postId?: string; status: string; error?: string }> = [];
+  const accepted: Array<{ accountId: string; slug: string; runId: string; submissionId: string }> = [];
+  // Finish code submissions for every selected account before invoking the AI.
+  // A slow or unavailable article provider must not hold up anyone's daily streak.
   for (const account of accounts) {
     let release: (() => Promise<void>) | null = null;
     try {
@@ -186,7 +196,7 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
       await reportProgress(onProgress, { accountId: account.id, stage: 'resolving_daily' });
       const daily = await resolveCurrentDaily(account, now);
       let run = await prisma.dailyRun.findUnique({ where: { accountId_date: { accountId: account.id, date: daily.date } } });
-      if (!run || run.problemSlug !== daily.slug || run.state !== 'SUCCESS' || !run.submissionId || run.submissionStatus !== 'Accepted') {
+      if (!acceptedDailyRun(run, daily.slug)) {
         // Lazy import avoids loading the submission stack for draft-only commands.
         const { runSubmissionNow } = await import('../scheduler/dailyWorker');
         await reportProgress(onProgress, { accountId: account.id, stage: 'submitting' });
@@ -194,32 +204,48 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
         if (!report) throw new PostError('SUBMISSION_WORKER_BUSY');
         run = await prisma.dailyRun.findUnique({ where: { accountId_date: { accountId: account.id, date: daily.date } } });
       }
-      if (!run || run.problemSlug !== daily.slug) throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
-      await reportProgress(onProgress, { accountId: account.id, stage: 'accepted', submissionId: run.submissionId ?? undefined });
+      if (!acceptedDailyRun(run, daily.slug) || !run) throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
+      await reportProgress(onProgress, { accountId: account.id, stage: 'accepted', submissionId: run.submissionId! });
+      accepted.push({ accountId: account.id, slug: daily.slug, runId: run.id, submissionId: run.submissionId! });
+    } catch (error) {
+      const code = errorCode(error, 'DAILY_SUBMISSION_FAILED');
+      results.push({ accountId: account.id, status: 'FAILED', error: code });
+      await reportProgress(onProgress, { accountId: account.id, stage: 'failed', error: code });
+    } finally { if (release) await release().catch(() => undefined); }
+  }
+  for (const run of accepted) {
+    let release: (() => Promise<void>) | null = null;
+    const accountId = run.accountId;
+    try {
+      release = await acquireDailyLease(accountId, now.toISOString().slice(0, 10));
+      if (!release) {
+        results.push({ accountId, status: 'SKIPPED', error: 'ACCOUNT_JOB_IN_PROGRESS' });
+        continue;
+      }
       const existing = await prisma.solutionPost.findUnique({ where: {
-        accountId_problemSlug_intent: { accountId: account.id, problemSlug: daily.slug, intent: 'community-solution' },
+        accountId_problemSlug_intent: { accountId, problemSlug: run.slug, intent: 'community-solution' },
       } });
       // Never resubmit accepted code for generation retries. Uncertain publications are left for reconciliation.
-      await reportProgress(onProgress, { accountId: account.id, stage: 'generating_article', submissionId: run.submissionId ?? undefined });
+      await reportProgress(onProgress, { accountId, stage: 'generating_article', submissionId: run.submissionId });
       let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status) ?
-        await retryPost(existing.id, true) : await generateForRun(account.id, run.id, true);
+        await retryPost(existing.id) : await generateForRun(accountId, run.runId);
       if (post.status === 'FAILED') {
         const error = post.lastError || 'GENERATION_FAILED';
-        results.push({ accountId: account.id, postId: post.id, status: 'FAILED', error });
-        await reportProgress(onProgress, { accountId: account.id, stage: 'failed', submissionId: run.submissionId ?? undefined, postId: post.id, error });
+        results.push({ accountId, postId: post.id, status: 'FAILED', error });
+        await reportProgress(onProgress, { accountId, stage: 'failed', submissionId: run.submissionId, postId: post.id, error });
         continue;
       }
       if (config.solutionPosts.autoPublish) {
-        await reportProgress(onProgress, { accountId: account.id, stage: 'publishing_article', submissionId: run.submissionId ?? undefined, postId: post.id });
+        await reportProgress(onProgress, { accountId, stage: 'publishing_article', submissionId: run.submissionId, postId: post.id });
         post = await publishGeneratedPost(post);
       }
-      results.push({ accountId: account.id, postId: post.id, status: post.status });
-      await reportProgress(onProgress, { accountId: account.id, stage: post.status === 'PUBLISHED' ? 'published' : 'article_ready',
-        submissionId: run.submissionId ?? undefined, postId: post.id, status: post.status });
+      results.push({ accountId, postId: post.id, status: post.status, ...(post.lastError ? { error: post.lastError } : {}) });
+      await reportProgress(onProgress, { accountId, stage: post.status === 'PUBLISHED' ? 'published' : 'article_ready',
+        submissionId: run.submissionId, postId: post.id, status: post.status });
     } catch (error) {
       const code = errorCode(error, 'COMBINED_WORKFLOW_FAILED');
-      results.push({ accountId: account.id, status: 'FAILED', error: code });
-      await reportProgress(onProgress, { accountId: account.id, stage: 'failed', error: code });
+      results.push({ accountId, status: 'FAILED', error: code });
+      await reportProgress(onProgress, { accountId, stage: 'failed', error: code });
     } finally { if (release) await release().catch(() => undefined); }
   }
   return results;
@@ -239,34 +265,77 @@ export async function setSelectedAccounts(accountIds: string[]) {
     publishing: config.solutionPosts.autoPublish ? 'automatic' : 'review-required' };
 }
 
-export function startSolutionPostScheduler(): () => void {
-  let running = false;
-  const tick = async () => {
-    if (running || !afterPostSchedule(new Date())) return;
-    running = true;
-    try {
-      await recoverGeneration();
-      const preferences = await prisma.solutionPostPreference.findMany({ where: { enabled: true } });
-      if (!preferences.length) return;
-      const today = new Date().toISOString().slice(0, 10);
-      const posts = await prisma.solutionPost.findMany({ where: { accountId: { in: preferences.map(p => p.accountId) } } });
-      const eligibleIds = preferences.filter(p => !posts.some(post => {
-        let date: string | undefined;
-        try { date = (JSON.parse(post.context) as { challengeDate: string }).challengeDate; } catch { return false; }
-        return post.accountId === p.accountId && date === today &&
-          (!['FAILED', 'RETRY_PENDING', 'PENDING'].includes(post.status) || post.retryCount >= 4);
-      })).map(p => p.accountId);
-      const pendingIds: string[] = [];
-      for (const id of eligibleIds) if (await reserveScheduledAttempt(id, today)) pendingIds.push(id);
-      if (!pendingIds.length) return;
-      const results = await runCombined(pendingIds);
-      logger.info({ results, timezone: POST_TIMEZONE, autoPublish: config.solutionPosts.autoPublish }, 'daily solution article workflow finished');
-    } catch { logger.warn('solution draft scheduler failed; inspect solution history'); }
-    finally { running = false; }
+export function isScheduledSolutionRunInProgress(): boolean { return scheduledRunInProgress; }
+
+/** Called by cron, restart catch-up, and the authenticated external wake endpoint. */
+export async function runScheduledSolutionPosts(now = new Date()) {
+  if (scheduledRunInProgress) return { status: 'BUSY' as const };
+  if (!afterPostSchedule(now)) return { status: 'BEFORE_SCHEDULE' as const };
+  scheduledRunInProgress = true;
+  const startedAt = now.toISOString();
+  const saveState = async (value: object) => {
+    const state = JSON.stringify({ startedAt, date: now.toISOString().slice(0, 10), ...value });
+    await prisma.systemState.upsert({ where: { key: SCHEDULE_STATE_KEY },
+      create: { key: SCHEDULE_STATE_KEY, value: state }, update: { value: state } });
   };
+  try {
+    await recoverGeneration(now);
+    const preferences = await prisma.solutionPostPreference.findMany({ where: { enabled: true } });
+    const selected = await prisma.account.findMany({ where: { id: { in: preferences.map(p => p.accountId) }, status: { not: 'DISABLED' } } });
+    const today = now.toISOString().slice(0, 10);
+    const ids = selected.map(a => a.id);
+    const [runs, posts] = await Promise.all([
+      prisma.dailyRun.findMany({ where: { accountId: { in: ids }, date: today } }),
+      prisma.solutionPost.findMany({ where: { accountId: { in: ids } } }),
+    ]);
+    const eligibleIds = ids.filter(id => {
+      const run = runs.find(r => r.accountId === id);
+      // A manual/existing article never substitutes for today's accepted code.
+      if (!run || !acceptedDailyRun(run, run.problemSlug)) return true;
+      const post = posts.find(p => p.accountId === id && p.problemSlug === run.problemSlug);
+      if (!post) return true;
+      if (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(post.status)) return config.solutionPosts.autoPublish;
+      return ['PENDING', 'RETRY_PENDING', 'FAILED'].includes(post.status) && post.retryCount < 4;
+    });
+    const pendingIds: string[] = [];
+    for (const id of eligibleIds) if (await reserveScheduledAttempt(id, today)) pendingIds.push(id);
+    if (!pendingIds.length) {
+      await saveState({ status: 'IDLE', selected: ids.length, eligible: eligibleIds.length,
+        reason: !ids.length ? 'NO_SELECTED_ACCOUNTS' : eligibleIds.length ? 'DAILY_RETRY_LIMIT' : 'NO_PENDING_WORK' });
+      return { status: 'IDLE' as const };
+    }
+    await saveState({ status: 'RUNNING', accountIds: pendingIds });
+    const results = await runCombined(pendingIds, now);
+    for (const result of results) {
+      // Contention is not an execution failure and must not use up the day's retries.
+      if (['SUBMISSION_WORKER_BUSY', 'ACCOUNT_JOB_IN_PROGRESS'].includes(result.error ?? '')) {
+        const key = `solution-post-schedule-budget:${result.accountId}:${today}`;
+        const old = await prisma.systemState.findUnique({ where: { key } });
+        if (old) await prisma.systemState.updateMany({ where: { key, value: old.value },
+          data: { value: String(Math.max(0, Number(old.value) - 1)) } });
+      }
+    }
+    await saveState({ status: 'FINISHED', finishedAt: new Date().toISOString(), results });
+    logger.info({ results, timezone: POST_TIMEZONE, autoPublish: config.solutionPosts.autoPublish }, 'daily solution article workflow finished');
+    if (config.telegram.enabled) {
+      const failures = results.filter(r => r.status === 'FAILED');
+      await sendTelegramMessage(`06:00 IST daily workflow: ${results.filter(r => r.status === 'PUBLISHED').length} article(s) published; ${failures.length} failed.` +
+        (failures.length ? '\n' + failures.map(r => `${r.accountId}: ${r.error ?? 'WORKFLOW_FAILED'}`).join('\n') : '')).catch(() => undefined);
+    }
+    return { status: 'FINISHED' as const, results };
+  } catch (error) {
+    const code = errorCode(error, 'SCHEDULE_OPERATION_FAILED');
+    await saveState({ status: 'FAILED', error: code }).catch(() => undefined);
+    logger.warn({ code }, 'solution scheduler failed; inspect /admin/solutions/diagnostics');
+    return { status: 'FAILED' as const, error: code };
+  } finally { scheduledRunInProgress = false; }
+}
+
+export function startSolutionPostScheduler(): () => void {
+  const tick = () => void runScheduledSolutionPosts();
   // The recovery timer also catches up after a restart; uniqueness and leases arbitrate multiple processes.
-  const daily = cron.schedule(POST_CRON, () => void tick(), { timezone: POST_TIMEZONE });
-  const recovery = cron.schedule('*/10 * * * *', () => void tick(), { timezone: POST_TIMEZONE });
-  void tick();
+  const daily = cron.schedule(POST_CRON, tick, { timezone: POST_TIMEZONE });
+  const recovery = cron.schedule('*/10 * * * *', tick, { timezone: POST_TIMEZONE });
+  tick();
   return () => { daily.stop(); recovery.stop(); };
 }

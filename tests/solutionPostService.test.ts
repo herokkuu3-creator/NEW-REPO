@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ row: null as any, rows: [] as any[], generation: vi.fn(), verifyVisuals: vi.fn(),
   checkSession: vi.fn(), launch: vi.fn(), browser: { newContext: vi.fn(), close: vi.fn() },
-  question: vi.fn(), verdict: vi.fn(), run: null as any, account: null as any }));
+  question: vi.fn(), verdict: vi.fn(), daily: vi.fn(), refresh: vi.fn(), run: null as any, account: null as any }));
 vi.mock('../src/database/prisma', () => ({ prisma: {
   solutionPost: {
     upsert: vi.fn(async ({ create }: any) => {
@@ -20,15 +20,17 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
   },
   dailyRun: { findUniqueOrThrow: vi.fn(async () => h.run), findFirst: vi.fn(async () => h.run) },
   account: { findUniqueOrThrow: vi.fn(async () => h.account) },
-  systemState: { findUnique: vi.fn(async () => null), upsert: vi.fn(async () => ({})) },
+  systemState: { findUnique: vi.fn(async () => null), upsert: vi.fn(async () => ({})), deleteMany: vi.fn(async () => ({ count: 1 })) },
 } }));
 vi.mock('../src/solutionPosts/article', async orig => ({ ...(await orig() as object), generateArticle: h.generation }));
 vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn(), verifyHostedVisualAssets: h.verifyVisuals }));
 vi.mock('playwright', () => ({ chromium: { launch: h.launch } }));
 vi.mock('../src/browser/sessionCheck', () => ({ checkSession: h.checkSession }));
 vi.mock('../src/leetcode/apiClient', () => ({ LeetCodeApi: class { awaitSubmission = h.verdict; } }));
-vi.mock('../src/leetcode/dailyChallenge', () => ({ fetchQuestionData: h.question, fetchDailyChallenge: vi.fn() }));
-import { activeSolutionApiKeys, generateForRun, generatePost, loadContext, withAccount } from '../src/solutionPosts/service';
+vi.mock('../src/leetcode/dailyChallenge', () => ({ fetchQuestionData: h.question, fetchDailyChallenge: h.daily }));
+vi.mock('../src/security/sessionAutoRefresh', () => ({ refreshLeetCodeAccount: h.refresh }));
+import { activeSolutionApiKeys, generateForRun, generatePost, loadContext, resolveCurrentDaily, resetFailedSolutionPostRetries, withAccount } from '../src/solutionPosts/service';
+import { prisma } from '../src/database/prisma';
 import { assertTransition, approvePost, move } from '../src/solutionPosts/store';
 import { ArticleReviewError, contextSchema, hash } from '../src/solutionPosts/article';
 import { RoutingError } from '../src/solutionPosts/router';
@@ -47,9 +49,21 @@ beforeEach(() => {
   h.checkSession.mockResolvedValue({ authenticated: true, username: 'alice' });
   h.verdict.mockResolvedValue({ classification: 'ACCEPTED' });
   h.question.mockResolvedValue({ questionId: '1', slug: 'example', contentHtml: 'An example problem', isPaidOnly: false });
+  h.daily.mockResolvedValue({ date: '2026-10-15', slug: 'example' });
+  h.refresh.mockResolvedValue({ status: 'refreshed' });
 });
 
 describe('solution workflow and persistence', () => {
+  it('renews an expired session before resolving the 06:00 daily, without waiting for the 07:00 session check', async () => {
+    h.checkSession.mockResolvedValueOnce({ authenticated: false, cause: 'signed-out' });
+    expect(await resolveCurrentDaily(h.account, new Date('2026-10-15T00:30:00Z'))).toMatchObject({ slug: 'example' });
+    expect(h.refresh).toHaveBeenCalledWith(h.account);
+    expect(h.browser.close).toHaveBeenCalledTimes(2);
+  });
+  it('clears both generation failures and the independent scheduled-attempt budget after a key repair', async () => {
+    await resetFailedSolutionPostRetries();
+    expect(prisma.systemState.deleteMany).toHaveBeenCalledWith({ where: { key: { startsWith: 'solution-post-schedule-budget:' } } });
+  });
   it('does not retry keys already advanced past for the current month', () => {
     expect(activeSolutionApiKeys({ keys: ['spent', 'usable-a', 'usable-b'], activeIndex: 1 })).toEqual(['usable-a', 'usable-b']);
     expect(activeSolutionApiKeys({ keys: ['spent'], activeIndex: 1 })).toEqual([]);

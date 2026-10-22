@@ -2,11 +2,13 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config';
 import { prisma } from '../database/prisma';
-import { generateForRun, retryPost, PostError } from './service';
+import { generateForRun, retryPost, PostError, resetFailedSolutionPostRetries } from './service';
 import { approvePost } from './store';
 import { publishPost, reconcilePost } from './publisher';
-import { runCombined, setSelectedAccounts, POST_CRON, POST_TIMEZONE } from './scheduler';
-import { appendSolutionApiKeys, solutionKeyPoolStatus } from './keyPool';
+import { runCombined, setSelectedAccounts, POST_CRON, POST_TIMEZONE, runScheduledSolutionPosts,
+  isScheduledSolutionRunInProgress, SCHEDULE_STATE_KEY } from './scheduler';
+import { appendSolutionApiKeys, solutionKeyPoolStatus, testSolutionApiKey } from './keyPool';
+import { PROVIDER_CHECK_STATE_KEY } from './providerDiagnostics';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
   app.register(async scoped => {
@@ -46,6 +48,23 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       const body = z.object({ accountIds: z.array(z.string().min(1)).min(1).max(100) }).strict().parse(req.body);
       return runCombined(body.accountIds);
     });
+    scoped.get('/admin/solutions/diagnostics', async () => ({
+      serverTime: new Date().toISOString(), executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
+      revision: process.env.RENDER_GIT_COMMIT ?? null,
+      cron: POST_CRON, timezone: POST_TIMEZONE, autoPublish: config.solutionPosts.autoPublish,
+      running: isScheduledSolutionRunInProgress(), models: config.solutionPosts.models,
+      selected: await prisma.solutionPostPreference.findMany({ where: { enabled: true } }),
+      scheduler: await prisma.systemState.findUnique({ where: { key: SCHEDULE_STATE_KEY } }),
+      provider: await prisma.systemState.findUnique({ where: { key: PROVIDER_CHECK_STATE_KEY } }),
+      keys: await solutionKeyPoolStatus(),
+    }));
+    scoped.post('/admin/solutions/scheduled', async (req, reply) => {
+      z.object({}).strict().parse(req.body ?? {});
+      if (isScheduledSolutionRunInProgress()) return reply.code(202).send({ status: 'ALREADY_RUNNING' });
+      // Return before a cold-start proxy timeout. Durable diagnostics record completion.
+      void runScheduledSolutionPosts();
+      return reply.code(202).send({ status: 'ACCEPTED', cron: POST_CRON, timezone: POST_TIMEZONE });
+    });
     scoped.post('/admin/solutions/generate', async req => {
       const body = z.object({ accountId: z.string().min(1), runId: z.string().min(1) }).strict().parse(req.body);
       const post = await generateForRun(body.accountId, body.runId);
@@ -57,7 +76,14 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       const { apiKeys } = z.object({ apiKeys: z.string().min(1).max(52000) }).strict().parse(req.body);
       const result = await appendSolutionApiKeys(apiKeys);
       const status = await solutionKeyPoolStatus();
+      if (status.active) await resetFailedSolutionPostRetries();
       return { added: result.added, duplicates: result.duplicates, ...status };
+    });
+    scoped.post('/admin/solutions/api-keys/test', async req => {
+      const body = z.object({ apiKey: z.string().min(8).max(512).optional(),
+        model: z.enum(['gpt-5.6-terra', 'gpt-5.6-luna', 'gemini-3.7-flash', 'gemini-3.8-flash']).optional(),
+      }).strict().parse(req.body ?? {});
+      return testSolutionApiKey(body.apiKey, body.model);
     });
     scoped.get('/admin/solutions/:id', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);

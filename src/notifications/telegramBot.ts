@@ -3251,6 +3251,7 @@ export async function handleAddSolutionApiKeys(commandArg?: string): Promise<voi
   pendingPromptType = null;
   try {
     const result = await appendSolutionApiKeys(raw);
+    if (result.added) await resetFailedSolutionPostRetries();
     const status = await solutionKeyPoolStatus();
     await replyHtml([
       '✅ <b>Article API key(s) saved</b>',
@@ -3311,7 +3312,7 @@ export async function handleTestSolutionApiKey(commandArg?: string): Promise<voi
     `• <b>GET /v1/models:</b> ${result.modelsStatus === 200 ? '🟢 HTTP 200 OK' : `🔴 HTTP ${result.modelsStatus}`} (${result.modelsCount} models returned)`,
   ];
   if (result.chatStatus) {
-    if (result.chatStatus === 200) {
+    if (result.ok) {
       lines.push(`• <b>POST /v1/chat/completions:</b> 🟢 HTTP 200 OK (model: <code>${result.chatModel}</code>)`);
       lines.push('');
       lines.push('✅ <b>Inference is fully operational!</b> Articles can be generated.');
@@ -3323,8 +3324,8 @@ export async function handleTestSolutionApiKey(commandArg?: string): Promise<voi
       lines.push('');
       if (result.chatStatus === 402) {
         lines.push('⚠️ <b>Cause:</b> CodeCraft rejected inference with <code>Billing verification failed</code>.');
-        lines.push('The key is syntactically valid and recognized by CodeCraft, but the account has not completed billing verification or has insufficient funds.');
-        lines.push('👉 Visit <a href="https://codecraftapi.com">codecraftapi.com</a> to verify billing or attach a payment method.');
+        lines.push('CodeCraft accepted the connection but rejected inference for billing/quota. A successful model list does not verify inference access.');
+        lines.push('Check the plan/allowance with <a href="https://codecraftapi.com">CodeCraft</a>, then use <code>/resetsolutionkeys</code> after the provider resolves it.');
       } else if (result.chatStatus === 401) {
         lines.push('⚠️ <b>Cause:</b> Invalid or revoked API key.');
       }
