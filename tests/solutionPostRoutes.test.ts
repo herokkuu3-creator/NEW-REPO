@@ -26,7 +26,8 @@ describe('solution admin routes', () => {
   it('requires the existing admin bearer token for reads and mutations', async () => {
     const app = Fastify(); registerSolutionPostRoutes(app, h => h === 'Bearer admin-test');
     for (const [method, url] of [['GET', '/admin/solutions'], ['PUT', '/admin/solutions/schedule'], ['POST', '/admin/solutions/generate'],
-      ['POST', '/admin/solutions/scheduled'], ['GET', '/admin/solutions/diagnostics'], ['POST', '/admin/solutions/api-keys/test']]) {
+      ['POST', '/admin/solutions/scheduled'], ['GET', '/admin/solutions/diagnostics'], ['POST', '/admin/solutions/api-keys/test'],
+      ['POST', '/admin/solutions/openrouter/free-test']]) {
       const response = await app.inject({ method: method as any, url }); expect(response.statusCode).toBe(401);
     }
     const history = await app.inject({ method: 'GET', url: '/admin/solutions', headers: { authorization: 'Bearer admin-test' } });
@@ -68,5 +69,24 @@ describe('solution admin routes', () => {
     expect((await app.inject({ method: 'POST', url: '/admin/solutions/scheduled', headers })).statusCode).toBe(202);
     expect(h.scheduled).toHaveBeenCalled();
     await app.close();
+  });
+  it('probes one fixed OpenRouter free model and never returns the supplied key', async () => {
+    const apiKey = `sk-or-v1-${'a'.repeat(64)}`;
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => new Response(JSON.stringify({
+      model: 'nvidia/nemotron-3-ultra-550b-a55b:free', provider: 'Nvidia',
+      choices: [{ finish_reason: 'stop', message: { content: 'OPENROUTER_RENDER_OK' } }], usage: { cost: 0 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const app = Fastify(); registerSolutionPostRoutes(app, h => h === 'Bearer admin-test');
+    const response = await app.inject({ method: 'POST', url: '/admin/solutions/openrouter/free-test',
+      headers: { authorization: 'Bearer admin-test' }, payload: { apiKey } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ ok: true, requestedModel: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+      servedModel: 'nvidia/nemotron-3-ultra-550b-a55b:free', reportedCostUsd: 0, executionHost: 'local' });
+    expect(response.body).not.toContain(apiKey);
+    expect(fetchMock).toHaveBeenCalledWith('https://openrouter.ai/api/v1/chat/completions', expect.objectContaining({
+      method: 'POST', body: expect.stringContaining('nvidia/nemotron-3-ultra-550b-a55b:free'),
+    }));
+    vi.unstubAllGlobals(); await app.close();
   });
 });

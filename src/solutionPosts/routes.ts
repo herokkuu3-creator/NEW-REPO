@@ -85,6 +85,37 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       }).strict().parse(req.body ?? {});
       return testSolutionApiKey(body.apiKey, body.model);
     });
+    scoped.post('/admin/solutions/openrouter/free-test', async req => {
+      const { apiKey } = z.object({ apiKey: z.string().regex(/^sk-or-v1-[A-Za-z0-9]{64}$/) })
+        .strict().parse(req.body ?? {});
+      const model = 'nvidia/nemotron-3-ultra-550b-a55b:free';
+      const maskedKey = `${apiKey.slice(0, 10)}…${apiKey.slice(-4)}`;
+      try {
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Reply with exactly OPENROUTER_RENDER_OK.' }],
+            max_tokens: 512, temperature: 0 }),
+          signal: AbortSignal.timeout(45000),
+        });
+        const raw = await response.text();
+        let data: any = {};
+        try { data = JSON.parse(raw); } catch {}
+        const content = data.choices?.[0]?.message?.content;
+        const cost = data.usage?.cost ?? data.usage?.total_cost ?? null;
+        return { ok: response.ok && typeof content === 'string' && content.trim().length > 0,
+          executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local', status: response.status,
+          keyMasked: maskedKey, requestedModel: model, servedModel: data.model ?? null,
+          provider: data.provider ?? null, finishReason: data.choices?.[0]?.finish_reason ?? null,
+          replyReceived: typeof content === 'string' && content.trim().length > 0,
+          reportedCostUsd: cost,
+          ...(response.ok ? {} : { error: String(data.error?.message ?? `HTTP_${response.status}`).replaceAll(apiKey, '[REDACTED]').slice(0, 300) }),
+        };
+      } catch {
+        return { ok: false, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
+          status: 0, keyMasked: maskedKey, requestedModel: model, error: 'OPENROUTER_REQUEST_FAILED' };
+      }
+    });
     scoped.get('/admin/solutions/:id', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);
       const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
