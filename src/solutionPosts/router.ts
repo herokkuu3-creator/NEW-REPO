@@ -1,7 +1,12 @@
 import OpenAI from 'openai';
 import { z } from 'zod';
 import { LLMMessage } from '../ai/provider';
-import { solutionPostProviderHeaders } from '../config/solutionPostProvider';
+import { isBazaarLinkProvider, solutionPostProviderHeaders } from '../config/solutionPostProvider';
+
+// BazaarLink documents 10 free requests/minute. Reserve starts across routers
+// in this process, with a little headroom for diagnostics. Never enable paid fallback.
+let nextBazaarFreeRequestAt = 0;
+let bazaarFreeBlockedUntil = 0;
 
 export interface RouterOptions {
   apiKey: string;
@@ -13,6 +18,7 @@ export interface RouterOptions {
   maxTokens: number;
   modelTimeoutMs?: Record<string, number>;
   reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  minRequestIntervalMs?: number;
 }
 export interface ModelAttempt {
   model: string;
@@ -22,6 +28,10 @@ export interface ModelAttempt {
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
   cost?: number;
   keySlot?: number;
+  stage?: string;
+  httpStatus?: number;
+  retryAfterMs?: number;
+  deferred?: boolean;
 }
 export class RoutingError extends Error {
   constructor(public readonly attempts: ModelAttempt[], public readonly lastFailure?: string) {
@@ -36,6 +46,7 @@ export class OutputValidationError extends Error {
 export class AIModelRouter {
   private readonly apiKeys: string[];
   private readonly exhaustedKeys = new Set<string>();
+  private readonly catalogs = new Map<string, Set<string>>();
   private readonly firstClient?: OpenAI;
   constructor(private readonly options: RouterOptions, client?: OpenAI,
     private readonly sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms)),
@@ -49,7 +60,7 @@ export class AIModelRouter {
   }
 
   async generate<T>(messages: LLMMessage[], validate: (text: string) => T, maxTokens = this.options.maxTokens,
-    jsonMode = false): Promise<{
+    jsonMode = false, stage?: string): Promise<{
     value: T; model: string; attempts: ModelAttempt[];
   }> {
     const attempts: ModelAttempt[] = [];
@@ -60,11 +71,17 @@ export class AIModelRouter {
       const client = keyIndex === 0 && this.firstClient ? this.firstClient : this.createClient(key);
       let available: Set<string>;
       try {
-        const list = await client.models.list({ timeout: this.options.timeoutMs });
-        available = new Set(list.data.map(m => m.id));
+        const cached = this.catalogs.get(key);
+        if (cached) available = cached;
+        else {
+          const list = await client.models.list({ timeout: this.options.timeoutMs });
+          available = new Set(list.data.map(m => m.id));
+          this.catalogs.set(key, available);
+        }
       } catch (error) {
         const discoveryForbidden = isModelDiscoveryForbidden(error);
-        const record = { model: 'discovery', attempt: 1, keySlot: keyIndex + 1, elapsedMs: 0,
+        const record: ModelAttempt = { model: 'discovery', attempt: 1, keySlot: keyIndex + 1, elapsedMs: 0, stage,
+          ...httpFailureDetails(error),
           outcome: discoveryForbidden ? 'MODELS_READ_FORBIDDEN' : safeOutcome(error) };
         attempts.push(record); this.onAttempt(record);
         // CodeCraft separates `models:read` from `inference`. A restricted key
@@ -73,9 +90,10 @@ export class AIModelRouter {
         // that case; never infer arbitrary provider models.
         if (discoveryForbidden) {
           available = new Set(this.options.models);
+          this.catalogs.set(key, available);
         } else {
           lastFailureReason = safeOutcome(error);
-          if (isKeyExhausted(error)) { await this.markExhausted(key, record.outcome); continue; }
+          if (isKeyExhausted(error, this.options.baseUrl)) { await this.markExhausted(key, record.outcome); continue; }
           throw new RoutingError(attempts, lastFailureReason);
         }
       }
@@ -88,9 +106,26 @@ export class AIModelRouter {
         let attemptMaxTokens = maxTokens;
         for (let n = 0; n <= this.options.retries; n++) {
           const started = Date.now();
-          const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'INVALID_OUTPUT' };
+          const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'INVALID_OUTPUT', stage };
           let transient = false;
           try {
+            if (isBazaarLinkProvider(this.options.baseUrl) && model.endsWith(':free')) {
+              const interval = this.options.minRequestIntervalMs ?? 6500;
+              if (interval > 0) {
+                assertBazaarCooldownBudget(record);
+                let start = Math.max(Date.now(), nextBazaarFreeRequestAt, bazaarFreeBlockedUntil);
+                nextBazaarFreeRequestAt = start + interval;
+                if (start > Date.now()) await this.sleep(start - Date.now());
+                // A different router may have received Retry-After while this
+                // reservation was waiting. Rebook its start behind the cooldown.
+                while (start < bazaarFreeBlockedUntil) {
+                  assertBazaarCooldownBudget(record);
+                  start = Math.max(Date.now(), nextBazaarFreeRequestAt, bazaarFreeBlockedUntil);
+                  nextBazaarFreeRequestAt = start + interval;
+                  if (start > Date.now()) await this.sleep(start - Date.now());
+                }
+              }
+            }
             const request = { model, messages, max_tokens: attemptMaxTokens,
               ...(jsonMode ? { response_format: { type: 'json_object' as const } } : {}),
               ...(this.options.reasoningEffort ? { reasoning_effort: this.options.reasoningEffort } : {}) };
@@ -108,7 +143,11 @@ export class AIModelRouter {
             attempts.push(record); this.onAttempt(record);
             return { value, model, attempts };
           } catch (error) {
-            if (isKeyExhausted(error)) {
+            Object.assign(record, httpFailureDetails(error));
+            if (!record.deferred && record.httpStatus === 429 && isBazaarLinkProvider(this.options.baseUrl)) {
+              bazaarFreeBlockedUntil = Math.max(bazaarFreeBlockedUntil, Date.now() + (record.retryAfterMs ?? 1000));
+            }
+            if (isKeyExhausted(error, this.options.baseUrl)) {
               const apiErr = error instanceof OpenAI.APIError ? error : undefined;
               record.outcome = apiErr?.status === 401 ? 'HTTP_401' :
                 apiErr?.status === 402 ? 'HTTP_402_BILLING_REQUIRED' : 'KEY_EXHAUSTED';
@@ -132,7 +171,9 @@ export class AIModelRouter {
           }
           transient ||= record.outcome === 'INCOMPLETE_OUTPUT';
           if (exhausted || !transient || n === this.options.retries) break;
-          await this.sleep(Math.min(1000 * 2 ** n, 8000));
+          // Defer instead of retrying before a long provider-specified reset.
+          if ((record.retryAfterMs ?? 0) > 60000) break;
+          await this.sleep(Math.max(Math.min(1000 * 2 ** n, 8000), record.retryAfterMs ?? 0));
         }
         if (exhausted) break;
       }
@@ -164,14 +205,33 @@ function safeOutcome(error: unknown): string {
 }
 
 /** Invalid credentials and spent allowances retire a key; ordinary rate limits do not. */
-export function isKeyExhausted(error: unknown): boolean {
+export function isKeyExhausted(error: unknown, baseUrl?: string): boolean {
   const api = error instanceof OpenAI.APIError ? error : undefined;
   const status = api?.status;
   if (status === 401 || status === 402) return true;
   if (status !== 429) return false;
+  // BazaarLink uses 429 for RPM/daily free allowances and spend brakes;
+  // monthly balance/allowance failures use 402. Do not retire a valid key for a month.
+  if (baseUrl && isBazaarLinkProvider(baseUrl)) return false;
   const candidate = error as { code?: unknown; type?: unknown; message?: unknown };
   const detail = [candidate.code, candidate.type, candidate.message].filter(v => typeof v === 'string').join(' ').toLowerCase();
   return /quota|credit|balance|billing|payment|monthly|insufficient_funds/.test(detail);
+}
+
+function httpFailureDetails(error: unknown): Pick<ModelAttempt, 'httpStatus' | 'retryAfterMs'> {
+  if (!(error instanceof OpenAI.APIError)) return {};
+  const headers = error.headers as Headers | Record<string, string> | undefined;
+  const value = headers instanceof Headers ? headers.get('retry-after') : headers?.['retry-after'];
+  const delay = value ? (/^\d+(?:\.\d+)?$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now()) : NaN;
+  return { httpStatus: error.status, ...(Number.isFinite(delay) ? { retryAfterMs: Math.max(0, delay) } : {}) };
+}
+
+function assertBazaarCooldownBudget(record: ModelAttempt): void {
+  const remaining = bazaarFreeBlockedUntil - Date.now();
+  if (remaining <= 60000) return;
+  record.deferred = true;
+  throw new OpenAI.RateLimitError(429, {}, 'Previously observed provider cooldown is still active',
+    { 'retry-after': String(Math.ceil(remaining / 1000)) });
 }
 
 /** A CodeCraft key may intentionally omit models:read while retaining inference. */

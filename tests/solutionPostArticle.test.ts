@@ -176,6 +176,51 @@ describe('AI model routing', () => {
     expect(advanced).not.toHaveBeenCalled();
     expect(api.chat.completions.create.mock.calls).toHaveLength(2);
   });
+  it('keeps a BazaarLink free-quota 429 active and respects Retry-After', async () => {
+    const api = client(); const retired = vi.fn(); const sleep = vi.fn(async () => {});
+    api.models.list.mockResolvedValue({ data: [{ id: 'qwen/qwen3.7-flash:free' }] });
+    api.chat.completions.create.mockRejectedValueOnce(new OpenAI.RateLimitError(429,
+      { code: 'free_quota_exceeded' }, 'Free quota exceeded', new Headers({ 'retry-after': '7' })))
+      .mockResolvedValueOnce(complete('ok'));
+    const result = await new AIModelRouter({ ...options, baseUrl: 'https://api.bazaarlink.ai/v1',
+      models: ['qwen/qwen3.7-flash:free'], minRequestIntervalMs: 0 }, api as never, sleep, undefined, retired)
+      .generate([], value => value);
+    expect(retired).not.toHaveBeenCalled(); expect(sleep).toHaveBeenCalledWith(7000);
+    expect(result.attempts[0]).toMatchObject({ outcome: 'HTTP_429', httpStatus: 429, retryAfterMs: 7000 });
+  });
+  it('paces free model requests across separate routers and caches discovery across stages', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const times: number[] = [];
+      const api = client(); api.models.list.mockResolvedValue({ data: [{ id: 'qwen/qwen3.7-flash:free' }] });
+      api.chat.completions.create.mockImplementation(async () => { times.push(Date.now()); return complete('ok'); });
+      const sleep = vi.fn(async (ms: number) => { vi.setSystemTime(Date.now() + ms); });
+      const opts = { ...options, baseUrl: 'https://api.bazaarlink.ai/v1', models: ['qwen/qwen3.7-flash:free'] };
+      const first = new AIModelRouter(opts, api as never, sleep);
+      await first.generate([], value => value);
+      await new AIModelRouter(opts, api as never, sleep).generate([], value => value);
+      await first.generate([], value => value);
+      expect(times[1]! - times[0]!).toBeGreaterThanOrEqual(6500);
+      expect(times[2]! - times[1]!).toBeGreaterThanOrEqual(6500);
+      expect(api.models.list).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+  it('defers a long free-allowance reset instead of retrying early or retiring the key', async () => {
+    const api = client(); const retired = vi.fn(); const sleep = vi.fn(async () => {});
+    api.models.list.mockResolvedValue({ data: [{ id: 'qwen/qwen3.7-flash:free' }] });
+    api.chat.completions.create.mockRejectedValue(new OpenAI.RateLimitError(429, {}, 'Free allowance limit',
+      new Headers({ 'retry-after': '3600' })));
+    const opts = { ...options, baseUrl: 'https://api.bazaarlink.ai/v1', models: ['qwen/qwen3.7-flash:free'], minRequestIntervalMs: 0 };
+    const first = await new AIModelRouter(opts, api as never, sleep, undefined, retired)
+      .generate([], value => value).catch(e => e as RoutingError);
+    expect(first.lastFailure).toBe('HTTP_429');
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled(); expect(retired).not.toHaveBeenCalled();
+    const queued = await new AIModelRouter({ ...opts, minRequestIntervalMs: 6500 }, api as never, sleep, undefined, retired)
+      .generate([], value => value).catch(e => e as RoutingError);
+    expect(queued.attempts[0]).toMatchObject({ outcome: 'HTTP_429', deferred: true });
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(1);
+  });
   it('does not retry the exhausted key during the separate review request or persist raw provider errors', async () => {
     const first = client(); const second = client();
     first.chat.completions.create.mockRejectedValue(new OpenAI.APIError(402, {}, 'billing secret-test-key', undefined));
@@ -217,6 +262,30 @@ describe('AI model routing', () => {
     api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
     await expect(generateArticle(new AIModelRouter(options, api as never), context, [])).rejects.toBeInstanceOf(RoutingError);
     expect(api.chat.completions.create).toHaveBeenCalledTimes(11);
+  });
+  it('normalizes JSON bullet arrays and grounds every animation in the supplied problem', async () => {
+    const api = client(); const responses = stagedResponses(article);
+    const approach = JSON.parse(responses[1]!.choices[0]!.message.content);
+    approach.section.markdown = ['Fix the left boundary.', 'Extend the set.', 'Add the squared count.'];
+    responses[1] = complete(JSON.stringify(approach));
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
+    const result = await generateArticle(new AIModelRouter(options, api as never), context, []);
+    expect(result.article.sections.find(s => s.kind === 'approach')?.markdown).toContain('- Extend the set.');
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(10);
+    const prompts = api.chat.completions.create.mock.calls.map(call => JSON.stringify(call[0])).join('\n');
+    expect(prompts).not.toContain('(()())'); expect(prompts).not.toContain('depth invariant');
+    expect(prompts).toContain(context.problem);
+  });
+  it('repairs a malformed section with the original source and explicit field types', async () => {
+    const api = client(); const responses = stagedResponses(article);
+    const valid = responses[1]!; const broken = JSON.parse(valid.choices[0]!.message.content);
+    broken.section.markdown = null;
+    responses.splice(1, 1, complete(JSON.stringify(broken)), valid);
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
+    await generateArticle(new AIModelRouter(options, api as never), context, []);
+    const repair = api.chat.completions.create.mock.calls[2]![0] as any;
+    expect(repair.messages[0].content).toContain('nonempty Markdown string');
+    expect(JSON.parse(repair.messages[1].content).source.code).toBe(context.code);
   });
   it.each([false, true])('resolves both GIFs after review and keeps trace tables only for offline fallback: %s', async hostFails => {
     const draft = structuredClone(article);

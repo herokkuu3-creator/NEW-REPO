@@ -113,7 +113,7 @@ describe('solution article API key pool', () => {
     const migrated = await loadSolutionKeyPool();
     expect(migrated.keys).toEqual(['opaque_environment_key', 'sk-bl-environment_key', 'sk-bl-saved_provider_key']);
     expect(migrated.activeIndex).toBe(0);
-    await rotateSolutionApiKey('opaque_environment_key');
+    await rotateSolutionApiKey('opaque_environment_key', 'HTTP_401');
     expect((await loadSolutionKeyPool()).activeIndex).toBe(1);
     expect(migrated.keys).not.toContain('cc_old_provider_key');
   });
@@ -137,7 +137,7 @@ describe('solution article API key pool', () => {
     expect((await loadSolutionKeyPool()).keys).toEqual([]);
     Object.assign(config.solutionPosts, { apiKeys: ['opaque_recovered_key'] });
     expect((await loadSolutionKeyPool()).keys).toEqual(['opaque_recovered_key']);
-    await rotateSolutionApiKey('opaque_recovered_key');
+    await rotateSolutionApiKey('opaque_recovered_key', 'HTTP_401');
     expect((await loadSolutionKeyPool()).activeIndex).toBe(1);
   });
   it('allows a bot-saved replacement to repair an invalid environment input', async () => {
@@ -149,6 +149,14 @@ describe('solution article API key pool', () => {
       .mockResolvedValueOnce(new Response('{"choices":[{"message":{"content":"OK"}}]}'));
     vi.stubGlobal('fetch', fetcher);
     expect(await testSolutionApiKey()).toMatchObject({ ok: true, chatStatus: 200 });
+  });
+  it('restores the BazaarLink slot wrongly retired for 429 without reviving an earlier invalid credential', async () => {
+    Object.assign(config.solutionPosts, { baseUrl: 'https://api.bazaarlink.ai/v1', apiKeys: [] });
+    await replaceSolutionApiKeys('invalid_key_0001,sk-bl-valid_key_0002');
+    await rotateSolutionApiKey('invalid_key_0001', 'HTTP_401');
+    await rotateSolutionApiKey('sk-bl-valid_key_0002', 'KEY_EXHAUSTED');
+    expect(await loadSolutionKeyPool()).toMatchObject({ activeIndex: 1, lastFailure: undefined });
+    expect((await loadSolutionKeyPool()).activeIndex).toBe(1);
   });
   it('tests the selected BazaarLink model and key pool without enabling paid fallback', async () => {
     Object.assign(config.solutionPosts, { baseUrl: 'https://api.bazaarlink.ai/v1', models: ['qwen/qwen3.7-flash:free'] });

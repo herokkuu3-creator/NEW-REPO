@@ -116,6 +116,12 @@ export async function loadSolutionKeyPool(now = new Date()): Promise<SolutionKey
         pool = await persist({ ...pool, keys: [...pool.keys, ...additions], environmentFingerprint,
           providerFingerprint: configuredProvider });
       }
+      // Older versions retired a valid BazaarLink key on free-tier 429 and
+      // skipped it until next month. Restore the most recently retired slot
+      // once, preserving earlier authentication/billing retirements.
+      if (bazaarLink && ['KEY_EXHAUSTED', 'HTTP_429'].includes(pool.lastFailure ?? '') && pool.activeIndex > 0) {
+        pool = await persist({ ...pool, activeIndex: pool.activeIndex - 1, lastFailure: undefined });
+      }
       const period = solutionKeyPeriod(now);
       // A previous month's exhausted quota must not permanently strand the
       // earlier keys. Reset only at a calendar-month boundary, never during

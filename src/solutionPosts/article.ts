@@ -2,6 +2,13 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { AIModelRouter, OutputValidationError, RoutingError, ModelAttempt } from './router';
 import { sectionKinds, visualFrameSchema, visualPlanSchema, VisualAsset, VisualResolver, renderVisualFallback, plainMarkdown } from './visuals';
+import { logger } from '../logger';
+
+// Some models represent requested action bullets as a JSON string array. This
+// lossless conversion still passes the normal length, markup, and review checks.
+const sectionMarkdown = z.preprocess(value => Array.isArray(value) && value.every(line => typeof line === 'string') ?
+  value.map(line => /^\s*(?:[-*]|\d+\.)\s/.test(line) ? line : `- ${line}`).join('\n') : value,
+z.string().min(12).max(1500));
 
 export const hash = (text: string): string => createHash('sha256').update(text).digest('hex');
 export const contextSchema = z.object({
@@ -18,7 +25,7 @@ export const articleSchema = z.object({
   // These are semantic requirements. The model chooses heading wording, ordering, and presentation.
   sections: z.array(z.object({
     kind: z.enum(sectionKinds),
-    heading: z.string().min(3).max(64), markdown: z.string().min(12).max(1500),
+    heading: z.string().min(3).max(64), markdown: sectionMarkdown,
   })).min(5).max(5),
   time: complexity, space: complexity,
   visuals: z.array(visualPlanSchema).max(2).default([]),
@@ -27,7 +34,7 @@ export type Article = z.infer<typeof articleSchema>;
 export class ArticleReviewError extends RoutingError {
   constructor(attempts: ModelAttempt[], public readonly draft: {
     title: string; markdown: string; style: string; model: string;
-  }) { super(attempts); }
+  }, lastFailure?: string) { super(attempts, lastFailure); }
 }
 export const STYLES = ['visual storytelling', 'interview masterclass', 'beginner walkthrough',
   'algorithm deep dive', 'pattern recognition', 'step-by-step simulation', 'naive to efficient', 'minimal and clear'] as const;
@@ -127,7 +134,7 @@ export async function generateArticle(router: AIModelRouter, context: Submission
   const style = selectStyle(context, recent.map(r => r.style));
   const attempts: ModelAttempt[] = [];
   const models: string[] = [];
-  const sectionSchema = z.object({ heading: z.string().min(3).max(64), markdown: z.string().min(12).max(1500) }).strict();
+  const sectionSchema = z.object({ heading: z.string().min(3).max(64), markdown: sectionMarkdown }).strict();
   const source = { title: context.title, difficulty: context.difficulty, problem: context.problem,
     language: context.language, code: context.code };
   const runStage = async <T>(name: string, request: string, schema: z.ZodType<T>, maxTokens = 512): Promise<T> => {
@@ -136,43 +143,54 @@ export async function generateArticle(router: AIModelRouter, context: Submission
       { role: 'system' as const, content: system },
       { role: 'user' as const, content: JSON.stringify({ source, request, style, titleIdeasToAvoid: recent.slice(0, 3).map(r => r.title) }) },
     ];
-    const first = await router.generate(messages, text => text, maxTokens, true);
+    const invoke = <R>(input: typeof messages, validate: (text: string) => R) =>
+      router.generate(input, validate, maxTokens, true, name).catch(error => {
+        if (error instanceof RoutingError) throw new RoutingError([...attempts, ...error.attempts], error.lastFailure);
+        throw error;
+      });
+    const first = await invoke(messages, text => text);
     attempts.push(...first.attempts); models.push(first.model);
     try { return schema.parse(parseJSON(first.value)); }
     catch (error) {
       const issues = error instanceof z.ZodError ? error.issues.map(i => `${i.path.join('.')}: ${i.message}`) :
-        error instanceof Error ? error.message : 'invalid JSON';
-      const repaired = await router.generate([
-        { role: 'system', content: `Repair this incomplete or invalid JSON for stage ${name}. Return only one complete JSON object matching the requested fields. Keep it concise, technically exact, and within the original constraints.` },
-        { role: 'user', content: JSON.stringify({ request, validationIssues: issues, previousOutput: first.value }) },
-      ], text => schema.parse(parseJSON(text)), maxTokens, true);
+        'invalid JSON';
+      logger.warn({ accountId: context.accountId, submissionId: context.submissionId, stage: name,
+        issues: error instanceof z.ZodError ? error.issues.map(i => ({ path: i.path.join('.'), code: i.code,
+          ...(i.code === 'invalid_type' ? { expected: i.expected, received: i.received } : {}),
+          ...(i.code === 'too_small' ? { minimum: i.minimum } : {}),
+          ...(i.code === 'too_big' ? { maximum: i.maximum } : {}) })) : [{ code: 'INVALID_JSON' }] },
+      'solution article stage validation failed; repairing');
+      const repaired = await invoke([
+        { role: 'system', content: `${system}\nRepair the invalid JSON below. When requested, markdown MUST be a nonempty Markdown string of 12-1500 characters; heading MUST be a string. Keep the exact requested fields and wrapper levels, including frame fields for animations. Return only a complete JSON object. Preserve the exact source algorithm.` },
+        { role: 'user', content: JSON.stringify({ source, request, validationIssues: issues, previousOutput: first.value }) },
+      ], text => schema.parse(parseJSON(text)));
       attempts.push(...repaired.attempts); models.push(repaired.model);
       return repaired.value;
     }
   };
   const intro = await runStage('title and intuition',
-    'Return {title, section}. title: 35-80 characters, one or two relevant emojis, memorable and truthful. section is {heading,markdown}; intuition: 1-2 short sentences, at most 24 words, identifying the depth boundary. Avoid bland title paraphrases.',
+    'Return {title, section}. title: 35-80 characters, one or two relevant emojis, memorable and truthful. section is {heading,markdown}; markdown is a string. Intuition: 1-2 short sentences, at most 24 words, identifying the key observation in the supplied source algorithm. Avoid bland title paraphrases.',
     z.object({ title: articleSchema.shape.title, section: sectionSchema }).strict());
   const approach = await runStage('approach and complexity',
-    'Return {section,time,space}. section is {heading,markdown}: exactly three action bullets, at most 32 words total. time and space each are {bound,reason}; define n, state the correct bound, and keep each reason to one short line.',
+    'Return {section,time,space}. section MUST be {"heading":"...","markdown":"- First action\\n- Second action\\n- Third action"}; markdown is one string, not an object. Use at most 32 words total. time and space each are {bound,reason}; define n, state the correct bound, and keep each reason to one short line.',
     z.object({ section: sectionSchema, time: complexity, space: complexity }).strict(), 640);
   const correctness = await runStage('correctness callout',
-    'Return {heading,markdown}. markdown is one short sentence stating the depth invariant, no more than 20 words.', sectionSchema);
+    'Return {heading,markdown}. markdown is one short string stating the invariant that makes the supplied source algorithm correct, no more than 20 words.', sectionSchema);
   const dryRun = await runStage('dry run',
-    'Return {heading,markdown}. markdown is one short sentence tracing (()())(()) to ()()() with depth, no more than 24 words.', sectionSchema);
+    'Return {heading,markdown}. Choose a tiny valid input for the supplied problem and trace the exact source to its expected output. markdown is one string of at most 24 words naming the input and result.', sectionSchema);
   const takeaway = await runStage('takeaway callout',
     'Return {heading,markdown}. markdown is one useful sentence, no more than 16 words.', sectionSchema);
   const frameMetadataSchema = z.object({ title: z.string().min(3).max(48), caption: z.string().min(5).max(100),
     theme: z.enum(['aurora', 'sunset', 'ocean', 'violet']), frame: visualFrameSchema }).strict();
   const visual1Start = await runStage('concept animation first frame',
-    'Return {title,caption,theme,frame} for visual-1. Use theme aurora or sunset. frame is one short step for input (()()), with 4-6 individual parenthesis characters in items; active is zero-based. Include label,state,metric,note. Keep values brief.', frameMetadataSchema);
+    'Return {title,caption,theme,frame} for visual-1. Use theme aurora or sunset. Explain the key observation of the supplied source on a tiny valid input. Represent its relevant values in 1-8 short items; active is zero-based. Include label,state,metric,note. Keep values brief.', frameMetadataSchema);
   const visual1Next = await runStage('concept animation next frame',
-    `Return {frame} only. Advance the same animation from this exact first frame: ${JSON.stringify(visual1Start.frame)}. Keep the same items; change active/state/metric/note to show a real next depth step.`,
+    `Return {frame} only. Advance the exact source algorithm from this first frame: ${JSON.stringify(visual1Start.frame)}. Keep the same items; change active/state/metric/note to show its real next algorithm state.`,
     z.object({ frame: visualFrameSchema }).strict());
   const visual2Start = await runStage('dry-run animation first frame',
-    'Return {title,caption,theme,frame} for visual-2. Use theme ocean or violet. frame is one short step for input (()())(()), with 6 individual parenthesis characters in items; active is zero-based. Include label,state,metric,note. Keep values brief.', frameMetadataSchema);
+    `Return {title,caption,theme,frame} for visual-2. Use theme ocean or violet. Animate the exact source on the same input as this dry run: ${dryRun.markdown}. Use 1-8 short items and zero-based active indices. Include label,state,metric,note. Keep values brief.`, frameMetadataSchema);
   const visual2Next = await runStage('dry-run animation next frame',
-    `Return {frame} only. Advance the same animation from this exact first frame: ${JSON.stringify(visual2Start.frame)}. Keep the same items; change active/state/metric/note to show a real next depth/output step.`,
+    `Return {frame} only. Advance the exact source from this first frame: ${JSON.stringify(visual2Start.frame)}. Keep the same items; change active/state/metric/note to show its real next state or output.`,
     z.object({ frame: visualFrameSchema }).strict());
   const plan1 = visualPlanSchema.parse({ id: 'visual-1', after: 'intuition', title: visual1Start.title,
     caption: visual1Start.caption, theme: visual1Start.theme, frames: [visual1Start.frame, visual1Next.frame] });
@@ -200,9 +218,9 @@ export async function generateArticle(router: AIModelRouter, context: Submission
     const result = z.object({ approved: z.boolean(), issues: z.array(z.string()) }).parse(parseJSON(text));
     if (!result.approved || result.issues.length) throw new Error('Technical review failed');
     return result;
-  }, 512, true).catch(error => { throw new ArticleReviewError([
+  }, 512, true, 'technical review').catch(error => { throw new ArticleReviewError([
     ...attempts, ...(error instanceof RoutingError ? error.attempts : []),
-  ], { title: article.title, markdown, style, model }); });
+  ], { title: article.title, markdown, style, model }, error instanceof RoutingError ? error.lastFailure : undefined); });
   let assets: VisualAsset[] = [];
   let visualFallback = false;
   if (resolveVisuals && article.visuals.length) {

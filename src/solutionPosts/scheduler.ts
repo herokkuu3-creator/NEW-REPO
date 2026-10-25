@@ -222,6 +222,7 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
       release = await acquireDailyLease(accountId, now.toISOString().slice(0, 10));
       if (!release) {
         results.push({ accountId, status: 'SKIPPED', error: 'ACCOUNT_JOB_IN_PROGRESS' });
+        await reportProgress(onProgress, { accountId, stage: 'skipped', error: 'ACCOUNT_JOB_IN_PROGRESS' });
         continue;
       }
       const existing = await prisma.solutionPost.findUnique({ where: {
@@ -232,6 +233,11 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
       let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status) ?
         await retryPost(existing.id, options.retryFailedGeneration === true) :
         await generateForRun(accountId, run.runId, options.retryFailedGeneration === true);
+      if (['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING', 'PUBLISHING'].includes(post.status)) {
+        results.push({ accountId, postId: post.id, status: 'SKIPPED', error: 'ACCOUNT_JOB_IN_PROGRESS' });
+        await reportProgress(onProgress, { accountId, stage: 'skipped', postId: post.id, error: 'ACCOUNT_JOB_IN_PROGRESS' });
+        continue;
+      }
       if (post.status === 'FAILED') {
         const error = post.lastError || 'GENERATION_FAILED';
         results.push({ accountId, postId: post.id, status: 'FAILED', error });

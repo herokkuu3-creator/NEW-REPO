@@ -1791,7 +1791,8 @@ function solutionStageText(stage: string, error?: string, previousError?: string
     case 'publishing_article': return '📮 Posting article to LeetCode…';
     case 'published': return '✅ Solution and article published';
     case 'article_ready': return '📝 Article generated and awaiting review';
-    case 'skipped': return `⏭️ Skipped: ${error ?? 'already in progress'}`;
+    case 'skipped': return error === 'ACCOUNT_JOB_IN_PROGRESS' ? '⏳ Another run is processing this account; this run skipped it.' :
+      `⏭️ Skipped: ${escapeHtml(error ?? 'already in progress')}`;
     case 'failed': {
       if (!error) return '❌ workflow failed';
       if (error === 'GENERATION_RETRY_LIMIT') return '❌ Automatic article attempts exhausted. Use “Run daily now” to retry.' +
@@ -1799,6 +1800,8 @@ function solutionStageText(stage: string, error?: string, previousError?: string
       if (error === 'AI_PROVIDER_ACCESS_BLOCKED') return '❌ The AI provider blocked this server (HTTP 403). Check /testsolkey; provider access must be restored.';
       if (error === 'AI_CONFIGURATION_REQUIRED') return '❌ No active AI keys. Use /setsolutionkeys to add a key for the configured article provider.';
       if (error === 'AI_KEY_INPUT_INVALID') return '❌ The configured article key contains invalid formatting. Run /testsolkey to identify the variable.';
+      if (error === 'AI_RATE_LIMITED' || error === 'AI_ERROR: HTTP_429') return '⏳ BazaarLink returned a rate/free-allowance limit (HTTP 429). Key retained; retry after the provider limit resets.';
+      if (error.startsWith('AI_ERROR: SCHEMA:')) return '❌ AI returned an invalid article field after repair. Accepted code was retained; details are in the stage-validation logs.';
       if (error === 'AI_AUTHENTICATION_FAILED' || error === 'AI_ERROR: HTTP_401') return '❌ The article provider rejected the key (HTTP 401). Save a key issued by that provider with /setsolutionkeys, then verify with /testsolkey.';
       if (error.startsWith('AI_ERROR:')) {
         const detail = error.slice('AI_ERROR:'.length).trim();
@@ -1863,8 +1866,10 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
       await runCombined(accountIds, new Date(), update, { retryFailedGeneration: true });
     const done = results.filter(result => result.status === 'PUBLISHED').length;
     const failed = results.filter(result => result.status === 'FAILED').length;
+    const skipped = results.filter(result => result.status === 'SKIPPED').length;
+    const pending = results.length - done - failed - skipped;
     const acceptedArticleFailed = results.filter(result => result.status === 'FAILED' && result.error === 'AI_MODELS_EXHAUSTED').length;
-    await reply(`🏁 ${questionNumber ? `Question #${questionNumber}` : 'Daily workflow'} finished: ${done} published · ${failed} article/workflow failed.${acceptedArticleFailed ? ` ${acceptedArticleFailed} stopped at article generation; accepted code was retained.` : ''}`);
+    await reply(`🏁 ${questionNumber ? `Question #${questionNumber}` : 'Daily workflow'} finished: ${done} published · ${failed} article/workflow failed · ${skipped} skipped${pending ? ` · ${pending} draft/pending` : ''}.${acceptedArticleFailed ? ` ${acceptedArticleFailed} stopped at article generation; accepted code was retained.` : ''}`);
   })().catch(async error => {
     await reply(`⚠️ Daily solution workflow failed: ${errText(error)}`).catch(() => undefined);
   });
@@ -3332,7 +3337,7 @@ export async function handleTestSolutionApiKey(commandArg?: string): Promise<voi
     if (result.ok) {
       lines.push(`• <b>POST /v1/chat/completions:</b> 🟢 HTTP 200 OK (model: <code>${result.chatModel}</code>)`);
       lines.push('');
-      lines.push('✅ <b>Inference is fully operational!</b> Articles can be generated.');
+      lines.push('✅ <b>Provider test passed.</b> Authentication and a short response worked. Full articles, GIFs, and publishing have separate validation steps.');
     } else {
       lines.push(`• <b>POST /v1/chat/completions:</b> 🔴 HTTP ${result.chatStatus} (model: <code>${result.chatModel}</code>)`);
       if (result.chatError) lines.push(`  └ <b>Error:</b> <code>${escapeHtml(result.chatError)}</code>`);

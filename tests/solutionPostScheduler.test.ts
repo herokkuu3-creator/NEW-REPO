@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Prisma } from '@prisma/client';
 const h = vi.hoisted(() => ({ accounts: [] as any[], runs: new Map<string, any>(), daily: vi.fn(), generate: vi.fn(),
   submit: vi.fn(), approve: vi.fn(), publish: vi.fn(), preferences: [] as any[], locks: new Map<string, string>(), calls: [] as any[],
   timers: [] as Array<() => void>, submitSingle: vi.fn(), retry: vi.fn(), posts: [] as any[] }));
@@ -18,7 +19,10 @@ vi.mock('../src/database/prisma', () => {
       findMany: vi.fn(async () => h.preferences),
     },
     systemState: {
-      create: vi.fn(async ({ data }: any) => { h.locks.set(data.key, data.value); }),
+      create: vi.fn(async ({ data }: any) => {
+        if (h.locks.has(data.key)) throw new Prisma.PrismaClientKnownRequestError('duplicate', { code: 'P2002', clientVersion: 'test' });
+        h.locks.set(data.key, data.value);
+      }),
       upsert: vi.fn(async ({ create }: any) => { h.locks.set(create.key, create.value); }),
       findUnique: vi.fn(async ({ where }: any) => h.locks.has(where.key) ? { key: where.key, value: h.locks.get(where.key) } : null),
       updateMany: vi.fn(async ({ where, data }: any) => {
@@ -99,6 +103,22 @@ describe('daily AI drafts', () => {
     const results = await runCombined(h.accounts.map(a => a.id), new Date('2026-10-15T00:30:00Z'));
     expect(results.filter(r => r.status === 'PUBLISHED')).toHaveLength(4);
     expect(results.filter(r => r.status === 'FAILED')).toHaveLength(1); expect(h.locks.size).toBe(0);
+  });
+  it('reports an explicit skipped state when another run owns the article phase', async () => {
+    let releaseA!: (post: any) => void; let releaseB!: (post: any) => void;
+    h.generate.mockImplementation(id => new Promise(resolve => { if (id === 'a') releaseA = resolve; else releaseB = resolve; }));
+    const events: any[] = [];
+    const first = runCombined(['a', 'b'], new Date('2026-10-15T00:30:00Z'), event => { events.push(event); });
+    await vi.waitFor(() => expect(releaseA).toBeTypeOf('function'));
+    const second = runCombined(['b'], new Date('2026-10-15T00:30:00Z'));
+    await vi.waitFor(() => expect(releaseB).toBeTypeOf('function'));
+    releaseA({ id: 'post-a', status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) });
+    const result = await first;
+    expect(result).toContainEqual({ accountId: 'b', status: 'SKIPPED', error: 'ACCOUNT_JOB_IN_PROGRESS' });
+    expect(events.at(-1)).toMatchObject({ accountId: 'b', stage: 'skipped', error: 'ACCOUNT_JOB_IN_PROGRESS' });
+    releaseB({ id: 'post-b', status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) });
+    await second;
+    expect(h.generate.mock.calls.filter(([id]) => id === 'b')).toHaveLength(1);
   });
   it('preserves an accepted submission and reports the stored article failure reason', async () => {
     h.accounts = [h.accounts[0]];

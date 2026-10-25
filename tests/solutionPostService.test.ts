@@ -98,6 +98,13 @@ describe('solution workflow and persistence', () => {
     expect(await generatePost(context)).toMatchObject({ status: 'FAILED', lastError: 'AI_AUTHENTICATION_FAILED' });
     expect(h.run).toMatchObject({ state: 'SUCCESS', submissionId: '123' });
   });
+  it('reports provider throttling as a retryable rate limit, including during technical review', async () => {
+    h.generation.mockRejectedValue(new ArticleReviewError([{ model: 'qwen', attempt: 1,
+      outcome: 'HTTP_429', httpStatus: 429, elapsedMs: 1 }],
+    { title: output.title, markdown: output.markdown, style: output.style, model: output.model }, 'HTTP_429'));
+    expect(await generatePost(context, {} as never)).toMatchObject({ status: 'FAILED', lastError: 'AI_RATE_LIMITED', markdown: output.markdown });
+    expect(h.run).toMatchObject({ state: 'SUCCESS', submissionId: '123' });
+  });
   it('refuses a public post when either mandatory GIF cannot be verified', async () => {
     h.verifyVisuals.mockResolvedValue(false);
     const post = await generatePost(context, {} as never);
