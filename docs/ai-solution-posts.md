@@ -22,8 +22,8 @@ Use Node 22+ and the existing PostgreSQL database. Set `DATABASE_URL`, `SETUP_TO
 
 ```dotenv
 SOLUTION_POST_API_KEYS=<key-1>,<key-2>,<key-3>
-SOLUTION_POST_BASE_URL=https://codecraftapi.com/v1
-SOLUTION_POST_MODELS=gpt-5.6-terra,gpt-5.6-luna,gemini-3.7-flash
+SOLUTION_POST_BASE_URL=https://api.bazaarlink.ai/v1
+SOLUTION_POST_MODELS=qwen/qwen3.7-flash:free
 SOLUTION_POST_TIMEOUT_MS=90000
 SOLUTION_POST_MODEL_TIMEOUTS={}
 SOLUTION_POST_RETRIES=1
@@ -126,7 +126,7 @@ The combined workflow completes daily code submissions for **all selected accoun
 
 Recovery resumes completed `DRAFT_READY` / `AWAITING_APPROVAL` posts when automatic publication is enabled. An uncertain `PUBLISHING` record is never clicked again. Busy workers and active account leases do not consume the four automatic daily attempts. Adding an available key or explicitly resetting the pool resets both failed AI posts and their scheduler budgets; automatic retries no longer force-reset exhausted generation attempts.
 
-`src/config/codecraft.ts` contains the operator-requested deployment bootstrap key. Set `SOLUTION_POST_API_KEY` / `SOLUTION_POST_API_KEYS` to override it, or explicitly set the singular variable to an empty string to disable it. Newly configured environment keys are appended to the encrypted database pool once per configuration change; old exhausted slots retain their positions. Explicit replacement does not silently re-add unchanged bootstrap keys.
+The default article provider is BazaarLink at `https://api.bazaarlink.ai/v1`, using `qwen/qwen3.7-flash:free`. Set `BAZAARLINK_API_KEY`, `SOLUTION_POST_API_KEY`, or `SOLUTION_POST_API_KEYS`, or save a BazaarLink `sk-bl-` key with `/setsolutionkeys`. There is no built-in article credential. A legacy CodeCraft bootstrap key is no longer loaded. On the provider switch, recognizable saved BazaarLink keys are retained; CodeCraft keys are excluded. Existing explicit `SOLUTION_POST_BASE_URL` and `SOLUTION_POST_MODELS` environment values still override defaults; update them to the values above on existing Render services. The Render blueprint and example environment use those defaults. BazaarLink requests disable paid fallback with `X-Free-Fallback: false`.
 
 On process startup, the server makes one small inference probe per configured Terra/Luna/Gemini model (maximum three). Set `SOLUTION_POST_VERIFY_ON_BOOT=false` to disable probes. Results, execution host, and HTTP failure category are saved under `solution-post-provider:last-check` and logged without full keys. Model-list success alone is not inference success; HTTP 402 is a provider billing/allowance failure. Missing `models:read` permission still permits the inference probe.
 

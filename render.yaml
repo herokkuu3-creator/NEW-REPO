@@ -90,6 +90,13 @@ services:
         value: community
       - key: WALKCCC_BASE_URL
         value: https://walkccc.me/LeetCode
+      # Article generation is independent of the executable-solution LLM below.
+      - key: SOLUTION_POST_BASE_URL
+        value: https://api.bazaarlink.ai/v1
+      - key: SOLUTION_POST_MODELS
+        value: qwen/qwen3.7-flash:free
+      - key: BAZAARLINK_API_KEY
+        sync: false
       # api = drive LeetCode's GraphQL + submit endpoints (no HTML page loads,
       # so Cloudflare's page-level challenge is not triggered). This is the
       # setting that makes the service work from Render's datacenter IP.

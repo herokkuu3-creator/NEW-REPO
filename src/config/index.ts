@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { DEFAULT_CODECRAFT_API_KEY } from './codecraft';
+import { DEFAULT_SOLUTION_POST_BASE_URL, DEFAULT_SOLUTION_POST_MODEL, isBazaarLinkProvider } from './solutionPostProvider';
 import { validateSolutionPostModels } from './solutionPostModels';
 
 /**
@@ -78,10 +78,11 @@ const envSchema = z.object({
 
   // SOLUTION_POST_API_KEYS is a comma-separated failover pool. The singular
   // name remains a backwards-compatible one-key bootstrap option.
-  SOLUTION_POST_API_KEY: z.string().default(DEFAULT_CODECRAFT_API_KEY),
+  SOLUTION_POST_API_KEY: z.string().default(''),
   SOLUTION_POST_API_KEYS: z.string().default(''),
-  SOLUTION_POST_BASE_URL: z.string().url().default('https://codecraftapi.com/v1'),
-  SOLUTION_POST_MODELS: z.string().default('gpt-5.6-terra,gpt-5.6-luna,gemini-3.7-flash'),
+  BAZAARLINK_API_KEY: z.string().default(''),
+  SOLUTION_POST_BASE_URL: z.string().url().default(DEFAULT_SOLUTION_POST_BASE_URL),
+  SOLUTION_POST_MODELS: z.string().default(DEFAULT_SOLUTION_POST_MODEL),
   SOLUTION_POST_TIMEOUT_MS: intFromString(90000).pipe(z.number().min(1000).max(300000)),
   SOLUTION_POST_RETRIES: intFromString(1).pipe(z.number().min(0).max(3)),
   SOLUTION_POST_MAX_TOKENS: intFromString(8192).pipe(z.number().min(2048).max(32768)),
@@ -182,6 +183,8 @@ function loadConfig(): Config {
     process.exit(1);
   }
   const env = parsed.data;
+  const articleKey = (isBazaarLinkProvider(env.SOLUTION_POST_BASE_URL) ? env.BAZAARLINK_API_KEY : '') ||
+    env.SOLUTION_POST_API_KEY;
 
   const headlessDefault = process.env.HEADLESS;
   return Object.freeze({
@@ -217,8 +220,8 @@ function loadConfig(): Config {
     },
     transport: env.TRANSPORT,
     solutionPosts: {
-      apiKey: env.SOLUTION_POST_API_KEY,
-      apiKeys: [...new Set((env.SOLUTION_POST_API_KEYS || env.SOLUTION_POST_API_KEY).split(',')
+      apiKey: articleKey,
+      apiKeys: [...new Set((env.SOLUTION_POST_API_KEYS || articleKey).split(',')
         .map(s => s.trim()).filter(Boolean))],
       baseUrl: env.SOLUTION_POST_BASE_URL,
       models: validateSolutionPostModels(env.SOLUTION_POST_MODELS),

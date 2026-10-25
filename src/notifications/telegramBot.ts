@@ -1797,7 +1797,7 @@ function solutionStageText(stage: string, error?: string, previousError?: string
       if (error === 'GENERATION_RETRY_LIMIT') return '❌ Automatic article attempts exhausted. Use “Run daily now” to retry.' +
         (previousError ? ` Last failure: ${escapeHtml(previousError.slice(0, 140))}` : '');
       if (error === 'AI_PROVIDER_ACCESS_BLOCKED') return '❌ The AI provider blocked this server (HTTP 403). Check /testsolkey; provider access must be restored.';
-      if (error === 'AI_CONFIGURATION_REQUIRED') return '❌ No active AI keys. Use /setsolutionkeys to add a CodeCraft key.';
+      if (error === 'AI_CONFIGURATION_REQUIRED') return '❌ No active AI keys. Use /setsolutionkeys to add a key for the configured article provider.';
       if (error.startsWith('AI_ERROR:')) {
         const detail = error.slice('AI_ERROR:'.length).trim();
         return `❌ ${escapeHtml(detail.slice(0, 140))}`;
@@ -3303,11 +3303,12 @@ export async function handleReplaceSolutionApiKeys(commandArg?: string): Promise
 
 export async function handleTestSolutionApiKey(commandArg?: string): Promise<void> {
   const arg = (commandArg ?? '').trim();
-  await replyHtml('🔎 <b>Testing CodeCraft API key…</b>\nChecking <code>/v1/models</code> and <code>/v1/chat/completions</code> from this server…');
+  const provider = new URL(config.solutionPosts.baseUrl).hostname;
+  await replyHtml(`🔎 <b>Testing ${escapeHtml(provider)} API key…</b>\nChecking models and inference from this server…`);
   const result = await testSolutionApiKey(arg || undefined);
   const hostLabel = process.env.RENDER_EXTERNAL_URL ? 'Render Web Service' : (process.env.RENDER_INSTANCE_ID ? 'Render Container' : 'Local Host');
   const lines = [
-    '🧪 <b>CodeCraft API Key Diagnostics</b>',
+    `🧪 <b>${escapeHtml(provider)} API Key Diagnostics</b>`,
     '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
     `🔑 <b>Key:</b> <code>${escapeHtml(result.keyMasked)}</code>`,
     `📍 <b>Execution host:</b> <code>${escapeHtml(hostLabel)}</code>`,
@@ -3326,13 +3327,12 @@ export async function handleTestSolutionApiKey(commandArg?: string): Promise<voi
       if (result.chatType) lines.push(`  └ <b>Type:</b> <code>${escapeHtml(result.chatType)}</code>`);
       lines.push('');
       if (result.chatStatus === 402) {
-        lines.push('⚠️ <b>Cause:</b> CodeCraft rejected inference with <code>Billing verification failed</code>.');
-        lines.push('CodeCraft accepted the connection but rejected inference for billing/quota. A successful model list does not verify inference access.');
-        lines.push('Check the plan/allowance with <a href="https://codecraftapi.com">CodeCraft</a>, then use <code>/resetsolutionkeys</code> after the provider resolves it.');
+        lines.push('⚠️ <b>Cause:</b> The provider rejected inference for billing/quota. A successful model list does not verify inference access.');
+        lines.push('Check the provider’s plan/allowance, then use <code>/resetsolutionkeys</code> after it is restored.');
       } else if (result.chatStatus === 401) {
         lines.push('⚠️ <b>Cause:</b> Invalid or revoked API key.');
       } else if (result.failureCategory === 'PROVIDER_ACCESS_BLOCKED') {
-        lines.push('⚠️ <b>Cause:</b> CodeCraft returned a Cloudflare HTML challenge to this server. Ask CodeCraft to permit authenticated API access from Render; switching models or keys does not resolve this access restriction.');
+        lines.push('⚠️ <b>Cause:</b> The provider returned an HTML access challenge. Ask the provider to permit authenticated API access from Render.');
       }
     }
   } else if (result.error) {

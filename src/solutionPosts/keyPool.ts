@@ -1,6 +1,9 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { config } from '../config';
 import { getSystemState, setSystemState } from '../database/models';
+import { DEFAULT_SOLUTION_POST_BASE_URL, DEFAULT_SOLUTION_POST_MODEL, isBazaarLinkProvider,
+  solutionPostProviderHeaders } from '../config/solutionPostProvider';
+import { validateSolutionPostModels } from '../config/solutionPostModels';
 
 const STATE_KEY = 'solution-post-api-key-pool:v1';
 const VERSION = 'v1';
@@ -84,6 +87,19 @@ function isDefaultCodeCraftProvider(): boolean {
   return config.solutionPosts.baseUrl.replace(/\/+$/, '').toLowerCase() === 'https://codecraftapi.com/v1';
 }
 
+function environmentArticleKeys(): string[] {
+  return parseSolutionApiKeys(config.solutionPosts.apiKeys)
+    .filter(key => !isBazaarLinkProvider(config.solutionPosts.baseUrl) || key.startsWith('sk-bl-'));
+}
+
+function suppliedArticleKeys(raw: string | string[]): string[] {
+  const keys = parseSolutionApiKeys(raw);
+  if (isBazaarLinkProvider(config.solutionPosts.baseUrl) && keys.some(key => !key.startsWith('sk-bl-'))) {
+    throw new Error('BazaarLink requires sk-bl- API keys');
+  }
+  return keys;
+}
+
 /** A spent monthly allowance remains skipped until this period changes. */
 export function solutionKeyPeriod(now = new Date()): string {
   const timezone = config.schedule?.timezone || 'Asia/Kolkata';
@@ -95,7 +111,8 @@ export function solutionKeyPeriod(now = new Date()): string {
 
 export async function loadSolutionKeyPool(now = new Date()): Promise<SolutionKeyPool> {
   const saved = await getSystemState(STATE_KEY);
-  const environmentKeys = parseSolutionApiKeys(config.solutionPosts.apiKeys);
+  const bazaarLink = isBazaarLinkProvider(config.solutionPosts.baseUrl);
+  const environmentKeys = environmentArticleKeys();
   const environmentFingerprint = createHash('sha256').update(JSON.stringify(environmentKeys)).digest('hex');
   const configuredProvider = providerFingerprint();
   if (saved) {
@@ -107,7 +124,10 @@ export async function loadSolutionKeyPool(now = new Date()): Promise<SolutionKey
         ? pool.providerFingerprint !== configuredProvider
         : !isDefaultCodeCraftProvider();
       if (providerChanged) {
-        return persist({ keys: environmentKeys, activeIndex: 0, activePeriod: solutionKeyPeriod(now),
+        // Older installations could save a BazaarLink key while CodeCraft was
+        // still the default. Carry only recognizable BazaarLink credentials.
+        const keys = [...new Set([...environmentKeys, ...(bazaarLink ? pool.keys.filter(key => key.startsWith('sk-bl-')) : [])])];
+        return persist({ keys, activeIndex: 0, activePeriod: solutionKeyPeriod(now),
           environmentFingerprint, providerFingerprint: configuredProvider, stored: true });
       }
       // Newly configured bootstrap keys must not be hidden by an older DB pool.
@@ -137,7 +157,7 @@ async function persist(pool: SolutionKeyPool): Promise<SolutionKeyPool> {
   const valid = normalise(pool, true);
   const activePeriod = valid.activePeriod ?? solutionKeyPeriod();
   const environmentFingerprint = valid.environmentFingerprint ?? createHash('sha256')
-    .update(JSON.stringify(parseSolutionApiKeys(config.solutionPosts.apiKeys))).digest('hex');
+    .update(JSON.stringify(environmentArticleKeys())).digest('hex');
   const currentProviderFingerprint = valid.providerFingerprint ?? providerFingerprint();
   await setSystemState(STATE_KEY, seal(JSON.stringify({ keys: valid.keys, activeIndex: valid.activeIndex, activePeriod,
     lastFailure: valid.lastFailure, environmentFingerprint, providerFingerprint: currentProviderFingerprint })));
@@ -150,7 +170,7 @@ async function persist(pool: SolutionKeyPool): Promise<SolutionKeyPool> {
 export async function appendSolutionApiKeys(raw: string | string[]): Promise<{
   pool: SolutionKeyPool; added: number; duplicates: number;
 }> {
-  const additions = parseSolutionApiKeys(raw);
+  const additions = suppliedArticleKeys(raw);
   if (!additions.length) throw new Error('NO_API_KEYS');
   const existing = await loadSolutionKeyPool();
   const set = new Set(existing.keys);
@@ -163,7 +183,7 @@ export async function appendSolutionApiKeys(raw: string | string[]): Promise<{
 
 /** Explicit operator action: discard stale/exhausted slots and start a fresh pool at key one. */
 export async function replaceSolutionApiKeys(raw: string | string[]): Promise<SolutionKeyPool> {
-  const keys = parseSolutionApiKeys(raw);
+  const keys = suppliedArticleKeys(raw);
   if (!keys.length) throw new Error('NO_API_KEYS');
   return persist({ keys, activeIndex: 0, activePeriod: solutionKeyPeriod(), stored: true });
 }
@@ -221,19 +241,21 @@ export async function testSolutionApiKey(candidateKey?: string, model?: string):
     return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0, error: 'NO_KEY_CONFIGURED' };
   }
   const masked = maskSolutionApiKey(key);
-  const testModel = model ?? config.solutionPosts.models?.[0] ?? 'gpt-5.6-terra';
+  const testModel = model ?? config.solutionPosts.models?.[0] ?? DEFAULT_SOLUTION_POST_MODEL;
   const executionHost = process.env.RENDER_INSTANCE_ID ? 'render' : 'local';
-  if (!/^(?:gpt-5\.6-(?:terra|luna)|gemini-3\.(?:7|8)-flash|qwen\/qwen3\.8-27b)$/.test(testModel)) {
+  let allowed = false;
+  try { allowed = validateSolutionPostModels(testModel).length === 1; } catch { /* invalid model */ }
+  if (!allowed) {
     return { ok: false, keyMasked: masked, modelsStatus: 0, modelsCount: 0, error: 'MODEL_NOT_ALLOWED', executionHost };
   }
   const redact = (value: string) => value.split(key!).join('[REDACTED]')
-    .replace(/(?:cc|gsk)_[A-Za-z0-9_-]+/g, '[REDACTED]').slice(0, 300);
+    .replace(/(?:(?:cc|gsk)_|sk-bl-)[A-Za-z0-9_-]+/g, '[REDACTED]').slice(0, 300);
   try {
-    const baseUrl = config.solutionPosts.baseUrl || 'https://codecraftapi.com/v1';
+    const baseUrl = config.solutionPosts.baseUrl || DEFAULT_SOLUTION_POST_BASE_URL;
     const modelsUrl = new URL('models', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
     const modelsRes = await fetch(modelsUrl.href, {
       method: 'GET',
-      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', ...solutionPostProviderHeaders(baseUrl) },
       signal: AbortSignal.timeout(20000),
     });
     // Discovery and inference have separate scopes. Even a 403 here does not
@@ -244,7 +266,7 @@ export async function testSolutionApiKey(candidateKey?: string, model?: string):
     const chatUrl = new URL('chat/completions', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
     const chatRes = await fetch(chatUrl.href, {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', ...solutionPostProviderHeaders(baseUrl) },
       body: JSON.stringify({
         model: testModel,
         messages: [{ role: 'user', content: 'Reply with only OK.' }],
@@ -270,7 +292,7 @@ export async function testSolutionApiKey(candidateKey?: string, model?: string):
         modelsCount,
         chatStatus: chatRes.status,
         chatError: chatRes.status === 403 && chatRes.headers.get('content-type')?.includes('text/html') ?
-          'CodeCraft returned an HTML access challenge to this server; authenticated API access must be allowed by the provider.' : redact(parsedMsg),
+          'The AI provider returned an HTML access challenge to this server; authenticated API access must be allowed by the provider.' : redact(parsedMsg),
         chatType: parsedType ? redact(parsedType) : undefined,
         chatCode: parsedCode ? redact(parsedCode) : undefined,
         chatModel: testModel,

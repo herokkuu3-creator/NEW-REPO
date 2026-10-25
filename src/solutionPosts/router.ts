@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { z } from 'zod';
 import { LLMMessage } from '../ai/provider';
+import { solutionPostProviderHeaders } from '../config/solutionPostProvider';
 
 export interface RouterOptions {
   apiKey: string;
@@ -41,7 +42,7 @@ export class AIModelRouter {
     private readonly onAttempt: (attempt: ModelAttempt) => void = () => {},
     private readonly onKeyExhausted: (key: string, reason: string) => Promise<void> | void = () => {},
     private readonly createClient: (key: string) => OpenAI = key => new OpenAI({ apiKey: key, baseURL: options.baseUrl,
-      timeout: options.timeoutMs, maxRetries: 0 })) {
+      timeout: options.timeoutMs, maxRetries: 0, defaultHeaders: solutionPostProviderHeaders(options.baseUrl) })) {
     this.apiKeys = [...new Set((options.apiKeys?.length ? options.apiKeys : [options.apiKey]).map(key => key.trim()).filter(Boolean))];
     if (!this.apiKeys.length) throw new Error('SOLUTION_POST_API_KEYS is required');
     this.firstClient = client;
