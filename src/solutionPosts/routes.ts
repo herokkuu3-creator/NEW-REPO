@@ -11,6 +11,7 @@ import { appendSolutionApiKeys, solutionKeyPoolStatus, testSolutionApiKey } from
 import { PROVIDER_CHECK_STATE_KEY } from './providerDiagnostics';
 import { probeOxion } from './oxionProbe';
 import { probeExperiential } from './experientialProbe';
+import { probeBazaarLink } from './bazaarlinkProbe';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
   app.register(async scoped => {
@@ -131,6 +132,11 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
         model: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$/).optional(),
       }).strict().parse(req.body ?? {});
       return probeExperiential(body.apiKey, body.model);
+    });
+    scoped.post('/admin/solutions/bazaarlink/free-test', async req => {
+      const body = z.object({ apiKey: z.string().regex(/^sk-bl-[A-Za-z0-9_-]{16,128}$/) })
+        .strict().parse(req.body ?? {});
+      return probeBazaarLink(body.apiKey);
     });
     scoped.get('/admin/solutions/:id', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);
