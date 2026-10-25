@@ -25,6 +25,18 @@ const plan = visualPlanSchema.parse({ id: 'visual-1', after: 'intuition', title:
   ] });
 
 describe('original solution animations', () => {
+  it('wraps complete grid labels and accepts bounded explanatory captions', async () => {
+    const grid = structuredClone(plan);
+    grid.caption = 'A cell coordinate identifies the current flood-fill position while the highlight and running state show which component is explored.';
+    grid.frames.forEach(frame => { frame.items[0] = 'grid[0][0] = 0'; });
+    expect(() => visualPlanSchema.parse(grid)).not.toThrow();
+    const svg = renderVisualFrame(grid, 0);
+    expect(svg.replace(/<[^>]*>/g, '')).toContain('grid[0][0] = 0');
+    const bytes = await renderVisualGif(grid);
+    expect((await sharp(bytes, { animated: true }).metadata()).pages).toBe(3);
+    grid.frames[0]!.items[0] = 'a'.repeat(25);
+    expect(() => visualPlanSchema.parse(grid)).toThrow();
+  });
   it('encodes every trace step as a looping, delayed GIF with bounded size', async () => {
     const bytes = await renderVisualGif(plan);
     const metadata = await sharp(bytes, { animated: true }).metadata();

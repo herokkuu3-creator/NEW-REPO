@@ -287,6 +287,16 @@ describe('AI model routing', () => {
     expect(repair.messages[0].content).toContain('nonempty Markdown string');
     expect(JSON.parse(repair.messages[1].content).source.code).toBe(context.code);
   });
+  it('accepts an otherwise valid unwrapped next frame without another API repair', async () => {
+    const api = client(); const responses = stagedResponses(article);
+    responses[6] = complete(JSON.stringify(article.visuals[0]!.frames[1]));
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
+    const result = await generateArticle(new AIModelRouter(options, api as never), context, []);
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(10);
+    expect(result.visuals[0]?.frames[1]).toEqual(article.visuals[0]!.frames[1]);
+    const system = (api.chat.completions.create.mock.calls[5]![0] as any).messages[0].content;
+    expect(system).toContain('each item at most 24'); expect(system).toContain('caption 5-160');
+  });
   it.each([false, true])('resolves both GIFs after review and keeps trace tables only for offline fallback: %s', async hostFails => {
     const draft = structuredClone(article);
     const api = client(); const responses = stagedResponses(draft);

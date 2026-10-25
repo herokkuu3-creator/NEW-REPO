@@ -33,3 +33,11 @@ Regression cases reproduce schema repair with original source, bullet-array norm
 Local tests use mocked providers/database adapters. They establish application behavior, not successful public article publication. A live generation after deployment must pass all stages, review, both hosted-GIF checks, and publication verification before it counts as restored. A provider daily allowance can still defer work even with correct pacing; changing code cannot expand that allowance.
 
 Primary provider reference: [free model quotas and errors](https://bazaarlink.ai/en/docs).
+
+## Live verification and renderer follow-up
+
+Revision `6a8eeeb` started on Render at 14:01:26.448 IST; its inference probe returned HTTP 200 at 14:01:31.826. Scheduled recovery ran automatically. The approach stage's invalid wrapper at 14:02:33.991 was successfully repaired by 14:02:39.131. HTTP 429 with Retry-After 30 seconds at 14:02:50.589 was followed by a successful dry run at 14:03:23.697; another 429 at 14:03:27.363 was followed by a successful takeaway at 14:04:01.933. The key was retained. These verify the new repair and rate-handling paths from the deployed host.
+
+The same live attempt then exposed a distinct rendering constraint: `frame.items` strings were limited to eight characters. Generated grid labels exceeded this; the dry-run animation repair still violated that limit and failed at 14:05:09.745. The follow-up allows bounded 24-character item labels, wraps them completely inside wider cells, and permits 160-character captions displayed below the GIF. All other frame-count, position, state-change, length, escaping, and review checks remain. A valid unwrapped next-frame object is normalized into the expected wrapper, avoiding an unnecessary repair call. Prompts now state every exact field limit.
+
+The follow-up passed all 141 solution-post tests and TypeScript compilation. An actual grid-label frame was rendered and visually inspected: labels remain complete and readable inside their cells. This does not establish successful public publication, which still requires an observed published result.

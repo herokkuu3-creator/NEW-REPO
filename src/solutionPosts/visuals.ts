@@ -3,13 +3,13 @@ import { z } from 'zod';
 export const sectionKinds = ['intuition', 'approach', 'correctness', 'dryRun', 'takeaways'] as const;
 export const visualThemes = ['aurora', 'sunset', 'ocean', 'violet'] as const;
 export const visualFrameSchema = z.object({
-  label: z.string().min(2).max(48), items: z.array(z.string().max(8)).min(1).max(8),
+  label: z.string().min(2).max(48), items: z.array(z.string().max(24)).min(1).max(8),
   active: z.array(z.number().int().min(0).max(7)).max(8),
   state: z.string().min(1).max(64), metric: z.string().min(1).max(40), note: z.string().max(76),
 }).strict();
 export const visualPlanSchema = z.object({
   id: z.string().regex(/^visual-[12]$/), after: z.enum(sectionKinds),
-  title: z.string().min(3).max(48), caption: z.string().min(5).max(100),
+  title: z.string().min(3).max(48), caption: z.string().min(5).max(160),
   theme: z.enum(visualThemes).default('aurora'),
   frames: z.array(visualFrameSchema).min(2).max(8),
 }).superRefine((plan, ctx) => {
@@ -48,12 +48,25 @@ export function renderVisualFrame(plan: VisualPlan, frameIndex: number): string 
   const frame = plan.frames[frameIndex]!;
   const colors = palettes[plan.theme];
   const width = 720; const height = 360;
-  const gap = 12; const box = Math.min(76, (width - 72 - gap * (frame.items.length - 1)) / frame.items.length);
+  const gap = 12; const box = Math.min(144, (width - 72 - gap * (frame.items.length - 1)) / frame.items.length);
   const left = (width - (box * frame.items.length + gap * (frame.items.length - 1))) / 2;
   const blocks = frame.items.map((item, i) => {
     const x = left + i * (box + gap); const active = frame.active.includes(i);
+    // Preserve complete coordinates/labels instead of forcing every item into
+    // an eight-character schema or shrinking a whole line to unreadable text.
+    const chars = Array.from(item);
+    const lineLength = Math.max(4, Math.floor((box - 16) / 10));
+    const lines: string[] = [];
+    for (let offset = 0; offset < chars.length; offset += lineLength) lines.push(chars.slice(offset, offset + lineLength).join(''));
+    if (!lines.length) lines.push('');
+    const font = Math.min(28, (box - 12) / (Math.max(...lines.map(line => Array.from(line).length), 1) * .62),
+      50 / (lines.length * 1.15));
+    const lineHeight = font * 1.15;
+    const label = lines.map((line, index) => text(x + box / 2,
+      155 + (index - (lines.length - 1) / 2) * lineHeight + font * .35,
+      line, font, active ? colors.ink : colors.muted, 700, 'middle')).join('');
     return `<rect x="${x}" y="122" width="${box}" height="66" rx="14" fill="${active ? colors.active : colors.idle}" stroke="${active ? colors.accent : 'none'}" stroke-width="${active ? 2 : 0}"/>` +
-      text(x + box / 2, 165, item, Math.min(30, (box - 12) / Math.max(1, item.length) * 1.5), active ? colors.ink : colors.muted, 700, 'middle') +
+      label +
       (active ? `<path d="M ${x + box / 2} 204 l -7 9 h 14 Z" fill="${colors.active}"/>` : '');
   }).join('');
   const progress = (frameIndex + 1) / plan.frames.length * 664;
