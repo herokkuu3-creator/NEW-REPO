@@ -78,8 +78,9 @@ export async function createPostRouter(correlation: { postId?: string; accountId
   const pool = await loadSolutionKeyPool();
   const activeKeys = activeSolutionApiKeys(pool);
   logger.info({ ...correlation, keyPool: { total: pool.keys.length, activeIndex: pool.activeIndex + 1,
-    activeKey: activeKeys[0] ? maskSolutionApiKey(activeKeys[0]) : null, stored: pool.stored } }, 'solution article router configured');
-  if (!activeKeys.length) throw new PostError(!pool.keys.length ? 'AI_CONFIGURATION_REQUIRED' :
+    activeKey: activeKeys[0] ? maskSolutionApiKey(activeKeys[0]) : null, stored: pool.stored },
+    keySource: config.solutionPosts.keySource, keyEnvironment: config.solutionPosts.keyEnvironment }, 'solution article router configured');
+  if (!activeKeys.length) throw new PostError(!pool.keys.length ? config.solutionPosts.keyError ?? 'AI_CONFIGURATION_REQUIRED' :
     pool.lastFailure === 'HTTP_402_BILLING_REQUIRED' ? 'AI_BILLING_REQUIRED' : 'AI_KEYS_EXHAUSTED');
   return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys }, undefined, undefined,
     attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'),

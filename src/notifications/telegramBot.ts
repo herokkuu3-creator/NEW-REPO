@@ -1798,6 +1798,7 @@ function solutionStageText(stage: string, error?: string, previousError?: string
         (previousError ? ` Last failure: ${escapeHtml(previousError.slice(0, 140))}` : '');
       if (error === 'AI_PROVIDER_ACCESS_BLOCKED') return '❌ The AI provider blocked this server (HTTP 403). Check /testsolkey; provider access must be restored.';
       if (error === 'AI_CONFIGURATION_REQUIRED') return '❌ No active AI keys. Use /setsolutionkeys to add a key for the configured article provider.';
+      if (error === 'AI_KEY_INPUT_INVALID') return '❌ The configured article key contains invalid formatting. Run /testsolkey to identify the variable.';
       if (error.startsWith('AI_ERROR:')) {
         const detail = error.slice('AI_ERROR:'.length).trim();
         return `❌ ${escapeHtml(detail.slice(0, 140))}`;
@@ -3282,8 +3283,11 @@ export async function handleReplaceSolutionApiKeys(commandArg?: string): Promise
         'Run <code>/manualsolution</code> to test from Render, or <code>/testsolkey</code> to verify key status.',
       ].join('\n'));
       return;
-    } catch {
-      await replyHtml('⚠️ Usage: <code>/setsolutionkeys key1,key2</code>\nOr send <code>/resetsolutionkeys</code> to reset the existing pool to key #1.');
+    } catch (error) {
+      const reason = error instanceof Error && error.message === 'NO_API_KEYS' ?
+        'No article key is stored or loaded from the environment. Reset cannot restore a missing key.' :
+        'The key pool could not be loaded. Run /testsolkey for configuration details.';
+      await replyHtml(`⚠️ ${reason}\nSave a key with <code>/setsolutionkeys key1,key2</code>.`);
       return;
     }
   }
@@ -3313,8 +3317,15 @@ export async function handleTestSolutionApiKey(commandArg?: string): Promise<voi
     `🔑 <b>Key:</b> <code>${escapeHtml(result.keyMasked)}</code>`,
     `📍 <b>Execution host:</b> <code>${escapeHtml(hostLabel)}</code>`,
     '',
-    `• <b>GET /v1/models:</b> ${result.modelsStatus === 200 ? '🟢 HTTP 200 OK' : `🔴 HTTP ${result.modelsStatus}`} (${result.modelsCount} models returned)`,
+    `• <b>GET /v1/models:</b> ${result.modelsStatus === 0 ? 'Not sent' :
+      result.modelsStatus === 200 ? '🟢 HTTP 200 OK' : `🔴 HTTP ${result.modelsStatus}`} (${result.modelsCount} models returned)`,
   ];
+  if (result.keyEnvironment) {
+    lines.push('', '<b>Article key environment:</b>');
+    for (const input of result.keyEnvironment) lines.push(
+      `• <code>${escapeHtml(input.name)}</code>: ${input.invalid ? 'invalid formatting' :
+        input.present ? `${input.count} key(s)` : 'not set'}${result.keySource === input.name ? ' — selected' : ''}`);
+  }
   if (result.chatStatus) {
     if (result.ok) {
       lines.push(`• <b>POST /v1/chat/completions:</b> 🟢 HTTP 200 OK (model: <code>${result.chatModel}</code>)`);

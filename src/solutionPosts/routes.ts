@@ -60,6 +60,8 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       scheduler: await prisma.systemState.findUnique({ where: { key: SCHEDULE_STATE_KEY } }),
       provider: await prisma.systemState.findUnique({ where: { key: PROVIDER_CHECK_STATE_KEY } }),
       keys: await solutionKeyPoolStatus(),
+      credentialConfiguration: { source: config.solutionPosts.keySource,
+        environment: config.solutionPosts.keyEnvironment, error: config.solutionPosts.keyError },
     }));
     scoped.post('/admin/solutions/scheduled', async (req, reply) => {
       z.object({}).strict().parse(req.body ?? {});

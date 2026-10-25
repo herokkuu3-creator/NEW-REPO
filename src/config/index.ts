@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { DEFAULT_SOLUTION_POST_BASE_URL, DEFAULT_SOLUTION_POST_MODEL, isBazaarLinkProvider } from './solutionPostProvider';
+import { DEFAULT_SOLUTION_POST_BASE_URL, DEFAULT_SOLUTION_POST_MODEL } from './solutionPostProvider';
+import { resolveArticleKeys, ArticleKeyInput } from './solutionPostKeys';
 import { validateSolutionPostModels } from './solutionPostModels';
 
 /**
@@ -81,6 +82,7 @@ const envSchema = z.object({
   SOLUTION_POST_API_KEY: z.string().default(''),
   SOLUTION_POST_API_KEYS: z.string().default(''),
   BAZAARLINK_API_KEY: z.string().default(''),
+  BAZAARLINK_API_KEYS: z.string().default(''),
   SOLUTION_POST_BASE_URL: z.string().url().default(DEFAULT_SOLUTION_POST_BASE_URL),
   SOLUTION_POST_MODELS: z.string().default(DEFAULT_SOLUTION_POST_MODEL),
   SOLUTION_POST_TIMEOUT_MS: intFromString(90000).pipe(z.number().min(1000).max(300000)),
@@ -164,6 +166,7 @@ export type Config = Readonly<{
   transport: 'api' | 'browser';
   solutionPosts: {
     apiKey: string; apiKeys: string[]; baseUrl: string; models: string[]; timeoutMs: number; retries: number; maxTokens: number;
+    keySource?: string; keyEnvironment?: ArticleKeyInput[]; keyError?: string;
     autoPublish: boolean; modelTimeoutMs: Record<string, number>;
   };
   telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean };
@@ -183,8 +186,7 @@ function loadConfig(): Config {
     process.exit(1);
   }
   const env = parsed.data;
-  const articleKey = (isBazaarLinkProvider(env.SOLUTION_POST_BASE_URL) ? env.BAZAARLINK_API_KEY : '') ||
-    env.SOLUTION_POST_API_KEY;
+  const articleKeys = resolveArticleKeys(env, env.SOLUTION_POST_BASE_URL);
 
   const headlessDefault = process.env.HEADLESS;
   return Object.freeze({
@@ -220,9 +222,7 @@ function loadConfig(): Config {
     },
     transport: env.TRANSPORT,
     solutionPosts: {
-      apiKey: articleKey,
-      apiKeys: [...new Set((env.SOLUTION_POST_API_KEYS || articleKey).split(',')
-        .map(s => s.trim()).filter(Boolean))],
+      ...articleKeys,
       baseUrl: env.SOLUTION_POST_BASE_URL,
       models: validateSolutionPostModels(env.SOLUTION_POST_MODELS),
       timeoutMs: env.SOLUTION_POST_TIMEOUT_MS,

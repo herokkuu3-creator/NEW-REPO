@@ -4,6 +4,8 @@ import { getSystemState, setSystemState } from '../database/models';
 import { DEFAULT_SOLUTION_POST_BASE_URL, DEFAULT_SOLUTION_POST_MODEL, isBazaarLinkProvider,
   solutionPostProviderHeaders } from '../config/solutionPostProvider';
 import { validateSolutionPostModels } from '../config/solutionPostModels';
+import { parseSolutionApiKeys, ArticleKeyInput } from '../config/solutionPostKeys';
+export { parseSolutionApiKeys } from '../config/solutionPostKeys';
 
 const STATE_KEY = 'solution-post-api-key-pool:v1';
 const VERSION = 'v1';
@@ -48,20 +50,6 @@ function open(value: string): string {
   return Buffer.concat([decipher.update(Buffer.from(encrypted, 'base64url')), decipher.final()]).toString('utf8');
 }
 
-export function parseSolutionApiKeys(input: string | string[]): string[] {
-  const pieces = (Array.isArray(input) ? input : input.split(/[,\n\r\t]+/)).map(value => value.trim()
-    .replace(/^["'`<[(\{]+|["'`>\])}\s]+$/g, ''));
-  const seen = new Set<string>();
-  const keys: string[] = [];
-  for (const value of pieces) {
-    if (!value || /^(?:none|null|undefined|test|fixture)$/i.test(value)) continue;
-    if (value.length < 8 || value.length > 512 || /\s/.test(value)) throw new Error('Each API key must be 8–512 non-whitespace characters');
-    if (!seen.has(value)) { seen.add(value); keys.push(value); }
-  }
-  if (keys.length > MAX_KEYS) throw new Error(`At most ${MAX_KEYS} API keys may be stored`);
-  return keys;
-}
-
 export function maskSolutionApiKey(key: string): string {
   return key.length <= 12 ? `${key.slice(0, 3)}…${key.slice(-2)}` : `${key.slice(0, 7)}…${key.slice(-4)}`;
 }
@@ -88,16 +76,7 @@ function isDefaultCodeCraftProvider(): boolean {
 }
 
 function environmentArticleKeys(): string[] {
-  return parseSolutionApiKeys(config.solutionPosts.apiKeys)
-    .filter(key => !isBazaarLinkProvider(config.solutionPosts.baseUrl) || key.startsWith('sk-bl-'));
-}
-
-function suppliedArticleKeys(raw: string | string[]): string[] {
-  const keys = parseSolutionApiKeys(raw);
-  if (isBazaarLinkProvider(config.solutionPosts.baseUrl) && keys.some(key => !key.startsWith('sk-bl-'))) {
-    throw new Error('BazaarLink requires sk-bl- API keys');
-  }
-  return keys;
+  return parseSolutionApiKeys(config.solutionPosts.apiKeys);
 }
 
 /** A spent monthly allowance remains skipped until this period changes. */
@@ -170,7 +149,7 @@ async function persist(pool: SolutionKeyPool): Promise<SolutionKeyPool> {
 export async function appendSolutionApiKeys(raw: string | string[]): Promise<{
   pool: SolutionKeyPool; added: number; duplicates: number;
 }> {
-  const additions = suppliedArticleKeys(raw);
+  const additions = parseSolutionApiKeys(raw);
   if (!additions.length) throw new Error('NO_API_KEYS');
   const existing = await loadSolutionKeyPool();
   const set = new Set(existing.keys);
@@ -183,7 +162,7 @@ export async function appendSolutionApiKeys(raw: string | string[]): Promise<{
 
 /** Explicit operator action: discard stale/exhausted slots and start a fresh pool at key one. */
 export async function replaceSolutionApiKeys(raw: string | string[]): Promise<SolutionKeyPool> {
-  const keys = suppliedArticleKeys(raw);
+  const keys = parseSolutionApiKeys(raw);
   if (!keys.length) throw new Error('NO_API_KEYS');
   return persist({ keys, activeIndex: 0, activePeriod: solutionKeyPeriod(), stored: true });
 }
@@ -228,17 +207,26 @@ export interface KeyTestResult {
   executionHost?: string;
   failureCategory?: string;
   providerRequestId?: string;
+  keySource?: string;
+  keyEnvironment?: ArticleKeyInput[];
 }
 
 export async function testSolutionApiKey(candidateKey?: string, model?: string): Promise<KeyTestResult> {
-  let key = candidateKey?.trim();
+  let key: string | undefined;
+  try {
+    const candidates = candidateKey ? parseSolutionApiKeys(candidateKey) : [];
+    if (candidates.length > 1) throw new Error('ONE_KEY_REQUIRED');
+    key = candidates[0];
+  } catch { return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0, error: 'AI_KEY_INPUT_INVALID' }; }
   if (!key) {
     const pool = await loadSolutionKeyPool();
     const active = pool.keys.slice(Math.max(0, pool.activeIndex));
     key = active[0] ?? pool.keys.at(-1);
   }
   if (!key) {
-    return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0, error: 'NO_KEY_CONFIGURED' };
+    return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0,
+      error: config.solutionPosts.keyError ?? 'NO_KEY_CONFIGURED',
+      keySource: config.solutionPosts.keySource, keyEnvironment: config.solutionPosts.keyEnvironment };
   }
   const masked = maskSolutionApiKey(key);
   const testModel = model ?? config.solutionPosts.models?.[0] ?? DEFAULT_SOLUTION_POST_MODEL;

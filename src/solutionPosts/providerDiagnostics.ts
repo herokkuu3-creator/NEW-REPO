@@ -7,6 +7,10 @@ export const PROVIDER_CHECK_STATE_KEY = 'solution-post-provider:last-check';
 
 /** A small real inference check on the deployed host; it never mutates quota pointers or posts. */
 export async function verifySolutionProviderOnBoot(): Promise<void> {
+  logger.info({ provider: new URL(config.solutionPosts.baseUrl).hostname,
+    keySource: config.solutionPosts.keySource, environment: config.solutionPosts.keyEnvironment,
+    configuredKeyCount: config.solutionPosts.apiKeys?.length ?? 0, inputError: config.solutionPosts.keyError },
+  'solution article credential configuration');
   if (process.env.SOLUTION_POST_VERIFY_ON_BOOT === 'false') return;
   const models = config.solutionPosts.models.slice(0, 3);
   const results = [];

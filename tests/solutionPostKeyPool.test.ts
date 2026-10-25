@@ -16,7 +16,7 @@ describe('solution article API key pool', () => {
   beforeEach(() => {
     db.value = null; vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-10-16T00:00:00Z'));
     Object.assign(config.solutionPosts, { apiKeys: ['env_primary_0001', 'env_backup_0002'],
-      baseUrl: 'https://codecraftapi.com/v1', models: ['gpt-5.6-terra'] });
+      baseUrl: 'https://codecraftapi.com/v1', models: ['gpt-5.6-terra'], keyError: undefined });
   });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
@@ -109,14 +109,46 @@ describe('solution article API key pool', () => {
   it('carries saved BazaarLink keys across the default switch and excludes CodeCraft credentials', async () => {
     await appendSolutionApiKeys('cc_old_provider_key,sk-bl-saved_provider_key');
     Object.assign(config.solutionPosts, { baseUrl: 'https://api.bazaarlink.ai/v1',
-      apiKeys: ['cc_old_environment_key', 'sk-bl-environment_key'] });
+      apiKeys: ['opaque_environment_key', 'sk-bl-environment_key'] });
     const migrated = await loadSolutionKeyPool();
-    expect(migrated.keys).toEqual(['sk-bl-environment_key', 'sk-bl-saved_provider_key']);
+    expect(migrated.keys).toEqual(['opaque_environment_key', 'sk-bl-environment_key', 'sk-bl-saved_provider_key']);
     expect(migrated.activeIndex).toBe(0);
-    await rotateSolutionApiKey('sk-bl-environment_key');
+    await rotateSolutionApiKey('opaque_environment_key');
     expect((await loadSolutionKeyPool()).activeIndex).toBe(1);
-    await expect(replaceSolutionApiKeys('cc_wrong_provider_key')).rejects.toThrow('BazaarLink requires sk-bl-');
-    await expect(appendSolutionApiKeys('cc_wrong_provider_key')).rejects.toThrow('BazaarLink requires sk-bl-');
+    expect(migrated.keys).not.toContain('cc_old_provider_key');
+  });
+  it('accepts an explicitly supplied opaque key and lets the provider report authentication failure', async () => {
+    Object.assign(config.solutionPosts, { baseUrl: 'https://api.bazaarlink.ai/v1',
+      apiKeys: [], models: ['qwen/qwen3.7-flash:free'] });
+    await replaceSolutionApiKeys('SOLUTION_POST_API_KEYS="opaque_provider_key"');
+    expect((await loadSolutionKeyPool()).keys).toEqual(['opaque_provider_key']);
+    const fetcher = vi.fn().mockResolvedValueOnce(new Response('{"data":[]}'))
+      .mockResolvedValueOnce(new Response('{"error":{"message":"invalid key"}}', { status: 401 }));
+    vi.stubGlobal('fetch', fetcher);
+    expect(await testSolutionApiKey()).toMatchObject({ chatStatus: 401, failureCategory: 'INVALID_API_KEY' });
+    expect(fetcher.mock.calls[1]![1].headers.Authorization).toBe('Bearer opaque_provider_key');
+  });
+  it('recovers an empty saved pool from environment keys previously excluded by prefix filtering', async () => {
+    Object.assign(config.solutionPosts, { baseUrl: 'https://api.bazaarlink.ai/v1', apiKeys: [] });
+    // Create an empty provider-bound record by switching from the old provider.
+    Object.assign(config.solutionPosts, { baseUrl: 'https://codecraftapi.com/v1' });
+    await replaceSolutionApiKeys('old_provider_key');
+    Object.assign(config.solutionPosts, { baseUrl: 'https://api.bazaarlink.ai/v1' });
+    expect((await loadSolutionKeyPool()).keys).toEqual([]);
+    Object.assign(config.solutionPosts, { apiKeys: ['opaque_recovered_key'] });
+    expect((await loadSolutionKeyPool()).keys).toEqual(['opaque_recovered_key']);
+    await rotateSolutionApiKey('opaque_recovered_key');
+    expect((await loadSolutionKeyPool()).activeIndex).toBe(1);
+  });
+  it('allows a bot-saved replacement to repair an invalid environment input', async () => {
+    Object.assign(config.solutionPosts, { baseUrl: 'https://api.bazaarlink.ai/v1', apiKeys: [],
+      models: ['qwen/qwen3.7-flash:free'], keyError: 'AI_KEY_INPUT_INVALID' });
+    expect(await testSolutionApiKey()).toMatchObject({ error: 'AI_KEY_INPUT_INVALID' });
+    await replaceSolutionApiKeys('opaque_bot_replacement');
+    const fetcher = vi.fn().mockResolvedValueOnce(new Response('{"data":[]}'))
+      .mockResolvedValueOnce(new Response('{"choices":[{"message":{"content":"OK"}}]}'));
+    vi.stubGlobal('fetch', fetcher);
+    expect(await testSolutionApiKey()).toMatchObject({ ok: true, chatStatus: 200 });
   });
   it('tests the selected BazaarLink model and key pool without enabling paid fallback', async () => {
     Object.assign(config.solutionPosts, { baseUrl: 'https://api.bazaarlink.ai/v1', models: ['qwen/qwen3.7-flash:free'] });
