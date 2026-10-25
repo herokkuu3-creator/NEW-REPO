@@ -11,6 +11,51 @@ export function shuffled<T>(items: readonly T[], choose = (limit: number) => ran
   return result;
 }
 
+/** Distinct starting questions until the range is exhausted; independently shuffled tails. */
+export function accountQuestionOrders(numbers: readonly number[], accountCount: number,
+  shuffle: (items: readonly number[]) => number[] = shuffled): number[][] {
+  if (!numbers.length) return Array.from({ length: accountCount }, () => []);
+  const starts = shuffle(numbers);
+  return Array.from({ length: accountCount }, (_, index) => {
+    const first = starts[index % starts.length]!;
+    return [first, ...shuffle(numbers.filter(number => number !== first))];
+  });
+}
+
+/** One reservation per in-flight question, shared by all workers in one range job. */
+export class QuestionReservations {
+  private readonly active = new Set<number>();
+  private readonly waiters = new Set<() => void>();
+
+  async claim(pending: readonly number[], signal: AbortSignal, onWait?: () => void): Promise<number | null> {
+    while (!signal.aborted) {
+      const available = pending.find(number => !this.active.has(number));
+      if (available !== undefined) {
+        this.active.add(available);
+        return available;
+      }
+      if (!pending.length) return null;
+      onWait?.();
+      if (signal.aborted) return null;
+      await new Promise<void>(resolve => {
+        const wake = () => {
+          this.waiters.delete(wake);
+          signal.removeEventListener('abort', wake);
+          resolve();
+        };
+        this.waiters.add(wake);
+        signal.addEventListener('abort', wake, { once: true });
+      });
+    }
+    return null;
+  }
+
+  release(number: number): void {
+    this.active.delete(number);
+    for (const wake of [...this.waiters]) wake();
+  }
+}
+
 interface Cursor { nextKey: string | null; lastCompletedKey: string | null }
 interface Plan { version: 1; original: string[]; order: string[]; initial: Cursor }
 export interface PlannedQueue<T> { queue: T[]; nextKey: string | null; initial: Cursor }

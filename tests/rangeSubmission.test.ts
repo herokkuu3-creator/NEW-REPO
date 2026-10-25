@@ -671,6 +671,81 @@ describe('calculateSafeRangeConcurrency', () => {
 });
 
 describe('parallel range submission', () => {
+  it('coordinates the screenshot case: 15 accounts, 11 questions, 5 workers with no in-flight duplicates', async () => {
+    const session = makeSession(() => 'accepted', []);
+    const active = new Set<number>();
+    let peak = 0;
+    const collisions: number[] = [];
+    const events: any[] = [];
+    const awaitResult = session.api.awaitResult.bind(session.api);
+    session.api.awaitResult = async (id, slug) => {
+      try {
+        await new Promise(resolve => setTimeout(resolve, 2));
+        return await awaitResult(id, slug);
+      } finally { active.delete(Number(slug.slice(5))); }
+    };
+    const { deps } = makeDeps(session, Array.from({ length: 15 }, (_, i) => acc(`parallel-${i}`)), {
+      questionOrder: undefined, // exercise the production coordinated shuffle
+      getPage: async n => {
+        if (active.has(n)) collisions.push(n);
+        active.add(n); peak = Math.max(peak, active.size);
+        return sol(n);
+      },
+      onProgress: event => { events.push(event); },
+    });
+    const run = await startRangeJob({ from: 3700, to: 3710 }, 'all', deps, {
+      mode: 'parallel', maxConcurrency: 5, overrideTotalMb: 1024, overrideUsedMb: 100,
+    });
+    const results = await run.done;
+    expect(results).toHaveLength(15);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(5);
+    expect(collisions).toEqual([]);
+    const firstWave = events.filter(event => event.accIndex < 5 && event.stepIndex === 1 && event.phase === 'processing');
+    expect(new Set(firstWave.map(event => event.questionNumber)).size).toBe(5);
+    for (const result of results) {
+      expect(result.results.map(item => item.number).sort((a, b) => a - b))
+        .toEqual(Array.from({ length: 11 }, (_, i) => 3700 + i));
+      expect(result.notAttempted).toEqual([]);
+    }
+  });
+
+  it('finishes when there are fewer questions than parallel accounts, even with identical preferred orders', async () => {
+    const { deps } = makeDeps(makeSession(() => 'accepted', []), Array.from({ length: 8 }, (_, i) => acc(`short-${i}`)));
+    const run = await startRangeJob({ from: 100, to: 101 }, 'all', deps, {
+      mode: 'parallel', maxConcurrency: 5, overrideTotalMb: 1024, overrideUsedMb: 100,
+    });
+    const results = await run.done;
+    expect(results).toHaveLength(8);
+    expect(results.every(result => result.results.length === 2 && result.notAttempted.length === 0)).toBe(true);
+  });
+
+  it('cancels workers waiting for a reserved question and closes every account session', async () => {
+    let release!: () => void;
+    let waitingReady!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const waiting = new Promise<void>(resolve => { waitingReady = resolve; });
+    const closed: string[] = [];
+    const session = makeSession(() => 'accepted', closed);
+    const awaitResult = session.api.awaitResult.bind(session.api);
+    session.api.awaitResult = async (id, slug) => { await held; return awaitResult(id, slug); };
+    let waiters = 0;
+    const { deps } = makeDeps(session, [acc('cancel-a'), acc('cancel-b'), acc('cancel-c')], {
+      onProgress: event => { if (event.phase === 'waiting-question' && ++waiters === 2) waitingReady(); },
+    });
+    const run = await startRangeJob({ from: 100, to: 100 }, 'all', deps, {
+      mode: 'parallel', maxConcurrency: 3, overrideTotalMb: 1024, overrideUsedMb: 100,
+    });
+    await waiting;
+    expect(cancelRangeJob()).toBe(true);
+    release();
+    const results = await run.done;
+    expect(results).toHaveLength(3);
+    expect(results.flatMap(result => result.results)).toHaveLength(1);
+    expect(results.filter(result => result.notAttempted.includes(100))).toHaveLength(2);
+    expect(closed.filter(item => item === 'closed')).toHaveLength(3);
+  });
+
   it('executes multiple accounts concurrently when mode is parallel', async () => {
     const activeConcurrentAccounts: number[] = [];
     let currentConcurrent = 0;
@@ -691,7 +766,7 @@ describe('parallel range submission', () => {
       },
     });
 
-    const r = await startRangeJob({ from: 100, to: 100 }, 'all', deps, {
+    const r = await startRangeJob({ from: 100, to: 103 }, 'all', deps, {
       mode: 'parallel',
       maxConcurrency: 4,
       overrideTotalMb: 1024,

@@ -4635,6 +4635,10 @@ export async function handleQuestionRangeTrigger(
         sec.activeLine = `⏳ Waiting ${event.waitSeconds ?? 30}s${nextStepStr} (human pacing)…`;
         break;
       }
+      case 'waiting-question': {
+        sec.activeLine = '⏳ Waiting for another account to finish a remaining question…';
+        break;
+      }
       case 'blocked': {
         sec.activeLine = '🧱 LeetCode rate-limit / challenge blocked';
         sec.accountStatus = '🧱 Blocked by LeetCode';

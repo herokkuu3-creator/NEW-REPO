@@ -17,7 +17,7 @@ import { shouldRetryWithOriginal, stripCppComments } from '../codeforces/codeSan
 import { ParsedProblem } from '../leetcode/parser';
 import { isRunInProgress } from './dailyWorker';
 import { config } from '../config';
-import { shuffled } from './questionOrder';
+import { accountQuestionOrders, QuestionReservations } from './questionOrder';
 import { refreshLeetCodeAccount, AccountRefreshOutcome } from '../security/sessionAutoRefresh';
 
 /**
@@ -146,6 +146,7 @@ export interface RangeProgressEvent {
     | 'premium'
     | 'error'
     | 'waiting'
+    | 'waiting-question'
     | 'blocked'
     | 'cancelled'
     | 'completed';
@@ -540,8 +541,15 @@ async function executeRangeJob(
 
   const concurrency = budget.concurrency;
   const results: AccountRangeResult[] = new Array(accounts.length);
+  const numbers = Array.from({ length: rangeSize(range) }, (_, i) => range.from + i);
+  const reservations = new QuestionReservations();
 
   try {
+    // Build once for the job so parallel workers receive coordinated starts.
+    const orders = deps.questionOrder ? accounts.map(account => deps.questionOrder!(numbers, account.id)) :
+      accountQuestionOrders(numbers, accounts.length);
+    logger.info({ scheduling: 'distinct-starts-with-question-reservations', mode: budget.mode,
+      firstQuestions: orders.map(order => order[0]), accountCount: accounts.length }, 'range question scheduling configured');
     let nextAccountIdx = 0;
 
     const runWorker = async (_workerId: number): Promise<void> => {
@@ -565,6 +573,8 @@ async function executeRangeJob(
             accountIdx + 1,
             accounts.length,
             usedCommunityUuidsByQuestion,
+            orders[accountIdx]!,
+            reservations,
           );
           results[accountIdx] = result;
           await deps
@@ -624,9 +634,11 @@ async function runAccountRange(
   index: number,
   total: number,
   usedCommunityUuidsByQuestion: Map<number, Set<string>> = new Map(),
+  plannedOrder: number[],
+  reservations: QuestionReservations,
 ): Promise<AccountRangeResult> {
   const numbers = Array.from({ length: rangeSize(range) }, (_, i) => range.from + i);
-  const order = deps.questionOrder ? deps.questionOrder(numbers, account.id) : shuffled(numbers);
+  const order = [...plannedOrder];
   const result: AccountRangeResult = {
     label: account.label,
     username: account.username,
@@ -675,7 +687,7 @@ async function runAccountRange(
         accTotal: total,
         stepIndex: 1,
         stepTotal: rangeSize(range),
-        questionNumber: range.from,
+        questionNumber: order[0]!,
         detail: result.fatal,
       });
       return finish();
@@ -691,7 +703,7 @@ async function runAccountRange(
       accTotal: total,
       stepIndex: 1,
       stepTotal: rangeSize(range),
-      questionNumber: range.from,
+      questionNumber: order[0]!,
     });
 
     let check = await session.api.checkSession();
@@ -724,7 +736,7 @@ async function runAccountRange(
         accTotal: total,
         stepIndex: 1,
         stepTotal: rangeSize(range),
-        questionNumber: range.from,
+        questionNumber: order[0]!,
         detail: result.fatal,
       });
       return finish();
@@ -742,12 +754,21 @@ async function runAccountRange(
     let accountDone = 0;
 
     logger.info({ accountId: account.id, count: order.length, firstQuestions: order.slice(0, 10) }, 'account question range shuffled');
-    for (const [offset, n] of order.entries()) {
+    const pending = [...order];
+    while (pending.length) {
       if (signal.aborted) break;
       await waitForDailyRun(deps, info, signal);
       if (signal.aborted) break;
 
-      const stepIndex = offset + 1;
+      const n = await reservations.claim(pending, signal, () => {
+        void deps.onProgress?.({ phase: 'waiting-question', label: account.label, username: result.username,
+          accIndex: index - 1, accTotal: total, stepIndex: result.results.length + 1,
+          stepTotal: rangeSize(range), questionNumber: pending[0]!,
+          detail: 'Waiting for another account to finish a remaining question' });
+      });
+      if (n === null) break;
+      pending.splice(pending.indexOf(n), 1);
+      const stepIndex = result.results.length + 1;
       const stepTotal = rangeSize(range);
       info.currentQuestion = n;
       let usedUuids = usedCommunityUuidsByQuestion.get(n);
@@ -763,14 +784,21 @@ async function runAccountRange(
         stepIndex,
         stepTotal,
       };
-      const { outcome, touchedLeetCode, blocked } = await solveOneWithRetries(
-        n,
-        session.api,
-        deps,
-        signal,
-        usedUuids,
-        progressCtx,
-      );
+      let solved: OneOutcome;
+      try {
+        logger.info({ accountId: account.id, question: n, stepIndex }, 'range question reserved');
+        solved = await solveOneWithRetries(
+          n,
+          session.api,
+          deps,
+          signal,
+          usedUuids,
+          progressCtx,
+        );
+      } finally {
+        reservations.release(n);
+      }
+      const { outcome, touchedLeetCode, blocked } = solved;
       if (outcome === null) break; // cancelled during a back-off wait
       result.results.push(outcome);
       accountDone++;

@@ -4,7 +4,7 @@ vi.mock('../src/database/models', () => ({
   getSystemState: vi.fn(async (key: string) => h.state.get(key) ?? null),
   setSystemState: vi.fn(async (key: string, value: string) => { h.state.set(key, value); }),
 }));
-import { shuffled, prepareShuffledBatch, plannedProgress } from '../src/scheduler/questionOrder';
+import { shuffled, prepareShuffledBatch, plannedProgress, accountQuestionOrders, QuestionReservations } from '../src/scheduler/questionOrder';
 import { setSystemState } from '../src/database/models';
 
 const reverse = (keys: readonly string[]) => [...keys].reverse();
@@ -12,6 +12,33 @@ const cursor = { nextKey: 'A', lastCompletedKey: null };
 beforeEach(() => { h.state.clear(); vi.clearAllMocks(); });
 
 describe('per-account question permutations', () => {
+  it('assigns distinct starts to the first parallel group and preserves every account permutation', () => {
+    const numbers = Array.from({ length: 11 }, (_, i) => 3700 + i);
+    const orders = accountQuestionOrders(numbers, 15, values => [...values].reverse());
+    expect(new Set(orders.slice(0, 5).map(order => order[0])).size).toBe(5);
+    expect(new Set(orders.slice(0, 11).map(order => order[0])).size).toBe(11);
+    expect(orders).toHaveLength(15);
+    for (const order of orders) expect([...order].sort((a, b) => a - b)).toEqual(numbers);
+    expect(accountQuestionOrders([1], 3)).toEqual([[1], [1], [1]]);
+  });
+  it('reserves different available questions and releases waiters without leaking cancelled claims', async () => {
+    const reservations = new QuestionReservations();
+    const controller = new AbortController();
+    expect(await reservations.claim([1, 2], controller.signal)).toBe(1);
+    expect(await reservations.claim([1, 2], controller.signal)).toBe(2);
+    const waiting = vi.fn();
+    const blocked = reservations.claim([1, 2], controller.signal, waiting);
+    expect(waiting).toHaveBeenCalledOnce();
+    reservations.release(2);
+    expect(await blocked).toBe(2);
+    const cancelled = reservations.claim([1, 2], controller.signal);
+    controller.abort();
+    expect(await cancelled).toBeNull();
+    reservations.release(1);
+    reservations.release(2);
+    expect(await reservations.claim([1], new AbortController().signal)).toBe(1);
+  });
+
   it('uses a permutation without mutating, repeating, or dropping any selected item', () => {
     const input = Array.from({ length: 51 }, (_, i) => 50 + i);
     const order = shuffled(input, () => 0);
