@@ -3,7 +3,7 @@ const mocks = vi.hoisted(() => ({
   post: vi.fn(), poll: vi.fn(), complete: vi.fn(), patch: vi.fn(), outcomes: vi.fn(), progress: vi.fn(),
 }));
 vi.mock('../src/database/models', () => ({
-  getSystemState: vi.fn(async () => 'proxy'), setSystemState: vi.fn(async () => {}), SystemKeys: { codeforcesNetworkMode: 'route' },
+  getSystemState: vi.fn(async (key: string) => key.startsWith('question-order:') ? null : 'proxy'), setSystemState: vi.fn(async () => {}), SystemKeys: { codeforcesNetworkMode: 'route' },
 }));
 vi.mock('../src/codeforces/storage', () => ({
   listCodeforcesAccounts: vi.fn(async () => [
@@ -110,6 +110,35 @@ it('marks every Codeforces final verdict as performed and advances its source cu
     expect(mocks.complete).toHaveBeenCalledTimes(2);
     expect(mocks.complete).toHaveBeenLastCalledWith('a2', expect.objectContaining({ completedKey: '8B', nextKey: '9A', verdict }));
   }
+});
+
+it('executes each shuffled source exactly once per account and resumes after exhaustion', async () => {
+  vi.useFakeTimers();
+  const storage = await import('../src/codeforces/storage');
+  const models = await import('../src/database/models');
+  const saved = new Map<string, string>();
+  const cursors = new Map(['a1', 'a2'].map(id => [id, { nextKey: '8B' as string | null, lastCompletedKey: null as string | null }]));
+  mocks.post.mockResolvedValue(posted);
+  await vi.mocked(models.getSystemState).withImplementation(async key => saved.get(key) ?? null, async () => {
+    await vi.mocked(models.setSystemState).withImplementation(async (key, value) => { saved.set(key, value); }, async () => {
+      await vi.mocked(storage.getCodeforcesProgress).withImplementation(async id => ({ ...cursors.get(id)! } as never), async () => {
+        await mocks.complete.withImplementation(async (id, data) => {
+          cursors.set(id, { nextKey: data.nextKey, lastCompletedKey: data.completedKey });
+        }, async () => {
+          const run = runCodeforcesNow('manual', { batchCount: 2, forceDailyAttempt: true });
+          await vi.runAllTimersAsync();
+          const report = await run;
+          expect(report?.totals.solved).toBe(4);
+          for (const label of ['first', 'second']) {
+            expect(mocks.post.mock.calls.filter(call => call[1] === label).map(call => call[3].key).sort()).toEqual(['8B', '9A']);
+          }
+          const again = await runCodeforcesNow('manual', { batchCount: 2, forceDailyAttempt: true });
+          expect(again?.totals.solved).toBe(0);
+          expect(mocks.post).toHaveBeenCalledTimes(4);
+        });
+      });
+    });
+  });
 });
 
 it('correctly determines whether the current time is after the scheduled Codeforces time', () => {

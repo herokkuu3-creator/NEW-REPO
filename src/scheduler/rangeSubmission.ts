@@ -17,6 +17,7 @@ import { shouldRetryWithOriginal, stripCppComments } from '../codeforces/codeSan
 import { ParsedProblem } from '../leetcode/parser';
 import { isRunInProgress } from './dailyWorker';
 import { config } from '../config';
+import { shuffled } from './questionOrder';
 import { refreshLeetCodeAccount, AccountRefreshOutcome } from '../security/sessionAutoRefresh';
 
 /**
@@ -173,6 +174,8 @@ export interface RangeProgressContext {
 }
 
 export interface RangeDeps {
+  /** Tests may inject an order; production generates a new permutation per account. */
+  questionOrder?: (numbers: readonly number[], accountId: string) => number[];
   listAccounts(): Promise<AccountRecord[]>;
   getAccount(id: string): Promise<AccountRecord | null>;
   openSession(account: AccountRecord): Promise<RangeSession>;
@@ -622,6 +625,8 @@ async function runAccountRange(
   total: number,
   usedCommunityUuidsByQuestion: Map<number, Set<string>> = new Map(),
 ): Promise<AccountRangeResult> {
+  const numbers = Array.from({ length: rangeSize(range) }, (_, i) => range.from + i);
+  const order = deps.questionOrder ? deps.questionOrder(numbers, account.id) : shuffled(numbers);
   const result: AccountRangeResult = {
     label: account.label,
     username: account.username,
@@ -632,6 +637,8 @@ async function runAccountRange(
     finishedAt: 0,
   };
   const finish = (): AccountRangeResult => {
+    const attempted = new Set(result.results.map(item => item.number));
+    result.notAttempted = numbers.filter(number => !attempted.has(number));
     result.finishedAt = deps.now();
     return result;
   };
@@ -734,12 +741,13 @@ async function runAccountRange(
     let cooledDown = false;
     let accountDone = 0;
 
-    for (let n = range.from; n <= range.to; n++) {
+    logger.info({ accountId: account.id, count: order.length, firstQuestions: order.slice(0, 10) }, 'account question range shuffled');
+    for (const [offset, n] of order.entries()) {
       if (signal.aborted) break;
       await waitForDailyRun(deps, info, signal);
       if (signal.aborted) break;
 
-      const stepIndex = n - range.from + 1;
+      const stepIndex = offset + 1;
       const stepTotal = rangeSize(range);
       info.currentQuestion = n;
       let usedUuids = usedCommunityUuidsByQuestion.get(n);
@@ -770,7 +778,7 @@ async function runAccountRange(
       info.counts[outcome.status]++;
       logger.info({ label: account.label, question: n, status: outcome.status, detail: outcome.detail }, 'range question finished');
 
-      if (deps.progressEvery > 0 && accountDone % deps.progressEvery === 0 && n < range.to) {
+      if (deps.progressEvery > 0 && accountDone % deps.progressEvery === 0 && stepIndex < order.length) {
         const c = info.counts;
         await deps
           .notify(`📈 ${who(result)}: ${accountDone}/${rangeSize(range)} done — ✅ ${c.accepted} · ❌ ${c.failed} · ⚠️ ${c.error}`)
@@ -795,7 +803,7 @@ async function runAccountRange(
         info.pausedReason = null;
       }
 
-      if (n < range.to && touchedLeetCode && !signal.aborted) {
+      if (stepIndex < order.length && touchedLeetCode && !signal.aborted) {
         void deps.onProgress?.({
           phase: 'waiting',
           label: account.label,
@@ -817,19 +825,15 @@ async function runAccountRange(
       username: result.username,
       accIndex: index - 1,
       accTotal: total,
-      stepIndex: rangeSize(range),
+      stepIndex: result.results.length,
       stepTotal: rangeSize(range),
-      questionNumber: range.to,
+      questionNumber: result.results.at(-1)?.number ?? order[0]!,
     });
 
     if (signal.aborted) result.stoppedEarly = 'cancelled';
-    const last = result.results.at(-1)?.number ?? range.from - 1;
-    for (let n = last + 1; n <= range.to; n++) result.notAttempted.push(n);
     return finish();
   } catch (err) {
     result.fatal = `unexpected: ${errText(err)}`;
-    const last = result.results.at(-1)?.number ?? range.from - 1;
-    for (let n = last + 1; n <= range.to; n++) result.notAttempted.push(n);
     return finish();
   } finally {
     info.currentQuestion = null;

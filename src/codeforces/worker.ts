@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import { CodeforcesAccountStatus } from '@prisma/client';
 import { config } from '../config';
+import { prepareShuffledBatch } from '../scheduler/questionOrder';
 import { logger } from '../logger';
 import { getSystemState, setSystemState, SystemKeys } from '../database/models';
 import { isRunInProgress as isLeetCodeBusy, todayInTimezone } from '../scheduler/dailyWorker';
@@ -311,6 +312,13 @@ export async function executeCodeforcesRun(
     for (const [accIndex, account] of accounts.entries()) {
       if (signal.aborted) break;
 
+      const cursor = await getCodeforcesProgress(account.id);
+      const current = resolveCurrentEntry(source.queue, cursor.nextKey, cursor.lastCompletedKey);
+      const plan = await prepareShuffledBatch('codeforces', account.id, source.queue, cursor,
+        current ? source.queue.indexOf(current) : source.queue.length, batchCount, entry => entry.key);
+      const accountSource = { ...source, queue: plan.queue };
+      logger.info({ accountId: account.id, count: batchCount, nextKey: plan.nextKey }, 'Codeforces account batch order prepared');
+
       for (let step = 0; step < batchCount; step++) {
         if (signal.aborted) break;
 
@@ -343,7 +351,7 @@ export async function executeCodeforcesRun(
         const outcome = await runForAccount(
           account,
           today,
-          source,
+          accountSource,
           stepForceAttempt,
           networkMode,
           (phase, username, attempt) =>
@@ -360,6 +368,7 @@ export async function executeCodeforcesRun(
               stepIndex: step + 1,
               stepTotal: batchCount,
             }),
+          step === 0 ? plan.nextKey : undefined,
         );
 
         outcomes.push(outcome);
@@ -503,6 +512,7 @@ async function runForAccount(
   forceDailyAttempt = false,
   networkMode: CodeforcesNetworkMode = 'proxy',
   onProgress?: (phase: 'verified' | 'source' | 'network' | 'opening' | 'submitting' | 'verdict' | 'attempt' | 'retry' | 'queued' | 'running', username: string | null, attempt?: number) => Promise<void> | void,
+  initialNextKey?: string | null,
 ): Promise<CodeforcesAccountOutcome> {
   const label = account.label;
   let stored = parseStoredCodeforcesState(account.storageState);
@@ -523,7 +533,7 @@ async function runForAccount(
   }
 
   let progress = await getCodeforcesProgress(account.id);
-  const resolved = resolveCurrentEntry(source.queue, progress.nextKey, progress.lastCompletedKey);
+  const resolved = resolveCurrentEntry(source.queue, initialNextKey === undefined ? progress.nextKey : initialNextKey, progress.lastCompletedKey);
   let current = resolved;
   let note: string | undefined;
   if (resolved && account.username) {

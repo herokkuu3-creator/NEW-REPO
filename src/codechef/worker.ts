@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { CodeChefAccountStatus } from '@prisma/client';
 import { logger } from '../logger';
 import { config } from '../config';
+import { prepareShuffledBatch, plannedProgress } from '../scheduler/questionOrder';
 import { getSystemState, setSystemState, SystemKeys } from '../database/models';
 import { isRunInProgress as isLeetCodeBusy } from '../scheduler/dailyWorker';
 import { sendTelegramMessage } from '../notifications/telegram';
@@ -192,7 +193,7 @@ export function findNextCodeChefSourceIndex(
   if (queue.length === 0) return 0;
   try {
     const idx = nextCodeChefSource(queue, progress);
-    return idx < queue.length ? idx : 0;
+    return idx;
   } catch {
     const refKey = progress.nextKey ?? progress.lastCompletedKey;
     if (refKey) {
@@ -319,7 +320,7 @@ export async function runCodeChefNow(
     const accounts = (await listCodeChefAccounts(true)).filter(
       (account) => !requestedAccountIds || requestedAccountIds.has(account.id)
     );
-    const queue = accounts.length ? await loadCodeChefSourceIndex() : [];
+    const sourceQueue = accounts.length ? await loadCodeChefSourceIndex() : [];
     const batchCount = Math.max(1, options.batchCount ?? 1);
     const forceAttempt = options.forceDailyAttempt ?? (reason === 'manual');
 
@@ -360,6 +361,11 @@ export async function runCodeChefNow(
       });
 
       let currentProgress = await getCodeChefProgress(account.id);
+      const plan = await prepareShuffledBatch('codechef', account.id, sourceQueue, currentProgress,
+        findNextCodeChefSourceIndex(sourceQueue, currentProgress), batchCount, entry => entry.problemCode!);
+      const queue = plan.queue;
+      currentProgress = plannedProgress(plan, currentProgress);
+      logger.info({ accountId: account.id, count: batchCount, nextKey: plan.nextKey }, 'CodeChef account batch order prepared');
       let validCandidate = await advanceToNextValidProblem(
         account.id,
         account.label,
@@ -456,7 +462,7 @@ export async function runCodeChefNow(
           const progressIndex = accounts.length > 1 && batchCount === 1 ? accIndex + 1 : (accounts.length > 1 ? accIndex * batchCount + step + 1 : step + 1);
           const progressTotal = accounts.length > 1 && batchCount === 1 ? accounts.length : (accounts.length > 1 ? accounts.length * batchCount : batchCount);
 
-          currentProgress = await getCodeChefProgress(account.id);
+          currentProgress = plannedProgress(plan, await getCodeChefProgress(account.id));
           const candidate = await advanceToNextValidProblem(
             account.id,
             account.label,

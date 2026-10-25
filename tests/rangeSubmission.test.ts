@@ -88,6 +88,7 @@ function makeDeps(session: RangeSession, accounts: AccountRecord[], overrides: P
   const notes: string[] = [];
   let t = 0;
   const deps: RangeDeps = {
+    questionOrder: numbers => [...numbers],
     listAccounts: async () => accounts,
     getAccount: async (id) => accounts.find((a) => a.id === id) ?? null,
     openSession: async () => session,
@@ -132,6 +133,32 @@ describe('parseQuestionRange', () => {
 });
 
 describe('range engine', () => {
+  it('uses an independent question order per account with position-based progress and pacing', async () => {
+    const events: any[] = [];
+    const { deps, sleeps } = makeDeps(makeSession(() => 'accepted', []), [acc('a1'), acc('a2')], {
+      questionOrder: (numbers, accountId) => accountId === 'a1' ? [...numbers].reverse() : [numbers[1]!, numbers[0]!, numbers[2]!],
+      onProgress: event => { events.push(event); },
+    });
+    const run = await startRangeJob({ from: 50, to: 52 }, 'all', deps);
+    const results = await run.done;
+    expect(results[0]!.results.map(item => item.number)).toEqual([52, 51, 50]);
+    expect(results[1]!.results.map(item => item.number)).toEqual([51, 50, 52]);
+    expect(results.every(item => item.notAttempted.length === 0)).toBe(true);
+    expect(sleeps).toHaveLength(5); // two question gaps per account, plus the account gap
+    expect(events.filter(event => event.accIndex === 0 && event.phase === 'processing').map(event => event.stepIndex)).toEqual([1, 2, 3]);
+  });
+
+  it('reports the exact unattempted set when cancelling a shuffled range', async () => {
+    const { deps } = makeDeps(makeSession(() => 'accepted', []), [acc('a1')], {
+      questionOrder: numbers => [...numbers].reverse(),
+      sleep: async () => { cancelRangeJob(); },
+    });
+    const run = await startRangeJob({ from: 50, to: 53 }, 'a1', deps);
+    const results = await run.done;
+    expect(results[0]!.results.map(item => item.number)).toEqual([53]);
+    expect(results[0]!.notAttempted).toEqual([50, 51, 52]);
+  });
+
   it('submits every question with a 30 s pause between (none after the last)', async () => {
     const log: string[] = [];
     const session = makeSession(() => 'accepted', log);

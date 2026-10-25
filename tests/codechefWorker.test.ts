@@ -59,6 +59,34 @@ beforeEach(() => {
 });
 
 describe('CodeChef daily progress', () => {
+  it('runs every item in a shuffled batch once and does not wrap at queue exhaustion', async () => {
+    vi.useFakeTimers();
+    let progress = { nextKey: 'AAA' as string | null, lastCompletedKey: null as string | null };
+    const saved = new Map<string, string>();
+    vi.mocked(getSystemState).mockImplementation(async key => saved.get(key) ?? null);
+    vi.mocked(setSystemState).mockImplementation(async (key, value) => { saved.set(key, value); });
+    vi.mocked(storage.getCodeChefProgress).mockImplementation(async () => ({ ...progress } as never));
+    vi.mocked(storage.completeCurrentProblem).mockImplementation(async (_id, data) => {
+      progress = { nextKey: data.nextKey, lastCompletedKey: data.completedKey };
+    });
+    vi.mocked(submitDirectlyViaCodeChefApi).mockResolvedValue({ ok: true, performed: true, clicked: true, submissionId: '123', verdict: 'Accepted' });
+    try {
+      const run = runCodeChefNow('manual', { batchCount: 3 });
+      await vi.runAllTimersAsync();
+      const report = await run;
+      expect(report?.outcomes.map(item => item.problem).sort()).toEqual(['AAA', 'BBB']);
+      expect(submitDirectlyViaCodeChefApi).toHaveBeenCalledTimes(2);
+      expect(progress.nextKey).toBeNull();
+      const again = await runCodeChefNow('manual', { batchCount: 2 });
+      expect(again?.outcomes[0]?.skipped).toBe(true);
+      expect(submitDirectlyViaCodeChefApi).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+      vi.mocked(storage.completeCurrentProblem).mockReset();
+      vi.mocked(storage.getCodeChefProgress).mockReset();
+    }
+  });
+
   it('advances after any confirmed terminal verdict, preserving the submission ID', async () => {
     vi.mocked(submitDirectlyViaCodeChefApi).mockResolvedValue({ ok: false, performed: true, clicked: true, submissionId: '123', verdict: 'Wrong Answer' });
     const report = await runCodeChefNow();
@@ -213,7 +241,7 @@ describe('CodeChef daily scheduler and retries', () => {
 
   it('runAutomaticCodeChefDaily ensures accounts are seeded and triggers run with forceDailyAttempt=true', async () => {
     const today = todayInTimezone();
-    vi.mocked(getSystemState).mockResolvedValue(JSON.stringify({ date: today, retryCount: 0 }));
+    vi.mocked(getSystemState).mockImplementation(async key => key.startsWith('question-order:') ? null : JSON.stringify({ date: today, retryCount: 0 }));
     vi.mocked(storage.listCodeChefAccounts).mockResolvedValue([
       { id: 'acc1', label: 'tester', username: 'tester', lastSubmissionDate: null, storageState: JSON.stringify({ cookies: [{ name: 'session' }], origins: [] }) },
     ] as never);
