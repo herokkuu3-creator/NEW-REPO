@@ -49,7 +49,7 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     });
     scoped.post('/admin/solutions/daily', async req => {
       const body = z.object({ accountIds: z.array(z.string().min(1)).min(1).max(100) }).strict().parse(req.body);
-      return runCombined(body.accountIds);
+      return runCombined(body.accountIds, new Date(), undefined, { retryFailedGeneration: true });
     });
     scoped.get('/admin/solutions/diagnostics', async () => ({
       serverTime: new Date().toISOString(), executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
@@ -147,7 +147,7 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     });
     scoped.post('/admin/solutions/:id/retry', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);
-      const post = await retryPost(id); return { id, status: post.status, lastError: post.lastError };
+      const post = await retryPost(id, true); return { id, status: post.status, lastError: post.lastError };
     });
     scoped.post('/admin/solutions/:id/approve', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);

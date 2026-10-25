@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ accounts: [] as any[], runs: new Map<string, any>(), daily: vi.fn(), generate: vi.fn(),
   submit: vi.fn(), approve: vi.fn(), publish: vi.fn(), preferences: [] as any[], locks: new Map<string, string>(), calls: [] as any[],
-  timers: [] as Array<() => void>, submitSingle: vi.fn(), posts: [] as any[] }));
+  timers: [] as Array<() => void>, submitSingle: vi.fn(), retry: vi.fn(), posts: [] as any[] }));
 vi.mock('node-cron', () => ({ default: { schedule: vi.fn((_expr, callback) => {
   h.timers.push(callback); return { stop: vi.fn() };
 }) } }));
@@ -30,20 +30,23 @@ vi.mock('../src/database/prisma', () => {
   };
   return { prisma: { ...tx, $transaction: vi.fn(async action => action(tx)) } };
 });
-vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error { code: string; constructor(code: string) { super(code); this.code = code; } },
-  generateForRun: h.generate, resolveCurrentDaily: h.daily, retryPost: vi.fn() }));
+vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error {
+  constructor(public readonly code: string, public readonly details?: object) { super(code); }
+}, generateForRun: h.generate, resolveCurrentDaily: h.daily, retryPost: h.retry }));
 vi.mock('../src/solutionPosts/store', () => ({ recoverGeneration: vi.fn(), approvePost: h.approve }));
 vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: h.publish }));
 vi.mock('../src/scheduler/dailyWorker', () => ({ runSubmissionNow: h.submit }));
 vi.mock('../src/scheduler/rangeSubmission', () => ({ submitSingleQuestionDirectly: h.submitSingle }));
 import { afterPostSchedule, POST_CRON, POST_TIMEZONE, runCombined, runManualQuestion, runScheduledSolutionPosts,
   SCHEDULE_STATE_KEY, setSelectedAccounts, startSolutionPostScheduler } from '../src/solutionPosts/scheduler';
+import { PostError } from '../src/solutionPosts/service';
 beforeEach(() => {
   vi.clearAllMocks(); h.locks.clear(); h.preferences = []; h.runs.clear(); h.calls = []; h.timers = []; h.posts = [];
   h.accounts = ['a', 'b', 'c', 'd', 'e'].map(id => ({ id, status: 'ACTIVE' }));
   for (const a of h.accounts) h.runs.set(a.id, { id: 'run-' + a.id, accountId: a.id, problemSlug: 'today', state: 'SUCCESS', submissionId: '123', submissionStatus: 'Accepted' });
   h.daily.mockResolvedValue({ date: '2026-10-15', slug: 'today' });
   h.generate.mockImplementation(async (id: string) => ({ id: 'post-' + id, status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) }));
+  h.retry.mockImplementation(async (id: string) => ({ id, status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) }));
   h.approve.mockImplementation(async (id: string) => ({ id, status: 'DRAFT_READY', contentHash: 'a'.repeat(64) }));
   h.publish.mockImplementation(async (id: string) => ({ id, status: 'PUBLISHED', contentHash: 'a'.repeat(64) }));
   h.submitSingle.mockResolvedValue({
@@ -125,7 +128,40 @@ describe('daily AI drafts', () => {
     const results = await runManualQuestion(3820, ['a'], new Date('2026-10-15T00:30:00Z'));
     expect(h.submitSingle).toHaveBeenCalledWith(expect.objectContaining({ id: 'a' }), 3820);
     expect(results).toEqual([{ accountId: 'a', postId: 'post-a', status: 'PUBLISHED' }]);
-    expect(h.generate).toHaveBeenCalledWith('a', 'manual-a');
+    expect(h.generate).toHaveBeenCalledWith('a', 'manual-a', true);
+  });
+  it('retries all four exhausted accounts on an explicit daily run without resubmitting accepted code', async () => {
+    h.accounts = h.accounts.slice(0, 4);
+    h.posts = h.accounts.map(a => ({ id: 'post-' + a.id, accountId: a.id, status: 'FAILED', retryCount: 4 }));
+    h.retry.mockImplementation(async (id, force) => {
+      if (!force) throw new PostError('GENERATION_RETRY_LIMIT');
+      return { id, status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64) };
+    });
+    const results = await runCombined(h.accounts.map(a => a.id), new Date('2026-10-15T00:30:00Z'), undefined,
+      { retryFailedGeneration: true });
+    expect(results.filter(r => r.status === 'PUBLISHED')).toHaveLength(4);
+    for (const post of h.posts) expect(h.retry).toHaveBeenCalledWith(post.id, true);
+    expect(h.submit).not.toHaveBeenCalled();
+    expect(h.generate).not.toHaveBeenCalled();
+  });
+  it('preserves the original failure in progress when an automatic combined run exhausts its budget', async () => {
+    h.accounts = [h.accounts[0]];
+    h.posts = [{ id: 'post-a', accountId: 'a', status: 'FAILED', retryCount: 4 }];
+    h.retry.mockRejectedValue(new PostError('GENERATION_RETRY_LIMIT', {
+      postId: 'post-a', retryCount: 4, previousError: 'AI_PROVIDER_ACCESS_BLOCKED',
+    }));
+    const events: any[] = [];
+    const results = await runCombined(['a'], new Date('2026-10-15T00:30:00Z'), event => { events.push(event); });
+    expect(h.retry).toHaveBeenCalledWith('post-a', false);
+    expect(results[0]).toMatchObject({ postId: 'post-a', error: 'GENERATION_RETRY_LIMIT', previousError: 'AI_PROVIDER_ACCESS_BLOCKED' });
+    expect(events.at(-1)).toMatchObject({ stage: 'failed', previousError: 'AI_PROVIDER_ACCESS_BLOCKED' });
+    expect(h.publish).not.toHaveBeenCalled();
+  });
+  it('keeps cron from force-resetting exhausted article records', async () => {
+    h.accounts = [h.accounts[0]]; h.preferences = [{ accountId: 'a', enabled: true }];
+    h.posts = [{ accountId: 'a', problemSlug: 'today', status: 'FAILED', retryCount: 4 }];
+    expect((await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'))).status).toBe('IDLE');
+    expect(h.retry).not.toHaveBeenCalled(); expect(h.generate).not.toHaveBeenCalled();
   });
   it('bounds restart/recovery retries per account and day in durable state', async () => {
     vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-10-15T00:30:00Z'));

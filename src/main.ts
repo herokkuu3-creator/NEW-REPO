@@ -25,6 +25,7 @@ import { verifySolutionProviderOnBoot } from './solutionPosts/providerDiagnostic
 async function main(): Promise<void> {
   logger.info(
     {
+      revision: process.env.RENDER_GIT_COMMIT ?? null,
       schedule: `${config.schedule.hour}:${String(config.schedule.minute).padStart(2, '0')}`,
       timezone: config.schedule.timezone,
       solutionSource: config.solution.source,

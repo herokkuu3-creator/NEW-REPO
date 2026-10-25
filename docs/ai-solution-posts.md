@@ -87,7 +87,7 @@ All routes require the existing `Authorization: Bearer <SETUP_TOKEN>` header and
 | PUT | `/admin/solutions/schedule` | `{"accountIds":["..."]}`; an empty array disables it |
 | GET | `/admin/solutions/api-keys` | Masked key slots, active slot, and storage source only |
 | POST | `/admin/solutions/api-keys` | `{"apiKeys":"key-1,key-2"}` appends a comma-separated pool; plaintext keys are never returned |
-| POST | `/admin/solutions/:id/retry` | Resume a failed generation within the retry budget |
+| POST | `/admin/solutions/:id/retry` | Explicitly retry a failed generation, renewing an exhausted generation budget |
 | POST | `/admin/solutions/:id/approve` | `{"contentHash":"<reviewed SHA-256>"}` |
 | POST | `/admin/solutions/:id/publish` | Explicitly publish the approved draft |
 | POST | `/admin/solutions/:id/reconcile` | `{"url":"https://leetcode.com/problems/.../solutions/.../.../"}` |
@@ -100,7 +100,9 @@ The new article cron is `0 6 * * *`, explicitly interpreted in `Asia/Kolkata`. R
 
 Each account authenticates independently and checks LeetCode's challenge date and slug. A stale pointer gets three bounded checks. Before invoking the existing submission worker, combined mode supplies the expected challenge date and selected account IDs; the worker checks the date again before submitting. An existing local accepted run is reused. One failed account does not stop the others.
 
-Generation has a maximum of four job attempts, including the original attempt. Scheduled combined jobs also have a durable four-attempt daily budget per account, including challenge/submission failures. Expired generation leases can be resumed after a restart. Completed drafts stay available regardless of submission or publishing failures.
+Automatic generation has a maximum of four job attempts, including the original attempt. Scheduled combined jobs also have a durable four-attempt daily budget per account, including challenge/submission failures. An explicit Telegram “run now” (daily or question), CLI `daily`/`retry`, or authenticated `/admin/solutions/daily`/`:id/retry` request can renew an exhausted generation budget for the selected posts. The accepted submission is reverified and reused for the daily article retry. Budget renewal occurs atomically with the generation claim after source verification. It does not reset API key exhaustion, change the scheduler's independent daily budget, or replay published/uncertain publications. Expired generation leases can be resumed after a restart. Completed drafts stay available regardless of submission or publishing failures.
+
+Generation claims and failures log the account ID, post ID, attempt count, explicit-retry flag, and previous error. AI attempt logs include the account/post IDs too. An automatic budget error retains and reports its underlying stored error rather than replacing it with a key-reset instruction. An AI provider HTTP 403 access challenge remains a provider access failure; renewing article attempts cannot remove that restriction.
 
 ## Publishing and limits
 

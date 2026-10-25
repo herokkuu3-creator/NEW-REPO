@@ -61,6 +61,7 @@ export interface SolutionWorkflowProgress {
   postId?: string;
   status?: string;
   error?: string;
+  previousError?: string;
 }
 
 type ProgressReporter = (event: SolutionWorkflowProgress) => void | Promise<void>;
@@ -116,7 +117,7 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
       } });
       let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status)
         ? await retryPost(existing.id, true)
-        : await generateForRun(account.id, run.id);
+        : await generateForRun(account.id, run.id, true);
       if (post.status === 'FAILED') {
         const error = post.lastError || 'GENERATION_FAILED';
         results.push({ accountId: account.id, postId: post.id, status: 'FAILED', error });
@@ -175,11 +176,12 @@ async function reserveScheduledAttempt(accountId: string, date: string): Promise
 }
 
 /** Each selected account is independent. Existing daily worker handles code submission unchanged. */
-export async function runCombined(accountIds: string[], now = new Date(), onProgress?: ProgressReporter) {
+export async function runCombined(accountIds: string[], now = new Date(), onProgress?: ProgressReporter,
+  options: { retryFailedGeneration?: boolean } = {}) {
   if (!accountIds.length || new Set(accountIds).size !== accountIds.length) throw new PostError('SELECT_ACCOUNTS_REQUIRED');
   const accounts = await prisma.account.findMany({ where: { id: { in: accountIds }, status: { not: 'DISABLED' } } });
   if (accounts.length !== accountIds.length) throw new PostError('ACCOUNT_UNAVAILABLE');
-  const results: Array<{ accountId: string; postId?: string; status: string; error?: string }> = [];
+  const results: Array<{ accountId: string; postId?: string; status: string; error?: string; previousError?: string }> = [];
   const accepted: Array<{ accountId: string; slug: string; runId: string; submissionId: string }> = [];
   // Finish code submissions for every selected account before invoking the AI.
   // A slow or unavailable article provider must not hold up anyone's daily streak.
@@ -228,7 +230,8 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
       // Never resubmit accepted code for generation retries. Uncertain publications are left for reconciliation.
       await reportProgress(onProgress, { accountId, stage: 'generating_article', submissionId: run.submissionId });
       let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status) ?
-        await retryPost(existing.id) : await generateForRun(accountId, run.runId);
+        await retryPost(existing.id, options.retryFailedGeneration === true) :
+        await generateForRun(accountId, run.runId, options.retryFailedGeneration === true);
       if (post.status === 'FAILED') {
         const error = post.lastError || 'GENERATION_FAILED';
         results.push({ accountId, postId: post.id, status: 'FAILED', error });
@@ -244,8 +247,11 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
         submissionId: run.submissionId, postId: post.id, status: post.status });
     } catch (error) {
       const code = errorCode(error, 'COMBINED_WORKFLOW_FAILED');
-      results.push({ accountId, status: 'FAILED', error: code });
-      await reportProgress(onProgress, { accountId, stage: 'failed', error: code });
+      const details = error instanceof PostError ? error.details : undefined;
+      const failure = { accountId, status: 'FAILED', error: code,
+        ...(details ? { postId: details.postId, ...(details.previousError ? { previousError: details.previousError } : {}) } : {}) };
+      results.push(failure);
+      await reportProgress(onProgress, { ...failure, stage: 'failed', submissionId: run.submissionId });
     } finally { if (release) await release().catch(() => undefined); }
   }
   return results;

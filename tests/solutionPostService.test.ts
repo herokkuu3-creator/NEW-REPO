@@ -29,7 +29,7 @@ vi.mock('../src/browser/sessionCheck', () => ({ checkSession: h.checkSession }))
 vi.mock('../src/leetcode/apiClient', () => ({ LeetCodeApi: class { awaitSubmission = h.verdict; } }));
 vi.mock('../src/leetcode/dailyChallenge', () => ({ fetchQuestionData: h.question, fetchDailyChallenge: h.daily }));
 vi.mock('../src/security/sessionAutoRefresh', () => ({ refreshLeetCodeAccount: h.refresh }));
-import { activeSolutionApiKeys, generateForRun, generatePost, loadContext, resolveCurrentDaily, resetFailedSolutionPostRetries, withAccount } from '../src/solutionPosts/service';
+import { activeSolutionApiKeys, generateForRun, generatePost, loadContext, resolveCurrentDaily, resetFailedSolutionPostRetries, retryPost, withAccount } from '../src/solutionPosts/service';
 import { prisma } from '../src/database/prisma';
 import { assertTransition, approvePost, move } from '../src/solutionPosts/store';
 import { ArticleReviewError, contextSchema, hash } from '../src/solutionPosts/article';
@@ -110,6 +110,47 @@ describe('solution workflow and persistence', () => {
     const results = await Promise.allSettled([generatePost(context, {} as never), generatePost(context, {} as never)]);
     expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
     expect(h.generation).toHaveBeenCalledTimes(1);
+  });
+  it('keeps the automatic four-attempt guard and exposes the original failure without altering it', async () => {
+    await generatePost(context, {} as never);
+    Object.assign(h.row, { status: 'FAILED', retryCount: 4, lastError: 'AI_PROVIDER_ACCESS_BLOCKED' });
+    h.generation.mockClear();
+    await expect(retryPost('post1')).rejects.toMatchObject({ code: 'GENERATION_RETRY_LIMIT', details: {
+      postId: 'post1', retryCount: 4, previousError: 'AI_PROVIDER_ACCESS_BLOCKED',
+    } });
+    expect(h.row).toMatchObject({ status: 'FAILED', retryCount: 4, lastError: 'AI_PROVIDER_ACCESS_BLOCKED' });
+    expect(h.generation).not.toHaveBeenCalled();
+  });
+  it('allows an explicit retry after four failures and reports the current configuration error', async () => {
+    await generatePost(context, {} as never);
+    Object.assign(h.row, { status: 'FAILED', retryCount: 4, lastError: 'OLD_PROVIDER_ERROR' });
+    const post = await retryPost('post1', true);
+    expect(post).toMatchObject({ status: 'FAILED', retryCount: 1, lastError: 'AI_CONFIGURATION_REQUIRED' });
+    expect(h.run).toMatchObject({ state: 'SUCCESS', submissionId: '123', solution: context.code });
+  });
+  it('atomically renews an exhausted recovered post once under simultaneous explicit retries', async () => {
+    await generatePost(context, {} as never);
+    Object.assign(h.row, { status: 'RETRY_PENDING', retryCount: 4, lastError: 'TWO_PUBLIC_GIFS_REQUIRED' });
+    h.generation.mockClear();
+    const results = await Promise.allSettled([generatePost(context, {} as never, true), generatePost(context, {} as never, true)]);
+    expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+    expect(h.generation).toHaveBeenCalledTimes(1);
+    expect(h.row).toMatchObject({ status: 'AWAITING_APPROVAL', retryCount: 1 });
+  });
+  it('does not reset an exhausted budget if the stored accepted source fails verification', async () => {
+    await generatePost(context, {} as never);
+    Object.assign(h.row, { status: 'FAILED', retryCount: 4 });
+    h.run.solution = 'a different accepted source';
+    await expect(retryPost('post1', true)).rejects.toThrow('SOURCE_INTEGRITY_FAILED');
+    expect(h.row.retryCount).toBe(4);
+  });
+  it.each(['PUBLISHING', 'PUBLISHED', 'AWAITING_APPROVAL'])('never resets or replays a %s post on explicit retry', async status => {
+    await generatePost(context, {} as never);
+    Object.assign(h.row, { status, retryCount: 4 });
+    h.generation.mockClear();
+    await expect(retryPost('post1', true)).rejects.toThrow('NOT_RETRYABLE');
+    expect(h.row).toMatchObject({ status, retryCount: 4 });
+    expect(h.generation).not.toHaveBeenCalled();
   });
   it('requires a matching content hash before approval', async () => {
     await generatePost(context, {} as never);

@@ -41,7 +41,7 @@ async function main() {
     await writeFile(resolve(args[1]), `# ${post.title}\n\n${post.markdown}`, 'utf8');
     console.log(`Review hash: ${post.contentHash}`); return;
   }
-  if (command === 'retry') { if (!args[0]) throw new Error('postId required'); console.log(await retryPost(args[0])); return; }
+  if (command === 'retry') { if (!args[0]) throw new Error('postId required'); console.log(await retryPost(args[0], true)); return; }
   if (command === 'approve') {
     if (!args[0] || !args[1]) throw new Error('Usage: solution:post approve <postId> <reviewedContentHash>');
     console.log(await approvePost(args[0], args[1])); return;
@@ -70,7 +70,8 @@ async function main() {
     }
     console.log(`${action}: ${ids.length} accounts; schedule 06:00 Asia/Kolkata; generate, validate, and publish when SOLUTION_POST_AUTO_PUBLISH=true.`);
     if ((await rl.question('Apply this selection? Type yes: ')).trim() !== 'yes') return;
-    console.log(action === 'schedule' ? await setSelectedAccounts(ids) : await runCombined(ids));
+    console.log(action === 'schedule' ? await setSelectedAccounts(ids) :
+      await runCombined(ids, new Date(), undefined, { retryFailedGeneration: true }));
   } finally { rl.close(); }
 }
 

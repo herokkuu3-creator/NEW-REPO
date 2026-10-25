@@ -14,7 +14,17 @@ import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, maskSolutionApiKey, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 
 export class PostError extends Error {
-  constructor(public readonly code: string) { super(code); }
+  constructor(public readonly code: string, public readonly details?: {
+    postId: string; retryCount: number; previousError: string | null;
+  }) { super(code); }
+}
+
+function checkGenerationBudget(post: SolutionPost, force: boolean): void {
+  if (post.retryCount < 4) return;
+  const details = { postId: post.id, retryCount: post.retryCount, previousError: post.lastError };
+  logger.warn({ accountId: post.accountId, ...details, explicitRetry: force },
+    force ? 'solution article retry explicitly requested' : 'solution article automatic retry budget exhausted');
+  if (!force) throw new PostError('GENERATION_RETRY_LIMIT', details);
 }
 
 /** Keys before activeIndex were exhausted this month and must not be retried. */
@@ -64,41 +74,43 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
   });
 }
 
-export async function createPostRouter(): Promise<AIModelRouter> {
+export async function createPostRouter(correlation: { postId?: string; accountId?: string } = {}): Promise<AIModelRouter> {
   const pool = await loadSolutionKeyPool();
   const activeKeys = activeSolutionApiKeys(pool);
-  logger.info({ keyPool: { total: pool.keys.length, activeIndex: pool.activeIndex + 1,
+  logger.info({ ...correlation, keyPool: { total: pool.keys.length, activeIndex: pool.activeIndex + 1,
     activeKey: activeKeys[0] ? maskSolutionApiKey(activeKeys[0]) : null, stored: pool.stored } }, 'solution article router configured');
   if (!activeKeys.length) throw new PostError(!pool.keys.length ? 'AI_CONFIGURATION_REQUIRED' :
     pool.lastFailure === 'HTTP_402_BILLING_REQUIRED' ? 'AI_BILLING_REQUIRED' : 'AI_KEYS_EXHAUSTED');
   return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys }, undefined, undefined,
-    attempt => logger.info({ attempt }, 'solution article AI attempt finished'),
+    attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'),
     async (failedKey, reason) => {
       const advanced = await rotateSolutionApiKey(failedKey, reason);
-      logger.warn({ reason, activeKey: advanced.activeIndex + 1, totalKeys: advanced.keys.length }, 'solution article API key advanced');
+      logger.warn({ ...correlation, reason, activeKey: advanced.activeIndex + 1, totalKeys: advanced.keys.length }, 'solution article API key advanced');
     });
 }
 
 export async function generatePost(context: SubmissionContext, router?: AIModelRouter, force = false): Promise<SolutionPost> {
   let post = await ensurePost(context);
   if (!['PENDING', 'RETRY_PENDING'].includes(post.status)) return post;
-  if (!force && post.retryCount >= 4) throw new PostError('GENERATION_RETRY_LIMIT');
-  if (force && post.retryCount >= 4) {
-    post = await prisma.solutionPost.update({ where: { id: post.id }, data: { retryCount: 0 } });
-  }
+  checkGenerationBudget(post, force);
   // Use the immutable original snapshot when a later submission for the same problem exists.
   const savedContext = contextSchema.parse(JSON.parse(post.context));
   if (hash(savedContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
   const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs));
   const leaseMs = 2 * Math.max(1, config.solutionPosts.models.length) * (config.solutionPosts.retries + 1) *
     (maxTimeout + 8000) + 120000;
-  post = await move(post, 'CHECKING_ELIGIBILITY', { leaseUntil: new Date(Date.now() + leaseMs), retryCount: { increment: 1 } });
+  // Reset an explicitly renewed attempt budget in the same CAS that claims
+  // generation. A separate unconditional update can reset another worker's job.
+  post = await move(post, 'CHECKING_ELIGIBILITY', { leaseUntil: new Date(Date.now() + leaseMs),
+    retryCount: force && post.retryCount >= 4 ? 1 : { increment: 1 } });
+  logger.info({ postId: post.id, accountId: post.accountId, retryCount: post.retryCount,
+    explicitRetry: force, previousError: post.lastError }, 'solution article generation claimed');
   try {
     // Context comes only from a verified accepted DailyRun; publishing rechecks eligibility and identity.
     const recent = await prisma.solutionPost.findMany({ where: { accountId: post.accountId, title: { not: null } },
       orderBy: { createdAt: 'desc' }, take: 8 });
     post = await move(post, 'GENERATING', { lastError: null });
-    const activeRouter = router ?? await createPostRouter();
+    const activeRouter = router ?? await createPostRouter({ postId: post.id, accountId: post.accountId });
     const article = await generateArticle(activeRouter, savedContext,
       recent.map(r => ({ style: r.style ?? '', title: r.title ?? '' })),
       plans => storeVisualAssets(plans, config.api.publicUrl));
@@ -125,6 +137,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
         ...(error instanceof ArticleReviewError ? { ...error.draft,
           contentHash: hash(`${error.draft.title}\n${error.draft.markdown}`), approvedHash: null } : {}),
         ...(error instanceof RoutingError ? { attempts: JSON.stringify(error.attempts) } : {}) });
+      logger.warn({ postId: post.id, accountId: post.accountId, retryCount: post.retryCount,
+        error: post.lastError }, 'solution article generation failed');
     }
     return post;
   }
@@ -147,10 +161,8 @@ export async function generateForRun(accountId: string, runId: string, force = f
 
 export async function retryPost(id: string, force = false): Promise<SolutionPost> {
   let post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
-  if (!force && post.retryCount >= 4) throw new PostError('GENERATION_RETRY_LIMIT');
-  if (force && post.retryCount >= 4) {
-    post = await prisma.solutionPost.update({ where: { id }, data: { retryCount: 0 } });
-  }
+  if (!['FAILED', 'RETRY_PENDING'].includes(post.status)) throw new PostError('NOT_RETRYABLE');
+  checkGenerationBudget(post, force);
   if (post.status === 'FAILED') post = await move(post, 'RETRY_PENDING');
   if (post.status !== 'RETRY_PENDING') throw new PostError('NOT_RETRYABLE');
   const context = contextSchema.parse(JSON.parse(post.context));

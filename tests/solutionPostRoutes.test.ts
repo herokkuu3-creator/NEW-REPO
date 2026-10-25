@@ -1,7 +1,8 @@
 import Fastify from 'fastify';
 import { describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ schedule: vi.fn(async ids => ({ accountIds: ids, timezone: 'Asia/Kolkata' })),
-  scheduled: vi.fn(async () => ({ status: 'IDLE' })), reset: vi.fn(async () => 1) }));
+  scheduled: vi.fn(async () => ({ status: 'IDLE' })), reset: vi.fn(async () => 1),
+  combined: vi.fn(async () => []), retry: vi.fn(async id => ({ id, status: 'AWAITING_APPROVAL', lastError: null })) }));
 const keys = vi.hoisted(() => ({
   append: vi.fn(async () => ({ added: 2, duplicates: 1 })),
   test: vi.fn(async () => ({ ok: false, executionHost: 'render', chatStatus: 402, failureCategory: 'PROVIDER_BILLING_REQUIRED' })),
@@ -14,10 +15,10 @@ vi.mock('../src/database/prisma', () => ({ prisma: { solutionPost: { findMany: v
   solutionPostPreference: { findMany: vi.fn(async () => [{ accountId: 'a', enabled: true }]) },
   systemState: { findUnique: vi.fn(async () => ({ value: '{"status":"FINISHED"}' })) },
 } }));
-vi.mock('../src/solutionPosts/service', () => ({ generateForRun: vi.fn(), retryPost: vi.fn(), resetFailedSolutionPostRetries: h.reset, PostError: class extends Error {} }));
+vi.mock('../src/solutionPosts/service', () => ({ generateForRun: vi.fn(), retryPost: h.retry, resetFailedSolutionPostRetries: h.reset, PostError: class extends Error {} }));
 vi.mock('../src/solutionPosts/store', () => ({ approvePost: vi.fn() }));
 vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: vi.fn(), reconcilePost: vi.fn() }));
-vi.mock('../src/solutionPosts/scheduler', () => ({ setSelectedAccounts: h.schedule, runCombined: vi.fn(),
+vi.mock('../src/solutionPosts/scheduler', () => ({ setSelectedAccounts: h.schedule, runCombined: h.combined,
   runScheduledSolutionPosts: h.scheduled, isScheduledSolutionRunInProgress: () => false,
   SCHEDULE_STATE_KEY: 'solution-post-scheduler:last-tick', POST_CRON: '0 6 * * *', POST_TIMEZONE: 'Asia/Kolkata' }));
 vi.mock('../src/solutionPosts/keyPool', () => ({ appendSolutionApiKeys: keys.append, solutionKeyPoolStatus: keys.status, testSolutionApiKey: keys.test }));
@@ -42,6 +43,16 @@ describe('solution admin routes', () => {
     expect((await request({ accountIds: ['a'], publishAutomatically: true })).statusCode).toBe(400);
     expect((await request({ accountIds: ['a'] })).statusCode).toBe(200);
     expect(h.schedule).toHaveBeenCalledWith(['a']); await app.close();
+  });
+  it('treats authenticated daily and retry requests as explicit fresh attempts', async () => {
+    const app = Fastify(); registerSolutionPostRoutes(app, h => h === 'Bearer admin-test');
+    const headers = { authorization: 'Bearer admin-test' };
+    expect((await app.inject({ method: 'POST', url: '/admin/solutions/daily', headers,
+      payload: { accountIds: ['a'] } })).statusCode).toBe(200);
+    expect(h.combined).toHaveBeenCalledWith(['a'], expect.any(Date), undefined, { retryFailedGeneration: true });
+    expect((await app.inject({ method: 'POST', url: '/admin/solutions/post-a/retry', headers })).statusCode).toBe(200);
+    expect(h.retry).toHaveBeenCalledWith('post-a', true);
+    await app.close();
   });
   it('adds article API keys without returning plaintext secrets', async () => {
     const app = Fastify(); registerSolutionPostRoutes(app, h => h === 'Bearer admin-test');

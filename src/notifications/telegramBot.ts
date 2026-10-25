@@ -1781,7 +1781,7 @@ async function sendDailySolutionPicker(): Promise<void> {
   await defaultCoinClaimUiDeps.send(picker.text, picker.buttons);
 }
 
-function solutionStageText(stage: string, error?: string): string {
+function solutionStageText(stage: string, error?: string, previousError?: string): string {
   switch (stage) {
     case 'starting': return '⏳ Starting…';
     case 'resolving_daily': return '🔎 Finding today’s problem…';
@@ -1794,7 +1794,9 @@ function solutionStageText(stage: string, error?: string): string {
     case 'skipped': return `⏭️ Skipped: ${error ?? 'already in progress'}`;
     case 'failed': {
       if (!error) return '❌ workflow failed';
-      if (error === 'GENERATION_RETRY_LIMIT') return '❌ Retry limit reached (4 failed attempts). Use /resetsolutionkeys to reset.';
+      if (error === 'GENERATION_RETRY_LIMIT') return '❌ Automatic article attempts exhausted. Use “Run daily now” to retry.' +
+        (previousError ? ` Last failure: ${escapeHtml(previousError.slice(0, 140))}` : '');
+      if (error === 'AI_PROVIDER_ACCESS_BLOCKED') return '❌ The AI provider blocked this server (HTTP 403). Check /testsolkey; provider access must be restored.';
       if (error === 'AI_CONFIGURATION_REQUIRED') return '❌ No active AI keys. Use /setsolutionkeys to add a CodeCraft key.';
       if (error.startsWith('AI_ERROR:')) {
         const detail = error.slice('AI_ERROR:'.length).trim();
@@ -1812,13 +1814,13 @@ function solutionStageText(stage: string, error?: string): string {
 function renderSolutionWorkflowProgress(
   title: string,
   accounts: AccountRecord[],
-  states: ReadonlyMap<string, { stage: string; error?: string }>,
+  states: ReadonlyMap<string, { stage: string; error?: string; previousError?: string }>,
 ): string {
   const lines = [`🏆 <b>${title}</b>`, '<code>━━━━━━━━━━━━━━━━━━━━</code>', ''];
   accounts.forEach((account, index) => {
     const state = states.get(account.id);
     lines.push(`👤 <b>Account ${index + 1}/${accounts.length} · ${escapeHtml(accountName(account))}</b>`);
-    lines.push(`└ ${solutionStageText(state?.stage ?? 'queued', state?.error)}`);
+    lines.push(`└ ${solutionStageText(state?.stage ?? 'queued', state?.error, state?.previousError)}`);
   });
   return lines.join('\n').slice(0, 3900);
 }
@@ -1828,7 +1830,7 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
   const description = questionNumber ? `question #${questionNumber}` : 'today’s daily question';
   const accounts = (await listEnabledAccounts()).filter(account => accountIds.includes(account.id));
   if (accounts.length !== accountIds.length) { await reply('⚠️ One or more selected accounts are no longer available. Open the picker again.'); return; }
-  const states = new Map<string, { stage: string; error?: string }>(accounts.map(account => [account.id, { stage: 'queued' }]));
+  const states = new Map<string, { stage: string; error?: string; previousError?: string }>(accounts.map(account => [account.id, { stage: 'queued' }]));
   const title = questionNumber ? `QUESTION #${questionNumber} + SOLUTION ARTICLE` : 'DAILY SUBMISSION + SOLUTION ARTICLE';
   let rendered = renderSolutionWorkflowProgress(title, accounts, states);
   let messageId: number | undefined;
@@ -1840,8 +1842,8 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
   } catch {
     await reply(`🚀 Starting ${description} for ${accountIds.length} selected account(s). Progress updates will be logged.`);
   }
-  const update = async (event: { accountId: string; stage: string; error?: string }) => {
-    states.set(event.accountId, { stage: event.stage, error: event.error });
+  const update = async (event: { accountId: string; stage: string; error?: string; previousError?: string }) => {
+    states.set(event.accountId, { stage: event.stage, error: event.error, previousError: event.previousError });
     const next = renderSolutionWorkflowProgress(title, accounts, states);
     if (!messageId || next === rendered) return;
     rendered = next;
@@ -1854,7 +1856,8 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
     }
   };
   void (async () => {
-    const results = questionNumber ? await runManualQuestion(questionNumber, accountIds, new Date(), update) : await runCombined(accountIds, new Date(), update);
+    const results = questionNumber ? await runManualQuestion(questionNumber, accountIds, new Date(), update) :
+      await runCombined(accountIds, new Date(), update, { retryFailedGeneration: true });
     const done = results.filter(result => result.status === 'PUBLISHED').length;
     const failed = results.filter(result => result.status === 'FAILED').length;
     const acceptedArticleFailed = results.filter(result => result.status === 'FAILED' && result.error === 'AI_MODELS_EXHAUSTED').length;
