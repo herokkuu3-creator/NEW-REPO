@@ -27,7 +27,7 @@ describe('solution admin routes', () => {
     const app = Fastify(); registerSolutionPostRoutes(app, h => h === 'Bearer admin-test');
     for (const [method, url] of [['GET', '/admin/solutions'], ['PUT', '/admin/solutions/schedule'], ['POST', '/admin/solutions/generate'],
       ['POST', '/admin/solutions/scheduled'], ['GET', '/admin/solutions/diagnostics'], ['POST', '/admin/solutions/api-keys/test'],
-      ['POST', '/admin/solutions/openrouter/free-test']]) {
+      ['POST', '/admin/solutions/openrouter/free-test'], ['POST', '/admin/solutions/oxion/test']]) {
       const response = await app.inject({ method: method as any, url }); expect(response.statusCode).toBe(401);
     }
     const history = await app.inject({ method: 'GET', url: '/admin/solutions', headers: { authorization: 'Bearer admin-test' } });
@@ -68,6 +68,15 @@ describe('solution admin routes', () => {
     expect((await app.inject({ method: 'GET', url: '/admin/solutions/diagnostics', headers })).json()).toMatchObject({ timezone: 'Asia/Kolkata', selected: [{ accountId: 'a' }] });
     expect((await app.inject({ method: 'POST', url: '/admin/solutions/scheduled', headers })).statusCode).toBe(202);
     expect(h.scheduled).toHaveBeenCalled();
+    await app.close();
+  });
+  it('validates Oxion probe requests before making provider calls', async () => {
+    const app = Fastify(); registerSolutionPostRoutes(app, h => h === 'Bearer admin-test');
+    for (const payload of [{ apiKey: 'short' }, { apiKey: 'cc_valid_key_1234567890', baseUrl: 'https://example.com' },
+      { apiKey: 'cc_valid_key_1234567890', model: '../models' }, { apiKey: 'cc_valid_key_1234567890', maxTokens: 9999 }]) {
+      expect((await app.inject({ method: 'POST', url: '/admin/solutions/oxion/test',
+        headers: { authorization: 'Bearer admin-test' }, payload })).statusCode).toBe(400);
+    }
     await app.close();
   });
   it('probes one fixed OpenRouter free model and never returns the supplied key', async () => {

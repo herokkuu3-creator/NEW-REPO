@@ -9,6 +9,7 @@ import { runCombined, setSelectedAccounts, POST_CRON, POST_TIMEZONE, runSchedule
   isScheduledSolutionRunInProgress, SCHEDULE_STATE_KEY } from './scheduler';
 import { appendSolutionApiKeys, solutionKeyPoolStatus, testSolutionApiKey } from './keyPool';
 import { PROVIDER_CHECK_STATE_KEY } from './providerDiagnostics';
+import { probeOxion } from './oxionProbe';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
   app.register(async scoped => {
@@ -115,6 +116,14 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
         return { ok: false, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
           status: 0, keyMasked: maskedKey, requestedModel: model, error: 'OPENROUTER_REQUEST_FAILED' };
       }
+    });
+    // A fixed provider origin prevents this authenticated diagnostic from becoming a general proxy.
+    scoped.post('/admin/solutions/oxion/test', async req => {
+      const body = z.object({ apiKey: z.string().regex(/^cc_[A-Za-z0-9_-]{16,128}$/),
+        model: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/).optional(),
+        structured: z.boolean().default(false), maxTokens: z.union([z.literal(128), z.literal(512)]).default(128),
+      }).strict().parse(req.body ?? {});
+      return probeOxion(body.apiKey, body.model, body.structured, body.maxTokens);
     });
     scoped.get('/admin/solutions/:id', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);
