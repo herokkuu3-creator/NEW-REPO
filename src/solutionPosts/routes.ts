@@ -10,6 +10,7 @@ import { runCombined, setSelectedAccounts, POST_CRON, POST_TIMEZONE, runSchedule
 import { appendSolutionApiKeys, solutionKeyPoolStatus, testSolutionApiKey } from './keyPool';
 import { PROVIDER_CHECK_STATE_KEY } from './providerDiagnostics';
 import { probeOxion } from './oxionProbe';
+import { probeExperiential } from './experientialProbe';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
   app.register(async scoped => {
@@ -124,6 +125,12 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
         structured: z.boolean().default(false), maxTokens: z.union([z.literal(128), z.literal(512)]).default(128),
       }).strict().parse(req.body ?? {});
       return probeOxion(body.apiKey, body.model, body.structured, body.maxTokens);
+    });
+    scoped.post('/admin/solutions/experiential/test', async req => {
+      const body = z.object({ apiKey: z.string().regex(/^xpl_[A-Za-z0-9_-]{16,128}$/),
+        model: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$/).optional(),
+      }).strict().parse(req.body ?? {});
+      return probeExperiential(body.apiKey, body.model);
     });
     scoped.get('/admin/solutions/:id', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);

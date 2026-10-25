@@ -27,7 +27,8 @@ describe('solution admin routes', () => {
     const app = Fastify(); registerSolutionPostRoutes(app, h => h === 'Bearer admin-test');
     for (const [method, url] of [['GET', '/admin/solutions'], ['PUT', '/admin/solutions/schedule'], ['POST', '/admin/solutions/generate'],
       ['POST', '/admin/solutions/scheduled'], ['GET', '/admin/solutions/diagnostics'], ['POST', '/admin/solutions/api-keys/test'],
-      ['POST', '/admin/solutions/openrouter/free-test'], ['POST', '/admin/solutions/oxion/test']]) {
+      ['POST', '/admin/solutions/openrouter/free-test'], ['POST', '/admin/solutions/oxion/test'],
+      ['POST', '/admin/solutions/experiential/test']]) {
       const response = await app.inject({ method: method as any, url }); expect(response.statusCode).toBe(401);
     }
     const history = await app.inject({ method: 'GET', url: '/admin/solutions', headers: { authorization: 'Bearer admin-test' } });
@@ -75,6 +76,15 @@ describe('solution admin routes', () => {
     for (const payload of [{ apiKey: 'short' }, { apiKey: 'cc_valid_key_1234567890', baseUrl: 'https://example.com' },
       { apiKey: 'cc_valid_key_1234567890', model: '../models' }, { apiKey: 'cc_valid_key_1234567890', maxTokens: 9999 }]) {
       expect((await app.inject({ method: 'POST', url: '/admin/solutions/oxion/test',
+        headers: { authorization: 'Bearer admin-test' }, payload })).statusCode).toBe(400);
+    }
+    await app.close();
+  });
+  it('validates Experiential probe credentials and disallows caller-controlled origins', async () => {
+    const app = Fastify(); registerSolutionPostRoutes(app, h => h === 'Bearer admin-test');
+    for (const payload of [{ apiKey: 'short' }, { apiKey: `xpl_${'a'.repeat(40)}`, baseUrl: 'https://example.com' },
+      { apiKey: `xpl_${'a'.repeat(40)}`, model: '../models' }]) {
+      expect((await app.inject({ method: 'POST', url: '/admin/solutions/experiential/test',
         headers: { authorization: 'Bearer admin-test' }, payload })).statusCode).toBe(400);
     }
     await app.close();
