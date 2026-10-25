@@ -11,6 +11,7 @@ export interface RouterOptions {
   retries: number;
   maxTokens: number;
   modelTimeoutMs?: Record<string, number>;
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 }
 export interface ModelAttempt {
   model: string;
@@ -46,7 +47,8 @@ export class AIModelRouter {
     this.firstClient = client;
   }
 
-  async generate<T>(messages: LLMMessage[], validate: (text: string) => T): Promise<{
+  async generate<T>(messages: LLMMessage[], validate: (text: string) => T, maxTokens = this.options.maxTokens,
+    jsonMode = false): Promise<{
     value: T; model: string; attempts: ModelAttempt[];
   }> {
     const attempts: ModelAttempt[] = [];
@@ -82,13 +84,18 @@ export class AIModelRouter {
           const record = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'UNAVAILABLE' };
           attempts.push(record); this.onAttempt(record); continue;
         }
+        let attemptMaxTokens = maxTokens;
         for (let n = 0; n <= this.options.retries; n++) {
           const started = Date.now();
           const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'INVALID_OUTPUT' };
           let transient = false;
           try {
-            const response = await client.chat.completions.create({ model, messages,
-              max_tokens: this.options.maxTokens }, { timeout: this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs });
+            const request = { model, messages, max_tokens: attemptMaxTokens,
+              ...(jsonMode ? { response_format: { type: 'json_object' as const } } : {}),
+              ...(this.options.reasoningEffort ? { reasoning_effort: this.options.reasoningEffort } : {}) };
+            const response = await client.chat.completions.create(
+              request as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+            { timeout: this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs });
             record.usage = response.usage;
             const cost = (response as unknown as { cost?: unknown }).cost;
             if (typeof cost === 'number' && Number.isFinite(cost)) record.cost = cost;
@@ -115,6 +122,13 @@ export class AIModelRouter {
             attempts.push(record); this.onAttempt(record);
           }
           if (record.outcome === 'PROVIDER_ACCESS_BLOCKED') throw new RoutingError(attempts, record.outcome);
+          // Some reasoning/free-tier models occasionally stop at their token
+          // boundary even for short structured outputs. Retry that response
+          // once under the configured bounded retry budget.
+          if (record.outcome === 'INCOMPLETE_OUTPUT' && /openrouter\.ai/i.test(this.options.baseUrl)) {
+            attemptMaxTokens = Math.min(maxTokens * 2, 2048);
+          }
+          transient ||= record.outcome === 'INCOMPLETE_OUTPUT';
           if (exhausted || !transient || n === this.options.retries) break;
           await this.sleep(Math.min(1000 * 2 ** n, 8000));
         }
@@ -136,6 +150,7 @@ export class AIModelRouter {
 function safeOutcome(error: unknown): string {
   if (error instanceof OpenAI.APIConnectionTimeoutError) return 'TIMEOUT';
   if (error instanceof OpenAI.APIConnectionError) return 'CONNECTION_ERROR';
+  if (error instanceof Error && ['INCOMPLETE_OUTPUT', 'EMPTY_OUTPUT'].includes(error.message)) return error.message;
   if (error instanceof OpenAI.APIError) {
     if (error.status === 403 && /<!doctype html|<html|just a moment|cf-chl-/i.test(error.message)) return 'PROVIDER_ACCESS_BLOCKED';
     return `HTTP_${error.status ?? 'ERROR'}`;

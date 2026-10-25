@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { DEFAULT_CODECRAFT_API_KEY } from './codecraft';
+import { validateSolutionPostModels } from './solutionPostModels';
 
 /**
  * Central configuration. Every environment variable is parsed and validated
@@ -247,13 +248,4 @@ function loadConfig(): Config {
 }
 
 /** Keep article generation on the user-approved economical model families. */
-function validateSolutionPostModels(raw: string): string[] {
-  const models = [...new Set(raw.split(',').map(s => s.trim()).filter(Boolean))];
-  const allowed = /^(?:gpt-5\.6-(?:terra|luna)|gemini-3\.(?:7|8)-flash|qwen[\w.-]*)$/i;
-  if (models.some(model => !allowed.test(model))) {
-    throw new Error('SOLUTION_POST_MODELS only supports gpt-5.6-terra, gpt-5.6-luna, gemini-3.7/3.8-flash, or Qwen models');
-  }
-  return models;
-}
-
 export const config = loadConfig();

@@ -2,15 +2,16 @@ import { z } from 'zod';
 
 export const sectionKinds = ['intuition', 'approach', 'correctness', 'dryRun', 'takeaways'] as const;
 export const visualThemes = ['aurora', 'sunset', 'ocean', 'violet'] as const;
+export const visualFrameSchema = z.object({
+  label: z.string().min(2).max(48), items: z.array(z.string().max(8)).min(1).max(8),
+  active: z.array(z.number().int().min(0).max(7)).max(8),
+  state: z.string().min(1).max(64), metric: z.string().min(1).max(40), note: z.string().max(76),
+}).strict();
 export const visualPlanSchema = z.object({
   id: z.string().regex(/^visual-[12]$/), after: z.enum(sectionKinds),
   title: z.string().min(3).max(48), caption: z.string().min(5).max(100),
   theme: z.enum(visualThemes).default('aurora'),
-  frames: z.array(z.object({
-    label: z.string().min(2).max(48), items: z.array(z.string().max(8)).min(1).max(8),
-    active: z.array(z.number().int().min(0).max(7)).max(8),
-    state: z.string().min(1).max(64), metric: z.string().min(1).max(40), note: z.string().max(76),
-  })).min(2).max(8),
+  frames: z.array(visualFrameSchema).min(2).max(8),
 }).superRefine((plan, ctx) => {
   for (const [i, frame] of plan.frames.entries()) if (frame.active.some(n => n >= frame.items.length)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['frames', i, 'active'], message: 'Active index is outside the diagram' });

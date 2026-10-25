@@ -26,6 +26,26 @@ const options = { apiKey: 'secret-test-key', baseUrl: 'https://example.test/v1',
 const complete = (content: string, finish_reason = 'stop') => ({ choices: [{ message: { content }, finish_reason }], usage: { total_tokens: 20 } });
 function client() { return { models: { list: vi.fn(async () => ({ data: [{ id: 'terra' }, { id: 'luna' }] })) },
   chat: { completions: { create: vi.fn() } } }; }
+function stagedResponses(draft: typeof article, review = '{"approved":true,"issues":[]}') {
+  const section = (kind: typeof draft.sections[number]['kind']) => {
+    const value = draft.sections.find(item => item.kind === kind)!;
+    return { heading: value.heading, markdown: value.markdown };
+  };
+  return [
+    complete(JSON.stringify({ title: draft.title, section: section('intuition') })),
+    complete(JSON.stringify({ section: section('approach'), time: draft.time, space: draft.space })),
+    complete(JSON.stringify(section('correctness'))),
+    complete(JSON.stringify(section('dryRun'))),
+    complete(JSON.stringify(section('takeaways'))),
+    complete(JSON.stringify({ title: draft.visuals[0]!.title, caption: draft.visuals[0]!.caption,
+      theme: draft.visuals[0]!.theme, frame: draft.visuals[0]!.frames[0] })),
+    complete(JSON.stringify({ frame: draft.visuals[0]!.frames[1] })),
+    complete(JSON.stringify({ title: draft.visuals[1]!.title, caption: draft.visuals[1]!.caption,
+      theme: draft.visuals[1]!.theme, frame: draft.visuals[1]!.frames[0] })),
+    complete(JSON.stringify({ frame: draft.visuals[1]!.frames[1] })),
+    complete(review),
+  ];
+}
 
 describe('solution articles', () => {
   it('preserves source bytes including CRLF and trailing newlines exactly once', () => {
@@ -101,7 +121,15 @@ describe('AI model routing', () => {
   });
   it('falls back on truncated and invalid content', async () => {
     const api = client(); api.chat.completions.create.mockResolvedValueOnce(complete('{}', 'length')).mockResolvedValueOnce(complete('42'));
-    expect((await new AIModelRouter(options, api as never).generate([], JSON.parse)).model).toBe('luna');
+    expect((await new AIModelRouter(options, api as never).generate([], JSON.parse)).model).toBe('terra');
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(2);
+  });
+  it('raises the bounded output budget after a truncated OpenRouter response', async () => {
+    const api = client(); api.chat.completions.create.mockResolvedValueOnce(complete('{}', 'length')).mockResolvedValueOnce(complete('42'));
+    await new AIModelRouter({ ...options, baseUrl: 'https://openrouter.ai/api/v1' }, api as never)
+      .generate([], JSON.parse, 512, true);
+    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as { max_tokens: number }).max_tokens))
+      .toEqual([512, 1024]);
   });
   it('applies per-model timeouts and handles a timeout with bounded retry', async () => {
     const api = client(); const sleep = vi.fn(async () => {});
@@ -175,19 +203,18 @@ describe('AI model routing', () => {
     expect(api.chat.completions.create).not.toHaveBeenCalled(); expect(advanced).not.toHaveBeenCalled();
   });
   it('requires a separate successful technical review', async () => {
-    const api = client(); api.chat.completions.create.mockResolvedValueOnce(complete(JSON.stringify(article)))
-      .mockResolvedValueOnce(complete('{"approved":false,"issues":["wrong complexity"]}'))
-      .mockResolvedValueOnce(complete('{"approved":false,"issues":["wrong trace"]}'));
+    const api = client(); const responses = stagedResponses(article, '{"approved":false,"issues":["wrong trace"]}');
+    responses.push(complete('{"approved":false,"issues":["wrong trace"]}'));
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
     await expect(generateArticle(new AIModelRouter(options, api as never), context, [])).rejects.toBeInstanceOf(RoutingError);
-    expect(api.chat.completions.create).toHaveBeenCalledTimes(3);
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(11);
   });
   it.each([false, true])('resolves both GIFs after review and keeps trace tables only for offline fallback: %s', async hostFails => {
     const draft = structuredClone(article);
-    const api = client();
-    api.chat.completions.create.mockResolvedValueOnce(complete(JSON.stringify(draft)))
-      .mockResolvedValueOnce(complete('{"approved":true,"issues":[]}'));
+    const api = client(); const responses = stagedResponses(draft);
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
     const resolve = vi.fn(async () => {
-      expect(api.chat.completions.create).toHaveBeenCalledTimes(2);
+      expect(api.chat.completions.create).toHaveBeenCalledTimes(10);
       if (hostFails) throw new Error('Host unavailable');
       return draft.visuals.map((visual, index) => ({ id: visual.id, url: `https://assets.example.test/${index}.gif`, alt: visual.caption }));
     });
@@ -196,7 +223,11 @@ describe('AI model routing', () => {
     expect(result.visualFallback).toBe(hostFails);
     expect(result.markdown).toContain(hostFails ? '| Step | State | Result |' : 'https://assets.example.test/0.gif');
     expect(result.assets).toHaveLength(hostFails ? 0 : 2);
-    const request = api.chat.completions.create.mock.calls[1]![0] as { messages: { content: string }[] };
+    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as { max_tokens: number }).max_tokens))
+      .toEqual([512, 640, 512, 512, 512, 512, 512, 512, 512, 512]);
+    expect((api.chat.completions.create.mock.calls[2]![0] as { messages: { content: string }[] }).messages[0]!.content)
+      .toContain('correctness callout');
+    const request = api.chat.completions.create.mock.calls[9]![0] as { messages: { content: string }[] };
     expect(request.messages[1]!.content).toContain('Second interval');
   });
 });
