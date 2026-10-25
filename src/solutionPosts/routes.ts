@@ -84,7 +84,7 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     });
     scoped.post('/admin/solutions/api-keys/test', async req => {
       const body = z.object({ apiKey: z.string().min(8).max(512).optional(),
-        model: z.enum(['gpt-5.6-terra', 'gpt-5.6-luna', 'gemini-3.7-flash', 'gemini-3.8-flash']).optional(),
+        model: z.enum(['gpt-5.6-terra', 'gpt-5.6-luna', 'gemini-3.7-flash', 'gemini-3.8-flash', 'qwen/qwen3.8-27b']).optional(),
       }).strict().parse(req.body ?? {});
       return testSolutionApiKey(body.apiKey, body.model);
     });

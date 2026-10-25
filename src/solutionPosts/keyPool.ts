@@ -13,6 +13,8 @@ export interface SolutionKeyPool {
   activePeriod?: string;
   lastFailure?: string;
   environmentFingerprint?: string;
+  /** Prevents credentials for one provider being reused after the configured endpoint changes. */
+  providerFingerprint?: string;
   stored: boolean;
 }
 
@@ -69,8 +71,17 @@ function normalise(pool: Partial<SolutionKeyPool>, stored: boolean): SolutionKey
     activePeriod: /^\d{4}-\d{2}$/.test(pool.activePeriod ?? '') ? pool.activePeriod : undefined,
     lastFailure: pool.lastFailure && /^(?:HTTP_\d+(?:_BILLING_REQUIRED)?|KEY_EXHAUSTED)$/.test(pool.lastFailure) ? pool.lastFailure : undefined,
     environmentFingerprint: pool.environmentFingerprint,
+    providerFingerprint: /^[a-f0-9]{64}$/.test(pool.providerFingerprint ?? '') ? pool.providerFingerprint : undefined,
     stored,
   };
+}
+
+function providerFingerprint(): string {
+  return createHash('sha256').update(config.solutionPosts.baseUrl.replace(/\/+$/, '').toLowerCase()).digest('hex');
+}
+
+function isDefaultCodeCraftProvider(): boolean {
+  return config.solutionPosts.baseUrl.replace(/\/+$/, '').toLowerCase() === 'https://codecraftapi.com/v1';
 }
 
 /** A spent monthly allowance remains skipped until this period changes. */
@@ -84,16 +95,27 @@ export function solutionKeyPeriod(now = new Date()): string {
 
 export async function loadSolutionKeyPool(now = new Date()): Promise<SolutionKeyPool> {
   const saved = await getSystemState(STATE_KEY);
+  const environmentKeys = parseSolutionApiKeys(config.solutionPosts.apiKeys);
+  const environmentFingerprint = createHash('sha256').update(JSON.stringify(environmentKeys)).digest('hex');
+  const configuredProvider = providerFingerprint();
   if (saved) {
     try {
       let pool = normalise(JSON.parse(open(saved)), true);
+      // A key valid for CodeCraft must never be sent to a newly selected provider.
+      // Legacy entries predate providerFingerprint and are treated as CodeCraft only.
+      const providerChanged = pool.providerFingerprint
+        ? pool.providerFingerprint !== configuredProvider
+        : !isDefaultCodeCraftProvider();
+      if (providerChanged) {
+        return persist({ keys: environmentKeys, activeIndex: 0, activePeriod: solutionKeyPeriod(now),
+          environmentFingerprint, providerFingerprint: configuredProvider, stored: true });
+      }
       // Newly configured bootstrap keys must not be hidden by an older DB pool.
       // Preserve every existing slot and its exhaustion pointer.
-      const environmentKeys = parseSolutionApiKeys(config.solutionPosts.apiKeys);
-      const environmentFingerprint = createHash('sha256').update(JSON.stringify(environmentKeys)).digest('hex');
       if (pool.environmentFingerprint !== environmentFingerprint) {
         const additions = environmentKeys.filter(key => !pool.keys.includes(key));
-        pool = await persist({ ...pool, keys: [...pool.keys, ...additions], environmentFingerprint });
+        pool = await persist({ ...pool, keys: [...pool.keys, ...additions], environmentFingerprint,
+          providerFingerprint: configuredProvider });
       }
       const period = solutionKeyPeriod(now);
       // A previous month's exhausted quota must not permanently strand the
@@ -108,7 +130,7 @@ export async function loadSolutionKeyPool(now = new Date()): Promise<SolutionKey
       throw new Error('SOLUTION_KEY_POOL_UNREADABLE');
     }
   }
-  return normalise({ keys: config.solutionPosts.apiKeys, activeIndex: 0 }, false);
+  return normalise({ keys: environmentKeys, activeIndex: 0, environmentFingerprint, providerFingerprint: configuredProvider }, false);
 }
 
 async function persist(pool: SolutionKeyPool): Promise<SolutionKeyPool> {
@@ -116,10 +138,12 @@ async function persist(pool: SolutionKeyPool): Promise<SolutionKeyPool> {
   const activePeriod = valid.activePeriod ?? solutionKeyPeriod();
   const environmentFingerprint = valid.environmentFingerprint ?? createHash('sha256')
     .update(JSON.stringify(parseSolutionApiKeys(config.solutionPosts.apiKeys))).digest('hex');
+  const currentProviderFingerprint = valid.providerFingerprint ?? providerFingerprint();
   await setSystemState(STATE_KEY, seal(JSON.stringify({ keys: valid.keys, activeIndex: valid.activeIndex, activePeriod,
-    lastFailure: valid.lastFailure, environmentFingerprint })));
+    lastFailure: valid.lastFailure, environmentFingerprint, providerFingerprint: currentProviderFingerprint })));
   valid.activePeriod = activePeriod;
   valid.environmentFingerprint = environmentFingerprint;
+  valid.providerFingerprint = currentProviderFingerprint;
   return valid;
 }
 
@@ -199,10 +223,11 @@ export async function testSolutionApiKey(candidateKey?: string, model?: string):
   const masked = maskSolutionApiKey(key);
   const testModel = model ?? config.solutionPosts.models?.[0] ?? 'gpt-5.6-terra';
   const executionHost = process.env.RENDER_INSTANCE_ID ? 'render' : 'local';
-  if (!/^(?:gpt-5\.6-(?:terra|luna)|gemini-3\.(?:7|8)-flash)$/.test(testModel)) {
+  if (!/^(?:gpt-5\.6-(?:terra|luna)|gemini-3\.(?:7|8)-flash|qwen\/qwen3\.8-27b)$/.test(testModel)) {
     return { ok: false, keyMasked: masked, modelsStatus: 0, modelsCount: 0, error: 'MODEL_NOT_ALLOWED', executionHost };
   }
-  const redact = (value: string) => value.split(key!).join('[REDACTED]').replace(/cc_[A-Za-z0-9_-]+/g, '[REDACTED]').slice(0, 300);
+  const redact = (value: string) => value.split(key!).join('[REDACTED]')
+    .replace(/(?:cc|gsk)_[A-Za-z0-9_-]+/g, '[REDACTED]').slice(0, 300);
   try {
     const baseUrl = config.solutionPosts.baseUrl || 'https://codecraftapi.com/v1';
     const modelsUrl = new URL('models', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
