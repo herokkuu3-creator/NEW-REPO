@@ -145,6 +145,15 @@ describe('AI model routing', () => {
     await expect(new AIModelRouter(options, api as never).generate([], s => s)).rejects.toBeInstanceOf(RoutingError);
     expect(api.chat.completions.create).toHaveBeenCalledTimes(1);
   });
+  it('preserves HTTP 401 as authentication failure when retiring an inference key', async () => {
+    const api = client(); const retired = vi.fn(async () => {});
+    api.chat.completions.create.mockRejectedValue(new OpenAI.AuthenticationError(401, {}, 'invalid credential', undefined));
+    const error = await new AIModelRouter(options, api as never, undefined, undefined, retired)
+      .generate([], value => value).catch(e => e as RoutingError);
+    expect(error.lastFailure).toBe('HTTP_401');
+    expect(error.attempts.at(-1)?.outcome).toBe('HTTP_401');
+    expect(retired).toHaveBeenCalledWith(options.apiKey, 'HTTP_401');
+  });
   it('advances to the next API key only after a quota-exhaustion response', async () => {
     const first = client(); const second = client(); const advanced = vi.fn(async () => {});
     const quota = new OpenAI.RateLimitError(429, {}, '', undefined);

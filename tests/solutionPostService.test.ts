@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ row: null as any, rows: [] as any[], generation: vi.fn(), verifyVisuals: vi.fn(),
-  checkSession: vi.fn(), launch: vi.fn(), browser: { newContext: vi.fn(), close: vi.fn() },
+  pool: vi.fn(), checkSession: vi.fn(), launch: vi.fn(), browser: { newContext: vi.fn(), close: vi.fn() },
   question: vi.fn(), verdict: vi.fn(), daily: vi.fn(), refresh: vi.fn(), run: null as any, account: null as any }));
 vi.mock('../src/database/prisma', () => ({ prisma: {
   solutionPost: {
@@ -29,6 +29,7 @@ vi.mock('../src/browser/sessionCheck', () => ({ checkSession: h.checkSession }))
 vi.mock('../src/leetcode/apiClient', () => ({ LeetCodeApi: class { awaitSubmission = h.verdict; } }));
 vi.mock('../src/leetcode/dailyChallenge', () => ({ fetchQuestionData: h.question, fetchDailyChallenge: h.daily }));
 vi.mock('../src/security/sessionAutoRefresh', () => ({ refreshLeetCodeAccount: h.refresh }));
+vi.mock('../src/solutionPosts/keyPool', async orig => ({ ...(await orig() as object), loadSolutionKeyPool: h.pool }));
 import { activeSolutionApiKeys, generateForRun, generatePost, loadContext, resolveCurrentDaily, resetFailedSolutionPostRetries, retryPost, withAccount } from '../src/solutionPosts/service';
 import { prisma } from '../src/database/prisma';
 import { assertTransition, approvePost, move } from '../src/solutionPosts/store';
@@ -41,6 +42,7 @@ const output = { title: 'Example title', markdown: 'verified exact source\r\n', 
 beforeEach(() => {
   vi.clearAllMocks(); h.row = null; h.rows = [];
   h.generation.mockResolvedValue(output);
+  h.pool.mockResolvedValue({ keys: [], activeIndex: 0, stored: false });
   h.verifyVisuals.mockResolvedValue(true);
   h.account = { id: 'a', username: 'alice', status: 'ACTIVE', storageState: '{"cookies":[{"name":"fake"}],"origins":[]}' };
   h.run = { id: 'run1', accountId: 'a', state: 'SUCCESS', solution: context.code, submissionId: '123', submissionStatus: 'Accepted',
@@ -87,6 +89,14 @@ describe('solution workflow and persistence', () => {
     const post = await generatePost(context, {} as never);
     expect(post.status).toBe('FAILED'); expect(post.lastError).toBe('AI_MODELS_EXHAUSTED');
     expect(post.attempts).toContain('TIMEOUT'); expect(h.run.state).toBe('SUCCESS'); expect(h.run.submissionId).toBe('123');
+  });
+  it('reports the same authentication rejection for the first and all later accounts sharing the invalid pool', async () => {
+    h.generation.mockRejectedValue(new RoutingError([{ model: 'discovery', attempt: 1, outcome: 'HTTP_401', elapsedMs: 1 }], 'HTTP_401'));
+    expect(await generatePost(context, {} as never)).toMatchObject({ status: 'FAILED', lastError: 'AI_AUTHENTICATION_FAILED' });
+    h.row = null;
+    h.pool.mockResolvedValue({ keys: ['invalid_key_0001'], activeIndex: 1, stored: true, lastFailure: 'HTTP_401' });
+    expect(await generatePost(context)).toMatchObject({ status: 'FAILED', lastError: 'AI_AUTHENTICATION_FAILED' });
+    expect(h.run).toMatchObject({ state: 'SUCCESS', submissionId: '123' });
   });
   it('refuses a public post when either mandatory GIF cannot be verified', async () => {
     h.verifyVisuals.mockResolvedValue(false);

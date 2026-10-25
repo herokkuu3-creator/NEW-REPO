@@ -110,7 +110,8 @@ export class AIModelRouter {
           } catch (error) {
             if (isKeyExhausted(error)) {
               const apiErr = error instanceof OpenAI.APIError ? error : undefined;
-              record.outcome = apiErr?.status === 402 ? 'HTTP_402_BILLING_REQUIRED' : 'KEY_EXHAUSTED';
+              record.outcome = apiErr?.status === 401 ? 'HTTP_401' :
+                apiErr?.status === 402 ? 'HTTP_402_BILLING_REQUIRED' : 'KEY_EXHAUSTED';
               lastFailureReason = record.outcome;
               exhausted = true;
             } else {
@@ -162,7 +163,7 @@ function safeOutcome(error: unknown): string {
   return 'INVALID_OUTPUT';
 }
 
-/** Quota exhaustion is distinct from a short-lived rate limit: only this rotates a saved key pool. */
+/** Invalid credentials and spent allowances retire a key; ordinary rate limits do not. */
 export function isKeyExhausted(error: unknown): boolean {
   const api = error instanceof OpenAI.APIError ? error : undefined;
   const status = api?.status;

@@ -81,7 +81,8 @@ export async function createPostRouter(correlation: { postId?: string; accountId
     activeKey: activeKeys[0] ? maskSolutionApiKey(activeKeys[0]) : null, stored: pool.stored },
     keySource: config.solutionPosts.keySource, keyEnvironment: config.solutionPosts.keyEnvironment }, 'solution article router configured');
   if (!activeKeys.length) throw new PostError(!pool.keys.length ? config.solutionPosts.keyError ?? 'AI_CONFIGURATION_REQUIRED' :
-    pool.lastFailure === 'HTTP_402_BILLING_REQUIRED' ? 'AI_BILLING_REQUIRED' : 'AI_KEYS_EXHAUSTED');
+    pool.lastFailure === 'HTTP_401' ? 'AI_AUTHENTICATION_FAILED' :
+      pool.lastFailure === 'HTTP_402_BILLING_REQUIRED' ? 'AI_BILLING_REQUIRED' : 'AI_KEYS_EXHAUSTED');
   return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys }, undefined, undefined,
     attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'),
     async (failedKey, reason) => {
@@ -132,7 +133,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     if (['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING'].includes(post.status)) {
       post = await move(post, 'FAILED', { leaseUntil: null,
         lastError: error instanceof ArticleReviewError ? 'TECHNICAL_REVIEW_FAILED' :
-          error instanceof RoutingError ? (error.lastFailure === 'PROVIDER_ACCESS_BLOCKED' ? 'AI_PROVIDER_ACCESS_BLOCKED' :
+          error instanceof RoutingError ? (error.lastFailure === 'HTTP_401' ? 'AI_AUTHENTICATION_FAILED' :
+            error.lastFailure === 'PROVIDER_ACCESS_BLOCKED' ? 'AI_PROVIDER_ACCESS_BLOCKED' :
             error.lastFailure ? `AI_ERROR: ${error.lastFailure}` : 'AI_MODELS_EXHAUSTED') :
             error instanceof PostError ? error.code : 'GENERATION_FAILED',
         ...(error instanceof ArticleReviewError ? { ...error.draft,
@@ -186,6 +188,7 @@ export async function resetFailedSolutionPostRetries(): Promise<number> {
         { lastError: 'AI_BILLING_REQUIRED' },
         { lastError: 'AI_KEYS_EXHAUSTED' },
         { lastError: 'AI_PROVIDER_ACCESS_BLOCKED' },
+        { lastError: 'AI_AUTHENTICATION_FAILED' },
         { lastError: { startsWith: 'AI_ERROR:' } },
       ],
     },

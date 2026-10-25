@@ -1799,6 +1799,7 @@ function solutionStageText(stage: string, error?: string, previousError?: string
       if (error === 'AI_PROVIDER_ACCESS_BLOCKED') return '❌ The AI provider blocked this server (HTTP 403). Check /testsolkey; provider access must be restored.';
       if (error === 'AI_CONFIGURATION_REQUIRED') return '❌ No active AI keys. Use /setsolutionkeys to add a key for the configured article provider.';
       if (error === 'AI_KEY_INPUT_INVALID') return '❌ The configured article key contains invalid formatting. Run /testsolkey to identify the variable.';
+      if (error === 'AI_AUTHENTICATION_FAILED' || error === 'AI_ERROR: HTTP_401') return '❌ The article provider rejected the key (HTTP 401). Save a key issued by that provider with /setsolutionkeys, then verify with /testsolkey.';
       if (error.startsWith('AI_ERROR:')) {
         const detail = error.slice('AI_ERROR:'.length).trim();
         return `❌ ${escapeHtml(detail.slice(0, 140))}`;
@@ -1806,6 +1807,7 @@ function solutionStageText(stage: string, error?: string, previousError?: string
       if (error === 'AI_MODELS_EXHAUSTED') {
         return '❌ AI models exhausted or billing verification required. Run /testsolkey to check.';
       }
+      if (error === 'AI_KEYS_EXHAUSTED') return '❌ No usable article keys remain. Run /testsolkey for the provider’s rejection reason.';
       return `❌ ${escapeHtml(error.slice(0, 140))}`;
     }
     default: return '⏳ Queued…';
