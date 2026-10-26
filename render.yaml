@@ -148,57 +148,6 @@ services:
   # value as CODEFORCES_SUBMITTER_TOKEN here and on the main service, then set
   # CODEFORCES_SUBMITTER_URL on the main service to this service's public URL
   # (no trailing slash).
-  # ---------------------------------------------------------------------------
-  - type: web
-    name: codeforces-submit-browser
-    runtime: docker
-    plan: free
-    region: frankfurt
-    healthCheckPath: /health
-    dockerCommand: bash /app/scripts/start-submitter.sh
-    envVars:
-      - key: HEADLESS
-        value: "true"
-      # GitHub-hosted runners are unavailable when Actions billing is blocked.
-      # Run Chromium inside this isolated service instead; no other application
-      # workload shares this service's memory allocation.
-      - key: CODEFORCES_RUNNER_MODE
-        value: render
-      - key: CODEFORCES_BROWSER
-        value: chromium
-      # Retained so switching CODEFORCES_RUNNER_MODE back to github needs no
-      # repository configuration change.
-      - key: CODEFORCES_RUNNER_REPOSITORY
-        value: herokkuu41/NEW-REPO
-      # Required: a fine-grained Actions-write token dispatches the browser job.
-      # Jobs fail immediately when it is absent instead of waiting indefinitely.
-      - key: GITHUB_DISPATCH_TOKEN
-        sync: false
-      # Route Firefox through a userspace Cloudflare WARP tunnel so Codeforces'
-      # Cloudflare sees a WARP egress IP when the tunnel passes its connectivity
-      # check. This does not guarantee verification succeeds. Set to "false"
-      # to use the direct connection. An explicit CODEFORCES_PROXY takes priority.
-      - key: WARP_ENABLED
-        value: "false"
-      # Nothing but a tiny HTTP server and one Firefox lives here.
-      - key: NODE_OPTIONS
-        value: --max-old-space-size=96
-      # Bounded waits: never hold the container open for a long challenge.
-      - key: CODEFORCES_TURNSTILE_WAIT_MS
-        value: "60000"
-      - key: CODEFORCES_CHALLENGE_WAIT_MS
-        value: "30000"
-      - key: CODEFORCES_SUBMITTER_TOKEN
-        sync: false
-      - key: LOG_LEVEL
-        value: info
-      - key: CODEFORCES_BROWSER_MIN_FREE_MB
-        value: "120"
-      - key: CPSOLVER_URL
-        value: https://pk-coder.onrender.com
-      - key: CODEFORCES_RESIDENTIAL_PROXY
-        sync: false
-
 databases:
   - name: leetcode-agent-db
     databaseName: leetcode_agent
