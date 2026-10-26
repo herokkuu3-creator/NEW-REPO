@@ -1,19 +1,15 @@
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import { buildLaunchArgs } from '../browser/playwright';
-import { MemoryWatch, memoryReading, memoryLimitMb, releaseHeap } from '../memory';
+import { releaseHeap } from '../memory';
+import { logger } from '../logger';
 
 export type CodeChefState = Awaited<ReturnType<BrowserContext['storageState']>>;
 
 export async function withCodeChefPage<T>(state: CodeChefState | undefined, action: (page: Page) => Promise<T>): Promise<T> {
   releaseHeap();
-  const memory = memoryReading();
-  if (memory.usedMb !== null && memoryLimitMb() - memory.usedMb < 60) {
-    throw new Error(`Not enough free memory to start CodeChef browser safely (Used: ${memory.usedMb}MB, Limit: ${memoryLimitMb()}MB). Try again after the other run finishes.`);
-  }
+  logger.info('Launching lightweight Chromium context for CodeChef action...');
   const browser = await chromium.launch({ headless: true, args: buildLaunchArgs() });
-  const watch = new MemoryWatch(() => { void browser.close().catch(() => undefined); });
   try {
-    watch.start();
     const safeState = state ? {
       cookies: state.cookies || [],
       origins: [],
@@ -38,10 +34,11 @@ export async function withCodeChefPage<T>(state: CodeChefState | undefined, acti
 
       return route.continue();
     });
-    return await action(await context.newPage());
+    const page = context.pages()[0] ?? (await context.newPage());
+    return await action(page);
   } finally {
-    watch.stop();
-    await browser.close();
+    await browser.close().catch(() => undefined);
     releaseHeap();
   }
 }
+
