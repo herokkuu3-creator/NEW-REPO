@@ -32,9 +32,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: leetcode-agent-db
-          property: connectionString
+        sync: false
       # No persistent disk on free tier — these live on the ephemeral
       # filesystem; the durable copies are in Postgres.
       - key: BROWSER_PROFILE_PATH
@@ -148,8 +146,3 @@ services:
   # value as CODEFORCES_SUBMITTER_TOKEN here and on the main service, then set
   # CODEFORCES_SUBMITTER_URL on the main service to this service's public URL
   # (no trailing slash).
-databases:
-  - name: leetcode-agent-db
-    databaseName: leetcode_agent
-    region: frankfurt
-    plan: free # 1 GB, expires 30 days after creation — see DEPLOYMENT.md §13
