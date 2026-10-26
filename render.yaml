@@ -153,4 +153,3 @@ databases:
     databaseName: leetcode_agent
     region: frankfurt
     plan: free # 1 GB, expires 30 days after creation — see DEPLOYMENT.md §13
-    region: frankfurt
