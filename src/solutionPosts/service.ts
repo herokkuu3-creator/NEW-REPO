@@ -106,7 +106,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   const savedContext = contextSchema.parse(JSON.parse(post.context));
   if (hash(savedContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
   const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs));
-  const leaseMs = config.solution.aiProvider === 'firecrawl' ? 4 * 210000 + 120000 :
+  const leaseMs = config.solution.aiProvider === 'firecrawl' ? 6 * 210000 + 120000 :
     2 * Math.max(1, config.solutionPosts.models.length) * (config.solutionPosts.retries + 1) * (maxTimeout + 8000) + 120000;
   // Reset an explicitly renewed attempt budget in the same CAS that claims
   // generation. A separate unconditional update can reset another worker's job.

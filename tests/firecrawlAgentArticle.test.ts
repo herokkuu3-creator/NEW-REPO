@@ -24,31 +24,32 @@ describe('Firecrawl Agent article workflow', () => {
     const router = new FirecrawlAgentRouter('fc-test-key-1234567890');
     const invalid = structuredClone(article);
     invalid.visuals[1].frames[1].items[0] = 'a'.repeat(25);
-    const run = vi.spyOn(router, 'generateStructured').mockResolvedValueOnce(done(invalid))
-      .mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done({ approved: true, issues: [] }));
+    const run = vi.spyOn(router, 'generateStructured').mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done(invalid))
+      .mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done({ approved: true, issues: [] }));
     await generateArticle(router, context, [], async () => assets);
-    const [messages, schema] = run.mock.calls[0];
+    const [messages] = run.mock.calls[0];
+    const schema = run.mock.calls[1]![1];
     expect(messages[0].content).toContain('at most 24 characters');
     expect((schema as any).properties.visuals.items.properties.frames.items.properties.items.items.maxLength).toBe(24);
-    expect(JSON.stringify(run.mock.calls[1][0])).toContain('24');
+    expect(JSON.stringify(run.mock.calls[2][0])).toContain('24');
   });
   it('repairs a rejected draft, requires a separate review, and renders two GIFs', async () => {
     const router = new FirecrawlAgentRouter('fc-test-key-1234567890');
-    const run = vi.spyOn(router, 'generateStructured').mockResolvedValueOnce(done(article))
+    const run = vi.spyOn(router, 'generateStructured').mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done(article))
       .mockResolvedValueOnce(done({ approved: false, issues: ['Fix the trace.'] }))
-      .mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done({ approved: true, issues: [] }));
+      .mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done({ approved: true, issues: [] }));
     const resolve = vi.fn(async () => assets);
     const result = await generateArticle(router, context, [], resolve);
-    expect(run).toHaveBeenCalledTimes(4); expect(resolve).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledTimes(6); expect(resolve).toHaveBeenCalledOnce();
     expect(result.visualFallback).toBe(false); expect(result.markdown).toContain(context.code);
     expect(result.markdown).toContain('one.gif'); expect(result.markdown).toContain('two.gif');
     expect(result.markdown).not.toContain('<br>');
   });
   it('never publishes a draft rejected by both reviews', async () => {
     const router = new FirecrawlAgentRouter('fc-test-key-1234567890');
-    vi.spyOn(router, 'generateStructured').mockResolvedValueOnce(done(article))
+    vi.spyOn(router, 'generateStructured').mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done(article))
       .mockResolvedValueOnce(done({ approved: false, issues: ['Wrong state'] }))
-      .mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done({ approved: false, issues: ['Still wrong'] }));
+      .mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done({ approved: false, issues: ['Still wrong'] }));
     const resolve = vi.fn(async () => assets);
     await expect(generateArticle(router, context, [], resolve)).rejects.toBeInstanceOf(ArticleReviewError);
     expect(resolve).not.toHaveBeenCalled();

@@ -270,8 +270,20 @@ async function generateAgentArticle(router: FirecrawlAgentRouter, context: Submi
         '\nReturn strictly the requested schema. Never use HTML tags. Keep identifiers and all animation states faithful to the exact code.' },
       { role: 'user' as const, content: JSON.stringify({ source, ...(feedback ? { feedback, previousArticle: prior } : {}) }) },
     ];
-    const generated = await router.generateStructured(messages, schema, data => data, round ? 'article repair' : 'article generation');
-    attempts.push(...generated.attempts);
+    // Generate text and visual plans separately so each Agent job has a smaller,
+    // focused output. The visual job sees the completed prose and exact source.
+    const proseSchema = { type: 'object', properties: { title: schema.properties.title, sections: schema.properties.sections,
+      time: schema.properties.time, space: schema.properties.space }, required: ['title', 'sections', 'time', 'space'] };
+    const visualSchema = { type: 'object', properties: { visuals: schema.properties.visuals }, required: ['visuals'] };
+    const prose = await router.generateStructured(messages, proseSchema, data => z.object({ title: z.unknown(), sections: z.unknown(),
+      time: z.unknown(), space: z.unknown() }).passthrough().parse(data), round ? 'article prose repair' : 'article prose');
+    attempts.push(...prose.attempts);
+    const visualMessages = [messages[0]!, { role: 'user' as const, content: JSON.stringify({ source, prose: prose.value,
+      ...(feedback ? { feedback, previousArticle: prior } : {}) }) }];
+    const visual = await router.generateStructured(visualMessages, visualSchema,
+      data => z.object({ visuals: z.unknown() }).passthrough().parse(data), round ? 'animation plan repair' : 'animation plans');
+    attempts.push(...visual.attempts);
+    const generated = { value: { ...prose.value, visuals: visual.value.visuals }, model: prose.model };
     prior = generated.value;
     // Firecrawl sometimes inserts HTML line breaks in otherwise valid Markdown.
     // Convert only those line breaks; the normal markup validator rejects all other HTML.

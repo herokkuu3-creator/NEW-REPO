@@ -21,7 +21,7 @@ describe('Firecrawl Agent router', () => {
     expect(JSON.parse(options.body)).toMatchObject({ maxCredits: 50, strictConstrainToURLs: true });
     expect(JSON.stringify(attempts)).not.toContain(secret);
   });
-  it('does not send an overlong prompt or retry a provider rejection', async () => {
+  it('does not send an overlong prompt and bounds rate-limit retries', async () => {
     const fetcher = vi.fn().mockResolvedValue(response({ error: secret }, 429));
     const router = new FirecrawlAgentRouter(secret, 100, () => {}, fetcher, async () => {});
     await expect(router.generate([{ role: 'user', content: 'x'.repeat(10001) }], x => x)).rejects.toMatchObject({ lastFailure: 'FIRECRAWL_PROMPT_TOO_LONG' });
@@ -31,7 +31,18 @@ describe('Firecrawl Agent router', () => {
     expect(error).toBeInstanceOf(RoutingError);
     expect((error as RoutingError).lastFailure).toBe('HTTP_429');
     expect(JSON.stringify(error)).not.toContain(secret);
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+  it('waits on a rate-limited poll and resumes the same job', async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ success: true, id }))
+      .mockResolvedValueOnce(new Response('{}', { status: 429, headers: { 'retry-after': '2' } }))
+      .mockResolvedValueOnce(response({ success: true, status: 'completed', data: { content: 'done' } }));
+    const sleep = vi.fn(async () => {});
+    const router = new FirecrawlAgentRouter(secret, 20, () => {}, fetcher, sleep);
+    expect((await router.generate([{ role: 'user', content: 'hello' }], x => x)).value).toBe('done');
+    expect(sleep).toHaveBeenCalledWith(2000);
+    expect(fetcher.mock.calls.filter(c => c[1]?.method === 'POST')).toHaveLength(1);
+    expect(fetcher.mock.calls[1]![0]).toBe(fetcher.mock.calls[2]![0]);
   });
   it('cancels its own unfinished job after a timeout', async () => {
     let clock = 0;

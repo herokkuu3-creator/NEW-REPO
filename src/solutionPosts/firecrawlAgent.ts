@@ -39,8 +39,24 @@ export class FirecrawlAgentRouter extends AIModelRouter {
     const headers = { Authorization: `Bearer ${this.key}`, 'Content-Type': 'application/json' };
     let id: string | undefined;
     let finished = false;
+    // Retry a rate-limited request in place: a poll keeps its existing job ID,
+    // and a failed start is retried only after an explicit HTTP 429 response.
+    const request = async (url: string, init: RequestInit): Promise<Response> => {
+      let waits = 0;
+      for (;;) {
+        const response = await this.fetcher(url, { ...init, signal: AbortSignal.timeout(init.method === 'POST' ? 30000 : 15000) });
+        if (response.status !== 429 || waits >= 2) return response;
+        const retryAfter = response.headers.get('retry-after');
+        const seconds = retryAfter !== null && /^\d+(?:\.\d+)?$/.test(retryAfter) ? Number(retryAfter) : NaN;
+        const retryDate = retryAfter && !Number.isFinite(seconds) ? Date.parse(retryAfter) : NaN;
+        const delay = Number.isFinite(seconds) ? seconds * 1000 : Number.isFinite(retryDate) ? Math.max(0, retryDate - this.now()) : 30000 * (waits + 1);
+        if (delay > 120000 || this.now() - started + delay >= this.timeoutMs) return response;
+        waits++;
+        await this.agentSleep(Math.max(1000, delay));
+      }
+    };
     try {
-      const response = await this.fetcher(origin, { method: 'POST', headers, redirect: 'error', signal: AbortSignal.timeout(30000),
+      const response = await request(origin, { method: 'POST', headers, redirect: 'error',
         body: JSON.stringify({ prompt, schema, model: 'spark-2', maxCredits: this.maxCredits,
           urls: ['https://walkccc.me/LeetCode/'], strictConstrainToURLs: true }) });
       if (!response.ok) { record.httpStatus = response.status; return fail(`HTTP_${response.status}`); }
@@ -50,7 +66,7 @@ export class FirecrawlAgentRouter extends AIModelRouter {
       id = startedJob.id;
       while (this.now() - started < this.timeoutMs) {
         await this.agentSleep(3000);
-        const poll = await this.fetcher(`${origin}/${id}`, { headers, redirect: 'error', signal: AbortSignal.timeout(15000) });
+        const poll = await request(`${origin}/${id}`, { headers, redirect: 'error' });
         if (!poll.ok) { record.httpStatus = poll.status; return fail(`HTTP_${poll.status}`); }
         const result: any = await poll.json();
         if (result?.status === 'processing' || result?.status === 'pending') continue;
