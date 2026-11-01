@@ -7,6 +7,8 @@ import { LeetCodeApi, looksLikeChallenge, SubmissionOutcome } from '../leetcode/
 import { fetchQuestionData, RawQuestionData } from '../leetcode/dailyChallenge';
 import { checkSession, SessionCheckResult } from '../browser/sessionCheck';
 import { fetchWalkcccPage, signatureMatchesStarter, WalkcccError, WalkcccPage } from '../solutions/walkccc';
+import { generateFirecrawlSolution } from '../solutions/firecrawlSolve';
+import { parseProblem } from '../leetcode/parser';
 import {
   fetchCommunitySolution,
   resolveLeetCodeSlugByNumber,
@@ -1021,7 +1023,7 @@ async function solveOne(
     //    Fallback: Walkccc solution
     let solutionCode: string | null = null;
     let fallbackWalkcccCode: string | null = null;
-    let chosenSource: 'community' | 'walkccc' = 'walkccc';
+    let chosenSource: 'community' | 'walkccc' | 'firecrawl' = 'walkccc';
     let chosenUuid: string | null = null;
 
     if (walkcccPage?.code && signatureMatchesStarter(walkcccPage.code, problem)) {
@@ -1030,7 +1032,16 @@ async function solveOne(
 
     const commFetcher = deps.fetchCommunity;
 
-    if (commFetcher) {
+    if (config.solution.firecrawlApiKey) {
+      try {
+        solutionCode = await generateFirecrawlSolution(parseProblem(q, 'cpp'));
+        chosenSource = 'firecrawl';
+      } catch (error) {
+        logger.warn({ question: n, slug, error: error instanceof Error ? error.message : 'FIRECRAWL_SOLUTION_FAILED' }, 'Firecrawl-assisted solution failed');
+        return err('Firecrawl-assisted solution failed; see server logs');
+      }
+    }
+    if (!config.solution.firecrawlApiKey && commFetcher) {
       try {
         const commSol = await commFetcher(slug, problem, {
           language: 'cpp',

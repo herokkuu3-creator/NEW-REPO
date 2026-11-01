@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AccountRecord } from '../src/database/accounts';
 import { LeetCodeHttpError } from '../src/leetcode/apiClient';
 import { WalkcccError, WalkcccPage } from '../src/solutions/walkccc';
+import { config } from '../src/config';
+import * as firecrawlSolver from '../src/solutions/firecrawlSolve';
 import type { CommunitySolution } from '../src/solutions/communitySolutions';
 import {
   calculateSafeRangeConcurrency,
@@ -417,6 +419,29 @@ describe('range engine', () => {
     expect(res.capture?.code).toContain('main');
     expect(isRangeJobActive()).toBe(false);
     expect(rangeQueueLength()).toBe(0);
+  });
+  it('uses Firecrawl generation for manual submissions and does not submit on generation failure', async () => {
+    const options = config.solution as { firecrawlApiKey: string };
+    const previous = options.firecrawlApiKey;
+    const log: string[] = [];
+    const session = makeSession(() => 'accepted', log);
+    const question = session.api.question;
+    session.api.question = async slug => ({ ...await question(slug), contentHtml: '<p>A sufficiently detailed problem statement for validation.</p>' });
+    const { deps } = makeDeps(session, [acc('a1')]);
+    const generate = vi.spyOn(firecrawlSolver, 'generateFirecrawlSolution')
+      .mockResolvedValueOnce('class Solution { public: int main() { return 42; } };')
+      .mockRejectedValueOnce(new Error('FIRECRAWL_HTTP_401'));
+    options.firecrawlApiKey = 'fc-test';
+    try {
+      const success = await submitSingleQuestionDirectly(acc('a1'), 200, deps);
+      expect(success.outcome.status).toBe('accepted');
+      expect(success.capture?.code).toContain('42');
+      expect(generate).toHaveBeenCalledTimes(1);
+      log.length = 0;
+      const failed = await submitSingleQuestionDirectly(acc('a1'), 200, deps);
+      expect(failed.outcome.status).toBe('error');
+      expect(log).not.toContain('submit:slug-200');
+    } finally { options.firecrawlApiKey = previous; generate.mockRestore(); }
   });
 });
 

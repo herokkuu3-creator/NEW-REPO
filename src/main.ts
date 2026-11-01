@@ -28,7 +28,7 @@ async function main(): Promise<void> {
       revision: process.env.RENDER_GIT_COMMIT ?? null,
       schedule: `${config.schedule.hour}:${String(config.schedule.minute).padStart(2, '0')}`,
       timezone: config.schedule.timezone,
-      solutionSource: config.solution.source,
+      solutionSource: config.solution.firecrawlApiKey ? 'firecrawl-assisted-ai' : config.solution.source,
       llmProvider: config.llm.provider,
       llmModel: config.llm.model,
       language: config.llm.language,

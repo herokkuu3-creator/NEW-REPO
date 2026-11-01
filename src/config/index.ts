@@ -76,6 +76,7 @@ const envSchema = z.object({
   // 'llm': generate with an LLM (LLM_PROVIDER etc.).
   SOLUTION_SOURCE: z.enum(['community', 'walkccc', 'llm']).default('community'),
   WALKCCC_BASE_URL: z.string().default('https://walkccc.me/LeetCode'),
+  FIRECRAWL_API_KEY: z.string().default(''),
 
   // SOLUTION_POST_API_KEYS is a comma-separated failover pool. The singular
   // name remains a backwards-compatible one-key bootstrap option.
@@ -162,6 +163,7 @@ export type Config = Readonly<{
   solution: {
     source: 'community' | 'walkccc' | 'llm';
     walkcccBaseUrl: string;
+    firecrawlApiKey: string;
   };
   transport: 'api' | 'browser';
   solutionPosts: {
@@ -219,6 +221,7 @@ function loadConfig(): Config {
     solution: {
       source: env.SOLUTION_SOURCE,
       walkcccBaseUrl: env.WALKCCC_BASE_URL,
+      firecrawlApiKey: env.FIRECRAWL_API_KEY.trim(),
     },
     transport: env.TRANSPORT,
     solutionPosts: {
