@@ -20,6 +20,18 @@ const done = (value: unknown) => ({ value, model: 'firecrawl/spark-2', attempts:
 const assets = [{ id: 'visual-1', url: 'https://example.com/one.gif', alt: 'First animation' },
   { id: 'visual-2', url: 'https://example.com/two.gif', alt: 'Second animation' }];
 describe('Firecrawl Agent article workflow', () => {
+  it('requests bounded frame items and gives actionable length feedback when a draft violates the limit', async () => {
+    const router = new FirecrawlAgentRouter('fc-test-key-1234567890');
+    const invalid = structuredClone(article);
+    invalid.visuals[1].frames[1].items[0] = 'a'.repeat(25);
+    const run = vi.spyOn(router, 'generateStructured').mockResolvedValueOnce(done(invalid))
+      .mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done({ approved: true, issues: [] }));
+    await generateArticle(router, context, [], async () => assets);
+    const [messages, schema] = run.mock.calls[0];
+    expect(messages[0].content).toContain('at most 24 characters');
+    expect((schema as any).properties.visuals.items.properties.frames.items.properties.items.items.maxLength).toBe(24);
+    expect(JSON.stringify(run.mock.calls[1][0])).toContain('24');
+  });
   it('repairs a rejected draft, requires a separate review, and renders two GIFs', async () => {
     const router = new FirecrawlAgentRouter('fc-test-key-1234567890');
     const run = vi.spyOn(router, 'generateStructured').mockResolvedValueOnce(done(article))
