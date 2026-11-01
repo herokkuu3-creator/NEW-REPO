@@ -53,10 +53,18 @@ async function checkEligibility(api: LeetCodeApi, context: SubmissionContext, us
 
 /** Uses only the visible post-solution UI, with exact source comparison before replacing the template. */
 export async function prepareEditor(page: Page, context: SubmissionContext, title: string, markdown: string) {
-  await page.goto(`https://leetcode.com/problems/${context.slug}/post-solution/?submissionId=${context.submissionId}`,
+  const navigation = await page.goto(`https://leetcode.com/problems/${context.slug}/post-solution/?submissionId=${context.submissionId}`,
     { waitUntil: 'domcontentloaded', timeout: 30000 });
   const titleInput = page.getByPlaceholder('Enter your title', { exact: true });
-  await titleInput.waitFor({ state: 'visible', timeout: 15000 });
+  try { await titleInput.waitFor({ state: 'visible', timeout: 15000 }); }
+  catch (error) {
+    const document = await page.evaluate(() => ({ title: window.document.title,
+      placeholders: Array.from(window.document.querySelectorAll('input,textarea')).map(e => e.getAttribute('placeholder')).filter(Boolean),
+      verificationRequired: /just a moment|verify you are human|checking your browser/i.test(window.document.body?.innerText ?? '') }));
+    logger.warn({ accountId: context.accountId, submissionId: context.submissionId, url: page.url(),
+      httpStatus: navigation?.status(), document }, 'LeetCode article editor unavailable');
+    throw error;
+  }
   const editor = page.getByRole('textbox', { name: 'Editor content', exact: true });
   await editor.waitFor({ state: 'visible', timeout: 15000 });
   // Read the model behind this observed editor, not an unrelated global editor.
