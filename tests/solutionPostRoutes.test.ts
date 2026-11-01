@@ -29,7 +29,8 @@ describe('solution admin routes', () => {
     for (const [method, url] of [['GET', '/admin/solutions'], ['PUT', '/admin/solutions/schedule'], ['POST', '/admin/solutions/generate'],
       ['POST', '/admin/solutions/scheduled'], ['GET', '/admin/solutions/diagnostics'], ['POST', '/admin/solutions/api-keys/test'],
       ['POST', '/admin/solutions/openrouter/free-test'], ['POST', '/admin/solutions/oxion/test'],
-      ['POST', '/admin/solutions/experiential/test'], ['POST', '/admin/solutions/bazaarlink/free-test']]) {
+      ['POST', '/admin/solutions/experiential/test'], ['POST', '/admin/solutions/bazaarlink/free-test'],
+      ['POST', '/admin/solutions/firecrawl/test']]) {
       const response = await app.inject({ method: method as any, url }); expect(response.statusCode).toBe(401);
     }
     const history = await app.inject({ method: 'GET', url: '/admin/solutions', headers: { authorization: 'Bearer admin-test' } });
@@ -107,6 +108,32 @@ describe('solution admin routes', () => {
         headers: { authorization: 'Bearer admin-test' }, payload })).statusCode).toBe(400);
     }
     await app.close();
+  });
+  it('validates Firecrawl credentials and rejects caller-controlled destinations', async () => {
+    const app = Fastify(); registerSolutionPostRoutes(app, h => h === 'Bearer admin-test');
+    const mock = vi.fn(); vi.stubGlobal('fetch', mock);
+    try {
+      for (const payload of [{}, { apiKey: 'invalid' },
+        { apiKey: `fc-${'a'.repeat(32)}`, url: 'http://127.0.0.1' }]) {
+        expect((await app.inject({ method: 'POST', url: '/admin/solutions/firecrawl/test',
+          headers: { authorization: 'Bearer admin-test' }, payload })).statusCode).toBe(400);
+      }
+      expect(mock).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); await app.close(); }
+  });
+  it('returns sanitized Firecrawl evidence through the authenticated route', async () => {
+    const secret = `fc-${'b'.repeat(32)}`;
+    const mock = vi.fn(async () => new Response(JSON.stringify({ success: true,
+      data: { markdown: `# Example Domain\n${secret}`, metadata: { statusCode: 200 } } })));
+    vi.stubGlobal('fetch', mock);
+    const app = Fastify(); registerSolutionPostRoutes(app, h => h === 'Bearer admin-test');
+    try {
+      const response = await app.inject({ method: 'POST', url: '/admin/solutions/firecrawl/test',
+        headers: { authorization: 'Bearer admin-test' }, payload: { apiKey: secret } });
+      expect(response.statusCode).toBe(200); expect(response.headers['cache-control']).toBe('no-store');
+      expect(response.json()).toMatchObject({ ok: true, executionHost: 'local', status: 200, category: 'SCRAPE_OK' });
+      expect(response.body).not.toContain(secret); expect(mock).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllGlobals(); await app.close(); }
   });
   it('probes one fixed OpenRouter free model and never returns the supplied key', async () => {
     const apiKey = `sk-or-v1-${'a'.repeat(64)}`;

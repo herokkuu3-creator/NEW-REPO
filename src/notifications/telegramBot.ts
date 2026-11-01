@@ -92,6 +92,7 @@ import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver
 import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool, solutionKeyPoolStatus, testSolutionApiKey } from '../solutionPosts/keyPool';
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
 import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
+import { firecrawlProbeRequest, probeFirecrawl } from '../solutionPosts/firecrawlProbe';
 
 import {
   isRunInProgress,
@@ -278,6 +279,7 @@ export const HELP_TEXT = [
   '├ /setsolutionkeys &lt;key1,key2&gt; — Replace/reset CodeCraft API key pool',
   '├ /resetsolutionkeys — Reset active key to #1 &amp; clear retry limits',
   '├ /testsolkey [key] — Test CodeCraft API key &amp; inference diagnostics',
+  '├ /testfirecrawl key — Test a Firecrawl scrape from this server (one page)',
   '└ /solutionkeystatus — Show masked article-generation key pool',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
@@ -670,6 +672,10 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/resetsolutionkeys':
         await deleteSensitiveTelegramMessage(msg);
         await handleReplaceSolutionApiKeys(commandArg);
+        return;
+      case '/testfirecrawl':
+        await deleteSensitiveTelegramMessage(msg);
+        await handleTestFirecrawl(commandArg);
         return;
       case '/testsolkey':
       case '/testsolkeys':
@@ -3310,6 +3316,26 @@ export async function handleReplaceSolutionApiKeys(commandArg?: string): Promise
   } catch (error) {
     await replyHtml(`❌ <b>Could not replace article API keys:</b> ${escapeHtml(error instanceof Error ? error.message : 'invalid input')}`);
   }
+}
+
+export async function handleTestFirecrawl(commandArg?: string): Promise<void> {
+  const parsed = firecrawlProbeRequest.safeParse({ apiKey: (commandArg ?? '').trim() });
+  if (!parsed.success) {
+    await replyHtml('Usage: <code>/testfirecrawl fc-your-key</code>. Runs one public-page scrape; the key is not saved.');
+    return;
+  }
+  await replyHtml('🔎 Testing Firecrawl from this server…');
+  const result = await probeFirecrawl(parsed.data.apiKey);
+  logger.info({ diagnostic: result }, 'Firecrawl server probe');
+  await replyHtml([
+    `${result.ok ? '✅' : '❌'} <b>Firecrawl diagnostic</b>`,
+    `Host: <code>${escapeHtml(result.executionHost)}</code>`,
+    `HTTP: <code>${result.status || 'no response'}</code> · <code>${result.category}</code>`,
+    `Duration: ${result.elapsedMs} ms`,
+    `Tested at: <code>${result.testedAt}</code>`,
+    result.ok ? 'Authentication and one public-page scrape worked. Solution generation has separate validation.' :
+      'The scrape did not pass. No solution workflow was started.',
+  ].join('\n'));
 }
 
 export async function handleTestSolutionApiKey(commandArg?: string): Promise<void> {

@@ -12,6 +12,8 @@ import { PROVIDER_CHECK_STATE_KEY } from './providerDiagnostics';
 import { probeOxion } from './oxionProbe';
 import { probeExperiential } from './experientialProbe';
 import { probeBazaarLink } from './bazaarlinkProbe';
+import { firecrawlProbeRequest, probeFirecrawl } from './firecrawlProbe';
+import { logger } from '../logger';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
   app.register(async scoped => {
@@ -121,6 +123,12 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
         return { ok: false, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
           status: 0, keyMasked: maskedKey, requestedModel: model, error: 'OPENROUTER_REQUEST_FAILED' };
       }
+    });
+    scoped.post('/admin/solutions/firecrawl/test', async req => {
+      const { apiKey } = firecrawlProbeRequest.parse(req.body ?? {});
+      const result = await probeFirecrawl(apiKey);
+      logger.info({ diagnostic: result }, 'Firecrawl server probe');
+      return result;
     });
     // A fixed provider origin prevents this authenticated diagnostic from becoming a general proxy.
     scoped.post('/admin/solutions/oxion/test', async req => {
