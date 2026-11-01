@@ -6,6 +6,7 @@ import { contextSchema, hash, SubmissionContext } from './article';
 import { move } from './store';
 import { PostError, withAccount } from './service';
 import { UGC_SOLUTION_ARTICLE_QUERY } from '../solutions/communitySolutions';
+import { logger } from '../logger';
 
 // LeetCode's My Solution filter scopes the list to the authenticated account.
 // A global HOT scan can never prove absence on problems with >1000 articles.
@@ -105,6 +106,7 @@ async function verifyPublished(api: LeetCodeApi, page: Page, url: string, contex
 }
 
 export async function publishPost(id: string) {
+  let preparationStage = 'load';
   let post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
   if (post.status === 'PUBLISHED') return post;
   if (post.status === 'PUBLISHING') throw new PostError('PUBLICATION_UNCERTAIN_RECONCILE_FIRST');
@@ -115,9 +117,12 @@ export async function publishPost(id: string) {
     context.submissionId !== post.submissionId) throw new PostError('SOURCE_INTEGRITY_FAILED');
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
   return withAccount(account, async (api, page, username) => {
+    preparationStage = 'eligibility';
     await checkEligibility(api, context, username);
+    preparationStage = 'duplicate-check';
     const duplicate = await existingPost(api, context);
     if (duplicate) return move(post, 'SKIPPED', { lastError: 'EXISTING_ACCOUNT_SOLUTION', publishedUrl: duplicate });
+    preparationStage = 'editor';
     await prepareEditor(page, context, post.title!, post.markdown!);
     // CAS before the sole irreversible click. A crash after this point never repeats the click.
     post = await move(post, 'PUBLISHING');
@@ -132,6 +137,9 @@ export async function publishPost(id: string) {
       return prisma.solutionPost.update({ where: { id }, data: { lastError: 'PUBLICATION_UNCERTAIN_RECONCILE_FIRST' } });
     }
   }).catch(async error => {
+    logger.warn({ postId: id, stage: preparationStage, errorName: error instanceof Error ? error.name : 'Unknown',
+      error: error instanceof Error ? error.message.replace(/(?:fc-|sk-|cc_)[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 1500) : 'Unknown' },
+      'solution article publishing preparation failed');
     await prisma.solutionPost.updateMany({ where: { id, status: 'DRAFT_READY' }, data: {
       lastError: error instanceof PostError ? error.code : 'PUBLISH_PREPARATION_FAILED',
     } });
