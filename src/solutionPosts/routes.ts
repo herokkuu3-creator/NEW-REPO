@@ -4,7 +4,7 @@ import { config } from '../config';
 import { prisma } from '../database/prisma';
 import { generateForRun, retryPost, PostError, resetFailedSolutionPostRetries } from './service';
 import { approvePost } from './store';
-import { publishPost, reconcilePost } from './publisher';
+import { publishPost, reconcilePost, reserveBrowserPublication } from './publisher';
 import { runCombined, setSelectedAccounts, POST_CRON, POST_TIMEZONE, runScheduledSolutionPosts,
   isScheduledSolutionRunInProgress, SCHEDULE_STATE_KEY } from './scheduler';
 import { appendSolutionApiKeys, solutionKeyPoolStatus, testSolutionApiKey } from './keyPool';
@@ -182,6 +182,12 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       const { id } = z.object({ id: z.string() }).parse(req.params);
       const { url } = z.object({ url: z.string().url() }).strict().parse(req.body);
       const post = await reconcilePost(id, url); return { id, status: post.status, url: post.publishedUrl };
+    });
+    scoped.post('/admin/solutions/:id/reserve-browser', async req => {
+      const { id } = z.object({ id: z.string() }).parse(req.params);
+      const { approvedHash } = z.object({ approvedHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(req.body);
+      const post = await reserveBrowserPublication(id, approvedHash);
+      return { id, status: post.status, url: post.publishedUrl };
     });
   });
 }

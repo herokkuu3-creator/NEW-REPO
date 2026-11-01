@@ -14,7 +14,7 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
 vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error { constructor(code: string) { super(code); } },
   withAccount: vi.fn(async (_account, action) => action(h.api, h.page, 'alice')) }));
 import { hash } from '../src/solutionPosts/article';
-import { prepareEditor, publishPost, reconcilePost, validSolutionUrl } from '../src/solutionPosts/publisher';
+import { prepareEditor, publishPost, reconcilePost, reserveBrowserPublication, validSolutionUrl } from '../src/solutionPosts/publisher';
 const context = { accountId: 'a', username: 'alice', problemId: '1', slug: 'example', title: 'Example', difficulty: 'Easy',
   problem: 'Example problem', submissionId: '456', language: 'cpp', code: 'class Solution {};', challengeDate: '2026-10-15' };
 const markdown = '## Teach with sets\n\nAn educational explanation.\n\n```cpp\nclass Solution {};\n```\n';
@@ -44,6 +44,19 @@ beforeEach(() => {
 });
 
 describe('authorized solution publishing', () => {
+  it('reserves local browser publication atomically and verifies it through the API without opening Render UI', async () => {
+    expect((await reserveBrowserPublication('post1', h.row.approvedHash)).status).toBe('PUBLISHING');
+    await expect(reserveBrowserPublication('post1', h.row.approvedHash)).rejects.toThrow();
+    await expect(publishPost('post1')).rejects.toThrow();
+    h.duplicate = true;
+    expect((await reconcilePost('post1', h.url)).status).toBe('PUBLISHED');
+    expect(h.page.goto).not.toHaveBeenCalled();
+    expect(h.click).not.toHaveBeenCalled();
+  });
+  it('rejects an altered draft when reserving local publication', async () => {
+    await expect(reserveBrowserPublication('post1', '0'.repeat(64))).rejects.toThrow('REVIEW_REQUIRED');
+    expect(h.row.status).toBe('DRAFT_READY');
+  });
   it('prepares and verifies exact source, clicks once, verifies article content and author', async () => {
     const post = await publishPost('post1');
     expect(post.status).toBe('PUBLISHED'); expect(post.publishedUrl).toBe(h.url);

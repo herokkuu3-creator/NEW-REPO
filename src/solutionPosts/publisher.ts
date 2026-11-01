@@ -98,6 +98,11 @@ async function verifyPublished(api: LeetCodeApi, page: Page, url: string, contex
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   // The live solution detail header renders the article title as plain text, not a heading.
   await page.getByText(title, { exact: true }).waitFor({ state: 'visible', timeout: 15000 });
+  await verifyPublishedContent(api, url, context, title, markdown);
+}
+
+async function verifyPublishedContent(api: LeetCodeApi, url: string, context: SubmissionContext, title: string, markdown: string) {
+  if (!validSolutionUrl(url, context.slug)) throw new PostError('POST_URL_UNVERIFIED');
   const topicId = new URL(url).pathname.split('/')[4]!;
   const content = await api.graphql(UGC_SOLUTION_ARTICLE_QUERY, { topicId },
     z.object({ ugcArticleSolutionArticle: z.object({ content: z.string(), title: z.string(), topicId: z.number() }) }));
@@ -113,6 +118,23 @@ async function verifyPublished(api: LeetCodeApi, page: Page, url: string, contex
     if (!list.ugcArticleSolutionArticles.pageInfo.hasNextPage) break;
   }
   if (!verified) throw new PostError('POST_AUTHOR_UNVERIFIED');
+}
+
+/** Reserve an approved draft before the operator posts it in an authenticated local browser. */
+export async function reserveBrowserPublication(id: string, approvedHash: string) {
+  const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
+  if (post.status !== 'DRAFT_READY' || !post.title || !post.markdown || !post.approvedHash ||
+    approvedHash !== post.approvedHash || approvedHash !== hash(`${post.title}\n${post.markdown}`)) throw new PostError('REVIEW_REQUIRED');
+  const context = contextSchema.parse(JSON.parse(post.context));
+  if (hash(context.code) !== post.codeHash || context.accountId !== post.accountId || context.slug !== post.problemSlug ||
+    context.submissionId !== post.submissionId) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
+  return withAccount(account, async (api, _page, username) => {
+    await checkEligibility(api, context, username);
+    const duplicate = await existingPost(api, context);
+    if (duplicate) return move(post, 'SKIPPED', { lastError: 'EXISTING_ACCOUNT_SOLUTION', publishedUrl: duplicate });
+    return move(post, 'PUBLISHING', { lastError: 'LOCAL_BROWSER_PUBLICATION_PENDING' });
+  });
 }
 
 export async function publishPost(id: string) {
@@ -166,7 +188,10 @@ export async function reconcilePost(id: string, url: string) {
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
   return withAccount(account, async (api, page, username) => {
     await checkEligibility(api, context, username);
-    await verifyPublished(api, page, url, context, post.title!, post.markdown!);
+    // The operator's local browser may be able to open the UI while Render's
+    // browser is blocked. Exact content, topic and authenticated author must
+    // still be independently verified through LeetCode's API.
+    await verifyPublishedContent(api, url, context, post.title!, post.markdown!);
     return move(post, 'PUBLISHED', { publishedUrl: url, publishedAt: new Date(), lastError: null });
   });
 }
