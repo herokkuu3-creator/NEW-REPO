@@ -93,6 +93,7 @@ import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool,
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
 import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
 import { firecrawlProbeRequest, probeFirecrawl } from '../solutionPosts/firecrawlProbe';
+import { answerChat } from './aiChat';
 
 import {
   isRunInProgress,
@@ -280,6 +281,7 @@ export const HELP_TEXT = [
   '├ /resetsolutionkeys — Reset active key to #1 &amp; clear retry limits',
   '├ /testsolkey [key] — Test CodeCraft API key &amp; inference diagnostics',
   '├ /testfirecrawl key — Test a Firecrawl scrape from this server (one page)',
+  '├ /ask &lt;question&gt; — Ask the configured AI',
   '└ /solutionkeystatus — Show masked article-generation key pool',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
@@ -672,6 +674,9 @@ async function handleMessage(msg: TgMessage): Promise<void> {
       case '/resetsolutionkeys':
         await deleteSensitiveTelegramMessage(msg);
         await handleReplaceSolutionApiKeys(commandArg);
+        return;
+      case '/ask':
+        void handleAiChat(commandArg);
         return;
       case '/testfirecrawl':
         await deleteSensitiveTelegramMessage(msg);
@@ -1125,6 +1130,11 @@ async function handleMessage(msg: TgMessage): Promise<void> {
   // Non-command message: check if it's pasted proxy list first
   if (!msg.document && isLikelyProxyPayload(text)) {
     await handleAddProxyCommand(text);
+    return;
+  }
+
+  if (!msg.document && text && !pendingRenewalLabel && !looksLikeCookiePayload(text)) {
+    void handleAiChat(text);
     return;
   }
 
@@ -3315,6 +3325,14 @@ export async function handleReplaceSolutionApiKeys(commandArg?: string): Promise
     ].filter(Boolean).join('\n'));
   } catch (error) {
     await replyHtml(`❌ <b>Could not replace article API keys:</b> ${escapeHtml(error instanceof Error ? error.message : 'invalid input')}`);
+  }
+}
+
+export async function handleAiChat(question: string): Promise<void> {
+  const result = await answerChat(question);
+  const characters = Array.from(result);
+  for (let offset = 0; offset < characters.length; offset += 3500) {
+    await reply(characters.slice(offset, offset + 3500).join(''));
   }
 }
 
