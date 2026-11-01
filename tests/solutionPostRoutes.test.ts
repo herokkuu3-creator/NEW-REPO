@@ -2,6 +2,7 @@ import Fastify from 'fastify';
 import { describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ schedule: vi.fn(async ids => ({ accountIds: ids, timezone: 'Asia/Kolkata' })),
   scheduled: vi.fn(async () => ({ status: 'IDLE' })), reset: vi.fn(async () => 1),
+  agentProbe: vi.fn(async () => ({ ok: true, provider: 'firecrawl-agent', executionHost: 'render' })),
   combined: vi.fn(async () => []), retry: vi.fn(async id => ({ id, status: 'AWAITING_APPROVAL', lastError: null })) }));
 const keys = vi.hoisted(() => ({
   append: vi.fn(async () => ({ added: 2, duplicates: 1 })),
@@ -22,6 +23,8 @@ vi.mock('../src/solutionPosts/scheduler', () => ({ setSelectedAccounts: h.schedu
   runScheduledSolutionPosts: h.scheduled, isScheduledSolutionRunInProgress: () => false,
   SCHEDULE_STATE_KEY: 'solution-post-scheduler:last-tick', POST_CRON: '0 6 * * *', POST_TIMEZONE: 'Asia/Kolkata' }));
 vi.mock('../src/solutionPosts/keyPool', () => ({ appendSolutionApiKeys: keys.append, solutionKeyPoolStatus: keys.status, testSolutionApiKey: keys.test }));
+vi.mock('../src/solutionPosts/firecrawlAgentProbe', () => ({ probeFirecrawlAgent: h.agentProbe }));
+import { config } from '../src/config';
 import { registerSolutionPostRoutes } from '../src/solutionPosts/routes';
 describe('solution admin routes', () => {
   it('requires the existing admin bearer token for reads and mutations', async () => {
@@ -120,6 +123,21 @@ describe('solution admin routes', () => {
       }
       expect(mock).not.toHaveBeenCalled();
     } finally { vi.unstubAllGlobals(); await app.close(); }
+  });
+  it('tests the selected Firecrawl Agent instead of the legacy BazaarLink key', async () => {
+    const settings = config.solution as { aiProvider: 'firecrawl' | 'bazaarlink'; firecrawlApiKey: string; agentMaxCredits: number };
+    const previous = { ...settings };
+    const secret = `fc-${'c'.repeat(32)}`;
+    settings.aiProvider = 'firecrawl'; settings.firecrawlApiKey = secret; settings.agentMaxCredits = 75;
+    keys.test.mockClear(); h.agentProbe.mockClear();
+    const app = Fastify(); registerSolutionPostRoutes(app, header => header === 'Bearer admin-test');
+    try {
+      const result = await app.inject({ method: 'POST', url: '/admin/solutions/api-keys/test',
+        headers: { authorization: 'Bearer admin-test' }, payload: {} });
+      expect(result.json()).toMatchObject({ ok: true, provider: 'firecrawl-agent' });
+      expect(h.agentProbe).toHaveBeenCalledWith(secret, 75);
+      expect(keys.test).not.toHaveBeenCalled(); expect(result.body).not.toContain(secret);
+    } finally { Object.assign(settings, previous); await app.close(); }
   });
   it('returns sanitized Firecrawl evidence through the authenticated route', async () => {
     const secret = `fc-${'b'.repeat(32)}`;

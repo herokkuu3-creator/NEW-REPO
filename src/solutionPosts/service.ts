@@ -8,6 +8,7 @@ import { checkSession } from '../browser/sessionCheck';
 import { LeetCodeApi } from '../leetcode/apiClient';
 import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallenge';
 import { AIModelRouter, RoutingError } from './router';
+import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext } from './article';
 import { ensurePost, move } from './store';
 import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
@@ -74,7 +75,13 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
   });
 }
 
-export async function createPostRouter(correlation: { postId?: string; accountId?: string } = {}): Promise<AIModelRouter> {
+export async function createPostRouter(correlation: { postId?: string; accountId?: string } = {},
+  providerOverride?: 'firecrawl' | 'bazaarlink'): Promise<AIModelRouter> {
+  if ((providerOverride ?? config.solution.aiProvider) === 'firecrawl') {
+    if (!config.solution.firecrawlApiKey) throw new PostError('FIRECRAWL_KEY_REQUIRED');
+    return new FirecrawlAgentRouter(config.solution.firecrawlApiKey, config.solution.agentMaxCredits,
+      attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'));
+  }
   const pool = await loadSolutionKeyPool();
   const activeKeys = activeSolutionApiKeys(pool);
   logger.info({ ...correlation, keyPool: { total: pool.keys.length, activeIndex: pool.activeIndex + 1,
@@ -99,8 +106,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   const savedContext = contextSchema.parse(JSON.parse(post.context));
   if (hash(savedContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
   const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs));
-  const leaseMs = 2 * Math.max(1, config.solutionPosts.models.length) * (config.solutionPosts.retries + 1) *
-    (maxTimeout + 8000) + 120000;
+  const leaseMs = config.solution.aiProvider === 'firecrawl' ? 4 * 210000 + 120000 :
+    2 * Math.max(1, config.solutionPosts.models.length) * (config.solutionPosts.retries + 1) * (maxTimeout + 8000) + 120000;
   // Reset an explicitly renewed attempt budget in the same CAS that claims
   // generation. A separate unconditional update can reset another worker's job.
   post = await move(post, 'CHECKING_ELIGIBILITY', { leaseUntil: new Date(Date.now() + leaseMs),

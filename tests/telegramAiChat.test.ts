@@ -9,6 +9,7 @@ describe('Telegram AI chat', () => {
     mock.generate.mockResolvedValue({ value: 'Why did the bug cross the road? To get to the other byte.', model: 'test' });
     mock.create.mockResolvedValue({ generate: mock.generate });
     expect(await answerChat('Tell me a joke')).toContain('byte');
+    expect(mock.create).toHaveBeenCalledWith({}, 'bazaarlink');
     expect(mock.generate).toHaveBeenCalledWith(expect.arrayContaining([{ role: 'user', content: 'Tell me a joke' }]),
       expect.any(Function), 900, false, 'telegram-chat');
   });

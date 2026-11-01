@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ParsedProblem } from '../src/leetcode/parser';
+import { config } from '../src/config';
 const mocks = vi.hoisted(() => ({ create: vi.fn(), generate: vi.fn() }));
 vi.mock('../src/solutionPosts/service', () => ({ createPostRouter: mocks.create }));
 import { fetchFirecrawlReference, generateFirecrawlSolution } from '../src/solutions/firecrawlSolve';
@@ -10,7 +11,10 @@ const problem: ParsedProblem = { slug: 'two-sum', title: 'Two Sum', difficulty: 
   language: 'cpp', exampleTestcasesRaw: '' };
 const code = 'class Solution { public: vector<int> twoSum(vector<int>& nums, int target) { return {0, 1}; } };';
 const html = `<h1><a href="https://leetcode.com/problems/two-sum/">1. Two Sum</a></h1><pre><code>${code}</code></pre>`;
-afterEach(() => { vi.unstubAllGlobals(); vi.resetAllMocks(); });
+const settings = config.solution as { firecrawlApiKey: string };
+const previousKey = settings.firecrawlApiKey;
+beforeEach(() => { settings.firecrawlApiKey = 'fc-test'; });
+afterEach(() => { settings.firecrawlApiKey = previousKey; vi.unstubAllGlobals(); vi.resetAllMocks(); });
 describe('Firecrawl-assisted solution', () => {
   it('fetches only the fixed public page without forwarding cookies', async () => {
     const fetcher = vi.fn(async () => new Response(JSON.stringify({ success: true, data: { html, metadata: { statusCode: 200 } } })));

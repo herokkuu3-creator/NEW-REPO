@@ -77,6 +77,8 @@ const envSchema = z.object({
   SOLUTION_SOURCE: z.enum(['community', 'walkccc', 'llm']).default('community'),
   WALKCCC_BASE_URL: z.string().default('https://walkccc.me/LeetCode'),
   FIRECRAWL_API_KEY: z.string().default(''),
+  SOLUTION_AI_PROVIDER: z.enum(['firecrawl', 'bazaarlink']).default('firecrawl'),
+  FIRECRAWL_AGENT_MAX_CREDITS: intFromString(300).pipe(z.number().int().min(1).max(2500)),
 
   // SOLUTION_POST_API_KEYS is a comma-separated failover pool. The singular
   // name remains a backwards-compatible one-key bootstrap option.
@@ -164,6 +166,8 @@ export type Config = Readonly<{
     source: 'community' | 'walkccc' | 'llm';
     walkcccBaseUrl: string;
     firecrawlApiKey: string;
+    aiProvider: 'firecrawl' | 'bazaarlink';
+    agentMaxCredits: number;
   };
   transport: 'api' | 'browser';
   solutionPosts: {
@@ -222,6 +226,8 @@ function loadConfig(): Config {
       source: env.SOLUTION_SOURCE,
       walkcccBaseUrl: env.WALKCCC_BASE_URL,
       firecrawlApiKey: env.FIRECRAWL_API_KEY.trim(),
+      aiProvider: env.SOLUTION_AI_PROVIDER,
+      agentMaxCredits: env.FIRECRAWL_AGENT_MAX_CREDITS,
     },
     transport: env.TRANSPORT,
     solutionPosts: {

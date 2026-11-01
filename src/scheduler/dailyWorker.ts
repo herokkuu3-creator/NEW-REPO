@@ -666,7 +666,7 @@ async function obtainSolution(
   username: string,
   usedCommunityUuids: Set<string> = new Set(),
 ): Promise<SolutionResult> {
-  if (config.solution.firecrawlApiKey) {
+  if (config.solution.firecrawlApiKey || config.solution.aiProvider === 'firecrawl') {
     try {
       if (problem.language !== 'cpp') throw new Error('FIRECRAWL_CPP_ONLY');
       const code = await generateFirecrawlSolution(problem);

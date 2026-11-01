@@ -1032,7 +1032,7 @@ async function solveOne(
 
     const commFetcher = deps.fetchCommunity;
 
-    if (config.solution.firecrawlApiKey) {
+    if (config.solution.firecrawlApiKey || config.solution.aiProvider === 'firecrawl') {
       try {
         solutionCode = await generateFirecrawlSolution(parseProblem(q, 'cpp'));
         chosenSource = 'firecrawl';
@@ -1041,7 +1041,7 @@ async function solveOne(
         return err('Firecrawl-assisted solution failed; see server logs');
       }
     }
-    if (!config.solution.firecrawlApiKey && commFetcher) {
+    if (!config.solution.firecrawlApiKey && config.solution.aiProvider !== 'firecrawl' && commFetcher) {
       try {
         const commSol = await commFetcher(slug, problem, {
           language: 'cpp',

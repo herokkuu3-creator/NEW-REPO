@@ -7,6 +7,11 @@ export const PROVIDER_CHECK_STATE_KEY = 'solution-post-provider:last-check';
 
 /** A small real inference check on the deployed host; it never mutates quota pointers or posts. */
 export async function verifySolutionProviderOnBoot(): Promise<void> {
+  if (config.solution.aiProvider === 'firecrawl') {
+    logger.info({ provider: 'firecrawl-agent', keyConfigured: Boolean(config.solution.firecrawlApiKey),
+      maxCreditsPerJob: config.solution.agentMaxCredits }, 'solution article credential configuration');
+    return; // Avoid consuming agent credits on every restart.
+  }
   logger.info({ provider: new URL(config.solutionPosts.baseUrl).hostname,
     keySource: config.solutionPosts.keySource, environment: config.solutionPosts.keyEnvironment,
     configuredKeyCount: config.solutionPosts.apiKeys?.length ?? 0, inputError: config.solutionPosts.keyError },

@@ -32,6 +32,7 @@ export interface ModelAttempt {
   httpStatus?: number;
   retryAfterMs?: number;
   deferred?: boolean;
+  agentCreditsUsed?: number;
 }
 export class RoutingError extends Error {
   constructor(public readonly attempts: ModelAttempt[], public readonly lastFailure?: string) {

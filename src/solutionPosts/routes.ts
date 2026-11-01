@@ -13,6 +13,7 @@ import { probeOxion } from './oxionProbe';
 import { probeExperiential } from './experientialProbe';
 import { probeBazaarLink } from './bazaarlinkProbe';
 import { firecrawlProbeRequest, probeFirecrawl } from './firecrawlProbe';
+import { probeFirecrawlAgent } from './firecrawlAgentProbe';
 import { logger } from '../logger';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
@@ -57,13 +58,15 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       serverTime: new Date().toISOString(), executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
       revision: process.env.RENDER_GIT_COMMIT ?? null,
       cron: POST_CRON, timezone: POST_TIMEZONE, autoPublish: config.solutionPosts.autoPublish,
-      running: isScheduledSolutionRunInProgress(), models: config.solutionPosts.models,
+      running: isScheduledSolutionRunInProgress(), aiProvider: config.solution.aiProvider,
+      models: config.solution.aiProvider === 'firecrawl' ? ['firecrawl/spark-2'] : config.solutionPosts.models,
       selected: await prisma.solutionPostPreference.findMany({ where: { enabled: true } }),
       scheduler: await prisma.systemState.findUnique({ where: { key: SCHEDULE_STATE_KEY } }),
-      provider: await prisma.systemState.findUnique({ where: { key: PROVIDER_CHECK_STATE_KEY } }),
-      keys: await solutionKeyPoolStatus(),
-      credentialConfiguration: { source: config.solutionPosts.keySource,
-        environment: config.solutionPosts.keyEnvironment, error: config.solutionPosts.keyError },
+      provider: config.solution.aiProvider === 'firecrawl' ? null : await prisma.systemState.findUnique({ where: { key: PROVIDER_CHECK_STATE_KEY } }),
+      keys: config.solution.aiProvider === 'firecrawl' ? null : await solutionKeyPoolStatus(),
+      credentialConfiguration: config.solution.aiProvider === 'firecrawl' ?
+        { source: 'FIRECRAWL_API_KEY', present: Boolean(config.solution.firecrawlApiKey), maxCreditsPerJob: config.solution.agentMaxCredits } :
+        { source: config.solutionPosts.keySource, environment: config.solutionPosts.keyEnvironment, error: config.solutionPosts.keyError },
     }));
     scoped.post('/admin/solutions/scheduled', async (req, reply) => {
       z.object({}).strict().parse(req.body ?? {});
@@ -87,6 +90,12 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       return { added: result.added, duplicates: result.duplicates, ...status };
     });
     scoped.post('/admin/solutions/api-keys/test', async req => {
+      if (config.solution.aiProvider === 'firecrawl') {
+        const body = z.object({ apiKey: z.string().regex(/^fc-[A-Za-z0-9_-]{16,128}$/).optional() }).strict().parse(req.body ?? {});
+        const key = body.apiKey ?? config.solution.firecrawlApiKey;
+        if (!key) return { ok: false, error: 'FIRECRAWL_KEY_REQUIRED' };
+        return probeFirecrawlAgent(key, config.solution.agentMaxCredits);
+      }
       const body = z.object({ apiKey: z.string().min(8).max(512).optional(),
         model: z.enum(['gpt-5.6-terra', 'gpt-5.6-luna', 'gemini-3.7-flash', 'gemini-3.8-flash',
           'qwen/qwen3.8-27b', 'qwen/qwen3.7-flash:free']).optional(),

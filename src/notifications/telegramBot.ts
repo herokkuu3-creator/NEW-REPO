@@ -93,6 +93,7 @@ import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool,
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
 import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
 import { firecrawlProbeRequest, probeFirecrawl } from '../solutionPosts/firecrawlProbe';
+import { probeFirecrawlAgent } from '../solutionPosts/firecrawlAgentProbe';
 import { answerChat } from './aiChat';
 
 import {
@@ -279,7 +280,7 @@ export const HELP_TEXT = [
   '├ /addsolutionkeys &lt;key1,key2&gt; — Append CodeCraft API keys',
   '├ /setsolutionkeys &lt;key1,key2&gt; — Replace/reset CodeCraft API key pool',
   '├ /resetsolutionkeys — Reset active key to #1 &amp; clear retry limits',
-  '├ /testsolkey [key] — Test CodeCraft API key &amp; inference diagnostics',
+  '├ /testsolkey [key] — Test the configured solution provider key',
   '├ /testfirecrawl key — Test a Firecrawl scrape from this server (one page)',
   '├ /ask &lt;question&gt; — Ask the configured AI',
   '└ /solutionkeystatus — Show masked article-generation key pool',
@@ -687,7 +688,7 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       case '/testkey':
       case '/checksolkey':
         await deleteSensitiveTelegramMessage(msg);
-        await handleTestSolutionApiKey(commandArg);
+        void handleTestSolutionApiKey(commandArg).catch(() => logger.warn('solution provider diagnostic failed'));
         return;
       case '/solutionkeystatus':
       case '/solutionkey_status':
@@ -1823,9 +1824,15 @@ function solutionStageText(stage: string, error?: string, previousError?: string
       if (error === 'AI_PROVIDER_ACCESS_BLOCKED') return '❌ The AI provider blocked this server (HTTP 403). Check /testsolkey; provider access must be restored.';
       if (error === 'AI_CONFIGURATION_REQUIRED') return '❌ No active AI keys. Use /setsolutionkeys to add a key for the configured article provider.';
       if (error === 'AI_KEY_INPUT_INVALID') return '❌ The configured article key contains invalid formatting. Run /testsolkey to identify the variable.';
-      if (error === 'AI_RATE_LIMITED' || error === 'AI_ERROR: HTTP_429') return '⏳ BazaarLink returned a rate/free-allowance limit (HTTP 429). Key retained; retry after the provider limit resets.';
+      if (error === 'AI_RATE_LIMITED' || error === 'AI_ERROR: HTTP_429') return config.solution.aiProvider === 'firecrawl'
+        ? '⏳ Firecrawl Agent returned HTTP 429. Retry after its rate or allowance limit resets.'
+        : '⏳ BazaarLink returned a rate/free-allowance limit (HTTP 429). Key retained; retry after the provider limit resets.';
+      if (error === 'FIRECRAWL_KEY_REQUIRED') return '❌ Firecrawl Agent requires FIRECRAWL_API_KEY in the server environment.';
+      if (error === 'AI_ERROR: FIRECRAWL_CREDIT_LIMIT') return '❌ Firecrawl Agent reached the per-job credit limit; no article was published.';
       if (error.startsWith('AI_ERROR: SCHEMA:')) return '❌ AI returned an invalid article field after repair. Accepted code was retained; details are in the stage-validation logs.';
-      if (error === 'AI_AUTHENTICATION_FAILED' || error === 'AI_ERROR: HTTP_401') return '❌ The article provider rejected the key (HTTP 401). Save a key issued by that provider with /setsolutionkeys, then verify with /testsolkey.';
+      if (error === 'AI_AUTHENTICATION_FAILED' || error === 'AI_ERROR: HTTP_401') return config.solution.aiProvider === 'firecrawl'
+        ? '❌ Firecrawl rejected its key (HTTP 401). Check FIRECRAWL_API_KEY in the server environment.'
+        : '❌ The article provider rejected the key (HTTP 401). Save a key issued by that provider with /setsolutionkeys, then verify with /testsolkey.';
       if (error.startsWith('AI_ERROR:')) {
         const detail = error.slice('AI_ERROR:'.length).trim();
         return `❌ ${escapeHtml(detail.slice(0, 140))}`;
@@ -3364,6 +3371,15 @@ export async function handleTestFirecrawl(commandArg?: string): Promise<void> {
 }
 
 export async function handleTestSolutionApiKey(commandArg?: string): Promise<void> {
+  if (config.solution.aiProvider === 'firecrawl') {
+    const parsed = firecrawlProbeRequest.safeParse({ apiKey: (commandArg ?? '').trim() || config.solution.firecrawlApiKey });
+    if (!parsed.success) { await reply('Firecrawl Agent needs a valid FIRECRAWL_API_KEY in the server environment or /testsolkey <key>.'); return; }
+    await reply('Testing Firecrawl Agent from this server (up to 50 credits)...');
+    const result = await probeFirecrawlAgent(parsed.data.apiKey, config.solution.agentMaxCredits);
+    logger.info({ diagnostic: result }, 'Firecrawl Agent server probe');
+    await reply(`${result.ok ? '✅' : '❌'} Firecrawl Agent: ${result.outcome}\nHost: ${result.executionHost}\nCredits used: ${result.creditsUsed ?? 'unknown'}\nThe full article and publication require separate verification.`);
+    return;
+  }
   const arg = (commandArg ?? '').trim();
   const provider = new URL(config.solutionPosts.baseUrl).hostname;
   await replyHtml(`🔎 <b>Testing ${escapeHtml(provider)} API key…</b>\nChecking models and inference from this server…`);

@@ -28,7 +28,8 @@ async function main(): Promise<void> {
       revision: process.env.RENDER_GIT_COMMIT ?? null,
       schedule: `${config.schedule.hour}:${String(config.schedule.minute).padStart(2, '0')}`,
       timezone: config.schedule.timezone,
-      solutionSource: config.solution.firecrawlApiKey ? 'firecrawl-assisted-ai' : config.solution.source,
+      solutionSource: config.solution.firecrawlApiKey || config.solution.aiProvider === 'firecrawl' ? 'firecrawl-assisted-ai' : config.solution.source,
+      solutionAiProvider: config.solution.aiProvider,
       llmProvider: config.llm.provider,
       llmModel: config.llm.model,
       language: config.llm.language,
@@ -39,7 +40,7 @@ async function main(): Promise<void> {
 
   // The LLM key is only required when the LLM solution source is selected.
   // With the default walkccc source, no LLM key is needed at all.
-  if (config.solution.source === 'llm' && !config.llm.apiKey) {
+  if (config.solution.source === 'llm' && !config.solution.firecrawlApiKey && !config.llm.apiKey) {
     logger.warn(
       { provider: config.llm.provider },
       'SOLUTION_SOURCE=llm but no LLM API key configured (LLM_API_KEY / GEMINI_API_KEY) — runs will fail with LLM_ERROR until it is set',

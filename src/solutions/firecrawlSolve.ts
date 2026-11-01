@@ -9,6 +9,7 @@ import { extractCppSolution, extractProblemLink, signatureMatchesStarter } from 
 
 /** Scrape one fixed public source; no browser cookies or user data are sent to Firecrawl. */
 export async function fetchFirecrawlReference(problem: ParsedProblem, apiKey: string): Promise<string> {
+  if (!apiKey) throw new Error('FIRECRAWL_KEY_REQUIRED');
   if (!/^\d{1,5}$/.test(problem.frontendId)) throw new Error('FIRECRAWL_INVALID_PROBLEM');
   const url = `https://walkccc.me/LeetCode/problems/${problem.frontendId}/`;
   let response: Response;

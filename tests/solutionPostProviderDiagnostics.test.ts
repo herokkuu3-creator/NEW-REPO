@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest';
-const h = vi.hoisted(() => ({ probe: vi.fn(async () => ({ ok: true })), save: vi.fn() }));
-vi.mock('../src/config', () => ({ config: { solutionPosts: { baseUrl: 'https://api.bazaarlink.ai/v1',
+const h = vi.hoisted(() => ({ probe: vi.fn(async () => ({ ok: true })), save: vi.fn(),
+  solution: { aiProvider: 'bazaarlink', firecrawlApiKey: '', agentMaxCredits: 300 } }));
+vi.mock('../src/config', () => ({ config: { solution: h.solution, solutionPosts: { baseUrl: 'https://api.bazaarlink.ai/v1',
   models: ['qwen/qwen3.7-flash:free'], apiKey: 'outdated_environment_key' } } }));
 vi.mock('../src/database/models', () => ({ setSystemState: h.save }));
 vi.mock('../src/solutionPosts/keyPool', () => ({ testSolutionApiKey: h.probe }));
@@ -12,4 +13,9 @@ it('probes the configured free Qwen model using the active saved pool rather tha
   await verifySolutionProviderOnBoot();
   expect(h.probe).toHaveBeenCalledWith(undefined, 'qwen/qwen3.7-flash:free');
   expect(h.save).toHaveBeenCalledWith('solution-post-provider:last-check', expect.stringContaining('"ok":true'));
+});
+it('does not call BazaarLink or spend agent credits on startup in Firecrawl mode', async () => {
+  h.solution.aiProvider = 'firecrawl'; h.probe.mockClear(); h.save.mockClear();
+  try { await verifySolutionProviderOnBoot(); expect(h.probe).not.toHaveBeenCalled(); expect(h.save).not.toHaveBeenCalled(); }
+  finally { h.solution.aiProvider = 'bazaarlink'; }
 });

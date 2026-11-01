@@ -1,6 +1,6 @@
 # AI solution articles
 
-The article workflow is independent of executable code submission. Existing daily and range submission commands keep their existing defaults. New accounts have no article schedule and no publication permission by default.
+The article workflow uses an accepted code submission as its source. `SOLUTION_AI_PROVIDER=firecrawl` is the default for solution generation and article generation; set `FIRECRAWL_API_KEY` to enable it. Firecrawl Agent drafts the article in one bounded job and reviews it in another, with at most one repair and second review. Existing validation, two hosted GIF requirements, and publishing checks still apply. Firecrawl reports credits per job; `FIRECRAWL_AGENT_MAX_CREDITS` defaults to 300 **per job**, so one article can use up to four such jobs. General Telegram AI chat remains on the separately configured BazaarLink provider. Firecrawl Agent has a 10,000-character prompt limit; oversized requests fail explicitly. Select `SOLUTION_AI_PROVIDER=bazaarlink` to use the legacy article provider described below.
 
 ## Integration and storage
 
@@ -8,7 +8,7 @@ The existing `Account` owns authentication, and `DailyRun` owns the accepted cod
 
 `SolutionPost` stores an immutable source snapshot and SHA-256 code hash separately from `DailyRun`. It records generation/review models, usage, attempt outcomes and durations, draft Markdown, a content hash, human approval, publication status, and URL. A unique account/problem/publication-intent constraint prevents another article for the same problem even when a different accepted submission exists. Compare-and-swap state updates and generation leases prevent concurrent article generation. `SystemState` leases serialize combined jobs across worker replicas.
 
-The AI router discovers exact available model IDs before generation, then tries the configured IDs in order. Transient connection errors, timeouts, HTTP 429, and server errors have bounded exponential retries. Invalid/incomplete responses move to the next model. Authentication, access, and payment failures stop the chain. Provider error bodies and secrets are not logged. Usage is recorded whenever returned, including failed validation attempts; a provider-returned numeric `cost` is recorded when present. Missing cost is unknown, never zero.
+When the legacy BazaarLink provider is selected, the AI router discovers exact available model IDs before generation, then tries the configured IDs in order. Transient connection errors, timeouts, HTTP 429, and server errors have bounded exponential retries. Invalid/incomplete responses move to the next model. Authentication, access, and payment failures stop the chain. Provider error bodies and secrets are not logged. Usage is recorded whenever returned, including failed validation attempts; a provider-returned numeric `cost` is recorded when present. Missing cost is unknown, never zero.
 
 For BazaarLink free models, inference starts are spaced at least 6.5 seconds apart across router instances in the same process; a `Retry-After` cooldown is shared and honored up to a bounded 60 seconds per retry. Discovery is cached per key within an article router. A BazaarLink HTTP 429 never retires the key for a month: free RPM/daily limits and spend brakes differ from HTTP 402 balance/monthly budget failures. The last slot incorrectly retired by an older version for a free-tier 429 is restored once without reviving earlier authentication failures. Provider daily allowance still limits throughput, and paid fallback stays disabled. The pacing is process-local; additional deployment replicas and unrelated clients share the provider allowance and can still cause 429.
 
@@ -25,6 +25,15 @@ Cooldowns longer than the 60-second in-job wait budget defer generation without 
 ## Setup
 
 Use Node 22+ and the existing PostgreSQL database. Set `DATABASE_URL`, `SETUP_TOKEN`, and the existing account configuration. Add the following environment variables through your normal secret manager or local ignored `.env` file (Node 22 can load it with `--env-file`). The project does not automatically load `.env` itself.
+
+```dotenv
+FIRECRAWL_API_KEY=<firecrawl-key>
+SOLUTION_AI_PROVIDER=firecrawl
+FIRECRAWL_AGENT_MAX_CREDITS=300
+SOLUTION_POST_AUTO_PUBLISH=true
+```
+
+The following legacy settings are used only when `SOLUTION_AI_PROVIDER=bazaarlink` (and for general Telegram AI chat):
 
 ```dotenv
 SOLUTION_POST_API_KEYS=<key-1>,<key-2>,<key-3>

@@ -15,6 +15,7 @@ export default defineConfig({
       LLM_MODEL: 'gemini-3.5-flash',
       SOLUTION_POST_API_KEY: '',
       SOLUTION_POST_API_KEYS: '',
+      SOLUTION_AI_PROVIDER: 'bazaarlink',
     },
   },
 });

@@ -12,7 +12,8 @@ export async function answerChat(text: string): Promise<string> {
   if (text.length > 4000) return 'Please keep your question under 4,000 characters.';
   if (isSensitiveChatText(text)) return 'Please remove credentials or session data before asking the AI.';
   try {
-    const router = await createPostRouter();
+    // General Telegram chat is independent of the requested solution provider.
+    const router = await createPostRouter({}, 'bazaarlink');
     const result = await router.generate([
       { role: 'system', content: 'You are a helpful assistant responding in a Telegram chat. Answer the user directly and clearly. Do not claim to have taken actions or browsed unless you have.' },
       { role: 'user', content: text },

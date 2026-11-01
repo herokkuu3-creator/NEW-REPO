@@ -30,7 +30,9 @@ vi.mock('../src/leetcode/apiClient', () => ({ LeetCodeApi: class { awaitSubmissi
 vi.mock('../src/leetcode/dailyChallenge', () => ({ fetchQuestionData: h.question, fetchDailyChallenge: h.daily }));
 vi.mock('../src/security/sessionAutoRefresh', () => ({ refreshLeetCodeAccount: h.refresh }));
 vi.mock('../src/solutionPosts/keyPool', async orig => ({ ...(await orig() as object), loadSolutionKeyPool: h.pool }));
-import { activeSolutionApiKeys, generateForRun, generatePost, loadContext, resolveCurrentDaily, resetFailedSolutionPostRetries, retryPost, withAccount } from '../src/solutionPosts/service';
+import { activeSolutionApiKeys, createPostRouter, generateForRun, generatePost, loadContext, resolveCurrentDaily, resetFailedSolutionPostRetries, retryPost, withAccount } from '../src/solutionPosts/service';
+import { config } from '../src/config';
+import { FirecrawlAgentRouter } from '../src/solutionPosts/firecrawlAgent';
 import { prisma } from '../src/database/prisma';
 import { assertTransition, approvePost, move } from '../src/solutionPosts/store';
 import { ArticleReviewError, contextSchema, hash } from '../src/solutionPosts/article';
@@ -39,6 +41,22 @@ const context = contextSchema.parse({ accountId: 'a', username: 'alice', problem
   title: 'Example', difficulty: 'Easy', problem: 'An example problem', submissionId: '123', language: 'cpp', code: 'source\r\n', challengeDate: '2026-10-15' });
 const output = { title: 'Example title', markdown: 'verified exact source\r\n', model: 'terra', reviewModel: 'luna', style: 'visual storytelling',
   attempts: [], visuals: [{ id: 'visual-1' }, { id: 'visual-2' }], assets: [{ id: 'visual-1' }, { id: 'visual-2' }], visualFallback: false };
+it('uses the Firecrawl Agent directly without reading the BazaarLink pool', async () => {
+  const settings = config.solution as { aiProvider: 'firecrawl' | 'bazaarlink'; firecrawlApiKey: string };
+  const previous = { ...settings };
+  settings.aiProvider = 'firecrawl'; settings.firecrawlApiKey = 'fc-test-key-1234567890';
+  h.pool.mockClear();
+  try { expect(await createPostRouter()).toBeInstanceOf(FirecrawlAgentRouter); expect(h.pool).not.toHaveBeenCalled(); }
+  finally { settings.aiProvider = previous.aiProvider; settings.firecrawlApiKey = previous.firecrawlApiKey; }
+});
+it('fails closed when Firecrawl is selected without a key', async () => {
+  const settings = config.solution as { aiProvider: 'firecrawl' | 'bazaarlink'; firecrawlApiKey: string };
+  const previous = { ...settings };
+  settings.aiProvider = 'firecrawl'; settings.firecrawlApiKey = '';
+  h.pool.mockClear();
+  try { await expect(createPostRouter()).rejects.toMatchObject({ code: 'FIRECRAWL_KEY_REQUIRED' }); expect(h.pool).not.toHaveBeenCalled(); }
+  finally { settings.aiProvider = previous.aiProvider; settings.firecrawlApiKey = previous.firecrawlApiKey; }
+});
 beforeEach(() => {
   vi.clearAllMocks(); h.row = null; h.rows = [];
   h.generation.mockResolvedValue(output);
