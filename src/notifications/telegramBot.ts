@@ -1819,6 +1819,9 @@ function solutionStageText(stage: string, error?: string, previousError?: string
       `⏭️ Skipped: ${escapeHtml(error ?? 'already in progress')}`;
     case 'failed': {
       if (!error) return '❌ workflow failed';
+      if (error === 'LEETCODE_BROWSER_VERIFICATION_REQUIRED') return '🔐 LeetCode requires browser verification before opening the article editor. The article and GIFs are saved; publication is pending.';
+      if (error === 'LEETCODE_EDITOR_ACCESS_DENIED') return '🔐 LeetCode blocked access to the article editor (HTTP 403). The article is saved and remains unpublished.';
+      if (error === 'LEETCODE_EDITOR_UNAVAILABLE') return '⚠️ LeetCode’s article editor did not load. The article is saved and remains unpublished.';
       if (error === 'GENERATION_RETRY_LIMIT') return '❌ Automatic article attempts exhausted. Use “Run daily now” to retry.' +
         (previousError ? ` Last failure: ${escapeHtml(previousError.slice(0, 140))}` : '');
       if (error === 'AI_PROVIDER_ACCESS_BLOCKED') return '❌ The AI provider blocked this server (HTTP 403). Check /testsolkey; provider access must be restored.';

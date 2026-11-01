@@ -97,6 +97,15 @@ describe('authorized solution publishing', () => {
     await prepareEditor(h.page, context as any, 'Teach with sets', markdown);
     expect(h.text).toBe(markdown);
   });
+  it('reports a 403 verification page without editing or posting', async () => {
+    h.page.goto.mockResolvedValueOnce({ status: () => 403 });
+    h.page.getByPlaceholder.mockReturnValueOnce({ waitFor: vi.fn().mockRejectedValue(new Error('timeout')) });
+    h.page.evaluate.mockResolvedValueOnce({ title: 'Just a moment...', placeholders: [], verificationRequired: true });
+    await expect(prepareEditor(h.page, context as any, 'Teach with sets', markdown))
+      .rejects.toThrow('LEETCODE_BROWSER_VERIFICATION_REQUIRED');
+    expect(h.click).not.toHaveBeenCalled();
+    expect(h.text).toBe(h.original);
+  });
   it.each(['https://evil.test/problems/example/solutions/123/name/',
     'http://leetcode.com/problems/example/solutions/123/name/',
     'https://leetcode.com/problems/other/solutions/123/name/',

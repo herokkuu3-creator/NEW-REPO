@@ -60,10 +60,12 @@ export async function prepareEditor(page: Page, context: SubmissionContext, titl
   catch (error) {
     const document = await page.evaluate(() => ({ title: window.document.title,
       placeholders: Array.from(window.document.querySelectorAll('input,textarea')).map(e => e.getAttribute('placeholder')).filter(Boolean),
-      verificationRequired: /just a moment|verify you are human|checking your browser/i.test(window.document.body?.innerText ?? '') }));
+      verificationRequired: /just a moment|verify you are human|checking your browser/i.test(window.document.title + '\n' + (window.document.body?.innerText ?? '')) }));
     logger.warn({ accountId: context.accountId, submissionId: context.submissionId, url: page.url(),
       httpStatus: navigation?.status(), document }, 'LeetCode article editor unavailable');
-    throw error;
+    if (document.verificationRequired) throw new PostError('LEETCODE_BROWSER_VERIFICATION_REQUIRED');
+    if (navigation?.status() === 403) throw new PostError('LEETCODE_EDITOR_ACCESS_DENIED');
+    throw new PostError('LEETCODE_EDITOR_UNAVAILABLE');
   }
   const editor = page.getByRole('textbox', { name: 'Editor content', exact: true });
   await editor.waitFor({ state: 'visible', timeout: 15000 });
