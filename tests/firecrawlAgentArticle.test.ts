@@ -20,6 +20,22 @@ const done = (value: unknown) => ({ value, model: 'firecrawl/spark-2', attempts:
 const assets = [{ id: 'visual-1', url: 'https://example.com/one.gif', alt: 'First animation' },
   { id: 'visual-2', url: 'https://example.com/two.gif', alt: 'Second animation' }];
 describe('Firecrawl Agent article workflow', () => {
+  it('repairs overlong prose without duplicating the full article in animation prompts', async () => {
+    const router = new FirecrawlAgentRouter('fc-test-key-1234567890');
+    const long = structuredClone(article);
+    long.sections[0]!.markdown = 'value '.repeat(60);
+    const run = vi.spyOn(router, 'generateStructured').mockResolvedValueOnce(done(long)).mockResolvedValueOnce(done(article))
+      .mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done(article)).mockResolvedValueOnce(done({ approved: true, issues: [] }));
+    await generateArticle(router, context, [], async () => assets);
+    const repair = JSON.parse(run.mock.calls[2]![0][1]!.content);
+    const visuals = JSON.parse(run.mock.calls[3]![0][1]!.content);
+    expect(JSON.stringify(repair.feedback)).toContain('45 words');
+    expect(repair).not.toHaveProperty('previousArticle');
+    expect(visuals).not.toHaveProperty('previousArticle');
+    expect(visuals).not.toHaveProperty('prose');
+    expect(visuals.dryRun.kind).toBe('dryRun');
+    expect(JSON.stringify(run.mock.calls[3]![0]).length).toBeLessThan(10000);
+  });
   it('requests bounded frame items and gives actionable length feedback when a draft violates the limit', async () => {
     const router = new FirecrawlAgentRouter('fc-test-key-1234567890');
     const invalid = structuredClone(article);

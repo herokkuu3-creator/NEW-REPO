@@ -263,12 +263,11 @@ async function generateAgentArticle(router: FirecrawlAgentRouter, context: Submi
   const reviewSchema = { type: 'object', properties: { approved: { type: 'boolean' },
     issues: { type: 'array', items: { type: 'string' } } }, required: ['approved', 'issues'] };
   let feedback: unknown = null;
-  let prior: unknown = null;
   for (let round = 0; round < 2; round++) {
     const messages = [
       { role: 'system' as const, content: compactArticlePrompt(context, style, recent.slice(0, 3).map(r => r.title)) +
         '\nReturn strictly the requested schema. Never use HTML tags. Keep identifiers and all animation states faithful to the exact code.' },
-      { role: 'user' as const, content: JSON.stringify({ source, ...(feedback ? { feedback, previousArticle: prior } : {}) }) },
+      { role: 'user' as const, content: JSON.stringify({ source, ...(feedback ? { feedback } : {}) }) },
     ];
     // Generate text and visual plans separately so each Agent job has a smaller,
     // focused output. The visual job sees the completed prose and exact source.
@@ -278,13 +277,15 @@ async function generateAgentArticle(router: FirecrawlAgentRouter, context: Submi
     const prose = await router.generateStructured(messages, proseSchema, data => z.object({ title: z.unknown(), sections: z.unknown(),
       time: z.unknown(), space: z.unknown() }).passthrough().parse(data), round ? 'article prose repair' : 'article prose');
     attempts.push(...prose.attempts);
-    const visualMessages = [messages[0]!, { role: 'user' as const, content: JSON.stringify({ source, prose: prose.value,
-      ...(feedback ? { feedback, previousArticle: prior } : {}) }) }];
+    // Only the dry-run example is needed to keep the animation aligned with
+    // the prose. Repeating the previous article can exceed Agent's 10k limit.
+    const dryRun = Array.isArray(prose.value.sections) ? prose.value.sections.find((s: any) => s?.kind === 'dryRun') : undefined;
+    const visualMessages = [messages[0]!, { role: 'user' as const, content: JSON.stringify({ source, dryRun,
+      ...(feedback ? { feedback } : {}) }) }];
     const visual = await router.generateStructured(visualMessages, visualSchema,
       data => z.object({ visuals: z.unknown() }).passthrough().parse(data), round ? 'animation plan repair' : 'animation plans');
     attempts.push(...visual.attempts);
     const generated = { value: { ...prose.value, visuals: visual.value.visuals }, model: prose.model };
-    prior = generated.value;
     // Firecrawl sometimes inserts HTML line breaks in otherwise valid Markdown.
     // Convert only those line breaks; the normal markup validator rejects all other HTML.
     const normalized = generated.value && typeof generated.value === 'object'
@@ -297,7 +298,10 @@ async function generateAgentArticle(router: FirecrawlAgentRouter, context: Submi
     try { article = validateArticle(JSON.stringify(normalized), context, recent.map(r => r.title)); }
     catch (error) {
       const issues = error instanceof z.ZodError ? error.issues.map(i => ({ path: i.path.join('.'), code: i.code, message: i.message })) :
-        [{ code: error instanceof OutputValidationError ? error.category : 'INVALID_ARTICLE' }];
+        [{ code: error instanceof OutputValidationError ? error.category : 'INVALID_ARTICLE',
+          ...(error instanceof OutputValidationError && error.category === 'READING_BUDGET_EXCEEDED' ? {
+            message: `Keep total prose (including title, headings and complexity reasons) within ${readingBudget(context.difficulty)} words and EVERY paragraph within 45 words. Use shorter paragraphs separated by blank lines.`,
+          } : {}) }];
       logger.warn({ accountId: context.accountId, submissionId: context.submissionId, issues }, 'solution article validation failed');
       if (round === 0) { feedback = issues; continue; }
       throw new RoutingError(attempts, 'FIRECRAWL_INVALID_ARTICLE');
