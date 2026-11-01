@@ -511,7 +511,7 @@ export function isLikelyProxyPayload(text: string): boolean {
   });
 }
 
-async function handleMessage(msg: TgMessage): Promise<void> {
+export async function handleMessage(msg: TgMessage): Promise<void> {
   // Access control: one allowed chat only.
   if (String(msg.chat.id) !== config.telegram.chatId) {
     logger.warn('telegram: ignored a message from an unknown chat');
@@ -1130,6 +1130,13 @@ async function handleMessage(msg: TgMessage): Promise<void> {
   // Non-command message: check if it's pasted proxy list first
   if (!msg.document && isLikelyProxyPayload(text)) {
     await handleAddProxyCommand(text);
+    return;
+  }
+
+  // A lone number is normally a reply to a picker. If the active poller did
+  // not see that picker, never silently reinterpret the selection as AI chat.
+  if (!msg.document && /^\s*#?\d{1,5}\s*$/.test(text)) {
+    await reply('No selection is waiting for that number. Reopen the relevant command and try again. To ask the AI about a number, use /ask.');
     return;
   }
 
