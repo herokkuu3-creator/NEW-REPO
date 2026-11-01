@@ -33,6 +33,7 @@ export interface ModelAttempt {
   retryAfterMs?: number;
   deferred?: boolean;
   agentCreditsUsed?: number;
+  providerLimit?: 'requests_per_minute' | 'concurrency' | 'daily' | 'unknown';
 }
 export class RoutingError extends Error {
   constructor(public readonly attempts: ModelAttempt[], public readonly lastFailure?: string) {
