@@ -72,7 +72,8 @@ RUN tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
  && rm /tmp/wireproxy.tar.gz \
  && chmod 0755 /usr/local/bin/wgcf /usr/local/bin/wireproxy
 COPY scripts/start-submitter.sh /app/scripts/start-submitter.sh
-RUN sed -i 's/\r$//' /app/scripts/start-submitter.sh && chmod 0755 /app/scripts/start-submitter.sh
+COPY scripts/start-web.sh /app/scripts/start-web.sh
+RUN sed -i 's/\r$//' /app/scripts/start-submitter.sh /app/scripts/start-web.sh && chmod 0755 /app/scripts/start-submitter.sh /app/scripts/start-web.sh
 
 # Run as the pre-existing non-root user shipped with the Playwright image.
 RUN mkdir -p /tmp/browser-profile /tmp/diagnostics && chown -R pwuser:pwuser /tmp/browser-profile /tmp/diagnostics /app
@@ -80,4 +81,4 @@ USER pwuser
 
 # Apply migrations, then start the service. `prisma migrate deploy` is
 # idempotent and safe across restarts and free-tier spin-downs.
-CMD ["sh", "-c", "npx prisma migrate deploy && node --expose-gc dist/src/main.js"]
+CMD ["/app/scripts/start-web.sh"]
