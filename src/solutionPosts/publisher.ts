@@ -5,7 +5,16 @@ import { LeetCodeApi } from '../leetcode/apiClient';
 import { contextSchema, hash, SubmissionContext } from './article';
 import { move } from './store';
 import { PostError, withAccount } from './service';
-import { UGC_SOLUTION_ARTICLES_QUERY, UGC_SOLUTION_ARTICLE_QUERY } from '../solutions/communitySolutions';
+import { UGC_SOLUTION_ARTICLE_QUERY } from '../solutions/communitySolutions';
+
+// LeetCode's My Solution filter scopes the list to the authenticated account.
+// A global HOT scan can never prove absence on problems with >1000 articles.
+export const ACCOUNT_SOLUTION_ARTICLES_QUERY = `query ugcArticleSolutionArticles($questionSlug: String!, $skip: Int, $first: Int) {
+  ugcArticleSolutionArticles(questionSlug: $questionSlug, isMine: true, skip: $skip, first: $first) {
+    pageInfo { hasNextPage }
+    edges { node { topicId title slug author { userName } } }
+  }
+}`;
 
 const listSchema = z.object({ ugcArticleSolutionArticles: z.object({
   pageInfo: z.object({ hasNextPage: z.boolean() }), edges: z.array(z.object({ node: z.object({
@@ -17,8 +26,11 @@ const listSchema = z.object({ ugcArticleSolutionArticles: z.object({
 /** Bounded scan. If the full list cannot be checked, publication requires manual reconciliation. */
 async function existingPost(api: LeetCodeApi, context: SubmissionContext) {
   for (let page = 0; page < 10; page++) {
-    const result = await api.graphql(UGC_SOLUTION_ARTICLES_QUERY, { questionSlug: context.slug,
-      orderBy: 'HOT', skip: page * 100, first: 100, tagSlugs: [] }, listSchema);
+    const result = await api.graphql(ACCOUNT_SOLUTION_ARTICLES_QUERY, { questionSlug: context.slug,
+      skip: page * 100, first: 100 }, listSchema);
+    if (result.ugcArticleSolutionArticles.edges.some(e => e.node.author?.userName.toLowerCase() !== context.username.toLowerCase())) {
+      throw new PostError('ACCOUNT_SOLUTION_FILTER_UNVERIFIED');
+    }
     const found = result.ugcArticleSolutionArticles.edges.find(e => e.node.author?.userName.toLowerCase() === context.username.toLowerCase());
     if (found) return `https://leetcode.com/problems/${context.slug}/solutions/${found.node.topicId}/${found.node.slug}/`;
     if (!result.ugcArticleSolutionArticles.pageInfo.hasNextPage) return null;
@@ -83,8 +95,8 @@ async function verifyPublished(api: LeetCodeApi, page: Page, url: string, contex
   // Match the author to this specific topic; a profile link in the navbar is insufficient.
   let verified = false;
   for (let n = 0; n < 10; n++) {
-    const list = await api.graphql(UGC_SOLUTION_ARTICLES_QUERY, { questionSlug: context.slug,
-      orderBy: 'HOT', skip: n * 100, first: 100, tagSlugs: [] }, listSchema);
+    const list = await api.graphql(ACCOUNT_SOLUTION_ARTICLES_QUERY, { questionSlug: context.slug,
+      skip: n * 100, first: 100 }, listSchema);
     const node = list.ugcArticleSolutionArticles.edges.find(e => String(e.node.topicId) === topicId)?.node;
     if (node) { verified = node.author?.userName.toLowerCase() === context.username.toLowerCase(); break; }
     if (!list.ugcArticleSolutionArticles.pageInfo.hasNextPage) break;

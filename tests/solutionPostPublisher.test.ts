@@ -77,6 +77,18 @@ describe('authorized solution publishing', () => {
     h.duplicate = true; expect((await publishPost('post1')).status).toBe('SKIPPED');
     expect(h.page.goto).not.toHaveBeenCalled(); expect(h.click).not.toHaveBeenCalled();
   });
+  it('checks the authenticated account list instead of scanning global HOT articles', async () => {
+    await publishPost('post1');
+    const lists = h.api.graphql.mock.calls.filter((c: any[]) => c[0].includes('ugcArticleSolutionArticles('));
+    expect(lists.length).toBeGreaterThan(0);
+    expect(lists.every((c: any[]) => c[0].includes('isMine: true'))).toBe(true);
+  });
+  it('refuses to post if the account filter returns another author', async () => {
+    h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [
+      { node: { topicId: 789, title: 'Other post', slug: 'other', author: { userName: 'bob' } } }] } });
+    await expect(publishPost('post1')).rejects.toThrow('ACCOUNT_SOLUTION_FILTER_UNVERIFIED');
+    expect(h.click).not.toHaveBeenCalled();
+  });
   it('rejects mismatched account/code context', async () => {
     h.row.accountId = 'b'; await expect(publishPost('post1')).rejects.toThrow('SOURCE_INTEGRITY_FAILED');
     expect(h.click).not.toHaveBeenCalled();
