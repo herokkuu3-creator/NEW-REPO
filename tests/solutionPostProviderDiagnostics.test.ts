@@ -1,8 +1,8 @@
 import { afterEach, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ probe: vi.fn(async () => ({ ok: true })), save: vi.fn(),
   solution: { aiProvider: 'bazaarlink', firecrawlApiKey: '', agentMaxCredits: 300 } }));
-vi.mock('../src/config', () => ({ config: { solution: h.solution, solutionPosts: { baseUrl: 'https://api.bazaarlink.ai/v1',
-  models: ['qwen/qwen3.7-flash:free'], apiKey: 'outdated_environment_key' } } }));
+vi.mock('../src/config', () => ({ config: { solutionPosts: Object.assign(h.solution, { baseUrl: 'https://api.bazaarlink.ai/v1',
+  models: ['qwen/qwen3.7-flash:free'], apiKey: 'outdated_environment_key' }) } }));
 vi.mock('../src/database/models', () => ({ setSystemState: h.save }));
 vi.mock('../src/solutionPosts/keyPool', () => ({ testSolutionApiKey: h.probe }));
 vi.mock('../src/logger', () => ({ logger: { info: vi.fn() } }));

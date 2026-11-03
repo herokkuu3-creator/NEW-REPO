@@ -1827,13 +1827,13 @@ function solutionStageText(stage: string, error?: string, previousError?: string
       if (error === 'AI_PROVIDER_ACCESS_BLOCKED') return '❌ The AI provider blocked this server (HTTP 403). Check /testsolkey; provider access must be restored.';
       if (error === 'AI_CONFIGURATION_REQUIRED') return '❌ No active AI keys. Use /setsolutionkeys to add a key for the configured article provider.';
       if (error === 'AI_KEY_INPUT_INVALID') return '❌ The configured article key contains invalid formatting. Run /testsolkey to identify the variable.';
-      if (error === 'AI_RATE_LIMITED' || error === 'AI_ERROR: HTTP_429') return config.solution.aiProvider === 'firecrawl'
+      if (error === 'AI_RATE_LIMITED' || error === 'AI_ERROR: HTTP_429') return config.solutionPosts.aiProvider === 'firecrawl'
         ? '⏳ Firecrawl Agent returned HTTP 429. Retry after its rate or allowance limit resets.'
         : '⏳ BazaarLink returned a rate/free-allowance limit (HTTP 429). Key retained; retry after the provider limit resets.';
       if (error === 'FIRECRAWL_KEY_REQUIRED') return '❌ Firecrawl Agent requires FIRECRAWL_API_KEY in the server environment.';
       if (error === 'AI_ERROR: FIRECRAWL_CREDIT_LIMIT') return '❌ Firecrawl Agent reached the per-job credit limit; no article was published.';
       if (error.startsWith('AI_ERROR: SCHEMA:')) return '❌ AI returned an invalid article field after repair. Accepted code was retained; details are in the stage-validation logs.';
-      if (error === 'AI_AUTHENTICATION_FAILED' || error === 'AI_ERROR: HTTP_401') return config.solution.aiProvider === 'firecrawl'
+      if (error === 'AI_AUTHENTICATION_FAILED' || error === 'AI_ERROR: HTTP_401') return config.solutionPosts.aiProvider === 'firecrawl'
         ? '❌ Firecrawl rejected its key (HTTP 401). Check FIRECRAWL_API_KEY in the server environment.'
         : '❌ The article provider rejected the key (HTTP 401). Save a key issued by that provider with /setsolutionkeys, then verify with /testsolkey.';
       if (error.startsWith('AI_ERROR:')) {
@@ -3374,11 +3374,11 @@ export async function handleTestFirecrawl(commandArg?: string): Promise<void> {
 }
 
 export async function handleTestSolutionApiKey(commandArg?: string): Promise<void> {
-  if (config.solution.aiProvider === 'firecrawl') {
-    const parsed = firecrawlProbeRequest.safeParse({ apiKey: (commandArg ?? '').trim() || config.solution.firecrawlApiKey });
+  if (config.solutionPosts.aiProvider === 'firecrawl') {
+    const parsed = firecrawlProbeRequest.safeParse({ apiKey: (commandArg ?? '').trim() || config.solutionPosts.firecrawlApiKey });
     if (!parsed.success) { await reply('Firecrawl Agent needs a valid FIRECRAWL_API_KEY in the server environment or /testsolkey <key>.'); return; }
     await reply('Testing Firecrawl Agent from this server (up to 50 credits)...');
-    const result = await probeFirecrawlAgent(parsed.data.apiKey, config.solution.agentMaxCredits);
+    const result = await probeFirecrawlAgent(parsed.data.apiKey, config.solutionPosts.agentMaxCredits);
     logger.info({ diagnostic: result }, 'Firecrawl Agent server probe');
     await reply(`${result.ok ? '✅' : '❌'} Firecrawl Agent: ${result.outcome}\nHost: ${result.executionHost}\nCredits used: ${result.creditsUsed ?? 'unknown'}\nThe full article and publication require separate verification.`);
     return;

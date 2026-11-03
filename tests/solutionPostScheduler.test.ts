@@ -64,6 +64,18 @@ beforeEach(() => {
   });
 });
 describe('daily AI drafts', () => {
+  it('limits a failing 06:00 article workflow to selected accounts and preserves their accepted code', async () => {
+    h.preferences = [{ accountId: 'a', enabled: true }]; h.runs.clear();
+    h.generate.mockResolvedValue({ id: 'post-a', status: 'FAILED', lastError: 'AI_ERROR: HTTP_402' });
+    const result = await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'));
+    expect(result.status).toBe('FINISHED');
+    expect(h.calls).toEqual([{ accountIds: ['a'], expectedChallengeDate: '2026-10-15' }]);
+    expect(h.generate).toHaveBeenCalledTimes(1);
+    expect(h.generate.mock.calls[0]![0]).toBe('a');
+    expect(h.runs.get('a')).toMatchObject({ state: 'SUCCESS', submissionStatus: 'Accepted' });
+    expect(h.runs.has('b')).toBe(false);
+    expect(h.publish).not.toHaveBeenCalled();
+  });
   it('uses 06:00 in Asia/Kolkata regardless of host timezone', () => {
     expect(POST_CRON).toBe('0 6 * * *'); expect(POST_TIMEZONE).toBe('Asia/Kolkata');
     expect(afterPostSchedule(new Date('2026-10-15T00:29:59Z'))).toBe(false);

@@ -125,7 +125,7 @@ describe('solution admin routes', () => {
     } finally { vi.unstubAllGlobals(); await app.close(); }
   });
   it('tests the selected Firecrawl Agent instead of the legacy BazaarLink key', async () => {
-    const settings = config.solution as { aiProvider: 'firecrawl' | 'bazaarlink'; firecrawlApiKey: string; agentMaxCredits: number };
+    const settings = config.solutionPosts as { aiProvider: 'firecrawl' | 'bazaarlink'; firecrawlApiKey: string; agentMaxCredits: number };
     const previous = { ...settings };
     const secret = `fc-${'c'.repeat(32)}`;
     settings.aiProvider = 'firecrawl'; settings.firecrawlApiKey = secret; settings.agentMaxCredits = 75;

@@ -165,12 +165,12 @@ export type Config = Readonly<{
   solution: {
     source: 'community' | 'walkccc' | 'llm';
     walkcccBaseUrl: string;
-    firecrawlApiKey: string;
-    aiProvider: 'firecrawl' | 'bazaarlink';
-    agentMaxCredits: number;
   };
   transport: 'api' | 'browser';
   solutionPosts: {
+    firecrawlApiKey: string;
+    aiProvider: 'firecrawl' | 'bazaarlink';
+    agentMaxCredits: number;
     apiKey: string; apiKeys: string[]; baseUrl: string; models: string[]; timeoutMs: number; retries: number; maxTokens: number;
     keySource?: string; keyEnvironment?: ArticleKeyInput[]; keyError?: string;
     autoPublish: boolean; modelTimeoutMs: Record<string, number>;
@@ -225,12 +225,12 @@ function loadConfig(): Config {
     solution: {
       source: env.SOLUTION_SOURCE,
       walkcccBaseUrl: env.WALKCCC_BASE_URL,
-      firecrawlApiKey: env.FIRECRAWL_API_KEY.trim(),
-      aiProvider: env.SOLUTION_AI_PROVIDER,
-      agentMaxCredits: env.FIRECRAWL_AGENT_MAX_CREDITS,
     },
     transport: env.TRANSPORT,
     solutionPosts: {
+      firecrawlApiKey: env.FIRECRAWL_API_KEY.trim(),
+      aiProvider: env.SOLUTION_AI_PROVIDER,
+      agentMaxCredits: env.FIRECRAWL_AGENT_MAX_CREDITS,
       ...articleKeys,
       baseUrl: env.SOLUTION_POST_BASE_URL,
       models: validateSolutionPostModels(env.SOLUTION_POST_MODELS),

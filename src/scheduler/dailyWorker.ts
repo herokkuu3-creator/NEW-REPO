@@ -37,7 +37,6 @@ import { LeetCodeApi, looksLikeChallenge } from '../leetcode/apiClient';
 import { parseProblem, ProblemParseError } from '../leetcode/parser';
 import { createLLMProvider } from '../ai/provider';
 import { solveProblem, SolveResult } from '../ai/solver';
-import { generateFirecrawlSolution } from '../solutions/firecrawlSolve';
 import {
   fetchWalkcccSolution,
   signatureMatchesStarter,
@@ -666,19 +665,6 @@ async function obtainSolution(
   username: string,
   usedCommunityUuids: Set<string> = new Set(),
 ): Promise<SolutionResult> {
-  if (config.solution.firecrawlApiKey || config.solution.aiProvider === 'firecrawl') {
-    try {
-      if (problem.language !== 'cpp') throw new Error('FIRECRAWL_CPP_ONLY');
-      const code = await generateFirecrawlSolution(problem);
-      return { ok: true, code, source: 'llm' };
-    } catch (err) {
-      const error = err instanceof Error ? err.message : 'FIRECRAWL_SOLUTION_FAILED';
-      logger.warn({ label: account.label, error }, 'Firecrawl-assisted solution failed');
-      await finishRun(account, username, run, RunState.SOLUTION_VALIDATION_FAILED, { error });
-      return { ok: false, outcome: { label: account.label, username, kind: 'failed',
-        state: RunState.SOLUTION_VALIDATION_FAILED, error } };
-    }
-  }
   const cacheKey = {
     date: run.date,
     questionId: `${problem.frontendId}:${problem.slug}`,

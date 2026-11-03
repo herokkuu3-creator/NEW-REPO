@@ -42,7 +42,7 @@ const context = contextSchema.parse({ accountId: 'a', username: 'alice', problem
 const output = { title: 'Example title', markdown: 'verified exact source\r\n', model: 'terra', reviewModel: 'luna', style: 'visual storytelling',
   attempts: [], visuals: [{ id: 'visual-1' }, { id: 'visual-2' }], assets: [{ id: 'visual-1' }, { id: 'visual-2' }], visualFallback: false };
 it('uses the Firecrawl Agent directly without reading the BazaarLink pool', async () => {
-  const settings = config.solution as { aiProvider: 'firecrawl' | 'bazaarlink'; firecrawlApiKey: string };
+  const settings = config.solutionPosts as { aiProvider: 'firecrawl' | 'bazaarlink'; firecrawlApiKey: string };
   const previous = { ...settings };
   settings.aiProvider = 'firecrawl'; settings.firecrawlApiKey = 'fc-test-key-1234567890';
   h.pool.mockClear();
@@ -50,7 +50,7 @@ it('uses the Firecrawl Agent directly without reading the BazaarLink pool', asyn
   finally { settings.aiProvider = previous.aiProvider; settings.firecrawlApiKey = previous.firecrawlApiKey; }
 });
 it('fails closed when Firecrawl is selected without a key', async () => {
-  const settings = config.solution as { aiProvider: 'firecrawl' | 'bazaarlink'; firecrawlApiKey: string };
+  const settings = config.solutionPosts as { aiProvider: 'firecrawl' | 'bazaarlink'; firecrawlApiKey: string };
   const previous = { ...settings };
   settings.aiProvider = 'firecrawl'; settings.firecrawlApiKey = '';
   h.pool.mockClear();

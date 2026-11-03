@@ -2,9 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AccountRecord } from '../src/database/accounts';
 import { LeetCodeHttpError } from '../src/leetcode/apiClient';
 import { WalkcccError, WalkcccPage } from '../src/solutions/walkccc';
-import { config } from '../src/config';
-import * as firecrawlSolver from '../src/solutions/firecrawlSolve';
 import type { CommunitySolution } from '../src/solutions/communitySolutions';
+import { config } from '../src/config';
 import {
   calculateSafeRangeConcurrency,
   countResults,
@@ -135,6 +134,26 @@ describe('parseQuestionRange', () => {
 });
 
 describe('range engine', () => {
+  it.each(['sequential', 'parallel'] as const)('keeps %s ranges on community solutions when the article key has no credits', async mode => {
+    const previous = config.solutionPosts.firecrawlApiKey;
+    const previousProvider = config.solutionPosts.aiProvider;
+    const settings = config.solutionPosts as { firecrawlApiKey: string; aiProvider: 'firecrawl' | 'bazaarlink' };
+    const fetcher = vi.fn().mockResolvedValue(new Response('Credits exhausted', { status: 402 }));
+    vi.stubGlobal('fetch', fetcher);
+    settings.firecrawlApiKey = 'fc-exhausted-article-key'; settings.aiProvider = 'firecrawl';
+    const fetchCommunity = vi.fn(async () => ({ code: 'class Solution { public: int main() { return 42; } };',
+      sourceUrl: 'https://leetcode.com/solutions/example', title: 'Community solution', uuid: 'community-one', rankIndex: 3 }));
+    try {
+      const { deps } = makeDeps(makeSession(() => 'accepted', []), [acc('a1'), acc('a2')], { fetchCommunity });
+      const run = await startRangeJob({ from: 200, to: 201 }, 'all', deps,
+        { mode, maxConcurrency: 5, overrideTotalMb: 1024, overrideUsedMb: 100 });
+      const results = await run.done;
+      expect(results).toHaveLength(2);
+      expect(results.every(r => r.results.length === 2 && r.results.every(q => q.status === 'accepted'))).toBe(true);
+      expect(fetchCommunity).toHaveBeenCalledWith(expect.any(String), expect.anything(), expect.objectContaining({ randomize: true }));
+      expect(fetcher).not.toHaveBeenCalled();
+    } finally { settings.firecrawlApiKey = previous; settings.aiProvider = previousProvider; vi.unstubAllGlobals(); }
+  });
   it('uses an independent question order per account with position-based progress and pacing', async () => {
     const events: any[] = [];
     const { deps, sleeps } = makeDeps(makeSession(() => 'accepted', []), [acc('a1'), acc('a2')], {
@@ -419,29 +438,6 @@ describe('range engine', () => {
     expect(res.capture?.code).toContain('main');
     expect(isRangeJobActive()).toBe(false);
     expect(rangeQueueLength()).toBe(0);
-  });
-  it('uses Firecrawl generation for manual submissions and does not submit on generation failure', async () => {
-    const options = config.solution as { firecrawlApiKey: string };
-    const previous = options.firecrawlApiKey;
-    const log: string[] = [];
-    const session = makeSession(() => 'accepted', log);
-    const question = session.api.question;
-    session.api.question = async slug => ({ ...await question(slug), contentHtml: '<p>A sufficiently detailed problem statement for validation.</p>' });
-    const { deps } = makeDeps(session, [acc('a1')]);
-    const generate = vi.spyOn(firecrawlSolver, 'generateFirecrawlSolution')
-      .mockResolvedValueOnce('class Solution { public: int main() { return 42; } };')
-      .mockRejectedValueOnce(new Error('FIRECRAWL_HTTP_401'));
-    options.firecrawlApiKey = 'fc-test';
-    try {
-      const success = await submitSingleQuestionDirectly(acc('a1'), 200, deps);
-      expect(success.outcome.status).toBe('accepted');
-      expect(success.capture?.code).toContain('42');
-      expect(generate).toHaveBeenCalledTimes(1);
-      log.length = 0;
-      const failed = await submitSingleQuestionDirectly(acc('a1'), 200, deps);
-      expect(failed.outcome.status).toBe('error');
-      expect(log).not.toContain('submit:slug-200');
-    } finally { options.firecrawlApiKey = previous; generate.mockRestore(); }
   });
 });
 
