@@ -981,7 +981,7 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       case '/removeallsession':
         await handleRemoveAllSessions();
         return;
-      case '/cf_clear_cookies':
+
       case '/completeincomplete':
       case '/complete_incomplete':
       case '/solveincomplete':
@@ -999,6 +999,7 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       case '/incomplete_status':
         await handleRangeStatus();
         return;
+      case '/cf_clear_cookies':
       case '/cfclearcookies':
         await handleCfRemoveSession();
         return;
@@ -3885,7 +3886,7 @@ export interface CoinClaimUiDeps {
   answer: (callbackId: string, text?: string) => Promise<void>;
 }
 
-const coinClaimSelections = new Map<string, Set<string>>();
+export const coinClaimSelections = new Map<string, Set<string>>();
 let coinClaimInProgress = false;
 
 function coinHtml(value: string): string {
@@ -3965,7 +3966,7 @@ export async function handleCoinClaimCommand(
   await deps.send(picker.text, picker.buttons);
 }
 
-async function handleCoinClaimButton(
+export async function handleCoinClaimButton(
   chatId: number | string,
   messageId: number,
   callbackId: string,
@@ -4050,14 +4051,15 @@ async function handleCoinClaimButton(
           ].join('\n'),
         );
         const result = await deps.claim(account);
-        const claimParts: string[] = [];
-        if (result.checkinAwarded) claimParts.push('Daily check-in (+1)');
-        else if (result.checkedIn) claimParts.push('Checked in');
-        if (result.claimed) claimParts.push('Coins offered collected');
-        if (claimParts.length > 0) lines.push(`✅ ${coinHtml(accountName(account))} — ${claimParts.join(' & ')}`);
-        else if (result.claimed) lines.push(`✅ ${coinHtml(accountName(account))} — Coins offered collected`);
-        else if (result.error) lines.push(`❌ ${coinHtml(accountName(account))} — ${coinHtml(result.error.slice(0, 180))}`);
-        else lines.push(`▫️ ${coinHtml(accountName(account))} — No coin offer available`);
+        const statusParts: string[] = [];
+        if (result.checkinAwarded) statusParts.push('Daily check-in (+1)');
+        else if (result.checkedIn) statusParts.push('Checked in');
+        if (result.claimed) statusParts.push('Coins offered collected');
+        else if (result.error) statusParts.push(`Contest reward: ${coinHtml(result.error.slice(0, 140))}`);
+        else statusParts.push('No coin offer');
+
+        const icon = result.error ? '⚠️' : result.claimed || result.checkinAwarded ? '✅' : '▫️';
+        lines.push(`${icon} ${coinHtml(accountName(account))} — ${statusParts.join(' · ')}`);
       }
       await deps.edit(
         chatId,

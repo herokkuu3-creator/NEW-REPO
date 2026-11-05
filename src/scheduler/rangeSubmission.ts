@@ -779,7 +779,22 @@ async function runAccountRange(
         numbers = [...resolved];
         order = [...resolved];
       } catch (err) {
-        logger.warn({ account: account.label, err: errText(err) }, 'failed to resolve incomplete questions for account');
+        const errMsg = errText(err);
+        logger.warn({ account: account.label, err: errMsg }, 'failed to resolve incomplete questions for account');
+        result.fatal = `failed to resolve incomplete questions: ${errMsg}`;
+        void deps.onProgress?.({
+          phase: 'error',
+          label: account.label,
+          username: account.username,
+          accIndex: index - 1,
+          accTotal: total,
+          stepIndex: 1,
+          stepTotal: rangeSize(range),
+          questionNumber: order[0] ?? range.from,
+          detail: result.fatal,
+        });
+        await deps.notify(`❌ Account ${index}/${total}: ${who(result)}\n⚠️ Failed to lookup incomplete questions: ${errMsg}`).catch(() => undefined);
+        return finish();
       }
     }
 

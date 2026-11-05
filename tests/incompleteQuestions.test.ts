@@ -113,6 +113,60 @@ describe('LeetCode incomplete questions fetching', () => {
     expect(result.map((q) => q.number)).toEqual([2, 3, 4]);
     expect(call).toBe(2);
   });
+
+  it('requests ascending order by FRONTEND_ID and sorts scrambled questions ascending', async () => {
+    let capturedVars: any;
+    const mockGraphQL = vi.fn(async (_query: string, vars: any) => {
+      capturedVars = vars;
+      return {
+        problemsetQuestionList: {
+          total: 10,
+          questions: [
+            { frontendQuestionId: '42', titleSlug: 'q42', title: 'Q42', paidOnly: false, status: null },
+            { frontendQuestionId: '5', titleSlug: 'q5', title: 'Q5', paidOnly: false, status: null },
+            { frontendQuestionId: '17', titleSlug: 'q17', title: 'Q17', paidOnly: false, status: null },
+          ],
+        },
+      };
+    });
+
+    const result = await fetchIncompleteQuestions({ graphql: mockGraphQL }, 3);
+    expect(capturedVars?.filters).toEqual({
+      orderBy: 'FRONTEND_ID',
+      sortOrder: 'ASCENDING',
+    });
+    expect(result.map((q) => q.number)).toEqual([5, 17, 42]);
+  });
+
+  it('can paginate past 40 pages if needed without arbitrary cap', async () => {
+    let call = 0;
+    const mockGraphQL = vi.fn(async () => {
+      call++;
+      if (call === 42) {
+        return {
+          problemsetQuestionList: {
+            total: 5000,
+            questions: [
+              { frontendQuestionId: '1000', titleSlug: 'q1000', title: 'Q1000', paidOnly: false, status: null },
+            ],
+          },
+        };
+      }
+      return {
+        problemsetQuestionList: {
+          total: 5000,
+          questions: [
+            { frontendQuestionId: String(call), titleSlug: `q${call}`, title: `Q${call}`, paidOnly: false, status: 'ac' },
+          ],
+        },
+      };
+    });
+
+    const result = await fetchIncompleteQuestions({ graphql: mockGraphQL }, 1, 1);
+    expect(call).toBe(42);
+    expect(result).toHaveLength(1);
+    expect(result[0]!.number).toBe(1000);
+  });
 });
 
 describe('Telegram UI for /solveincomplete command', () => {

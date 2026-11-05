@@ -826,4 +826,21 @@ describe('parallel range submission', () => {
     expect(status).toContain('⚡ Parallel (3x)');
     expect(status).toContain('Active accounts (2/3): a1, a2');
   });
+
+  it('stops account with fatal and does not submit questions when resolveQuestions fails', async () => {
+    const submitLog: string[] = [];
+    const session = makeSession(() => 'accepted', submitLog);
+    const { deps } = makeDeps(session, [acc('a1')]);
+    const r = await startRangeJob({ from: 1, to: 5 }, 'a1', deps, {
+      jobType: 'incomplete',
+      resolveQuestions: async () => {
+        throw new Error('LeetCode GraphQL 500 error');
+      },
+    });
+    const results = await r.done;
+    expect(results).toHaveLength(1);
+    expect(results[0]!.fatal).toContain('failed to resolve incomplete questions: LeetCode GraphQL 500 error');
+    expect(results[0]!.results).toHaveLength(0);
+    expect(submitLog.filter((x) => x.startsWith('submit:'))).toHaveLength(0);
+  });
 });

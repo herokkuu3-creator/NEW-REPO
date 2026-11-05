@@ -3,7 +3,12 @@ import type { BrowserContext } from 'playwright';
 import type { AccountRecord } from '../src/database/accounts';
 import { claimContestReward, type ContestRewardApi } from '../src/leetcode/contestReward';
 import { LeetCodeApi } from '../src/leetcode/apiClient';
-import { buildCoinClaimPicker } from '../src/notifications/telegramBot';
+import {
+  buildCoinClaimPicker,
+  handleCoinClaimButton,
+  coinClaimSelections,
+  type CoinClaimUiDeps,
+} from '../src/notifications/telegramBot';
 import { formatOutcomeLine } from '../src/scheduler/report';
 
 function account(id: string, label: string): AccountRecord {
@@ -89,5 +94,58 @@ describe('/claimcoins picker', () => {
     expect(view.buttons[1]![0]!.text).toContain('✅');
     expect(view.buttons[2]![0]!.text).toContain('ALL (2)');
     expect(view.buttons[3]![0]!.text).toContain('Claim selected (1)');
+  });
+
+  it('reports both daily check-in and contest error without hiding the error', async () => {
+    const acc1 = account('a1', 'testUser');
+    coinClaimSelections.set('chat-1', new Set(['a1']));
+    const edits: string[] = [];
+    const deps: CoinClaimUiDeps = {
+      listAccounts: async () => [acc1],
+      claim: async () => ({
+        offered: true,
+        claimed: false,
+        checkedIn: true,
+        checkinAwarded: true,
+        error: 'Cloudflare challenge blocked contest page',
+      }),
+      busy: () => false,
+      send: async () => undefined,
+      edit: async (_c, _m, text) => {
+        edits.push(text);
+      },
+      answer: async () => undefined,
+    };
+
+    await handleCoinClaimButton('chat-1', 10, 'cb-run', 'lccoin:run', deps);
+    await new Promise((r) => setTimeout(r, 20));
+    const lastEdit = edits[edits.length - 1]!;
+    expect(lastEdit).toContain('⚠️ testUser — Daily check-in (+1) · Contest reward: Cloudflare challenge blocked contest page');
+  });
+
+  it('reports check-in and claimed coins together when both succeed', async () => {
+    const acc1 = account('a1', 'testUser');
+    coinClaimSelections.set('chat-1', new Set(['a1']));
+    const edits: string[] = [];
+    const deps: CoinClaimUiDeps = {
+      listAccounts: async () => [acc1],
+      claim: async () => ({
+        offered: true,
+        claimed: true,
+        checkedIn: true,
+        checkinAwarded: true,
+      }),
+      busy: () => false,
+      send: async () => undefined,
+      edit: async (_c, _m, text) => {
+        edits.push(text);
+      },
+      answer: async () => undefined,
+    };
+
+    await handleCoinClaimButton('chat-1', 10, 'cb-run', 'lccoin:run', deps);
+    await new Promise((r) => setTimeout(r, 20));
+    const lastEdit = edits[edits.length - 1]!;
+    expect(lastEdit).toContain('✅ testUser — Daily check-in (+1) · Coins offered collected');
   });
 });

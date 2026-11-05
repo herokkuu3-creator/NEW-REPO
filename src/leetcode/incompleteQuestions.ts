@@ -64,16 +64,18 @@ export async function fetchIncompleteQuestions(
   const result: IncompleteQuestion[] = [];
   const targetCount = Math.max(1, count);
   let skip = 0;
-  const maxPages = 40; // up to 2000 questions checked
 
-  for (let page = 0; page < maxPages && result.length < targetCount; page++) {
+  while (result.length < targetCount) {
     const data = await api.graphql(
       INCOMPLETE_QUESTION_LIST_QUERY,
       {
         categorySlug: '',
         skip,
         limit: pageSize,
-        filters: {},
+        filters: {
+          orderBy: 'FRONTEND_ID',
+          sortOrder: 'ASCENDING',
+        },
       },
       incompleteQuestionListSchema,
     );
@@ -103,13 +105,17 @@ export async function fetchIncompleteQuestions(
 
     skip += pageSize;
     const total = data?.problemsetQuestionList?.total ?? 0;
-    if (skip >= total) break;
+    if (total > 0 && skip >= total) break;
+    if (skip >= 10000) break;
   }
 
+  result.sort((a, b) => a.number - b.number);
+  const selected = result.slice(0, targetCount);
+
   logger.info(
-    { requestedCount: targetCount, foundCount: result.length, firstFew: result.slice(0, 5).map((q) => q.number) },
+    { requestedCount: targetCount, foundCount: selected.length, firstFew: selected.slice(0, 5).map((q) => q.number) },
     'resolved incomplete questions list',
   );
 
-  return result;
+  return selected;
 }
