@@ -315,6 +315,18 @@ describe('AI model routing', () => {
     expect(error.lastFailure).toBe('TECHNICAL_REVIEW_REJECTED');
     expect(api.chat.completions.create).toHaveBeenCalledTimes(14);
   });
+  it('repairs cross-frame validation errors before reviewing the complete article', async () => {
+    const api = client(); const responses = stagedResponses(article);
+    const frame = structuredClone(article.visuals[0]!.frames[1]!); frame.active = [7];
+    responses[6] = complete(JSON.stringify({ frame }));
+    responses.splice(9, 0, complete(JSON.stringify(article)));
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
+    const result = await generateArticle(new AIModelRouter(options, api as never), context, []);
+    expect(result.article.visuals[0]!.frames[1]!.active).toEqual(article.visuals[0]!.frames[1]!.active);
+    const repair = api.chat.completions.create.mock.calls[9]![0] as any;
+    expect(repair.messages[1].content).toContain('Active index is outside the diagram');
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(11);
+  });
   it('normalizes JSON bullet arrays and grounds every animation in the supplied problem', async () => {
     const api = client(); const responses = stagedResponses(article);
     const approach = JSON.parse(responses[1]!.choices[0]!.message.content);

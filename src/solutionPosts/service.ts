@@ -1,5 +1,6 @@
 import { chromium, Page } from 'playwright';
 import { Account, SolutionPost } from '@prisma/client';
+import { z } from 'zod';
 import { config } from '../config';
 import { logger } from '../logger';
 import { prisma } from '../database/prisma';
@@ -12,6 +13,7 @@ import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { isSageProvider } from '../config/solutionPostProvider';
 import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
 import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext } from './article';
+import { OutputValidationError } from './router';
 import { ensurePost, move } from './store';
 import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, maskSolutionApiKey, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
@@ -152,7 +154,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
           error instanceof RoutingError ? (error.lastFailure === 'HTTP_401' ? 'AI_AUTHENTICATION_FAILED' :
             error.lastFailure === 'PROVIDER_ACCESS_BLOCKED' ? 'AI_PROVIDER_ACCESS_BLOCKED' :
             error.lastFailure ? `AI_ERROR: ${error.lastFailure}` : 'AI_MODELS_EXHAUSTED') :
-            error instanceof PostError ? error.code : 'GENERATION_FAILED',
+            error instanceof PostError ? error.code : error instanceof OutputValidationError ? `AI_ERROR: ${error.category}` :
+              error instanceof z.ZodError ? `AI_ERROR: SCHEMA:${error.issues.map(i => i.path.join('.')).join(',').slice(0, 200)}` : 'GENERATION_FAILED',
         ...(error instanceof ArticleReviewError ? { ...error.draft,
           contentHash: hash(`${error.draft.title}\n${error.draft.markdown}`), approvedHash: null } : {}),
         ...(error instanceof RoutingError ? { attempts: JSON.stringify(error.attempts) } : {}) });

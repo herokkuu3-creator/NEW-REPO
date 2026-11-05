@@ -200,10 +200,10 @@ export async function generateArticle(router: AIModelRouter, context: Submission
   const visual2Next = await runStage('dry-run animation next frame',
     `Return {frame} only. Advance the exact source from this first frame: ${JSON.stringify(visual2Start.frame)}. Keep the same items; change active/state/metric/note to show its real next state or output.`,
     nextFrameSchema);
-  const plan1 = visualPlanSchema.parse({ id: 'visual-1', after: 'intuition', title: visual1Start.title,
-    caption: visual1Start.caption, theme: visual1Start.theme, frames: [visual1Start.frame, visual1Next.frame] });
-  const plan2 = visualPlanSchema.parse({ id: 'visual-2', after: 'dryRun', title: visual2Start.title,
-    caption: visual2Start.caption, theme: visual2Start.theme, frames: [visual2Start.frame, visual2Next.frame] });
+  const plan1 = { id: 'visual-1', after: 'intuition', title: visual1Start.title,
+    caption: visual1Start.caption, theme: visual1Start.theme, frames: [visual1Start.frame, visual1Next.frame] };
+  const plan2 = { id: 'visual-2', after: 'dryRun', title: visual2Start.title,
+    caption: visual2Start.caption, theme: visual2Start.theme, frames: [visual2Start.frame, visual2Next.frame] };
   const assembled = {
     title: intro.title,
     sections: [
@@ -215,7 +215,24 @@ export async function generateArticle(router: AIModelRouter, context: Submission
     ],
     time: approach.time, space: approach.space, visuals: [plan1, plan2],
   };
-  let article = validateArticle(JSON.stringify(assembled), context, recent.map(r => r.title));
+  let article: Article;
+  try { article = validateArticle(JSON.stringify(assembled), context, recent.map(r => r.title)); }
+  catch (error) {
+    const issues = error instanceof z.ZodError ? error.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`) :
+      [error instanceof OutputValidationError ? error.category : 'INVALID_ARTICLE'];
+    logger.warn({ accountId: context.accountId, submissionId: context.submissionId,
+      category: error instanceof OutputValidationError ? error.category : 'SCHEMA',
+      paths: error instanceof z.ZodError ? error.issues.map(i => i.path.join('.')) : [] },
+      'solution article assembled validation failed; repairing');
+    const repair = await router.generate([
+      { role: 'system', content: compactArticlePrompt(context, style, recent.slice(0, 3).map(r => r.title)) +
+        '\nRepair ALL validation issues in the complete article JSON. Return the whole article. Respect every length limit. Keep the SAME input and real successive states within each animation, active indices must be inside items. Both animations must visibly change. All prose including headings and complexity reasons must fit the reading budget; each paragraph <=45 words.' },
+      { role: 'user', content: JSON.stringify({ source, article: assembled, validationIssues: issues }) },
+    ], text => validateArticle(text, context, recent.map(r => r.title)), 4096, true, 'technical review repair')
+      .catch(error => { throw new RoutingError([...attempts, ...(error instanceof RoutingError ? error.attempts : [])],
+        error instanceof RoutingError ? error.lastFailure : 'INVALID_ARTICLE'); });
+    attempts.push(...repair.attempts); models.push(repair.model); article = repair.value;
+  }
   let reviewModel = '';
   // A valid rejection is feedback, not a model/protocol failure. Repair the
   // rejected content before requesting another verdict; never shop for approval.
