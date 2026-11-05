@@ -19,6 +19,7 @@ import { isRunInProgress } from './dailyWorker';
 import { config } from '../config';
 import { accountQuestionOrders, QuestionReservations } from './questionOrder';
 import { refreshLeetCodeAccount, AccountRefreshOutcome } from '../security/sessionAutoRefresh';
+import { claimDailyCheckin } from '../leetcode/dailyCheckin';
 
 /**
  * Question-range submission (Telegram /questionrangesubmission 200-400).
@@ -128,6 +129,7 @@ export interface RangeApi {
   question(slug: string): Promise<RawQuestionData>;
   submit(p: { slug: string; questionId: string; lang: string; code: string }): Promise<string>;
   awaitResult(submissionId: string, slug: string): Promise<SubmissionOutcome>;
+  graphql?<T>(query: string, variables: Record<string, unknown>, schema: unknown): Promise<T>;
 }
 
 export interface RangeSession {
@@ -324,6 +326,10 @@ export function calculateSafeRangeConcurrency(
 
 export interface StartRangeOptions extends RangeConcurrencyOptions {
   accountIds?: readonly string[];
+  jobType?: 'range' | 'incomplete';
+  incompleteCount?: number;
+  customQuestions?: number[];
+  resolveQuestions?: (account: AccountRecord, api: RangeApi) => Promise<number[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +350,9 @@ export interface RangeJobInfo {
   mode?: 'parallel' | 'sequential';
   concurrency?: number;
   activeAccounts?: string[];
+  jobType?: 'range' | 'incomplete';
+  incompleteCount?: number;
+  customQuestions?: number[];
 }
 
 interface RangeJob {
@@ -467,6 +476,9 @@ function createRangeJob(
     mode: budget.mode,
     concurrency: budget.concurrency,
     activeAccounts: [],
+    jobType: options?.jobType,
+    incompleteCount: options?.incompleteCount,
+    customQuestions: options?.customQuestions,
   };
   const job: RangeJob = { info, abort, done: Promise.resolve([]) };
   activeJob = job;
@@ -541,13 +553,17 @@ async function executeRangeJob(
 
   const concurrency = budget.concurrency;
   const results: AccountRangeResult[] = new Array(accounts.length);
-  const numbers = Array.from({ length: rangeSize(range) }, (_, i) => range.from + i);
+  let numbers = info.customQuestions && info.customQuestions.length > 0
+    ? [...info.customQuestions]
+    : Array.from({ length: rangeSize(range) }, (_, i) => range.from + i);
   const reservations = new QuestionReservations();
 
   try {
     // Build once for the job so parallel workers receive coordinated starts.
-    const orders = deps.questionOrder ? accounts.map(account => deps.questionOrder!(numbers, account.id)) :
-      accountQuestionOrders(numbers, accounts.length);
+    const orders = options?.jobType === 'incomplete'
+      ? accounts.map(() => [...numbers])
+      : (deps.questionOrder ? accounts.map(account => deps.questionOrder!(numbers, account.id)) :
+      accountQuestionOrders(numbers, accounts.length));
     logger.info({ scheduling: 'distinct-starts-with-question-reservations', mode: budget.mode,
       firstQuestions: orders.map(order => order[0]), accountCount: accounts.length }, 'range question scheduling configured');
     let nextAccountIdx = 0;
@@ -575,6 +591,7 @@ async function executeRangeJob(
             usedCommunityUuidsByQuestion,
             orders[accountIdx]!,
             reservations,
+            options,
           );
           results[accountIdx] = result;
           await deps
@@ -636,9 +653,12 @@ async function runAccountRange(
   usedCommunityUuidsByQuestion: Map<number, Set<string>> = new Map(),
   plannedOrder: number[],
   reservations: QuestionReservations,
+  options?: StartRangeOptions,
 ): Promise<AccountRangeResult> {
-  const numbers = Array.from({ length: rangeSize(range) }, (_, i) => range.from + i);
-  const order = [...plannedOrder];
+  let numbers = info.customQuestions && info.customQuestions.length > 0
+    ? [...info.customQuestions]
+    : Array.from({ length: rangeSize(range) }, (_, i) => range.from + i);
+  let order = [...plannedOrder];
   const result: AccountRangeResult = {
     label: account.label,
     username: account.username,
@@ -743,9 +763,29 @@ async function runAccountRange(
     }
     result.username = check.username ?? account.username;
 
+    // Perform daily check-in (+1 LeetCoin)
+    if (session.api.graphql) {
+      await claimDailyCheckin({ graphql: session.api.graphql as never }, account.label).catch(() => undefined);
+    }
+
+    if (options?.resolveQuestions) {
+      try {
+        const resolved = await options.resolveQuestions(account, session.api);
+        if (resolved.length === 0) {
+          logger.info({ account: account.label }, 'no incomplete questions found');
+          await deps.notify(`👤 Account ${index}/${total}: ${who(result)}\n🎉 All checked questions are already accepted on this account!`).catch(() => undefined);
+          return finish();
+        }
+        numbers = [...resolved];
+        order = [...resolved];
+      } catch (err) {
+        logger.warn({ account: account.label, err: errText(err) }, 'failed to resolve incomplete questions for account');
+      }
+    }
+
     await deps
       .notify(
-        `👤 Account ${index}/${total}: ${who(result)}\n🎯 Questions #${range.from}–#${range.to} (${rangeSize(range)}) — starting now`,
+        `👤 Account ${index}/${total}: ${who(result)}\n🎯 ${info.jobType === 'incomplete' ? `${numbers.length} Incomplete Questions (${numbers.slice(0, 5).map(n => `#${n}`).join(', ')}${numbers.length > 5 ? '…' : ''})` : `Questions #${range.from}–#${range.to} (${numbers.length})`} — starting now`,
       )
       .catch(() => undefined);
 
@@ -1362,7 +1402,9 @@ export function formatRangeJobStatus(j: RangeJobInfo, now: number, queuedCount =
     ? ` · ⚡ Parallel (${j.concurrency}x)`
     : ' · 🐢 Sequential';
   const lines = [
-    `⏳ Question-range job in progress (#${j.range.from}–#${j.range.to})${modeStr}`,
+    j.jobType === 'incomplete'
+      ? `⏳ Incomplete questions solver in progress (${j.incompleteCount ?? size} questions)${modeStr}`
+      : `⏳ Question-range job in progress (#${j.range.from}–#${j.range.to})${modeStr}`,
     j.activeAccounts && j.activeAccounts.length > 1
       ? `👥 Active accounts (${j.activeAccounts.length}/${j.accountLabels.length}): ${j.activeAccounts.join(', ')}`
       : `👤 Account ${j.accountIndex}/${j.accountLabels.length}: ${j.currentLabel ?? '—'}`,
@@ -1428,6 +1470,7 @@ async function openRequestSession(account: AccountRecord): Promise<RangeSession>
       question: (slug) => fetchQuestionData(api, slug),
       submit: (p) => api.submitSolution(p),
       awaitResult: (id, slug) => api.awaitSubmission(id, slug),
+      graphql: (q, v, s) => api.graphql(q, v, s as never),
     },
     close: () => ctx.dispose(),
   };

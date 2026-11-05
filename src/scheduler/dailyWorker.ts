@@ -25,6 +25,7 @@ import { refreshLeetCodeAccount } from '../security/sessionAutoRefresh';
 import { AccountOutcome, buildReport, RunReport, summarizeReport } from './report';
 import { BrowserSession, launchWithStorageStateObject } from '../browser/playwright';
 import { claimContestReward } from '../leetcode/contestReward';
+import { claimDailyCheckin } from '../leetcode/dailyCheckin';
 import { checkSession } from '../browser/sessionCheck';
 import { detectVerificationPage } from '../browser/cloudflareDetector';
 import { captureDiagnostics, pruneDiagnostics } from '../browser/diagnostics';
@@ -422,6 +423,8 @@ async function runForAccount(
     // Reward collection uses the contest frontend's authenticated GraphQL
     // operations and is deliberately best-effort, so it never navigates to
     // the Cloudflare-protected contest HTML or interrupts daily submission.
+    // Perform daily check-in first (collects +1 LeetCoin)
+    const checkinResult = await claimDailyCheckin(api, label);
     const contestReward = await claimContestReward(api, label);
 
     // --- 2) Locate the current LeetCode daily challenge --------------------
@@ -468,6 +471,7 @@ async function runForAccount(
         runtime: existing!.runtime,
         memory: existing!.memory,
         coinsCollected: contestReward.claimed,
+        dailyCheckin: checkinResult.checkedIn || checkinResult.awarded,
         error: existing!.state === RunState.SUCCESS ? null : existing!.error ?? 'today already has a daily run record',
       };
     }
@@ -596,7 +600,8 @@ async function runForAccount(
       }
     }
 
-    return contestReward.claimed ? { ...outcome, coinsCollected: true } : outcome;
+    const resultOutcome = contestReward.claimed ? { ...outcome, coinsCollected: true } : outcome;
+    return (checkinResult.checkedIn || checkinResult.awarded) ? { ...resultOutcome, dailyCheckin: true } : resultOutcome;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ label, err: msg }, 'account run failed with unexpected error');

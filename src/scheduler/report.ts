@@ -28,6 +28,8 @@ export interface AccountOutcome {
   memory?: string | null;
   /** True only when the optional contest-page LeetCoin offer was collected. */
   coinsCollected?: boolean;
+  /** True when daily check-in was confirmed/completed. */
+  dailyCheckin?: boolean;
   error?: string | null;
 }
 
@@ -123,7 +125,11 @@ export function formatOutcomeLine(o: AccountOutcome): string {
       const parts = [o.submissionStatus ?? 'done'];
       if (o.runtime) parts.push(o.runtime);
       if (o.memory) parts.push(o.memory);
-      return `✅ ${who} — ${parts.filter(Boolean).join(' · ')}${o.coinsCollected ? ' || Coins offered collected' : ''}`;
+      const extras: string[] = [];
+      if (o.dailyCheckin) extras.push('Daily check-in done');
+      if (o.coinsCollected) extras.push('Coins offered collected');
+      const extraStr = extras.length > 0 ? ` || ${extras.join(' || ')}` : '';
+      return `✅ ${who} — ${parts.filter(Boolean).join(' · ')}${extraStr}`;
     }
     case 'expired':
       return `⏰ ${who} — ${firstLine(o.error) ?? 'session token itself is expired — re-capture fresh cookies'}`;

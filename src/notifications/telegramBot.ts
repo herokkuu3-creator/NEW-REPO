@@ -125,6 +125,7 @@ import {
   StartRangeOptions,
   StartRangeResult,
 } from '../scheduler/rangeSubmission';
+import { fetchIncompleteQuestions } from '../leetcode/incompleteQuestions';
 
 /**
  * Telegram command bot â€” the interactive half of session renewal.
@@ -179,7 +180,7 @@ interface TgUpdate {
 
 export type InlineButton = { text: string; callback_data: string };
 
-export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | 'capzy' | 'addcapzy' | 'solutionkeys' | 'solutionquestion' | null;
+export type PendingPromptType = 'leetcode' | 'codeforces' | 'codechef' | 'queue' | 'capzy' | 'addcapzy' | 'solutionkeys' | 'solutionquestion' | 'incomplete' | null;
 let pendingPromptType: PendingPromptType = null;
 let pendingRangePrompt = false;
 let pendingQueuePrompt = false;
@@ -241,6 +242,7 @@ export const HELP_TEXT = [
   '<b>✨ 𝗟𝗘𝗘𝗧𝗖𝗢𝗗𝗘 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ /triggersubmission — Submit today’s daily question',
   '├ /claimcoins — Collect contest coins &amp; rewards',
+  '├ /solveincomplete — Solve incomplete questions one by one',
   '├ /questionrangesubmission — Range solver <i>(e.g. 200-400)</i>',
   '├ /rangestatus — Check active range job progress',
   '├ /cancelrange — Stop running range job',
@@ -606,7 +608,7 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       await reply('✖️ Command queuing cancelled.');
       return;
     }
-    const isInteractiveCommand = /^\/(?:cfrange|cf_range|cfbatch|cf_batch|ccrange|cc_range|ccbatch|cc_batch|questionrangesubmission|question_range_submission|rangesubmission)\b/.test(text.toLowerCase());
+    const isInteractiveCommand = /^\/(?:cfrange|cf_range|cfbatch|cf_batch|ccrange|cc_range|ccbatch|cc_batch|questionrangesubmission|question_range_submission|rangesubmission|completeincomplete|complete_incomplete|solveincomplete|solve_incomplete|incomplete)\b/.test(text.toLowerCase());
     if (!isInteractiveCommand) {
       const handled = await handleQueueCommandInput(text);
       if (handled) {
@@ -980,10 +982,27 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
         await handleRemoveAllSessions();
         return;
       case '/cf_clear_cookies':
+      case '/completeincomplete':
+      case '/complete_incomplete':
+      case '/solveincomplete':
+      case '/solve_incomplete':
+      case '/incomplete':
+        pendingPromptType = null;
+        await handleIncompleteQuestionsCommand(commandArg, defaultRemovalDeps, defaultRangeUiDeps, msg.chat.id);
+        return;
+      case '/cancelincomplete':
+      case '/cancel_incomplete':
+        pendingPromptType = null;
+        await handleCancelRange();
+        return;
+      case '/incompletestatus':
+      case '/incomplete_status':
+        await handleRangeStatus();
+        return;
       case '/cfclearcookies':
         await handleCfRemoveSession();
         return;
-      case '/questionrangesubmission':
+    case '/questionrangesubmission':
       case '/question_range_submission':
       case '/rangesubmission':
         pendingRangePrompt = false;
@@ -1112,6 +1131,13 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       const count = parseInt(text.replace(/^[#\s]+/, ''), 10);
       if (!isNaN(count) && count > 0) {
         await handleCodeChefTrigger({ forceNext: true, count: Math.min(50, count) });
+        return;
+      }
+    } else if (pendingPromptType === 'incomplete') {
+      pendingPromptType = null;
+      const count = parseInt(text.replace(/^[#\s]+/, ''), 10);
+      if (!isNaN(count) && count > 0) {
+        await handleIncompleteQuestionsCommand(String(count), defaultRemovalDeps, defaultRangeUiDeps, msg.chat.id);
         return;
       }
     } else if (pendingPromptType === 'leetcode' || pendingRangePrompt) {
@@ -4024,7 +4050,12 @@ async function handleCoinClaimButton(
           ].join('\n'),
         );
         const result = await deps.claim(account);
-        if (result.claimed) lines.push(`✅ ${coinHtml(accountName(account))} — Coins offered collected`);
+        const claimParts: string[] = [];
+        if (result.checkinAwarded) claimParts.push('Daily check-in (+1)');
+        else if (result.checkedIn) claimParts.push('Checked in');
+        if (result.claimed) claimParts.push('Coins offered collected');
+        if (claimParts.length > 0) lines.push(`✅ ${coinHtml(accountName(account))} — ${claimParts.join(' & ')}`);
+        else if (result.claimed) lines.push(`✅ ${coinHtml(accountName(account))} — Coins offered collected`);
         else if (result.error) lines.push(`❌ ${coinHtml(accountName(account))} — ${coinHtml(result.error.slice(0, 180))}`);
         else lines.push(`▫️ ${coinHtml(accountName(account))} — No coin offer available`);
       }
@@ -4200,6 +4231,11 @@ export async function handleCallbackQuery(
 
   if (data.startsWith('cfnet:')) {
     await handleCodeforcesNetworkButton(chatId, messageId, q.id, data, codeforcesNetworkUi);
+    return;
+  }
+
+  if (data.startsWith('lcincomp:')) {
+    await handleIncompleteButton(chatId, messageId, q.id, data, deps, ui);
     return;
   }
 
@@ -4962,6 +4998,282 @@ export function buildQuickRangeButtons(): InlineButton[][] {
   ];
 }
 
+export interface IncompleteSelectionState {
+  count: number;
+  selectedAccountIds: Set<string>;
+}
+
+export const lcIncompleteSelections = new Map<string, IncompleteSelectionState>();
+
+export function buildQuickIncompleteButtons(): InlineButton[][] {
+  return [
+    [
+      { text: '5 Questions', callback_data: 'lcincomp:cnt:5' },
+      { text: '10 Questions', callback_data: 'lcincomp:cnt:10' },
+      { text: '15 Questions', callback_data: 'lcincomp:cnt:15' },
+    ],
+    [
+      { text: '20 Questions', callback_data: 'lcincomp:cnt:20' },
+      { text: '25 Questions', callback_data: 'lcincomp:cnt:25' },
+      { text: '50 Questions', callback_data: 'lcincomp:cnt:50' },
+    ],
+    [
+      { text: '✖️ Cancel', callback_data: 'lcincomp:x' },
+    ],
+  ];
+}
+
+export function buildIncompletePicker(
+  count: number,
+  accounts: AccountRecord[],
+  selected: ReadonlySet<string> = new Set(),
+): { text: string; buttons: InlineButton[][] } {
+  const allSelected = accounts.length > 0 && accounts.every((a) => selected.has(a.id));
+  const selCount = selected.size;
+
+  const buttons: InlineButton[][] = accounts.map((a) => [
+    {
+      text: `${selected.has(a.id) ? '✅' : '▫️'} ${accountName(a)}`.slice(0, 60),
+      callback_data: `lcincomp:a:${a.id}`,
+    },
+  ]);
+
+  buttons.push([
+    {
+      text: allSelected ? '✖️ Deselect All' : `👥 All accounts (${accounts.length})`,
+      callback_data: 'lcincomp:all',
+    },
+  ]);
+
+  if (selCount > 0) {
+    buttons.push([
+      {
+        text: `▶️ Solve ${count} Incomplete (${selCount} account${selCount === 1 ? '' : 's'})`,
+        callback_data: 'lcincomp:run',
+      },
+    ]);
+  }
+
+  buttons.push([{ text: '✖️ Cancel', callback_data: 'lcincomp:x' }]);
+
+  const selectionHint = selCount > 0
+    ? `<i>Selected: ${selCount} of ${accounts.length} account${accounts.length === 1 ? '' : 's'}</i>`
+    : '<i>Tap account(s) to select, or tap All accounts below:</i>';
+
+  const text = [
+    `🧩 <b>Solve Incomplete Questions</b>`,
+    `<code>━━━━━━━━━━━━━━━━━━━━</code>`,
+    `📊 Target: <b>First ${count} incomplete questions</b> (from #1 onwards)`,
+    `<i>Finds questions left unsolved or attempted without acceptance, solving one by one.</i>`,
+    '',
+    '👇 Pick the account(s) to run on:',
+    selectionHint,
+    `⏳ Pacing: 30s gap between questions (Cloudflare-safe)`,
+  ].join('\n');
+
+  return { text, buttons };
+}
+
+export async function handleIncompleteQuestionsCommand(
+  arg: string,
+  deps: RemovalDeps = defaultRemovalDeps,
+  ui: RangeUiDeps = defaultRangeUiDeps,
+  chatId: number | string = config.telegram.chatId,
+): Promise<void> {
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    pendingPromptType = null;
+    await deps.send('📭 No accounts configured — send cookie .json files first (/renew).');
+    return;
+  }
+
+  if (!arg.trim()) {
+    pendingPromptType = 'incomplete';
+    const buttons = buildQuickIncompleteButtons();
+    const promptText = [
+      '🧩 <b>Solve Incomplete Questions</b>',
+      '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+      '❓ How many incomplete questions would you like to solve?',
+      'Pick a count below or type a number (e.g. <code>10</code>):',
+      '<i>The solver finds questions left unsolved or attempted without acceptance starting from #1, and solves them one by one.</i>',
+    ].join('\n');
+    await deps.send(promptText, buttons);
+    return;
+  }
+
+  pendingPromptType = null;
+  const tokens = arg.trim().split(/\s+/);
+  const rawCount = parseInt(tokens[0] || '', 10);
+  if (isNaN(rawCount) || rawCount < 1) {
+    await deps.send('⚠️ Send how many questions to solve, e.g. /solveincomplete 10');
+    return;
+  }
+  const count = Math.min(200, rawCount);
+
+  if (tokens.length >= 2 && tokens[1]) {
+    const rawTarget = tokens[1];
+    let target: string | 'all' | string[];
+    if (rawTarget === 'all' || rawTarget === 'all:seq' || rawTarget === 'all:parallel') {
+      target = 'all';
+    } else if (rawTarget.includes(',')) {
+      target = rawTarget.split(',').map((s) => s.trim()).filter(Boolean);
+    } else {
+      target = rawTarget;
+    }
+
+    const result = await ui.start(
+      { from: 1, to: count },
+      target,
+      {
+        mode: 'sequential',
+        jobType: 'incomplete',
+        incompleteCount: count,
+        resolveQuestions: async (_acc, api) => {
+          if (api.graphql) {
+            const items = await fetchIncompleteQuestions({ graphql: api.graphql }, count);
+            return items.map((q) => q.number);
+          }
+          return Array.from({ length: count }, (_, i) => i + 1);
+        },
+      },
+    );
+
+    if (!result.started) {
+      if ('queued' in result) {
+        await deps.send(`🗂️ Queued: solving ${count} incomplete questions (Queue position: ${result.position})`);
+      } else {
+        await deps.send(
+          result.reason === 'no-accounts'
+            ? '📭 No accounts configured — send cookie .json files first.'
+            : '🔍 That account does not exist — check /accounts.',
+        );
+      }
+    }
+    return;
+  }
+
+  const sel = new Set<string>();
+  const key = String(chatId);
+  lcIncompleteSelections.set(key, { count, selectedAccountIds: sel });
+
+  const picker = buildIncompletePicker(count, accounts, sel);
+  if (ui.current()) {
+    picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
+  }
+  await deps.send(picker.text, picker.buttons);
+}
+
+export async function handleIncompleteButton(
+  chatId: number | string,
+  messageId: number,
+  callbackId: string,
+  data: string,
+  deps: RemovalDeps,
+  ui: RangeUiDeps,
+): Promise<void> {
+  const key = String(chatId);
+
+  if (data === 'lcincomp:x') {
+    lcIncompleteSelections.delete(key);
+    pendingPromptType = null;
+    await deps.answer(callbackId, 'Cancelled');
+    await deps.edit(chatId, messageId, '✖️ Incomplete question solver cancelled.');
+    return;
+  }
+
+  const accounts = await deps.listAccounts();
+  if (accounts.length === 0) {
+    await deps.answer(callbackId, 'No accounts');
+    await deps.edit(chatId, messageId, '📭 No active accounts configured. Add one with /renew first.');
+    return;
+  }
+
+  if (data.startsWith('lcincomp:cnt:')) {
+    const raw = parseInt(data.slice('lcincomp:cnt:'.length), 10);
+    const count = !isNaN(raw) && raw > 0 ? Math.min(200, raw) : 10;
+    const sel = new Set<string>();
+    lcIncompleteSelections.set(key, { count, selectedAccountIds: sel });
+    await deps.answer(callbackId, `Target: ${count} questions`);
+    const picker = buildIncompletePicker(count, accounts, sel);
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  let state = lcIncompleteSelections.get(key);
+  if (!state) {
+    state = { count: 10, selectedAccountIds: new Set() };
+    lcIncompleteSelections.set(key, state);
+  }
+
+  if (data === 'lcincomp:all') {
+    const allSelected = accounts.every((a) => state!.selectedAccountIds.has(a.id));
+    state.selectedAccountIds.clear();
+    if (!allSelected) accounts.forEach((a) => state!.selectedAccountIds.add(a.id));
+    await deps.answer(callbackId, allSelected ? 'Cleared' : 'All accounts selected');
+    const picker = buildIncompletePicker(state.count, accounts, state.selectedAccountIds);
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data.startsWith('lcincomp:a:')) {
+    const id = data.slice('lcincomp:a:'.length);
+    if (!accounts.some((a) => a.id === id)) {
+      await deps.answer(callbackId, 'Account no longer available');
+      return;
+    }
+    if (state.selectedAccountIds.has(id)) {
+      state.selectedAccountIds.delete(id);
+    } else {
+      state.selectedAccountIds.add(id);
+    }
+    await deps.answer(callbackId, state.selectedAccountIds.has(id) ? 'Selected' : 'Unselected');
+    const picker = buildIncompletePicker(state.count, accounts, state.selectedAccountIds);
+    await deps.edit(chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data === 'lcincomp:run') {
+    const selected = accounts.filter((a) => state!.selectedAccountIds.has(a.id));
+    if (selected.length === 0) {
+      await deps.answer(callbackId, 'Select at least one account');
+      return;
+    }
+
+    const count = state.count;
+    lcIncompleteSelections.delete(key);
+    await deps.answer(callbackId, 'Solver started 🚀');
+    await deps.edit(
+      chatId,
+      messageId,
+      `🚀 Starting incomplete question solver for ${selected.length} account(s) (${count} questions each, one by one)…`,
+    );
+
+    const result = await ui.start(
+      { from: 1, to: count },
+      selected.map((a) => a.id),
+      {
+        mode: 'sequential',
+        jobType: 'incomplete',
+        incompleteCount: count,
+        resolveQuestions: async (_acc, api) => {
+          if (api.graphql) {
+            const items = await fetchIncompleteQuestions({ graphql: api.graphql }, count);
+            return items.map((q) => q.number);
+          }
+          return Array.from({ length: count }, (_, i) => i + 1);
+        },
+      },
+    );
+
+    if (!result.started && 'queued' in result) {
+      await deps.send(`🗂️ Queued: solving ${count} incomplete questions (Queue position: ${result.position})`);
+    }
+    return;
+  }
+
+  await deps.answer(callbackId);
+}
+
 export async function handleQuestionRangeCommand(
   arg: string,
   deps: RemovalDeps = defaultRemovalDeps,
@@ -5647,6 +5959,14 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
       const accountIds = tokens[1] ? tokens[1].split(',') : undefined;
       const res = await handleCodeChefTrigger({ forceNext: true, count, accountIds });
       if (res?.done) await res.done;
+      return;
+    }
+    case '/completeincomplete':
+    case '/complete_incomplete':
+    case '/solveincomplete':
+    case '/solve_incomplete':
+    case '/incomplete': {
+      await handleIncompleteQuestionsCommand(commandArg, defaultRemovalDeps, defaultRangeUiDeps, config.telegram.chatId);
       return;
     }
     case '/questionrangesubmission':

@@ -4,11 +4,14 @@ import { parseStoredStorageState } from '../database/accounts';
 import { checkSession } from '../browser/sessionCheck';
 import { launchWithStorageStateObject } from '../browser/playwright';
 import { LeetCodeApi } from './apiClient';
+import { claimDailyCheckin } from './dailyCheckin';
 import { logger } from '../logger';
 
 export interface ContestRewardResult {
   offered: boolean;
   claimed: boolean;
+  checkedIn?: boolean;
+  checkinAwarded?: boolean;
   error?: string;
 }
 
@@ -87,7 +90,13 @@ export async function claimContestRewardForAccount(account: AccountRecord): Prom
     if (!check.authenticated) {
       return { offered: false, claimed: false, error: 'LeetCode session is not authenticated; renew this account first' };
     }
-    return await claimContestReward(api, account.label);
+    const checkin = await claimDailyCheckin(api, account.label);
+    const reward = await claimContestReward(api, account.label);
+    return {
+      ...reward,
+      checkedIn: checkin.checkedIn,
+      checkinAwarded: checkin.awarded,
+    };
   } catch (err) {
     return { offered: false, claimed: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
