@@ -29,10 +29,27 @@ export class LeetCodeHttpError extends Error {
   }
 }
 
+/** Detects LeetCode submission limit / daily quota or rate limit errors. */
+export function isSubmissionLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (
+    /submission limit|submissions limit|daily limit|daily submission|maximum number of submissions|too many submissions|rate limit exceeded|requests too frequently/i.test(
+      msg,
+    )
+  ) {
+    return true;
+  }
+  if (err instanceof LeetCodeHttpError && err.status === 429) {
+    return true;
+  }
+  return false;
+}
+
 /** A 403 or a non-JSON body from LeetCode usually means an interstitial. */
 export function looksLikeChallenge(err: unknown): boolean {
+  if (isSubmissionLimitError(err)) return false;
   if (err instanceof LeetCodeHttpError) {
-    if (err.status === 403 || err.status === 429) return true;
+    if (err.status === 403) return true;
     if (/non-JSON body|no submission_id/i.test(err.message)) return true;
   }
   return false;
@@ -282,6 +299,10 @@ export class LeetCodeApi {
     }
     const id = (json as { submission_id?: number }).submission_id;
     if (typeof id !== 'number') {
+      const errMsg = (json as { error?: string })?.error ?? (json as { detail?: string })?.detail;
+      if (errMsg) {
+        throw new LeetCodeHttpError(`submit rejected: ${errMsg}`);
+      }
       throw new LeetCodeHttpError('submit response contained no submission_id');
     }
     logger.info({ submissionId: String(id) }, 'submission accepted by the judge, polling result');

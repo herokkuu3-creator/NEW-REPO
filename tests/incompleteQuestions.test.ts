@@ -220,7 +220,7 @@ describe('Telegram UI for /solveincomplete command', () => {
     expect(calls[0]!.target).toBe('all');
     expect(calls[0]!.options?.jobType).toBe('incomplete');
     expect(calls[0]!.options?.incompleteCount).toBe(10);
-    expect(calls[0]!.options?.mode).toBe('sequential');
+    expect(calls[0]!.options?.mode).toBe('parallel');
   });
 
   it('handles button interactions: select count, toggle account, and run', async () => {
@@ -255,5 +255,42 @@ describe('Telegram UI for /solveincomplete command', () => {
     await handleIncompleteButton('chat-1', 100, 'cb-cancel', 'lcincomp:x', deps, ui);
     expect(answers[0]!.text).toBe('Cancelled');
     expect(edits[0]!.text).toContain('Incomplete question solver cancelled');
+  });
+
+  it('supports 500 or more questions without artificial limit', async () => {
+    const { deps, sentViews } = makeDeps([acc('a1', 'acc-one'), acc('a2', 'acc-two')]);
+    const { ui } = makeUi(startedResult(['a1']));
+
+    await handleIncompleteQuestionsCommand('500', deps, ui, 'chat-1');
+
+    expect(sentViews).toHaveLength(1);
+    expect(sentViews[0]!.text).toContain('First 500 incomplete questions');
+    const state = lcIncompleteSelections.get('chat-1');
+    expect(state?.count).toBe(500);
+  });
+
+  it('runs parallel when user selects parallel with multiple accounts', async () => {
+    const accounts = [acc('a1', 'acc-one'), acc('a2', 'acc-two'), acc('a3', 'acc-three')];
+    const { deps, edits } = makeDeps(accounts);
+    const { ui, calls } = makeUi(startedResult(['a1', 'a2']));
+
+    // Select 500 questions
+    await handleIncompleteButton('chat-1', 100, 'cb-cnt', 'lcincomp:cnt:500', deps, ui);
+    // Select a1 and a2
+    await handleIncompleteButton('chat-1', 100, 'cb-a1', 'lcincomp:a:a1', deps, ui);
+    await handleIncompleteButton('chat-1', 100, 'cb-a2', 'lcincomp:a:a2', deps, ui);
+
+    const pickerEdit = edits[edits.length - 1]!;
+    const buttonTexts = (pickerEdit.buttons as any).flat().map((b: any) => b.text);
+    expect(buttonTexts).toContain('⚡ Solve 500 Parallel (2 accounts)');
+    expect(buttonTexts).toContain('🐢 Solve 500 Sequential (2 accounts)');
+
+    // Tap parallel
+    await handleIncompleteButton('chat-1', 100, 'cb-par', 'lcincomp:run:parallel', deps, ui);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.range).toEqual({ from: 1, to: 500 });
+    expect(calls[0]!.target).toEqual(['a1', 'a2']);
+    expect(calls[0]!.options?.mode).toBe('parallel');
+    expect(calls[0]!.options?.incompleteCount).toBe(500);
   });
 });

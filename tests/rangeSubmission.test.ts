@@ -843,4 +843,24 @@ describe('parallel range submission', () => {
     expect(results[0]!.results).toHaveLength(0);
     expect(submitLog.filter((x) => x.startsWith('submit:'))).toHaveLength(0);
   });
+
+  it('terminates flow for an account when LeetCode daily submission limit is hit', async () => {
+    const submitLog: string[] = [];
+    const session = makeSession((n) => {
+      if (n === 2) throw new Error('submit rejected: You have reached the submission limit for today.');
+      return 'accepted';
+    }, submitLog);
+    const { deps, notes } = makeDeps(session, [acc('a1')]);
+    const r = await startRangeJob({ from: 1, to: 10 }, 'a1', deps);
+    const results = await r.done;
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.stoppedEarly).toBe('submission-limit');
+    expect(results[0]!.results).toHaveLength(2);
+    expect(results[0]!.results[0]!.status).toBe('accepted');
+    expect(results[0]!.results[1]!.status).toBe('error');
+    expect(results[0]!.results[1]!.detail).toContain('submission limit');
+    expect(results[0]!.notAttempted).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(notes.some((n) => n.includes('daily submission limit reached'))).toBe(true);
+  });
 });

@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import { request as playwrightRequest } from 'playwright';
 import { logger } from '../logger';
 import { AccountRecord, getAccountById, listEnabledAccounts, parseStoredStorageState } from '../database/accounts';
-import { LeetCodeApi, looksLikeChallenge, SubmissionOutcome } from '../leetcode/apiClient';
+import { LeetCodeApi, looksLikeChallenge, isSubmissionLimitError, SubmissionOutcome } from '../leetcode/apiClient';
 import { fetchQuestionData, RawQuestionData } from '../leetcode/dailyChallenge';
 import { checkSession, SessionCheckResult } from '../browser/sessionCheck';
 import { fetchWalkcccPage, signatureMatchesStarter, WalkcccError, WalkcccPage } from '../solutions/walkccc';
@@ -107,7 +107,7 @@ export interface AccountRangeResult {
   /** Set when the account could not run at all (bad cookies, session rejected). */
   fatal?: string;
   /** Set when the account stopped before the end of the range. */
-  stoppedEarly?: 'cancelled' | 'blocked';
+  stoppedEarly?: 'cancelled' | 'blocked' | 'submission-limit';
   /** Question numbers never attempted because of an early stop. */
   notAttempted: number[];
   startedAt: number;
@@ -853,13 +853,24 @@ async function runAccountRange(
       } finally {
         reservations.release(n);
       }
-      const { outcome, touchedLeetCode, blocked } = solved;
+      const { outcome, touchedLeetCode, blocked, submissionLimit } = solved;
       if (outcome === null) break; // cancelled during a back-off wait
       result.results.push(outcome);
       accountDone++;
       info.doneInAccount++;
       info.counts[outcome.status]++;
       logger.info({ label: account.label, question: n, status: outcome.status, detail: outcome.detail }, 'range question finished');
+
+      if (submissionLimit) {
+        result.stoppedEarly = 'submission-limit';
+        logger.warn({ account: account.label, question: n }, 'terminating flow for account due to LeetCode submission limit');
+        await deps
+          .notify(
+            `🛑 Account ${index}/${total}: ${who(result)}\n⚠️ LeetCode daily submission limit reached on #${n}. Terminating flow for this account.`
+          )
+          .catch(() => undefined);
+        break;
+      }
 
       if (deps.progressEvery > 0 && accountDone % deps.progressEvery === 0 && stepIndex < order.length) {
         const c = info.counts;
@@ -938,6 +949,7 @@ interface OneOutcome {
   outcome: QuestionResult | null; // null = cancelled mid-wait
   touchedLeetCode: boolean;
   blocked: boolean;
+  submissionLimit?: boolean;
 }
 
 async function solveOneWithRetries(
@@ -952,6 +964,7 @@ async function solveOneWithRetries(
   for (let attempt = 0; ; attempt++) {
     const r = await solveOne(n, api, deps, usedCommunityUuids, progressCtx);
     touched ||= r.touchedLeetCode;
+    if (r.submissionLimit) return { ...r, touchedLeetCode: touched };
     if (!r.blocked) return { ...r, touchedLeetCode: touched };
     const wait = deps.blockedBackoffMs[attempt];
     if (wait === undefined) return { ...r, touchedLeetCode: touched }; // retries exhausted
@@ -968,7 +981,7 @@ async function solveOne(
   deps: RangeDeps,
   usedCommunityUuids?: Set<string>,
   progressCtx?: RangeProgressContext,
-): Promise<{ outcome: QuestionResult; touchedLeetCode: boolean; blocked: boolean }> {
+): Promise<{ outcome: QuestionResult; touchedLeetCode: boolean; blocked: boolean; submissionLimit?: boolean }> {
   let questionTitle: string | null = null;
   let slug: string | null = null;
 
@@ -1297,6 +1310,30 @@ async function solveOne(
       blocked: false,
     };
   } catch (e) {
+    if (isSubmissionLimitError(e)) {
+      const msg = `LeetCode submission limit reached: ${shortErr(e)}`;
+      if (progressCtx) {
+        void deps.onProgress?.({
+          phase: 'error',
+          label: progressCtx.label,
+          username: progressCtx.username,
+          accIndex: progressCtx.accIndex,
+          accTotal: progressCtx.accTotal,
+          stepIndex: progressCtx.stepIndex,
+          stepTotal: progressCtx.stepTotal,
+          questionNumber: n,
+          questionTitle: questionTitle ?? slug ?? undefined,
+          slug: slug ?? undefined,
+          detail: msg,
+        });
+      }
+      return {
+        outcome: { number: n, status: 'error', detail: msg },
+        touchedLeetCode: true,
+        blocked: false,
+        submissionLimit: true,
+      };
+    }
     if (looksLikeChallenge(e)) {
       if (progressCtx) {
         void deps.onProgress?.({
@@ -1368,6 +1405,9 @@ export function formatAccountRangeSummary(r: AccountRangeResult, index: number, 
   if (r.stoppedEarly === 'cancelled') lines.push('', `🛑 Cancelled — ${r.notAttempted.length} question(s) not attempted`);
   if (r.stoppedEarly === 'blocked') {
     lines.push('', `🧱 Stopped early: LeetCode kept blocking requests — ${r.notAttempted.length} not attempted (${numberList(r.notAttempted.slice(0, 1))} onwards)`);
+  }
+  if (r.stoppedEarly === 'submission-limit') {
+    lines.push('', `🛑 Stopped early: LeetCode daily submission limit reached — ${r.notAttempted.length} not attempted`);
   }
   lines.push(`⏱️ Took ${formatDuration(r.finishedAt - r.startedAt)}`);
   return truncate(lines.join('\n'));

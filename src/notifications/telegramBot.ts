@@ -5047,13 +5047,39 @@ export function buildIncompletePicker(
     },
   ]);
 
-  if (selCount > 0) {
+  if (selCount > 1) {
     buttons.push([
       {
-        text: `▶️ Solve ${count} Incomplete (${selCount} account${selCount === 1 ? '' : 's'})`,
+        text: `⚡ Solve ${count} Parallel (${selCount} accounts)`,
+        callback_data: 'lcincomp:run:parallel',
+      },
+      {
+        text: `🐢 Solve ${count} Sequential (${selCount} accounts)`,
+        callback_data: 'lcincomp:run:seq',
+      },
+    ]);
+  } else if (selCount === 1) {
+    buttons.push([
+      {
+        text: `🚀 Solve ${count} Incomplete (1 account)`,
         callback_data: 'lcincomp:run',
       },
     ]);
+  } else {
+    if (accounts.length > 1) {
+      buttons.push([
+        {
+          text: `⚡ All accounts (${accounts.length}, Parallel - Fast)`,
+          callback_data: 'lcincomp:all:parallel',
+        },
+      ]);
+      buttons.push([
+        {
+          text: `👥 All accounts (${accounts.length}, Sequential)`,
+          callback_data: 'lcincomp:all:seq',
+        },
+      ]);
+    }
   }
 
   buttons.push([{ text: '✖️ Cancel', callback_data: 'lcincomp:x' }]);
@@ -5110,24 +5136,30 @@ export async function handleIncompleteQuestionsCommand(
     await deps.send('⚠️ Send how many questions to solve, e.g. /solveincomplete 10');
     return;
   }
-  const count = Math.min(200, rawCount);
+  const count = rawCount;
 
   if (tokens.length >= 2 && tokens[1]) {
     const rawTarget = tokens[1];
     let target: string | 'all' | string[];
+    let mode: 'parallel' | 'sequential' = 'parallel';
     if (rawTarget === 'all' || rawTarget === 'all:seq' || rawTarget === 'all:parallel') {
       target = 'all';
+      if (rawTarget === 'all:seq') mode = 'sequential';
     } else if (rawTarget.includes(',')) {
       target = rawTarget.split(',').map((s) => s.trim()).filter(Boolean);
+      if (tokens[2]?.toLowerCase() === 'seq' || tokens[2]?.toLowerCase() === 'sequential') {
+        mode = 'sequential';
+      }
     } else {
       target = rawTarget;
+      mode = 'sequential';
     }
 
     const result = await ui.start(
       { from: 1, to: count },
       target,
       {
-        mode: 'sequential',
+        mode,
         jobType: 'incomplete',
         incompleteCount: count,
         resolveQuestions: async (_acc, api) => {
@@ -5192,7 +5224,7 @@ export async function handleIncompleteButton(
 
   if (data.startsWith('lcincomp:cnt:')) {
     const raw = parseInt(data.slice('lcincomp:cnt:'.length), 10);
-    const count = !isNaN(raw) && raw > 0 ? Math.min(200, raw) : 10;
+    const count = !isNaN(raw) && raw > 0 ? raw : 10;
     const sel = new Set<string>();
     lcIncompleteSelections.set(key, { count, selectedAccountIds: sel });
     await deps.answer(callbackId, `Target: ${count} questions`);
@@ -5234,27 +5266,56 @@ export async function handleIncompleteButton(
     return;
   }
 
-  if (data === 'lcincomp:run') {
-    const selected = accounts.filter((a) => state!.selectedAccountIds.has(a.id));
-    if (selected.length === 0) {
-      await deps.answer(callbackId, 'Select at least one account');
-      return;
+  if (
+    data === 'lcincomp:run' ||
+    data === 'lcincomp:run:parallel' ||
+    data === 'lcincomp:run:seq' ||
+    data === 'lcincomp:all:parallel' ||
+    data === 'lcincomp:all:seq'
+  ) {
+    let selected: AccountRecord[];
+    let mode: 'parallel' | 'sequential';
+
+    if (data === 'lcincomp:all:parallel' || data === 'lcincomp:all:seq') {
+      selected = accounts;
+      mode = data === 'lcincomp:all:seq' ? 'sequential' : 'parallel';
+    } else {
+      selected = accounts.filter((a) => state!.selectedAccountIds.has(a.id));
+      if (selected.length === 0) {
+        await deps.answer(callbackId, 'Select at least one account');
+        return;
+      }
+      mode = data === 'lcincomp:run:seq'
+        ? 'sequential'
+        : (selected.length > 1 ? 'parallel' : 'sequential');
     }
 
     const count = state.count;
     lcIncompleteSelections.delete(key);
     await deps.answer(callbackId, 'Solver started 🚀');
+
+    const budget = calculateSafeRangeConcurrency(selected.length, { mode });
+    const isParallel = mode === 'parallel' && selected.length > 1;
+    const modeStr = isParallel
+      ? ` · ⚡ Parallel (${budget.concurrency}x concurrent)`
+      : (selected.length > 1 ? ' · 🐢 Sequential (one by one)' : '');
+
     await deps.edit(
       chatId,
       messageId,
-      `🚀 Starting incomplete question solver for ${selected.length} account(s) (${count} questions each, one by one)…`,
+      [
+        `🚀 Starting incomplete question solver: ${count} questions`,
+        `👥 ${selected.length === 1 ? `Account: ${accountName(selected[0]!)}` : `Accounts (${selected.length}): ${selected.map((a) => accountName(a)).join(', ')}`}`,
+        modeStr ? `⚙️ Mode:${modeStr}` : '',
+        `⏳ 30 s break between questions (Cloudflare-safe)`,
+      ].filter(Boolean).join('\n'),
     );
 
     const result = await ui.start(
       { from: 1, to: count },
       selected.map((a) => a.id),
       {
-        mode: 'sequential',
+        mode,
         jobType: 'incomplete',
         incompleteCount: count,
         resolveQuestions: async (_acc, api) => {
@@ -5268,7 +5329,7 @@ export async function handleIncompleteButton(
     );
 
     if (!result.started && 'queued' in result) {
-      await deps.send(`🗂️ Queued: solving ${count} incomplete questions (Queue position: ${result.position})`);
+      await deps.send(`🗂️ Queued: solving ${count} incomplete questions on ${selected.length} account(s)${modeStr} (Queue position: ${result.position})`);
     }
     return;
   }
