@@ -7,6 +7,17 @@ import { move } from './store';
 import { PostError, withAccount } from './service';
 import { UGC_SOLUTION_ARTICLE_QUERY } from '../solutions/communitySolutions';
 import { logger } from '../logger';
+import { config } from '../config';
+
+// LeetCode's authenticated mutation. Request shape was validated against its
+// live GraphQL schema without executing a publication during discovery.
+export const PUBLISH_SOLUTION_MUTATION = `mutation ugcArticlePublishSolution($data: UgcArticlePublishSolutionInput!) {
+  ugcArticlePublishSolution(data: $data) { article { topicId slug } error }
+}`;
+const publishSchema = z.object({ ugcArticlePublishSolution: z.object({
+  article: z.object({ topicId: z.number(), slug: z.string().min(1) }).nullable(),
+  error: z.string().nullable().optional(),
+}) });
 
 // LeetCode's My Solution filter scopes the list to the authenticated account.
 // A global HOT scan can never prove absence on problems with >1000 articles.
@@ -154,6 +165,31 @@ export async function publishPost(id: string) {
     preparationStage = 'duplicate-check';
     const duplicate = await existingPost(api, context);
     if (duplicate) return move(post, 'SKIPPED', { lastError: 'EXISTING_ACCOUNT_SOLUTION', publishedUrl: duplicate });
+    if (config.solutionPosts.publishTransport === 'api') {
+      preparationStage = 'publication-api';
+      if (post.markdown!.split(context.code).length !== 2) throw new PostError('SOURCE_INTEGRITY_FAILED');
+      // Claim BEFORE the sole irreversible request. An error never causes an
+      // automatic repeat or a second attempt through the browser transport.
+      post = await move(post, 'PUBLISHING');
+      try {
+        const result = await api.graphql(PUBLISH_SOLUTION_MUTATION, { data: {
+          questionSlug: context.slug, title: post.title!, content: post.markdown!,
+          summary: post.title!, thumbnail: '', tags: [],
+        } }, publishSchema);
+        const response = result.ugcArticlePublishSolution;
+        if (response.error || !response.article) throw new PostError('POST_API_REJECTED');
+        const url = `https://leetcode.com/problems/${context.slug}/solutions/${response.article.topicId}/${response.article.slug}/`;
+        if (!validSolutionUrl(url, context.slug)) throw new PostError('POST_URL_UNVERIFIED');
+        post = await prisma.solutionPost.update({ where: { id }, data: { publishedUrl: url } });
+        await verifyPublishedContent(api, url, context, post.title!, post.markdown!);
+        post = await move(post, 'PUBLISHED', { publishedAt: new Date(), lastError: null });
+        logger.info({ postId: id, url, transport: 'api', executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
+          revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication verified');
+        return post;
+      } catch {
+        return prisma.solutionPost.update({ where: { id }, data: { lastError: 'PUBLICATION_UNCERTAIN_RECONCILE_FIRST' } });
+      }
+    }
     preparationStage = 'editor';
     await prepareEditor(page, context, post.title!, post.markdown!);
     // CAS before the sole irreversible click. A crash after this point never repeats the click.

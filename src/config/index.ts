@@ -95,6 +95,7 @@ const envSchema = z.object({
   // submission have both passed the existing source, identity, and post checks.
   // Set false only when drafts should remain queued for a manual review.
   SOLUTION_POST_AUTO_PUBLISH: enabledByDefault,
+  SOLUTION_POST_PUBLISH_TRANSPORT: z.enum(['api', 'browser']).default('api'),
   SOLUTION_POST_MODEL_TIMEOUTS: z.string().default('{}').transform((value, ctx) => {
     try { return z.record(z.number().int().min(1000).max(300000)).parse(JSON.parse(value)); }
     catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Expected JSON object of model IDs and timeout milliseconds' }); return z.NEVER; }
@@ -178,7 +179,7 @@ export type Config = Readonly<{
     agentMaxCredits: number;
     apiKey: string; apiKeys: string[]; baseUrl: string; models: string[]; timeoutMs: number; retries: number; maxTokens: number;
     keySource?: string; keyEnvironment?: ArticleKeyInput[]; keyError?: string;
-    autoPublish: boolean; modelTimeoutMs: Record<string, number>;
+    autoPublish: boolean; publishTransport: 'api' | 'browser'; modelTimeoutMs: Record<string, number>;
   };
   telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean };
   api: { port: number; setupToken: string; publicUrl: string };
@@ -244,6 +245,7 @@ function loadConfig(): Config {
       retries: env.SOLUTION_POST_RETRIES,
       maxTokens: env.SOLUTION_POST_MAX_TOKENS,
       autoPublish: env.SOLUTION_POST_AUTO_PUBLISH,
+      publishTransport: env.SOLUTION_POST_PUBLISH_TRANSPORT,
       modelTimeoutMs: env.SOLUTION_POST_MODEL_TIMEOUTS,
     },
     telegram: {

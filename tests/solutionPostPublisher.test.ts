@@ -14,11 +14,13 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
 vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error { constructor(code: string) { super(code); } },
   withAccount: vi.fn(async (_account, action) => action(h.api, h.page, 'alice')) }));
 import { hash } from '../src/solutionPosts/article';
+import { config } from '../src/config';
 import { prepareEditor, publishPost, reconcilePost, reserveBrowserPublication, validSolutionUrl } from '../src/solutionPosts/publisher';
 const context = { accountId: 'a', username: 'alice', problemId: '1', slug: 'example', title: 'Example', difficulty: 'Easy',
   problem: 'Example problem', submissionId: '456', language: 'cpp', code: 'class Solution {};', challengeDate: '2026-10-15' };
 const markdown = '## Teach with sets\n\nAn educational explanation.\n\n```cpp\nclass Solution {};\n```\n';
 beforeEach(() => {
+  config.solutionPosts.publishTransport = 'browser';
   vi.clearAllMocks(); h.text = h.original; h.title = ''; h.clicked = false; h.duplicate = false; h.verifyFailure = false;
   const digest = hash('Teach with sets\n' + markdown);
   h.row = { id: 'post1', accountId: 'a', problemSlug: 'example', submissionId: '456', context: JSON.stringify(context),
@@ -44,6 +46,29 @@ beforeEach(() => {
 });
 
 describe('authorized solution publishing', () => {
+  it('publishes through the authenticated API and verifies exact content and author without page navigation', async () => {
+    config.solutionPosts.publishTransport = 'api';
+    h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [] } })
+      .mockImplementationOnce(async () => { h.clicked = true;
+        return { ugcArticlePublishSolution: { article: { topicId: 123, slug: 'teach-with-sets' }, error: null } }; });
+    const result = await publishPost('post1');
+    expect(result.status).toBe('PUBLISHED'); expect(result.publishedUrl).toBe(h.url);
+    const mutation = h.api.graphql.mock.calls.find((call: any[]) => call[0].includes('mutation ugcArticlePublishSolution'));
+    expect(mutation[1].data).toEqual({ questionSlug: context.slug, title: h.row.title, content: markdown,
+      summary: h.row.title, thumbnail: '', tags: [] });
+    expect(h.page.goto).not.toHaveBeenCalled(); expect(h.click).not.toHaveBeenCalled();
+    await publishPost('post1');
+    expect(h.api.graphql.mock.calls.filter((call: any[]) => call[0].includes('mutation '))).toHaveLength(1);
+  });
+  it('never retries an uncertain publication API request or falls back to a Post click', async () => {
+    config.solutionPosts.publishTransport = 'api';
+    h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [] } })
+      .mockRejectedValueOnce(new Error('connection lost after request'));
+    expect((await publishPost('post1')).status).toBe('PUBLISHING');
+    await expect(publishPost('post1')).rejects.toThrow('PUBLICATION_UNCERTAIN');
+    expect(h.api.graphql.mock.calls.filter((call: any[]) => call[0].includes('mutation '))).toHaveLength(1);
+    expect(h.page.goto).not.toHaveBeenCalled(); expect(h.click).not.toHaveBeenCalled();
+  });
   it('reserves local browser publication atomically and verifies it through the API without opening Render UI', async () => {
     expect((await reserveBrowserPublication('post1', h.row.approvedHash)).status).toBe('PUBLISHING');
     await expect(reserveBrowserPublication('post1', h.row.approvedHash)).rejects.toThrow();

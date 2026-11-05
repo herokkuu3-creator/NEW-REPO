@@ -93,6 +93,9 @@ describe('solution workflow and persistence', () => {
     expect(loaded.code).toBe(context.code);
     const first = await generatePost(loaded, {} as never);
     expect(first.status).toBe('AWAITING_APPROVAL'); expect(first.codeHash).toBe(hash(context.code));
+    expect(prisma.solutionPost.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: { not: first.id } }),
+    }));
     const again = await generateForRun('a', 'run1');
     expect(again.id).toBe(first.id); expect(h.generation).toHaveBeenCalledTimes(1);
     expect(h.verdict).toHaveBeenCalledTimes(1);

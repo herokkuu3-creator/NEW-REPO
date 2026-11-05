@@ -125,7 +125,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     explicitRetry: force, previousError: post.lastError }, 'solution article generation claimed');
   try {
     // Context comes only from a verified accepted DailyRun; publishing rechecks eligibility and identity.
-    const recent = await prisma.solutionPost.findMany({ where: { accountId: post.accountId, title: { not: null } },
+    const recent = await prisma.solutionPost.findMany({ where: { accountId: post.accountId, id: { not: post.id }, title: { not: null } },
       orderBy: { createdAt: 'desc' }, take: 8 });
     post = await move(post, 'GENERATING', { lastError: null });
     const activeRouter = router ?? await createPostRouter({ postId: post.id, accountId: post.accountId });
