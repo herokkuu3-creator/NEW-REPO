@@ -23,6 +23,7 @@
  * could create a duplicate Codeforces submission.
  */
 import http from 'node:http';
+import { probeSageApi, askSage, sageConsoleHtml } from '../ai/sageProbe';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { AttemptCancelledError, attemptSleep, getAttemptContext, throwIfAttemptAborted, withAttemptContext } from './attemptContext';
@@ -1036,6 +1037,17 @@ async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () =>
 // HTTP surface
 // ---------------------------------------------------------------------------
 
+async function readJsonBody<T = any>(req: http.IncomingMessage): Promise<T> {
+  return new Promise((resolve) => {
+    let raw = '';
+    req.on('data', (c: Buffer) => raw += c.toString('utf8'));
+    req.on('end', () => {
+      try { resolve(JSON.parse(raw)); } catch { resolve({} as any); }
+    });
+    req.on('error', () => resolve({} as any));
+  });
+}
+
 function json(res: http.ServerResponse, code: number, payload: unknown): void {
   if (res.destroyed || res.writableEnded) return;
   const body = JSON.stringify(payload);
@@ -1125,6 +1137,44 @@ export const server = http.createServer((req, res) => {
       return;
     }
     json(res, 200, { ok: true, count: entries.length, logs: entries });
+    return;
+  }
+
+  // Sage Inkstone (Intern-AI) diagnostic & interactive chat routes
+  if (req.method === 'GET' && url === '/sage') {
+    const hostLabel = process.env.RENDER_EXTERNAL_URL ? 'Render Web Service' : (process.env.RENDER_INSTANCE_ID ? 'Render Container' : 'Local Host');
+    const html = sageConsoleHtml(hostLabel);
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-length': Buffer.byteLength(html),
+      'cache-control': 'no-store',
+    });
+    res.end(html);
+    return;
+  }
+
+  if (url === '/sage/test' || url.startsWith('/sage/test?')) {
+    if (req.method === 'GET') {
+      const query = new URL(url, 'http://localhost').searchParams;
+      void probeSageApi(query.get('apiKey') || undefined, query.get('model') || undefined).then((result) => {
+        json(res, 200, result);
+      });
+      return;
+    }
+    if (req.method === 'POST') {
+      void readJsonBody<{ apiKey?: string; model?: string }>(req).then(async (body) => {
+        const result = await probeSageApi(body.apiKey, body.model);
+        json(res, 200, result);
+      });
+      return;
+    }
+  }
+
+  if (req.method === 'POST' && url === '/sage/ask') {
+    void readJsonBody<{ question?: string; apiKey?: string; model?: string; maxTokens?: number }>(req).then(async (body) => {
+      const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
+      json(res, 200, result);
+    });
     return;
   }
 
