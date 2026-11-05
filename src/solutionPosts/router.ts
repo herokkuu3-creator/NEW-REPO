@@ -13,6 +13,7 @@ export interface RouterOptions {
   apiKeys?: string[];
   baseUrl: string;
   models: string[];
+  reviewModels?: string[];
   timeoutMs: number;
   retries: number;
   maxTokens: number;
@@ -102,7 +103,9 @@ export class AIModelRouter {
       }
       let exhausted = false;
       const sageReasoning = isSageProvider(this.options.baseUrl);
-      for (const model of [...new Set(this.options.models)]) {
+      const modelOrder = stage?.startsWith('technical review') && this.options.reviewModels?.length ?
+        this.options.reviewModels.filter(model => this.options.models.includes(model)) : this.options.models;
+      for (const model of [...new Set(modelOrder)]) {
         if (!available.has(model)) {
           const record = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'UNAVAILABLE' };
           attempts.push(record); this.onAttempt(record); continue;

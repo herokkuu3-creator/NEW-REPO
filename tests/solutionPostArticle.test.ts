@@ -144,6 +144,14 @@ describe('AI model routing', () => {
     const error = await new AIModelRouter(options, api as never).generate([], JSON.parse).catch(e => e);
     expect(error).toBeInstanceOf(RoutingError); expect(error.lastFailure).toBe('EMPTY_OUTPUT');
   });
+  it('uses the configured review model order for both verdicts and repairs', async () => {
+    const api = client(); api.chat.completions.create.mockResolvedValue(complete('42'));
+    const router = new AIModelRouter({ ...options, reviewModels: ['not-configured', 'luna'] }, api as never);
+    await router.generate([], JSON.parse, 512, true, 'technical review');
+    await router.generate([], JSON.parse, 512, true, 'technical review repair');
+    await router.generate([], JSON.parse, 512, true, 'title and intuition');
+    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as any).model)).toEqual(['luna', 'luna', 'terra']);
+  });
   it('applies per-model timeouts and handles a timeout with bounded retry', async () => {
     const api = client(); const sleep = vi.fn(async () => {});
     api.chat.completions.create.mockRejectedValue(new OpenAI.APIConnectionTimeoutError());

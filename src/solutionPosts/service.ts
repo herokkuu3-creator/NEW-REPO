@@ -9,6 +9,7 @@ import { LeetCodeApi } from '../leetcode/apiClient';
 import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallenge';
 import { AIModelRouter, RoutingError } from './router';
 import { FirecrawlAgentRouter } from './firecrawlAgent';
+import { isSageProvider } from '../config/solutionPostProvider';
 import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
 import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext } from './article';
 import { ensurePost, move } from './store';
@@ -91,7 +92,12 @@ export async function createPostRouter(correlation: { postId?: string; accountId
   if (!activeKeys.length) throw new PostError(!pool.keys.length ? config.solutionPosts.keyError ?? 'AI_CONFIGURATION_REQUIRED' :
     pool.lastFailure === 'HTTP_401' ? 'AI_AUTHENTICATION_FAILED' :
       pool.lastFailure === 'HTTP_402_BILLING_REQUIRED' ? 'AI_BILLING_REQUIRED' : 'AI_KEYS_EXHAUSTED');
-  return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys }, undefined, undefined,
+  // Live MiniMax reviews produced contradictory arithmetic and fed those errors
+  // back into repairs. Use the configured reasoning models for this gate and
+  // its repairs; never add an unconfigured provider/model or skip the review.
+  const reviewModels = isSageProvider(config.solutionPosts.baseUrl) ?
+    config.solutionPosts.models.filter(model => /^deepseek-|^qwen/i.test(model)) : undefined;
+  return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys, reviewModels }, undefined, undefined,
     attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'),
     async (failedKey, reason) => {
       const advanced = await rotateSolutionApiKey(failedKey, reason);
