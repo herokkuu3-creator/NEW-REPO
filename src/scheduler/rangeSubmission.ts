@@ -613,7 +613,13 @@ async function executeRangeJob(
     const workerCount = Math.min(concurrency, accounts.length);
     const workers: Promise<void>[] = [];
     for (let w = 0; w < workerCount; w++) {
-      workers.push(runWorker(w));
+      const workerIdx = w;
+      workers.push((async () => {
+        if (workerIdx > 0 && !abort.signal.aborted) {
+          await deps.sleep(workerIdx * 2000, abort.signal);
+        }
+        await runWorker(workerIdx);
+      })());
     }
     await Promise.all(workers);
 

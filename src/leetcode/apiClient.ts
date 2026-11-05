@@ -29,29 +29,33 @@ export class LeetCodeHttpError extends Error {
   }
 }
 
-/** Detects LeetCode submission limit / daily quota or rate limit errors. */
+/**
+ * Detects LeetCode account-level submission limit / daily quota errors.
+ * Note: Cloudflare rate limits / HTML interstitials (e.g. submit HTTP 429: <!DOCTYPE html>)
+ * are temporary network/Cloudflare challenge blocks, NOT an account-level daily limit!
+ */
 export function isSubmissionLimitError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  if (
-    /submission limit|submissions limit|daily limit|daily submission|maximum number of submissions|too many submissions|rate limit exceeded|requests too frequently/i.test(
+  // HTML or Cloudflare interstitial responses are NEVER LeetCode daily quota limits
+  if (/<!DOCTYPE|<html|<head|cloudflare|cf-chl|just a moment/i.test(msg)) {
+    return false;
+  }
+  return (
+    /submission limit|submissions limit|daily limit|daily submission|maximum number of submissions|submission quota|quota exceeded/i.test(
       msg,
     )
-  ) {
-    return true;
-  }
-  if (err instanceof LeetCodeHttpError && err.status === 429) {
-    return true;
-  }
-  return false;
+  );
 }
 
-/** A 403 or a non-JSON body from LeetCode usually means an interstitial. */
+/** A 403, 429, or non-JSON/HTML body from LeetCode or Cloudflare usually means an interstitial or challenge block. */
 export function looksLikeChallenge(err: unknown): boolean {
   if (isSubmissionLimitError(err)) return false;
   if (err instanceof LeetCodeHttpError) {
-    if (err.status === 403) return true;
+    if (err.status === 403 || err.status === 429) return true;
     if (/non-JSON body|no submission_id/i.test(err.message)) return true;
   }
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/<!DOCTYPE|<html|<head|cloudflare|cf-chl|just a moment/i.test(msg)) return true;
   return false;
 }
 

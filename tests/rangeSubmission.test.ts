@@ -863,4 +863,28 @@ describe('parallel range submission', () => {
     expect(results[0]!.notAttempted).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
     expect(notes.some((n) => n.includes('daily submission limit reached'))).toBe(true);
   });
+
+  it('does not misclassify HTTP 429 HTML interstitials as daily submission limit', async () => {
+    let call = 0;
+    const submitLog: string[] = [];
+    const session = makeSession((n) => {
+      call++;
+      if (n === 2 && call === 2) {
+        throw new LeetCodeHttpError(
+          'submit HTTP 429: <!DOCTYPE html> <html> <head> <meta charset="utf',
+          429,
+        );
+      }
+      return 'accepted';
+    }, submitLog);
+    const { deps, sleeps } = makeDeps(session, [acc('a1')]);
+    const r = await startRangeJob({ from: 1, to: 3 }, 'a1', deps);
+    const results = await r.done;
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.stoppedEarly).toBeUndefined();
+    expect(results[0]!.results).toHaveLength(3);
+    expect(results[0]!.results.every((q) => q.status === 'accepted')).toBe(true);
+    expect(sleeps.length).toBeGreaterThan(0);
+  });
 });
