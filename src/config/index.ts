@@ -130,6 +130,11 @@ const envSchema = z.object({
   CPSOLVER_URL: z.string().default(''),
   TURNSTILE_SOLVER_URL: z.string().default(''),
 
+  // Sage Inkstone (Intern-AI / Shanghai AI Lab) API
+  SAGE_API_KEY: z.string().default('sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056'),
+  SAGE_BASE_URL: z.string().default('https://discovery-api.intern-ai.org.cn/v1'),
+  SAGE_MODEL: z.string().default('deepseek-v4.1-flash-1017'),
+
   LOG_LEVEL: z
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace'])
     .default('info'),
@@ -178,6 +183,7 @@ export type Config = Readonly<{
   telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean };
   api: { port: number; setupToken: string; publicUrl: string };
   solver: { cpsolverUrl: string };
+  sage: { apiKey: string; baseUrl: string; model: string };
   logLevel: z.infer<typeof envSchema>['LOG_LEVEL'];
 }>;
 
@@ -254,6 +260,11 @@ function loadConfig(): Config {
     },
     solver: {
       cpsolverUrl: (env.CPSOLVER_URL || env.TURNSTILE_SOLVER_URL || '').trim().replace(/\/+$/, ''),
+    },
+    sage: {
+      apiKey: env.SAGE_API_KEY.trim() || 'sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056',
+      baseUrl: env.SAGE_BASE_URL.trim() || 'https://discovery-api.intern-ai.org.cn/v1',
+      model: env.SAGE_MODEL.trim() || 'deepseek-v4.1-flash-1017',
     },
     logLevel: env.LOG_LEVEL,
   });

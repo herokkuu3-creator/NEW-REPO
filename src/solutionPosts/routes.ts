@@ -14,6 +14,7 @@ import { probeExperiential } from './experientialProbe';
 import { probeBazaarLink } from './bazaarlinkProbe';
 import { firecrawlProbeRequest, probeFirecrawl } from './firecrawlProbe';
 import { probeFirecrawlAgent } from './firecrawlAgentProbe';
+import { probeSageApi, askSage } from '../ai/sageProbe';
 import { logger } from '../logger';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
@@ -157,6 +158,22 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       const body = z.object({ apiKey: z.string().regex(/^sk-bl-[A-Za-z0-9_-]{16,128}$/) })
         .strict().parse(req.body ?? {});
       return probeBazaarLink(body.apiKey);
+    });
+    scoped.post('/admin/solutions/sage/test', async req => {
+      const body = z.object({
+        apiKey: z.string().optional(),
+        model: z.string().optional(),
+      }).strict().parse(req.body ?? {});
+      return probeSageApi(body.apiKey, body.model);
+    });
+    scoped.post('/admin/solutions/sage/ask', async req => {
+      const body = z.object({
+        question: z.string().min(1).max(4000),
+        apiKey: z.string().optional(),
+        model: z.string().optional(),
+        maxTokens: z.number().int().min(1).max(8192).optional(),
+      }).strict().parse(req.body ?? {});
+      return askSage(body.question, { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
     });
     scoped.get('/admin/solutions/:id', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);

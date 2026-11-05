@@ -1,6 +1,8 @@
 import { createPostRouter } from '../solutionPosts/service';
 import { RoutingError } from '../solutionPosts/router';
 import { logger } from '../logger';
+import { askSage, probeSageApi } from '../ai/sageProbe';
+export { askSage, probeSageApi } from '../ai/sageProbe';
 
 /** Do not forward recognizable credentials or session data to an AI provider. */
 export function isSensitiveChatText(text: string): boolean {
@@ -26,4 +28,12 @@ export async function answerChat(text: string): Promise<string> {
     logger.warn({ code }, 'telegram AI chat failed');
     return `AI reply failed (${code}). Check /testsolkey and try again.`;
   }
+}
+
+export async function answerSageChat(text: string, options?: { model?: string; apiKey?: string }): Promise<string> {
+  const res = await askSage(text, options);
+  if (!res.ok) {
+    return `Sage AI query failed: ${res.error || 'Unknown error'}. Check /testsage and try again.`;
+  }
+  return res.answer;
 }

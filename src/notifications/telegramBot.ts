@@ -95,6 +95,7 @@ import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
 import { firecrawlProbeRequest, probeFirecrawl } from '../solutionPosts/firecrawlProbe';
 import { probeFirecrawlAgent } from '../solutionPosts/firecrawlAgentProbe';
 import { answerChat } from './aiChat';
+import { probeSageApi, askSage } from '../ai/sageProbe';
 
 import {
   isRunInProgress,
@@ -284,6 +285,8 @@ export const HELP_TEXT = [
   '├ /resetsolutionkeys — Reset active key to #1 &amp; clear retry limits',
   '├ /testsolkey [key] — Test the configured solution provider key',
   '├ /testfirecrawl key — Test a Firecrawl scrape from this server (one page)',
+  '├ /testsage [key] — Test Sage Inkstone (Intern-AI) from Render',
+  '├ /asksage &lt;question&gt; — Ask Sage Inkstone / Intern-AI directly',
   '├ /ask &lt;question&gt; — Ask the configured AI',
   '└ /solutionkeystatus — Show masked article-generation key pool',
   '',
@@ -680,6 +683,18 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
         return;
       case '/ask':
         void handleAiChat(commandArg);
+        return;
+      case '/asksage':
+      case '/sage':
+      case '/askinkstone':
+      case '/inkstone':
+        void handleAskSage(commandArg);
+        return;
+      case '/testsage':
+      case '/testinkstone':
+      case '/testinternai':
+        await deleteSensitiveTelegramMessage(msg);
+        void handleTestSage(commandArg);
         return;
       case '/testfirecrawl':
         await deleteSensitiveTelegramMessage(msg);
@@ -3374,10 +3389,88 @@ export async function handleReplaceSolutionApiKeys(commandArg?: string): Promise
 
 export async function handleAiChat(question: string): Promise<void> {
   const result = await answerChat(question);
+  if (/AI reply failed \((?:AI_MODELS_EXHAUSTED|AI_CONFIGURATION_REQUIRED|AI_KEYS_EXHAUSTED|AI_CHAT_FAILED)\)/.test(result)) {
+    const sage = await askSage(question);
+    if (sage.ok) {
+      const header = `🤖 <b>Sage Inkstone</b> (<code>${escapeHtml(sage.model)}</code> · ${sage.elapsedMs}ms)\n<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n`;
+      const fullText = header + escapeHtml(sage.answer);
+      const characters = Array.from(fullText);
+      for (let offset = 0; offset < characters.length; offset += 3500) {
+        await replyHtml(characters.slice(offset, offset + 3500).join(''));
+      }
+      return;
+    }
+  }
   const characters = Array.from(result);
   for (let offset = 0; offset < characters.length; offset += 3500) {
     await reply(characters.slice(offset, offset + 3500).join(''));
   }
+}
+
+export async function handleAskSage(question?: string): Promise<void> {
+  const q = (question ?? '').trim();
+  if (!q) {
+    await replyHtml(
+      '❓ <b>Usage:</b> <code>/asksage &lt;your question&gt;</code> (or <code>/sage &lt;question&gt;</code>)\n' +
+      'Ask any question to Sage Inkstone (Intern-AI) directly from this server.'
+    );
+    return;
+  }
+  await reply('🤔 Thinking with Sage Inkstone (Intern-AI)…');
+  const result = await askSage(q);
+  if (!result.ok) {
+    await replyHtml(
+      `❌ <b>Sage AI Query Failed:</b> ${escapeHtml(result.error ?? 'Unknown error')}\n` +
+      'Use <code>/testsage</code> to verify API status from this server.'
+    );
+    return;
+  }
+  const header = `🤖 <b>Sage Inkstone</b> (<code>${escapeHtml(result.model)}</code> · ${result.elapsedMs}ms)\n<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n`;
+  const fullText = header + escapeHtml(result.answer);
+  const characters = Array.from(fullText);
+  for (let offset = 0; offset < characters.length; offset += 3500) {
+    await replyHtml(characters.slice(offset, offset + 3500).join(''));
+  }
+}
+
+export async function handleTestSage(commandArg?: string): Promise<void> {
+  const key = (commandArg ?? '').trim();
+  const hostLabel = process.env.RENDER_EXTERNAL_URL ? 'Render Web Service' : (process.env.RENDER_INSTANCE_ID ? 'Render Container' : 'Local Host');
+  await replyHtml(`🔎 <b>Testing Sage Inkstone (Intern-AI) from ${escapeHtml(hostLabel)}…</b>\nChecking <code>discovery-api.intern-ai.org.cn</code> models and chat completions…`);
+  const result = await probeSageApi(key || undefined);
+  logger.info({ diagnostic: result }, 'Sage Inkstone server probe');
+  const lines = [
+    `🧪 <b>Sage Inkstone (Intern-AI) Diagnostics</b>`,
+    '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    `🔑 <b>Key:</b> <code>${escapeHtml(result.keyMasked)}</code>`,
+    `📍 <b>Execution host:</b> <code>${escapeHtml(hostLabel)}</code>`,
+    `🌐 <b>Endpoint:</b> <code>${escapeHtml(result.baseUrl)}</code>`,
+    `⏱️ <b>Duration:</b> ${result.elapsedMs} ms`,
+    '',
+    `• <b>GET /v1/models:</b> ${result.modelsStatus === 200 ? '🟢 HTTP 200 OK' : `🔴 HTTP ${result.modelsStatus}`} (${result.modelsCount} models)`,
+  ];
+  if (result.models && result.models.length > 0) {
+    lines.push(`  └ <b>Active models:</b> <code>${escapeHtml(result.models.slice(0, 5).join(', '))}${result.models.length > 5 ? '…' : ''}</code>`);
+  }
+  lines.push('');
+  if (result.chatStatus === 200) {
+    lines.push(`• <b>POST /v1/chat/completions:</b> 🟢 HTTP 200 OK (model: <code>${result.chatModel}</code>)`);
+    if (result.chatReply) {
+      lines.push(`  └ <b>Sample output:</b> <code>${escapeHtml(result.chatReply.slice(0, 100))}</code>`);
+    }
+    lines.push('');
+    lines.push('✅ <b>Sage Inkstone API is fully operational from Render!</b>');
+    lines.push('You can ask questions anytime using <code>/asksage &lt;question&gt;</code> or <code>/sage &lt;question&gt;</code>.');
+  } else {
+    lines.push(`• <b>POST /v1/chat/completions:</b> 🔴 HTTP ${result.chatStatus} (model: <code>${result.chatModel}</code>)`);
+    if (result.error) {
+      lines.push(`  └ <b>Error:</b> <code>${escapeHtml(result.error)}</code>`);
+    }
+    if (result.category) {
+      lines.push(`  └ <b>Category:</b> <code>${escapeHtml(result.category)}</code>`);
+    }
+  }
+  await replyHtml(lines.join('\n'));
 }
 
 export async function handleTestFirecrawl(commandArg?: string): Promise<void> {

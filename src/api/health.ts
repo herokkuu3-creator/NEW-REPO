@@ -29,6 +29,7 @@ import { isoLocal } from '../time';
 import { PIN_COOKIE, PinGate, pinPage, readPinFromEnv, safeNext } from './pinGate';
 import { registerSolutionPostRoutes } from '../solutionPosts/routes';
 import { registerVisualAssetRoutes } from '../solutionPosts/visualStore';
+import { probeSageApi, askSage, sageConsoleHtml } from '../ai/sageProbe';
 
 /**
  * Health + minimal admin API.
@@ -183,6 +184,55 @@ export async function startHealthServer(
 
   registerSolutionPostRoutes(app, requireAdmin);
   registerVisualAssetRoutes(app);
+
+  // Sage Inkstone (Intern-AI) Console and API endpoints
+  app.get('/sage', async (_req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const hostLabel = process.env.RENDER_EXTERNAL_URL ? 'Render Web Service' : (process.env.RENDER_INSTANCE_ID ? 'Render Container' : 'Local Host');
+    return reply.type('text/html; charset=utf-8').send(sageConsoleHtml(hostLabel));
+  });
+
+  app.post('/sage/test', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as { apiKey?: string; model?: string };
+    const result = await probeSageApi(body.apiKey, body.model);
+    return reply.send(result);
+  });
+
+  app.get('/admin/sage/test', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const query = (req.query ?? {}) as { apiKey?: string; model?: string };
+    const result = await probeSageApi(query.apiKey, query.model);
+    return reply.send(result);
+  });
+
+  app.post('/admin/sage/test', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as { apiKey?: string; model?: string };
+    const result = await probeSageApi(body.apiKey, body.model);
+    return reply.send(result);
+  });
+
+  app.post('/sage/ask', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as { question?: string; apiKey?: string; model?: string; maxTokens?: number };
+    const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
+    return reply.send(result);
+  });
+
+  app.post('/admin/sage/ask', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as { question?: string; apiKey?: string; model?: string; maxTokens?: number };
+    const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
+    return reply.send(result);
+  });
+
+  app.post('/api/sage/ask', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as { question?: string; apiKey?: string; model?: string; maxTokens?: number };
+    const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
+    return reply.send(result);
+  });
 
   app.get('/health', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
