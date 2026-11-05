@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import { z } from 'zod';
 import { LLMMessage } from '../ai/provider';
-import { isBazaarLinkProvider, solutionPostProviderHeaders } from '../config/solutionPostProvider';
+import { isBazaarLinkProvider, isSageProvider, solutionPostProviderHeaders } from '../config/solutionPostProvider';
 
 // BazaarLink documents 10 free requests/minute. Reserve starts across routers
 // in this process, with a little headroom for diagnostics. Never enable paid fallback.
@@ -100,12 +100,19 @@ export class AIModelRouter {
         }
       }
       let exhausted = false;
+      const sageReasoning = isSageProvider(this.options.baseUrl);
       for (const model of [...new Set(this.options.models)]) {
         if (!available.has(model)) {
           const record = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'UNAVAILABLE' };
           attempts.push(record); this.onAttempt(record); continue;
         }
-        let attemptMaxTokens = maxTokens;
+        // Sage Inkstone reasoning models (deepseek, qwen3.8) spend a large
+        // portion of max_tokens on internal reasoning_content. The visible
+        // JSON output only appears after reasoning finishes. A 512-token
+        // budget is entirely consumed by reasoning, leaving zero content.
+        // Guarantee at least 4096 tokens so the model has room for both
+        // reasoning AND the actual structured JSON output.
+        let attemptMaxTokens = sageReasoning ? Math.min(Math.max(maxTokens * 6, 4096), 16384) : maxTokens;
         for (let n = 0; n <= this.options.retries; n++) {
           const started = Date.now();
           const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'INVALID_OUTPUT', stage };
@@ -137,7 +144,10 @@ export class AIModelRouter {
             record.usage = response.usage;
             const cost = (response as unknown as { cost?: unknown }).cost;
             if (typeof cost === 'number' && Number.isFinite(cost)) record.cost = cost;
-            if (response.choices[0]?.finish_reason !== 'stop') throw new Error('INCOMPLETE_OUTPUT');
+            const finishReason = response.choices[0]?.finish_reason;
+            if (finishReason === 'length' || (finishReason && finishReason !== 'stop')) {
+              throw new Error('INCOMPLETE_OUTPUT');
+            }
             const text = response.choices[0]?.message.content || (response.choices[0]?.message as any)?.reasoning_content;
             if (!text?.trim()) throw new Error('EMPTY_OUTPUT');
             const value = validate(text);
@@ -168,8 +178,8 @@ export class AIModelRouter {
           // Some reasoning/free-tier models occasionally stop at their token
           // boundary even for short structured outputs. Retry that response
           // once under the configured bounded retry budget.
-          if (record.outcome === 'INCOMPLETE_OUTPUT' && /openrouter\.ai/i.test(this.options.baseUrl)) {
-            attemptMaxTokens = Math.min(maxTokens * 2, 2048);
+          if (record.outcome === 'INCOMPLETE_OUTPUT' && (/openrouter\.ai/i.test(this.options.baseUrl) || sageReasoning)) {
+            attemptMaxTokens = Math.min(attemptMaxTokens * 2, sageReasoning ? 16384 : 2048);
           }
           transient ||= record.outcome === 'INCOMPLETE_OUTPUT';
           if (exhausted || !transient || n === this.options.retries) break;
