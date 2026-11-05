@@ -33,7 +33,8 @@ describe('solution admin routes', () => {
       ['POST', '/admin/solutions/scheduled'], ['GET', '/admin/solutions/diagnostics'], ['POST', '/admin/solutions/api-keys/test'],
       ['POST', '/admin/solutions/openrouter/free-test'], ['POST', '/admin/solutions/oxion/test'],
       ['POST', '/admin/solutions/experiential/test'], ['POST', '/admin/solutions/bazaarlink/free-test'],
-      ['POST', '/admin/solutions/firecrawl/test']]) {
+      ['POST', '/admin/solutions/firecrawl/test'], ['POST', '/admin/solutions/test-control'],
+      ['POST', '/admin/solutions/server-tests'], ['GET', '/admin/solutions/server-tests/00000000-0000-4000-8000-000000000000']]) {
       const response = await app.inject({ method: method as any, url }); expect(response.statusCode).toBe(401);
     }
     const history = await app.inject({ method: 'GET', url: '/admin/solutions', headers: { authorization: 'Bearer admin-test' } });

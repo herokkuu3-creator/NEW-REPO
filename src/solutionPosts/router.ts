@@ -34,6 +34,7 @@ export interface ModelAttempt {
   deferred?: boolean;
   agentCreditsUsed?: number;
   providerLimit?: 'requests_per_minute' | 'concurrency' | 'daily' | 'unknown';
+  reviewIssues?: string[];
 }
 export class RoutingError extends Error {
   constructor(public readonly attempts: ModelAttempt[], public readonly lastFailure?: string) {
@@ -145,10 +146,10 @@ export class AIModelRouter {
             const cost = (response as unknown as { cost?: unknown }).cost;
             if (typeof cost === 'number' && Number.isFinite(cost)) record.cost = cost;
             const finishReason = response.choices[0]?.finish_reason;
-            if (finishReason === 'length' || (finishReason && finishReason !== 'stop')) {
+            if (finishReason !== 'stop') {
               throw new Error('INCOMPLETE_OUTPUT');
             }
-            const text = response.choices[0]?.message.content || (response.choices[0]?.message as any)?.reasoning_content;
+            const text = response.choices[0]?.message.content;
             if (!text?.trim()) throw new Error('EMPTY_OUTPUT');
             const value = validate(text);
             record.outcome = 'SUCCESS'; record.elapsedMs = Date.now() - started;

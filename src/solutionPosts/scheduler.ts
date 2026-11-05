@@ -142,7 +142,7 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
 }
 
 /** A database CAS lease serializes combined runs across replicas and scheduler restarts. */
-async function acquireDailyLease(accountId: string, date: string) {
+export async function acquireDailyLease(accountId: string, date: string) {
   const key = `solution-post-job:${accountId}:${date}`;
   const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs));
   const duration = config.solutionPosts.aiProvider === 'firecrawl' ? 6 * FIRECRAWL_STAGE_BUDGET_MS + 15 * 60 * 1000 :

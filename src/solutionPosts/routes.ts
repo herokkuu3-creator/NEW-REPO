@@ -16,6 +16,7 @@ import { firecrawlProbeRequest, probeFirecrawl } from './firecrawlProbe';
 import { probeFirecrawlAgent } from './firecrawlAgentProbe';
 import { probeSageApi, askSage } from '../ai/sageProbe';
 import { logger } from '../logger';
+import { configureServerTest, readServerTest, startServerTest } from './serverTest';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
   app.register(async scoped => {
@@ -44,6 +45,18 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
         select: { id: true, date: true, problemSlug: true, submissionId: true, language: true },
       } },
     }));
+    scoped.post('/admin/solutions/test-control', async req => {
+      const body = z.object({ accountId: z.string().min(1).nullable() }).strict().parse(req.body);
+      return configureServerTest(body.accountId);
+    });
+    scoped.post('/admin/solutions/server-tests', async (req, reply) => {
+      const body = z.object({ runId: z.string().min(1) }).strict().parse(req.body);
+      return reply.code(202).send(await startServerTest(body.runId));
+    });
+    scoped.get('/admin/solutions/server-tests/:testId', async req => {
+      const { testId } = z.object({ testId: z.string().uuid() }).parse(req.params);
+      return readServerTest(testId);
+    });
     scoped.get('/admin/solutions/schedule', async () => ({ cron: POST_CRON, timezone: POST_TIMEZONE,
       publishing: config.solutionPosts.autoPublish ? 'automatic' : 'review-required',
       accounts: await prisma.solutionPostPreference.findMany({ where: { enabled: true } }) }));

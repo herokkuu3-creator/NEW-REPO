@@ -131,6 +131,19 @@ describe('AI model routing', () => {
     expect(api.chat.completions.create.mock.calls.map(call => (call[0] as { max_tokens: number }).max_tokens))
       .toEqual([512, 1024]);
   });
+  it('reserves reasoning headroom on Sage and increases it on truncation', async () => {
+    const api = client(); api.chat.completions.create.mockResolvedValueOnce(complete('', 'length')).mockResolvedValueOnce(complete('42'));
+    const result = await new AIModelRouter({ ...options, baseUrl: 'https://discovery-api.intern-ai.org.cn/v1' }, api as never, async () => {})
+      .generate([], JSON.parse, 512, true);
+    expect(result.value).toBe(42);
+    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as any).max_tokens)).toEqual([4096, 8192]);
+  });
+  it('never treats internal reasoning as a completed article response', async () => {
+    const api = client(); api.chat.completions.create.mockResolvedValue({ choices: [{ finish_reason: 'stop',
+      message: { content: '', reasoning_content: '{"approved":true,"issues":[]}' } }] });
+    const error = await new AIModelRouter(options, api as never).generate([], JSON.parse).catch(e => e);
+    expect(error).toBeInstanceOf(RoutingError); expect(error.lastFailure).toBe('EMPTY_OUTPUT');
+  });
   it('applies per-model timeouts and handles a timeout with bounded retry', async () => {
     const api = client(); const sleep = vi.fn(async () => {});
     api.chat.completions.create.mockRejectedValue(new OpenAI.APIConnectionTimeoutError());
@@ -256,12 +269,27 @@ describe('AI model routing', () => {
     expect(error.lastFailure).toBe('PROVIDER_ACCESS_BLOCKED');
     expect(api.chat.completions.create).not.toHaveBeenCalled(); expect(advanced).not.toHaveBeenCalled();
   });
-  it('requires a separate successful technical review', async () => {
+  it('repairs a rejected draft, then independently reviews it before accepting', async () => {
     const api = client(); const responses = stagedResponses(article, '{"approved":false,"issues":["wrong trace"]}');
-    responses.push(complete('{"approved":false,"issues":["wrong trace"]}'));
+    responses.push(complete(JSON.stringify(article)), complete('{"approved":true,"issues":[]}'));
     api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
-    await expect(generateArticle(new AIModelRouter(options, api as never), context, [])).rejects.toBeInstanceOf(RoutingError);
-    expect(api.chat.completions.create).toHaveBeenCalledTimes(11);
+    const result = await generateArticle(new AIModelRouter(options, api as never), context, []);
+    expect(result.attempts.find(a => a.outcome === 'TECHNICAL_REVIEW_REJECTED')?.reviewIssues).toEqual(['wrong trace']);
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(12);
+    const repair = api.chat.completions.create.mock.calls[10]![0] as any;
+    expect(repair.messages[1].content).toContain('wrong trace');
+    expect(repair.messages[1].content).toContain(context.code.replace(/\r/g, '\\r').replace(/\n/g, '\\n'));
+    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as any).model)).toEqual(Array(12).fill('terra'));
+  });
+  it('fails closed after two repairs if the reviewer still rejects the article', async () => {
+    const rejection = '{"approved":false,"issues":["wrong trace"]}';
+    const api = client(); const responses = stagedResponses(article, rejection);
+    responses.push(complete(JSON.stringify(article)), complete(rejection), complete(JSON.stringify(article)), complete(rejection));
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
+    const error = await generateArticle(new AIModelRouter(options, api as never), context, []).catch(e => e);
+    expect(error).toBeInstanceOf(RoutingError);
+    expect(error.lastFailure).toBe('TECHNICAL_REVIEW_REJECTED');
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(14);
   });
   it('normalizes JSON bullet arrays and grounds every animation in the supplied problem', async () => {
     const api = client(); const responses = stagedResponses(article);
@@ -312,7 +340,7 @@ describe('AI model routing', () => {
     expect(result.markdown).toContain(hostFails ? '| Step | State | Result |' : 'https://assets.example.test/0.gif');
     expect(result.assets).toHaveLength(hostFails ? 0 : 2);
     expect(api.chat.completions.create.mock.calls.map(call => (call[0] as { max_tokens: number }).max_tokens))
-      .toEqual([512, 640, 512, 512, 512, 512, 512, 512, 512, 512]);
+      .toEqual([512, 640, 512, 512, 512, 512, 512, 512, 512, 1024]);
     expect((api.chat.completions.create.mock.calls[2]![0] as { messages: { content: string }[] }).messages[0]!.content)
       .toContain('correctness callout');
     const request = api.chat.completions.create.mock.calls[9]![0] as { messages: { content: string }[] };
