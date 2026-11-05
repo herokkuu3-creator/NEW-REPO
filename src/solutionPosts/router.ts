@@ -36,6 +36,7 @@ export interface ModelAttempt {
   agentCreditsUsed?: number;
   providerLimit?: 'requests_per_minute' | 'concurrency' | 'daily' | 'unknown';
   reviewIssues?: string[];
+  requestedMaxTokens?: number;
 }
 export class RoutingError extends Error {
   constructor(public readonly attempts: ModelAttempt[], public readonly lastFailure?: string) {
@@ -116,10 +117,14 @@ export class AIModelRouter {
         // budget is entirely consumed by reasoning, leaving zero content.
         // Guarantee at least 4096 tokens so the model has room for both
         // reasoning AND the actual structured JSON output.
-        let attemptMaxTokens = sageReasoning ? Math.min(Math.max(maxTokens * 6, 4096), 16384) : maxTokens;
+        // A full-article repair needs output plus reasoning headroom, but
+        // reserving 6x its 4096-token output can itself trip provider TPM limits.
+        let attemptMaxTokens = sageReasoning ? Math.min(Math.max(maxTokens * 2,
+          stage?.startsWith('technical review') ? 8192 : 4096), 16384) : maxTokens;
         for (let n = 0; n <= this.options.retries; n++) {
           const started = Date.now();
-          const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'INVALID_OUTPUT', stage };
+          const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0,
+            outcome: 'INVALID_OUTPUT', stage, requestedMaxTokens: attemptMaxTokens };
           let transient = false;
           try {
             if (isBazaarLinkProvider(this.options.baseUrl) && model.endsWith(':free')) {
@@ -144,7 +149,9 @@ export class AIModelRouter {
               ...(this.options.reasoningEffort ? { reasoning_effort: this.options.reasoningEffort } : {}) };
             const response = await client.chat.completions.create(
               request as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
-            { timeout: this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs });
+            { timeout: sageReasoning && stage?.startsWith('technical review') ?
+              Math.max(this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs, 180000) :
+              this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs });
             record.usage = response.usage;
             const cost = (response as unknown as { cost?: unknown }).cost;
             if (typeof cost === 'number' && Number.isFinite(cost)) record.cost = cost;
@@ -160,6 +167,7 @@ export class AIModelRouter {
             return { value, model, attempts };
           } catch (error) {
             Object.assign(record, httpFailureDetails(error));
+            if (sageReasoning && record.httpStatus === 429 && record.retryAfterMs == null) record.retryAfterMs = 60000;
             if (!record.deferred && record.httpStatus === 429 && isBazaarLinkProvider(this.options.baseUrl)) {
               bazaarFreeBlockedUntil = Math.max(bazaarFreeBlockedUntil, Date.now() + (record.retryAfterMs ?? 1000));
             }

@@ -147,7 +147,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     if (['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING'].includes(post.status)) {
       post = await move(post, 'FAILED', { leaseUntil: null,
         lastError: error instanceof RoutingError && error.lastFailure === 'HTTP_429' ? 'AI_RATE_LIMITED' :
-          error instanceof ArticleReviewError ? 'TECHNICAL_REVIEW_FAILED' :
+          error instanceof ArticleReviewError ?
+            error.lastFailure && error.lastFailure !== 'TECHNICAL_REVIEW_REJECTED' ? `AI_ERROR: ${error.lastFailure}` : 'TECHNICAL_REVIEW_FAILED' :
           error instanceof RoutingError ? (error.lastFailure === 'HTTP_401' ? 'AI_AUTHENTICATION_FAILED' :
             error.lastFailure === 'PROVIDER_ACCESS_BLOCKED' ? 'AI_PROVIDER_ACCESS_BLOCKED' :
             error.lastFailure ? `AI_ERROR: ${error.lastFailure}` : 'AI_MODELS_EXHAUSTED') :

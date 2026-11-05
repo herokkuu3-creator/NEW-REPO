@@ -152,6 +152,22 @@ describe('AI model routing', () => {
     await router.generate([], JSON.parse, 512, true, 'title and intuition');
     expect(api.chat.completions.create.mock.calls.map(call => (call[0] as any).model)).toEqual(['luna', 'luna', 'terra']);
   });
+  it('bounds full-article reasoning reservations and permits the longer server review', async () => {
+    const api = client(); api.chat.completions.create.mockResolvedValue(complete('42'));
+    await new AIModelRouter({ ...options, baseUrl: 'https://discovery-api.intern-ai.org.cn/v1' }, api as never)
+      .generate([], JSON.parse, 4096, true, 'technical review repair');
+    expect(api.chat.completions.create.mock.calls[0]![0]).toMatchObject({ max_tokens: 8192 });
+    expect(api.chat.completions.create.mock.calls[0]![1]).toEqual({ timeout: 180000 });
+  });
+  it('waits for a conservative Sage cooldown when a 429 has no Retry-After', async () => {
+    const api = client(); const sleep = vi.fn(async () => {});
+    api.chat.completions.create.mockRejectedValueOnce(new OpenAI.RateLimitError(429, {}, 'RPM limit', undefined))
+      .mockResolvedValueOnce(complete('42'));
+    const result = await new AIModelRouter({ ...options, baseUrl: 'https://discovery-api.intern-ai.org.cn/v1' }, api as never, sleep)
+      .generate([], JSON.parse, 4096, true, 'technical review repair');
+    expect(sleep).toHaveBeenCalledWith(60000);
+    expect(result.attempts[0]).toMatchObject({ outcome: 'HTTP_429', retryAfterMs: 60000 });
+  });
   it('applies per-model timeouts and handles a timeout with bounded retry', async () => {
     const api = client(); const sleep = vi.fn(async () => {});
     api.chat.completions.create.mockRejectedValue(new OpenAI.APIConnectionTimeoutError());
