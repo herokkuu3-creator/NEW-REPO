@@ -2,9 +2,9 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 import { config } from '../config';
 import { getSystemState, setSystemState } from '../database/models';
 import { DEFAULT_SOLUTION_POST_BASE_URL, DEFAULT_SOLUTION_POST_MODEL, isBazaarLinkProvider,
-  solutionPostProviderHeaders } from '../config/solutionPostProvider';
+  isSageProvider, solutionPostProviderHeaders } from '../config/solutionPostProvider';
 import { validateSolutionPostModels } from '../config/solutionPostModels';
-import { parseSolutionApiKeys, ArticleKeyInput } from '../config/solutionPostKeys';
+import { parseSolutionApiKeys, ArticleKeyInput, DEFAULT_SAGE_ARTICLE_KEY } from '../config/solutionPostKeys';
 export { parseSolutionApiKeys } from '../config/solutionPostKeys';
 
 const STATE_KEY = 'solution-post-api-key-pool:v1';
@@ -91,7 +91,11 @@ export function solutionKeyPeriod(now = new Date()): string {
 export async function loadSolutionKeyPool(now = new Date()): Promise<SolutionKeyPool> {
   const saved = await getSystemState(STATE_KEY);
   const bazaarLink = isBazaarLinkProvider(config.solutionPosts.baseUrl);
-  const environmentKeys = environmentArticleKeys();
+  const sage = isSageProvider(config.solutionPosts.baseUrl);
+  let environmentKeys = environmentArticleKeys();
+  if (!environmentKeys.length && sage) {
+    environmentKeys = [DEFAULT_SAGE_ARTICLE_KEY];
+  }
   const environmentFingerprint = createHash('sha256').update(JSON.stringify(environmentKeys)).digest('hex');
   const configuredProvider = providerFingerprint();
   if (saved) {
@@ -230,9 +234,13 @@ export async function testSolutionApiKey(candidateKey?: string, model?: string):
     key = active[0] ?? pool.keys.at(-1);
   }
   if (!key) {
-    return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0,
-      error: config.solutionPosts.keyError ?? 'NO_KEY_CONFIGURED',
-      keySource: config.solutionPosts.keySource, keyEnvironment: config.solutionPosts.keyEnvironment };
+    if (isSageProvider(config.solutionPosts.baseUrl)) {
+      key = DEFAULT_SAGE_ARTICLE_KEY;
+    } else {
+      return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0,
+        error: config.solutionPosts.keyError ?? 'NO_KEY_CONFIGURED',
+        keySource: config.solutionPosts.keySource, keyEnvironment: config.solutionPosts.keyEnvironment };
+    }
   }
   const masked = maskSolutionApiKey(key);
   const testModel = model ?? config.solutionPosts.models?.[0] ?? DEFAULT_SOLUTION_POST_MODEL;

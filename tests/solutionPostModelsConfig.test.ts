@@ -20,6 +20,11 @@ describe('solution post model configuration', () => {
       .toEqual(['qwen/qwen3.7-flash:free']);
   });
 
+  it('accepts supported Sage Inkstone models', () => {
+    expect(validateSolutionPostModels('deepseek-v4.1-flash-1017,qwen3.8-27b,Sage-A1.5,intern-s2'))
+      .toEqual(['deepseek-v4.1-flash-1017', 'qwen3.8-27b', 'Sage-A1.5', 'intern-s2']);
+  });
+
   it('keeps unrelated models outside the approved families', () => {
     expect(() => validateSolutionPostModels('anthropic/claude-opus'))
       .toThrow('SOLUTION_POST_MODELS only supports');

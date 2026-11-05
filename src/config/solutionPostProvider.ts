@@ -8,6 +8,15 @@ export function isBazaarLinkProvider(baseUrl: string): boolean {
       (url.hostname === 'bazaarlink.ai' && url.pathname.replace(/\/+$/, '') === '/api/v1'));
 }
 
+export function isSageProvider(baseUrl: string): boolean {
+  try {
+    const url = new URL(baseUrl);
+    return url.hostname.includes('intern-ai.org.cn');
+  } catch {
+    return false;
+  }
+}
+
 /** Keep free model requests from automatically falling back to paid usage. */
 export function solutionPostProviderHeaders(baseUrl: string): Record<string, string> {
   return isBazaarLinkProvider(baseUrl) ? { 'X-Free-Fallback': 'false' } : {};

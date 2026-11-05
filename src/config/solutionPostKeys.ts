@@ -1,7 +1,8 @@
-import { isBazaarLinkProvider } from './solutionPostProvider';
+import { isBazaarLinkProvider, isSageProvider } from './solutionPostProvider';
 
+export const DEFAULT_SAGE_ARTICLE_KEY = 'sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056';
 export const ARTICLE_KEY_VARIABLES = ['BAZAARLINK_API_KEYS', 'BAZAARLINK_API_KEY',
-  'SOLUTION_POST_API_KEYS', 'SOLUTION_POST_API_KEY'] as const;
+  'SOLUTION_POST_API_KEYS', 'SOLUTION_POST_API_KEY', 'SAGE_API_KEY'] as const;
 type KeyVariable = typeof ARTICLE_KEY_VARIABLES[number];
 export interface ArticleKeyInput {
   name: KeyVariable; present: boolean; count: number; invalid: boolean;
@@ -41,12 +42,23 @@ export function resolveArticleKeys(env: Partial<Record<KeyVariable, string>>, ba
     try { return { name, present: !!raw.trim(), keys: parseSolutionApiKeys(raw), invalid: false }; }
     catch { return { name, present: !!raw.trim(), keys: [] as string[], invalid: true }; }
   });
-  const order = isBazaarLinkProvider(baseUrl) ? ARTICLE_KEY_VARIABLES :
+  const order = isBazaarLinkProvider(baseUrl) ? ['BAZAARLINK_API_KEYS', 'BAZAARLINK_API_KEY', 'SOLUTION_POST_API_KEYS', 'SOLUTION_POST_API_KEY'] as const :
+    isSageProvider(baseUrl) ? ['SAGE_API_KEY', 'SOLUTION_POST_API_KEYS', 'SOLUTION_POST_API_KEY'] as const :
     ['SOLUTION_POST_API_KEYS', 'SOLUTION_POST_API_KEY'] as const;
   const selected = order.map(name => inputs.find(input => input.name === name)!)
-    .find(input => input.keys.length > 0 || input.invalid);
+    .find(input => input?.keys.length > 0 || input?.invalid);
+
+  let apiKey = selected?.keys[0] ?? '';
+  let apiKeys = selected?.keys ?? [];
+  let keySource = selected?.name;
+  if (!apiKeys.length && !selected?.invalid && isSageProvider(baseUrl)) {
+    apiKey = DEFAULT_SAGE_ARTICLE_KEY;
+    apiKeys = [DEFAULT_SAGE_ARTICLE_KEY];
+    keySource = 'DEFAULT_SAGE_KEY' as any;
+  }
+
   return {
-    apiKey: selected?.keys[0] ?? '', apiKeys: selected?.keys ?? [], keySource: selected?.name,
+    apiKey, apiKeys, keySource,
     keyError: selected?.invalid ? 'AI_KEY_INPUT_INVALID' : undefined,
     // This is the only form suitable for logs and diagnostic responses.
     keyEnvironment: inputs.map(({ name, present, keys, invalid }): ArticleKeyInput =>

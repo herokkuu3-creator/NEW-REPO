@@ -138,7 +138,7 @@ export class AIModelRouter {
             const cost = (response as unknown as { cost?: unknown }).cost;
             if (typeof cost === 'number' && Number.isFinite(cost)) record.cost = cost;
             if (response.choices[0]?.finish_reason !== 'stop') throw new Error('INCOMPLETE_OUTPUT');
-            const text = response.choices[0]?.message.content;
+            const text = response.choices[0]?.message.content || (response.choices[0]?.message as any)?.reasoning_content;
             if (!text?.trim()) throw new Error('EMPTY_OUTPUT');
             const value = validate(text);
             record.outcome = 'SUCCESS'; record.elapsedMs = Date.now() - started;

@@ -171,4 +171,23 @@ describe('solution article API key pool', () => {
     });
     expect(JSON.parse(fetcher.mock.calls[1]![1].body).model).toBe('qwen/qwen3.7-flash:free');
   });
+  it('uses default Sage Inkstone key for Sage provider when no keys configured in environment', async () => {
+    Object.assign(config.solutionPosts, {
+      baseUrl: 'https://discovery-api.intern-ai.org.cn/v1',
+      apiKeys: [],
+      models: ['deepseek-v4.1-flash-1017'],
+      keyError: undefined,
+    });
+    const pool = await loadSolutionKeyPool();
+    expect(pool.keys).toContain('sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056');
+
+    const fetcher = vi.fn().mockResolvedValueOnce(new Response('{"data":[]}'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: 'SAGE_OK' } }] })));
+    vi.stubGlobal('fetch', fetcher);
+    const result = await testSolutionApiKey();
+    expect(result.ok).toBe(true);
+    expect(fetcher.mock.calls[1]![1].headers.Authorization).toBe(
+      'Bearer sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056',
+    );
+  });
 });

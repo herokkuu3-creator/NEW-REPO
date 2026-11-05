@@ -47,4 +47,18 @@ describe('article credential input', () => {
     expect(result.keyEnvironment[1]).toMatchObject({ present: true, count: 0, invalid: true });
     expect(JSON.stringify(result)).not.toContain('bad value');
   });
+  it('falls back to default Sage Inkstone key when Sage provider is used without custom keys', () => {
+    const sageBaseUrl = 'https://discovery-api.intern-ai.org.cn/v1';
+    const result = resolveArticleKeys({}, sageBaseUrl);
+    expect(result.apiKey).toBe('sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056');
+    expect(result.apiKeys).toEqual(['sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056']);
+    expect(result.keySource).toBe('DEFAULT_SAGE_KEY');
+  });
+  it('prefers explicit SAGE_API_KEY over default Sage key', () => {
+    const sageBaseUrl = 'https://discovery-api.intern-ai.org.cn/v1';
+    const result = resolveArticleKeys({ SAGE_API_KEY: 'sk-custom-sage-key-12345' }, sageBaseUrl);
+    expect(result.apiKey).toBe('sk-custom-sage-key-12345');
+    expect(result.apiKeys).toEqual(['sk-custom-sage-key-12345']);
+    expect(result.keySource).toBe('SAGE_API_KEY');
+  });
 });
