@@ -17,6 +17,7 @@ import { probeFirecrawlAgent } from './firecrawlAgentProbe';
 import { probeSageApi, askSage } from '../ai/sageProbe';
 import { logger } from '../logger';
 import { configureServerTest, readServerTest, startServerTest } from './serverTest';
+import { dailyPublicationStatus } from './dailyPublication';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
   app.register(async scoped => {
@@ -50,8 +51,8 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       return configureServerTest(body.accountId);
     });
     scoped.post('/admin/solutions/server-tests', async (req, reply) => {
-      const body = z.object({ runId: z.string().min(1) }).strict().parse(req.body);
-      return reply.code(202).send(await startServerTest(body.runId));
+      const body = z.object({ runId: z.string().min(1), publicationMode: z.enum(['daily', 'manual']).default('manual') }).strict().parse(req.body);
+      return reply.code(202).send(await startServerTest(body.runId, body.publicationMode));
     });
     scoped.get('/admin/solutions/server-tests/:testId', async req => {
       const { testId } = z.object({ testId: z.string().uuid() }).parse(req.params);
@@ -73,6 +74,7 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       revision: process.env.RENDER_GIT_COMMIT ?? null,
       cron: POST_CRON, timezone: POST_TIMEZONE, autoPublish: config.solutionPosts.autoPublish,
       running: isScheduledSolutionRunInProgress(), aiProvider: config.solutionPosts.aiProvider,
+      dailyPublication: await dailyPublicationStatus(),
       models: config.solutionPosts.aiProvider === 'firecrawl' ? ['firecrawl/spark-2'] : config.solutionPosts.models,
       selected: await prisma.solutionPostPreference.findMany({ where: { enabled: true } }),
       scheduler: await prisma.systemState.findUnique({ where: { key: SCHEDULE_STATE_KEY } }),
@@ -193,7 +195,8 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
       // The context contains source/problem only, but keep it internal rather than exposing it unnecessarily.
       const { context: _context, leaseUntil: _lease, ...preview } = post;
-      return preview;
+      const stored = JSON.parse(post.context);
+      return { ...preview, presentation: stored.presentation ?? null };
     });
     scoped.post('/admin/solutions/:id/retry', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);

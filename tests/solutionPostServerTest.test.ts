@@ -20,6 +20,7 @@ vi.mock('../src/solutionPosts/service', () => ({ generateForRun: h.generate,
   PostError: class extends Error { constructor(public code: string) { super(code); } } }));
 vi.mock('../src/solutionPosts/store', () => ({ approvePost: h.approve }));
 vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: h.publish }));
+vi.mock('../src/solutionPosts/dailyPublication', () => ({ publishDailyPost: h.publish, dailyPublicationStatus: vi.fn() }));
 vi.mock('../src/solutionPosts/scheduler', () => ({ acquireDailyLease: h.lease }));
 import { configureServerTest, readServerTest, startServerTest, TEST_CONTROL_KEY } from '../src/solutionPosts/serverTest';
 

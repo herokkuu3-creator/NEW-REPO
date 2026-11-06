@@ -6,6 +6,7 @@ import { approvePost } from './store';
 import { publishPost } from './publisher';
 import { acquireDailyLease } from './scheduler';
 import { logger } from '../logger';
+import { publishDailyPost, dailyPublicationStatus } from './dailyPublication';
 
 export const TEST_CONTROL_KEY = 'solution-post-server-test:control';
 const jobKey = (id: string) => `solution-post-server-test:job:${id}`;
@@ -34,11 +35,20 @@ export async function configureServerTest(accountId: string | null) {
 
 export async function readServerTest(id: string) {
   const row = await prisma.systemState.findUniqueOrThrow({ where: { key: jobKey(id) } });
-  return JSON.parse(row.value);
+  const job = JSON.parse(row.value);
+  if (job.status === 'DEFERRED' && job.postId) {
+    const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id: job.postId } });
+    if (post.status === 'PUBLISHED') {
+      Object.assign(job, { status: 'PUBLISHED', stage: 'finished', postStatus: post.status, url: post.publishedUrl,
+        lastError: null, finishedAt: post.publishedAt?.toISOString() });
+      await prisma.systemState.updateMany({ where: { key: jobKey(id), value: row.value }, data: { value: JSON.stringify(job) } });
+    }
+  }
+  return job;
 }
 
 /** Return 202 immediately; every operation, including the Post click, runs on Render. */
-export async function startServerTest(runId: string) {
+export async function startServerTest(runId: string, publicationMode: 'daily' | 'manual' = 'manual') {
   if (!process.env.RENDER_INSTANCE_ID) throw new PostError('RENDER_SERVER_REQUIRED');
   const old = await prisma.systemState.findUnique({ where: { key: TEST_CONTROL_KEY } });
   const control: Control | null = old ? JSON.parse(old.value) : null;
@@ -52,7 +62,7 @@ export async function startServerTest(runId: string) {
   const claimed = JSON.stringify({ ...control, active: id });
   const claim = await prisma.systemState.updateMany({ where: { key: TEST_CONTROL_KEY, value: old!.value }, data: { value: claimed } });
   if (!claim.count) throw new PostError('SERVER_TEST_IN_PROGRESS');
-  const job = { id, accountId: control.accountId, runId, executionHost: 'render',
+  const job = { id, accountId: control.accountId, runId, publicationMode, executionHost: 'render',
     revision: process.env.RENDER_GIT_COMMIT ?? null, startedAt: new Date().toISOString(), status: 'RUNNING', stage: 'generation' };
   const save = async (update: object) => {
     Object.assign(job, update);
@@ -73,10 +83,12 @@ export async function startServerTest(runId: string) {
       }
       if (post.status === 'DRAFT_READY') {
         await save({ stage: 'publication' });
-        post = await publishPost(post.id);
+        post = publicationMode === 'daily' ? await publishDailyPost(post.id) : await publishPost(post.id);
       }
-      await save({ status: post.status === 'PUBLISHED' ? 'PUBLISHED' : 'FAILED', stage: 'finished',
+      const deferred = post.lastError === 'DAILY_PUBLICATION_COOLDOWN';
+      await save({ status: post.status === 'PUBLISHED' ? 'PUBLISHED' : deferred ? 'DEFERRED' : 'FAILED', stage: deferred ? 'publication_queued' : 'finished',
         postStatus: post.status, url: post.publishedUrl, lastError: post.lastError,
+        ...(deferred ? await dailyPublicationStatus() : {}),
         finishedAt: new Date().toISOString() });
     } catch (error) {
       await save({ status: 'FAILED', stage: 'finished', finishedAt: new Date().toISOString(),

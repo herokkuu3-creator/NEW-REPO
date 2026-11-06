@@ -11,6 +11,7 @@ import { approvePost, recoverGeneration } from './store';
 import { publishPost } from './publisher';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
+import { publishDailyPost, processDailyPublicationQueue } from './dailyPublication';
 
 export const POST_CRON = '0 6 * * *';
 export const POST_TIMEZONE = 'Asia/Kolkata';
@@ -26,13 +27,13 @@ export function afterPostSchedule(now: Date): boolean {
  * uncertain POST click remains PUBLISHING for reconciliation rather than a
  * second click. This scheduler is the only automatic publication entry point.
  */
-export async function publishGeneratedPost(post: SolutionPost): Promise<SolutionPost> {
+export async function publishGeneratedPost(post: SolutionPost, mode: 'daily' | 'manual' = 'manual'): Promise<SolutionPost> {
   let ready = post;
   if (ready.status === 'AWAITING_APPROVAL' || (ready.status === 'DRAFT_READY' && ready.approvedHash !== ready.contentHash)) {
     if (!ready.contentHash) throw new PostError('CONTENT_HASH_MISSING');
     ready = await approvePost(ready.id, ready.contentHash);
   }
-  if (ready.status === 'DRAFT_READY') return publishPost(ready.id);
+  if (ready.status === 'DRAFT_READY') return mode === 'daily' ? publishDailyPost(ready.id) : publishPost(ready.id);
   return ready;
 }
 
@@ -51,6 +52,7 @@ export type SolutionWorkflowStage =
   | 'publishing_article'
   | 'published'
   | 'article_ready'
+  | 'publication_queued'
   | 'failed'
   | 'skipped';
 
@@ -178,7 +180,7 @@ async function reserveScheduledAttempt(accountId: string, date: string): Promise
 
 /** Each selected account is independent. Existing daily worker handles code submission unchanged. */
 export async function runCombined(accountIds: string[], now = new Date(), onProgress?: ProgressReporter,
-  options: { retryFailedGeneration?: boolean } = {}) {
+  options: { retryFailedGeneration?: boolean; publicationMode?: 'daily' | 'manual' } = {}) {
   if (!accountIds.length || new Set(accountIds).size !== accountIds.length) throw new PostError('SELECT_ACCOUNTS_REQUIRED');
   const accounts = await prisma.account.findMany({ where: { id: { in: accountIds }, status: { not: 'DISABLED' } } });
   if (accounts.length !== accountIds.length) throw new PostError('ACCOUNT_UNAVAILABLE');
@@ -247,10 +249,11 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
       }
       if (config.solutionPosts.autoPublish) {
         await reportProgress(onProgress, { accountId, stage: 'publishing_article', submissionId: run.submissionId, postId: post.id });
-        post = await publishGeneratedPost(post);
+        post = await publishGeneratedPost(post, options.publicationMode ?? 'daily');
       }
       results.push({ accountId, postId: post.id, status: post.status, ...(post.lastError ? { error: post.lastError } : {}) });
-      await reportProgress(onProgress, { accountId, stage: post.status === 'PUBLISHED' ? 'published' : 'article_ready',
+      await reportProgress(onProgress, { accountId, stage: post.status === 'PUBLISHED' ? 'published' :
+        post.lastError === 'DAILY_PUBLICATION_COOLDOWN' ? 'publication_queued' : 'article_ready',
         submissionId: run.submissionId, postId: post.id, status: post.status });
     } catch (error) {
       const code = errorCode(error, 'COMBINED_WORKFLOW_FAILED');
@@ -321,7 +324,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
     const results = await runCombined(pendingIds, now);
     for (const result of results) {
       // Contention is not an execution failure and must not use up the day's retries.
-      if (['SUBMISSION_WORKER_BUSY', 'ACCOUNT_JOB_IN_PROGRESS'].includes(result.error ?? '')) {
+      if (['SUBMISSION_WORKER_BUSY', 'ACCOUNT_JOB_IN_PROGRESS', 'DAILY_PUBLICATION_COOLDOWN'].includes(result.error ?? '')) {
         const key = `solution-post-schedule-budget:${result.accountId}:${today}`;
         const old = await prisma.systemState.findUnique({ where: { key } });
         if (old) await prisma.systemState.updateMany({ where: { key, value: old.value },
@@ -349,6 +352,9 @@ export function startSolutionPostScheduler(): () => void {
   // The recovery timer also catches up after a restart; uniqueness and leases arbitrate multiple processes.
   const daily = cron.schedule(POST_CRON, tick, { timezone: POST_TIMEZONE });
   const recovery = cron.schedule('*/10 * * * *', tick, { timezone: POST_TIMEZONE });
+  const queueTick = () => void processDailyPublicationQueue().catch(error => logger.warn({ errorName: error?.name }, 'daily publication queue unavailable'));
+  const queue = cron.schedule('* * * * *', queueTick, { timezone: POST_TIMEZONE });
+  queueTick();
   tick();
-  return () => { daily.stop(); recovery.stop(); };
+  return () => { daily.stop(); recovery.stop(); queue.stop(); };
 }

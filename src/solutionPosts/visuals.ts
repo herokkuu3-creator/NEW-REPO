@@ -11,6 +11,7 @@ export const visualPlanSchema = z.object({
   id: z.string().regex(/^visual-[12]$/), after: z.enum(sectionKinds),
   title: z.string().min(3).max(48), caption: z.string().min(5).max(160),
   theme: z.enum(visualThemes).default('aurora'),
+  layout: z.enum(['strip', 'ledger', 'focus']).optional(),
   frames: z.array(visualFrameSchema).min(2).max(8),
 }).superRefine((plan, ctx) => {
   for (const [i, frame] of plan.frames.entries()) if (frame.active.some(n => n >= frame.items.length)) {
@@ -44,7 +45,7 @@ const palettes = {
 } as const;
 
 /** Original code-drawn diagrams: no fetched media, AI-generated URLs, or executable SVG markup. */
-export function renderVisualFrame(plan: VisualPlan, frameIndex: number): string {
+export function renderVisualFrame(plan: VisualPlan, frameIndex: number, phase = 1): string {
   const frame = plan.frames[frameIndex]!;
   const colors = palettes[plan.theme];
   const width = 720; const height = 360;
@@ -69,7 +70,10 @@ export function renderVisualFrame(plan: VisualPlan, frameIndex: number): string 
       label +
       (active ? `<path d="M ${x + box / 2} 204 l -7 9 h 14 Z" fill="${colors.active}"/>` : '');
   }).join('');
-  const progress = (frameIndex + 1) / plan.frames.length * 664;
+  const progress = (frameIndex + phase) / plan.frames.length * 664;
+  if (plan.layout === 'ledger' || plan.layout === 'focus') {
+    return renderAlternateFrame(plan, frameIndex, phase, progress);
+  }
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 720 360">
     <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${colors.start}"/><stop offset="1" stop-color="${colors.end}"/></linearGradient></defs>
     <rect width="720" height="360" rx="22" fill="url(#bg)"/>
@@ -78,6 +82,7 @@ export function renderVisualFrame(plan: VisualPlan, frameIndex: number): string 
     ${text(40, 39, 'TRACE · WATCH IT CHANGE', 11, colors.accent, 700)}
     ${text(30, 78, plan.title, 25, '#f7fbff', 700)}
     ${text(30, 105, frame.label, 16, colors.muted)}${blocks}
+    ${plan.layout ? `<circle cx="${40 + progress}" cy="211" r="${4 + phase * 3}" fill="${colors.accent}" opacity="${.4 + phase * .6}"/>` : ''}
     <rect x="28" y="224" width="664" height="80" rx="13" fill="${colors.panel}" stroke="${colors.flare}" stroke-opacity=".28"/>
     ${text(44, 251, frame.state, 16, '#f3f8ff', 600)}
     ${text(674, 281, frame.metric, 21, colors.accent, 700, 'end')}
@@ -87,16 +92,62 @@ export function renderVisualFrame(plan: VisualPlan, frameIndex: number): string 
   </svg>`;
 }
 
+function renderAlternateFrame(plan: VisualPlan, frameIndex: number, phase: number, progress: number): string {
+  const frame = plan.frames[frameIndex]!; const c = palettes[plan.theme];
+  const lines = (value: string, width: number) => {
+    const chars = Array.from(value); const out: string[] = [];
+    for (let i = 0; i < chars.length; i += width) out.push(chars.slice(i, i + width).join(''));
+    return out;
+  };
+  const wrapped = (value: string, x: number, y: number, width: number, size: number, color: string) =>
+    lines(value, width).map((line, i) => text(x, y + i * (size + 4), line, size, color, 600)).join('');
+  const ledger = plan.layout === 'ledger';
+  const tiles = frame.items.map((item, index) => {
+    const active = frame.active.includes(index);
+    const w = ledger ? 162 : Math.min(142, 652 / frame.items.length - 8);
+    const x = ledger ? 30 + (index % 2) * 174 : 30 + index * (w + 8);
+    const y = ledger ? 117 + Math.floor(index / 2) * 43 : 122;
+    const size = Math.min(ledger ? 20 : 28, Math.max(11, (w - 28) / (Math.min(Math.max(item.length, 1), 16) * .62)));
+    const perLine = Math.max(4, Math.floor((w - 28) / (size * .62)));
+    const lineCount = Math.max(1, lines(item, perLine).length);
+    const baseline = y + ((ledger ? 37 : 68) - (lineCount - 1) * (size + 4)) / 2 + size * .35;
+    return `<rect x="${x}" y="${y}" width="${w}" height="${ledger ? 37 : 68}" rx="${ledger ? 6 : 18}" fill="${active ? c.active : c.panel}" stroke="${active ? c.accent : c.idle}" stroke-width="${active ? 2 + phase * 2 : 1}"/>` +
+      text(x + 7, y + 12, String(index), 9, active ? c.ink : c.muted, 700) +
+      wrapped(item, x + 18, baseline, perLine, size, active ? c.ink : '#f7fbff') +
+      (active ? `<rect x="${x}" y="${y + (ledger ? 34 : 65)}" width="${w * phase}" height="3" rx="1.5" fill="${c.accent}"/>` : '');
+  }).join('');
+  const state = ledger ?
+    `<rect x="388" y="117" width="302" height="170" rx="17" fill="${c.panel}"/>` +
+      text(406, 141, 'CURRENT STATE', 11, c.accent, 700) + wrapped(frame.state, 406, 164, 29, 14, '#f7fbff') +
+      wrapped(frame.metric, 406, 246, 28, 15, c.active) :
+    `<rect x="30" y="212" width="660" height="91" rx="18" fill="${c.panel}"/>` +
+      wrapped(frame.state, 46, 238, 65, 14, '#f7fbff') + wrapped(frame.metric, 46, 281, 65, 16, c.accent);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360">
+    <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${c.start}"/><stop offset="1" stop-color="${c.end}"/></linearGradient></defs>
+    <rect width="720" height="360" rx="22" fill="url(#bg)"/>
+    ${text(30, 28, ledger ? 'VALUE LEDGER · FOLLOW THE HIGHLIGHT' : 'FOCUS VIEW · ONE DECISION AT A TIME', 11, c.accent, 700)}
+    ${text(30, 64, plan.title, 24, '#f7fbff', 700)}${text(30, 96, frame.label, 15, c.muted)}
+    ${tiles}${state}${text(30, 328, frame.note, 13, c.muted)}
+    <rect x="30" y="345" width="660" height="4" rx="2" fill="${c.idle}"/>
+    <rect x="30" y="345" width="${progress}" height="4" rx="2" fill="${c.active}"/>
+    <circle cx="${30 + progress}" cy="347" r="4" fill="${c.accent}"/>
+  </svg>`;
+}
+
 export async function renderVisualGif(input: VisualPlan): Promise<Buffer> {
   const plan = visualPlanSchema.parse(input);
   const [{ default: sharp }, { GIFEncoder, quantize, applyPalette }] = await Promise.all([import('sharp'), import('gifenc')]);
   const gif = GIFEncoder();
   // Process sequentially so a worker never retains a full animation of RGBA frames in memory.
   for (let i = 0; i < plan.frames.length; i++) {
-    const rgba = await sharp(Buffer.from(renderVisualFrame(plan, i))).ensureAlpha().raw().toBuffer();
+    const phases = plan.layout ? [.25, .65, 1] : [1];
+    for (const phase of phases) {
+    const rgba = await sharp(Buffer.from(renderVisualFrame(plan, i, phase))).ensureAlpha().raw().toBuffer();
     const palette = quantize(rgba, 64);
     gif.writeFrame(applyPalette(rgba, palette), 720, 360, { palette, repeat: 0,
-      delay: i === plan.frames.length - 1 ? 2300 : 1450 });
+      delay: phase < 1 ? (phase === .25 ? 120 : 160) :
+        (i === plan.frames.length - 1 ? 2300 : 1450) - (plan.layout ? 280 : 0) });
+    }
   }
   gif.finish();
   const result = Buffer.from(gif.bytes());

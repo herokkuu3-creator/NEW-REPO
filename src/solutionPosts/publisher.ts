@@ -2,7 +2,7 @@ import { Page } from 'playwright';
 import { z } from 'zod';
 import { prisma } from '../database/prisma';
 import { LeetCodeApi } from '../leetcode/apiClient';
-import { contextSchema, hash, SubmissionContext } from './article';
+import { contextSchema, hash, SubmissionContext, titleIncludesQuestionName } from './article';
 import { move } from './store';
 import { PostError, withAccount } from './service';
 import { UGC_SOLUTION_ARTICLE_QUERY } from '../solutions/communitySolutions';
@@ -156,6 +156,7 @@ export async function publishPost(id: string) {
   if (post.status !== 'DRAFT_READY' || !post.title || !post.markdown || !post.approvedHash ||
     post.approvedHash !== hash(`${post.title}\n${post.markdown}`)) throw new PostError('REVIEW_REQUIRED');
   const context = contextSchema.parse(JSON.parse(post.context));
+  if (titleIncludesQuestionName(post.title, context)) throw new PostError('QUESTION_NAME_IN_TITLE');
   if (hash(context.code) !== post.codeHash || context.accountId !== post.accountId || context.slug !== post.problemSlug ||
     context.submissionId !== post.submissionId) throw new PostError('SOURCE_INTEGRITY_FAILED');
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });

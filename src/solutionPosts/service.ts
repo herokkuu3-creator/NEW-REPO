@@ -11,6 +11,7 @@ import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallen
 import { AIModelRouter, RoutingError } from './router';
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { isSageProvider } from '../config/solutionPostProvider';
+import { reserveArticlePresentation } from './presentation';
 import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
 import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext } from './article';
 import { OutputValidationError } from './router';
@@ -108,11 +109,13 @@ export async function createPostRouter(correlation: { postId?: string; accountId
 }
 
 export async function generatePost(context: SubmissionContext, router?: AIModelRouter, force = false): Promise<SolutionPost> {
+  context = { ...context, presentation: context.presentation ?? await reserveArticlePresentation(context.accountId, context.slug) };
   let post = await ensurePost(context);
   if (!['PENDING', 'RETRY_PENDING'].includes(post.status)) return post;
   checkGenerationBudget(post, force);
   // Use the immutable original snapshot when a later submission for the same problem exists.
-  const savedContext = contextSchema.parse(JSON.parse(post.context));
+  const originalContext = contextSchema.parse(JSON.parse(post.context));
+  const savedContext = { ...originalContext, presentation: originalContext.presentation ?? context.presentation };
   if (hash(savedContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
   const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs));
   const leaseMs = config.solutionPosts.aiProvider === 'firecrawl' ? 6 * FIRECRAWL_STAGE_BUDGET_MS + 120000 :
@@ -120,12 +123,14 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   // Reset an explicitly renewed attempt budget in the same CAS that claims
   // generation. A separate unconditional update can reset another worker's job.
   post = await move(post, 'CHECKING_ELIGIBILITY', { leaseUntil: new Date(Date.now() + leaseMs),
+    context: JSON.stringify(savedContext),
     retryCount: force && post.retryCount >= 4 ? 1 : { increment: 1 } });
   logger.info({ postId: post.id, accountId: post.accountId, retryCount: post.retryCount,
     explicitRetry: force, previousError: post.lastError }, 'solution article generation claimed');
   try {
     // Context comes only from a verified accepted DailyRun; publishing rechecks eligibility and identity.
-    const recent = await prisma.solutionPost.findMany({ where: { accountId: post.accountId, id: { not: post.id }, title: { not: null } },
+    const recent = await prisma.solutionPost.findMany({ where: { OR: [{ accountId: post.accountId }, { problemSlug: post.problemSlug }],
+      id: { not: post.id }, title: { not: null } },
       orderBy: { createdAt: 'desc' }, take: 8 });
     post = await move(post, 'GENERATING', { lastError: null });
     const activeRouter = router ?? await createPostRouter({ postId: post.id, accountId: post.accountId });

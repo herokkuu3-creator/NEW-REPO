@@ -39,6 +39,7 @@ vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error 
 }, generateForRun: h.generate, resolveCurrentDaily: h.daily, retryPost: h.retry }));
 vi.mock('../src/solutionPosts/store', () => ({ recoverGeneration: vi.fn(), approvePost: h.approve }));
 vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: h.publish }));
+vi.mock('../src/solutionPosts/dailyPublication', () => ({ publishDailyPost: h.publish, processDailyPublicationQueue: vi.fn(async () => {}) }));
 vi.mock('../src/scheduler/dailyWorker', () => ({ runSubmissionNow: h.submit }));
 vi.mock('../src/scheduler/rangeSubmission', () => ({ submitSingleQuestionDirectly: h.submitSingle }));
 import { afterPostSchedule, POST_CRON, POST_TIMEZONE, runCombined, runManualQuestion, runScheduledSolutionPosts,

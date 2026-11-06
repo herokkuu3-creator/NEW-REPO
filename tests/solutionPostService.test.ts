@@ -23,6 +23,8 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
   systemState: { findUnique: vi.fn(async () => null), upsert: vi.fn(async () => ({})), deleteMany: vi.fn(async () => ({ count: 1 })) },
 } }));
 vi.mock('../src/solutionPosts/article', async orig => ({ ...(await orig() as object), generateArticle: h.generation }));
+vi.mock('../src/solutionPosts/presentation', async orig => ({ ...(await orig() as object),
+  reserveArticlePresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['strip', 'ledger'], themes: ['aurora', 'ocean'] })) }));
 vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn(), verifyHostedVisualAssets: h.verifyVisuals }));
 vi.mock('playwright', () => ({ chromium: { launch: h.launch } }));
 vi.mock('../src/browser/sessionCheck', () => ({ checkSession: h.checkSession }));

@@ -19,6 +19,7 @@ vi.mock('../src/database/prisma', () => ({ prisma: { solutionPost: { findMany: v
 vi.mock('../src/solutionPosts/service', () => ({ generateForRun: vi.fn(), retryPost: h.retry, resetFailedSolutionPostRetries: h.reset, PostError: class extends Error {} }));
 vi.mock('../src/solutionPosts/store', () => ({ approvePost: vi.fn() }));
 vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: vi.fn(), reconcilePost: vi.fn() }));
+vi.mock('../src/solutionPosts/dailyPublication', () => ({ dailyPublicationStatus: vi.fn(async () => ({ minimumGapMs: 1200000 })) }));
 vi.mock('../src/solutionPosts/scheduler', () => ({ setSelectedAccounts: h.schedule, runCombined: h.combined,
   runScheduledSolutionPosts: h.scheduled, isScheduledSolutionRunInProgress: () => false,
   SCHEDULE_STATE_KEY: 'solution-post-scheduler:last-tick', POST_CRON: '0 6 * * *', POST_TIMEZONE: 'Asia/Kolkata' }));

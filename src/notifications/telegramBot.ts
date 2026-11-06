@@ -1857,6 +1857,7 @@ function solutionStageText(stage: string, error?: string, previousError?: string
     case 'publishing_article': return '📮 Posting article to LeetCode…';
     case 'published': return '✅ Solution and article published';
     case 'article_ready': return '📝 Article generated and awaiting review';
+    case 'publication_queued': return '⏳ Reviewed article queued; daily posts are spaced at least 20 minutes apart.';
     case 'skipped': return error === 'ACCOUNT_JOB_IN_PROGRESS' ? '⏳ Another run is processing this account; this run skipped it.' :
       `⏭️ Skipped: ${escapeHtml(error ?? 'already in progress')}`;
     case 'failed': {
@@ -1906,7 +1907,7 @@ function renderSolutionWorkflowProgress(
   return lines.join('\n').slice(0, 3900);
 }
 
-async function startDailySolutionWorkflow(accountIds: string[], questionNumber?: number): Promise<void> {
+async function startDailySolutionWorkflow(accountIds: string[], questionNumber?: number, publicationMode: 'daily' | 'manual' = 'daily'): Promise<void> {
   if (!accountIds.length) { await reply('⚠️ Select at least one account for this workflow.'); return; }
   const description = questionNumber ? `question #${questionNumber}` : 'today’s daily question';
   const accounts = (await listEnabledAccounts()).filter(account => accountIds.includes(account.id));
@@ -1938,7 +1939,7 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
   };
   void (async () => {
     const results = questionNumber ? await runManualQuestion(questionNumber, accountIds, new Date(), update) :
-      await runCombined(accountIds, new Date(), update, { retryFailedGeneration: true });
+      await runCombined(accountIds, new Date(), update, { retryFailedGeneration: true, publicationMode });
     const done = results.filter(result => result.status === 'PUBLISHED').length;
     const failed = results.filter(result => result.status === 'FAILED').length;
     const skipped = results.filter(result => result.status === 'SKIPPED').length;
@@ -2043,7 +2044,7 @@ async function handleManualSolutionButton(chatId: number | string, messageId: nu
     manualSolutionSelections.delete(key); pendingPromptType = null;
     await defaultCoinClaimUiDeps.answer(callbackId, 'Starting manual workflow');
     await defaultCoinClaimUiDeps.edit(chatId, messageId, `🚀 Starting the selected accounts for ${question ? `question #${question}` : 'today’s daily problem'}.`);
-    await startDailySolutionWorkflow([...selected], question);
+    await startDailySolutionWorkflow([...selected], question, 'manual');
     return;
   } else { await defaultCoinClaimUiDeps.answer(callbackId); return; }
   const picker = buildManualSolutionPicker(accounts, selected);
