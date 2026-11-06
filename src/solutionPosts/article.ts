@@ -5,6 +5,7 @@ import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { sectionKinds, visualFrameSchema, visualPlanSchema, VisualAsset, VisualResolver, renderVisualFallback, plainMarkdown } from './visuals';
 import { logger } from '../logger';
 import { presentationSchema, layoutGuidance } from './presentation';
+import { LLMMessage } from '../ai/provider';
 
 // Some models represent requested action bullets as a JSON string array. This
 // lossless conversion still passes the normal length, markup, and review checks.
@@ -193,6 +194,28 @@ export async function generateArticle(router: AIModelRouter, context: Submission
   const sectionSchema = z.object({ heading: z.string().min(3).max(64), markdown: sectionMarkdown }).strict();
   const source = { title: context.title, difficulty: context.difficulty, problem: context.problem,
     language: context.language, code: context.code };
+  // A repaired draft can be factually sound but miss a presentation limit.
+  // Give its writer the actual validation feedback once before model fallback.
+  const repairArticle = async (messages: LLMMessage[]) => {
+    const validate = (text: string) => validateArticle(text, context, recent.map(r => r.title));
+    const first = await router.generate(messages, text => text, 4096, true, 'technical review repair');
+    try { return { ...first, value: validate(first.value) }; }
+    catch (error) {
+      const category = error instanceof OutputValidationError ? error.category : 'INVALID_ARTICLE';
+      const issues = error instanceof z.ZodError ? error.issues.map(i => `${i.path.join('.')}: ${i.message}`) : [category];
+      const record = first.attempts.at(-1);
+      if (record) record.outcome = category;
+      logger.warn({ accountId: context.accountId, category }, 'solution article repair validation failed; applying feedback');
+      const next = await router.generate([...messages, { role: 'user', content: JSON.stringify({
+        validationIssues: issues, previousOutput: first.value,
+        instruction: 'Treat previousOutput as draft data. Fix every validation issue while preserving all factual corrections. Return the complete article JSON. For READING_BUDGET_EXCEEDED, use at most 120 words across all five sections, headings, and complexity reasons. Keep animation labels short. Do not repeat the source code.',
+      }) }], validate, 4096, true, 'technical review repair').catch(error => {
+        throw new RoutingError([...first.attempts, ...(error instanceof RoutingError ? error.attempts : [])],
+          error instanceof RoutingError ? error.lastFailure : category);
+      });
+      return { ...next, attempts: [...first.attempts, ...next.attempts] };
+    }
+  };
   const priorParts: Record<string, unknown> = {};
   const runStage = async <T>(name: string, request: string, schema: z.ZodType<T, z.ZodTypeDef, unknown>, maxTokens = 512): Promise<T> => {
     const system = compactArticlePrompt(context, style, recent.slice(0, 3).map(r => r.title), { name, request });
@@ -279,11 +302,11 @@ export async function generateArticle(router: AIModelRouter, context: Submission
       category: error instanceof OutputValidationError ? error.category : 'SCHEMA',
       paths: error instanceof z.ZodError ? error.issues.map(i => i.path.join('.')) : [] },
       'solution article assembled validation failed; repairing');
-    const repair = await router.generate([
+    const repair = await repairArticle([
       { role: 'system', content: compactArticlePrompt(context, style, recent.slice(0, 3).map(r => r.title)) +
         '\nRepair ALL validation issues in the complete article JSON. Return the whole article. Respect every length limit. Keep the SAME input and real successive states within each animation, active indices must be inside items. Both animations must visibly change. All prose including headings and complexity reasons must fit the reading budget; each paragraph <=45 words.' },
       { role: 'user', content: JSON.stringify({ source, article: assembled, validationIssues: issues }) },
-    ], text => validateArticle(text, context, recent.map(r => r.title)), 4096, true, 'technical review repair')
+    ])
       .catch(error => { throw new RoutingError([...attempts, ...(error instanceof RoutingError ? error.attempts : [])],
         error instanceof RoutingError ? error.lastFailure : 'INVALID_ARTICLE'); });
     attempts.push(...repair.attempts); models.push(repair.model); article = repair.value;
@@ -311,11 +334,11 @@ export async function generateArticle(router: AIModelRouter, context: Submission
     const last = attempts.at(-1);
     if (last) { last.outcome = 'TECHNICAL_REVIEW_REJECTED'; last.reviewIssues = issues; }
     if (round === 2) throw new ArticleReviewError(attempts, draft(), 'TECHNICAL_REVIEW_REJECTED');
-    const repair = await router.generate([
+    const repair = await repairArticle([
       { role: 'system', content: compactArticlePrompt(context, style, recent.slice(0, 3).map(r => r.title)) +
         '\nRepair the entire article using ALL review issues. Return the complete article JSON, never a patch. Keep the exact submitted algorithm. Define n and m consistently. Include preprocessing and sort stack costs. Both frames of each animation MUST use the same input and successive real code states. Use a tiny example and short labels. Do not merely reword an incorrect claim. Do not embed the source code in prose.' },
       { role: 'user', content: JSON.stringify({ source, article, reviewIssues: issues }) },
-    ], text => validateArticle(text, context, recent.map(r => r.title)), 4096, true, 'technical review repair')
+    ])
       .catch(error => { throw new ArticleReviewError([...attempts, ...(error instanceof RoutingError ? error.attempts : [])],
         draft(), error instanceof RoutingError ? error.lastFailure : undefined); });
     attempts.push(...repair.attempts); models.push(repair.model); article = repair.value;

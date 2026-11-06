@@ -340,6 +340,21 @@ describe('AI model routing', () => {
     expect(error.lastFailure).toBe('TECHNICAL_REVIEW_REJECTED');
     expect(api.chat.completions.create).toHaveBeenCalledTimes(14);
   });
+  it('repairs an overlong factual correction with explicit validation feedback before another review', async () => {
+    const api = client();
+    const responses = stagedResponses(article, '{"approved":false,"issues":["Fix the trace"]}');
+    const overlong = structuredClone(article);
+    overlong.sections.forEach(section => { section.markdown = Array(35).fill('Track this value carefully.').join(' '); });
+    responses.push(complete(JSON.stringify(overlong)), complete(JSON.stringify(article)), complete('{"approved":true,"issues":[]}'));
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
+    const result = await generateArticle(new AIModelRouter(options, api as never), context, []);
+    expect(result.reviewModel).toBe('terra');
+    expect(result.attempts.some(a => a.outcome === 'READING_BUDGET_EXCEEDED')).toBe(true);
+    const feedback = (api.chat.completions.create.mock.calls[11]![0] as any).messages.at(-1).content;
+    expect(feedback).toContain('READING_BUDGET_EXCEEDED');
+    expect(feedback).toContain('at most 120 words');
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(13);
+  });
   it('repairs cross-frame validation errors before reviewing the complete article', async () => {
     const api = client(); const responses = stagedResponses(article);
     const frame = structuredClone(article.visuals[0]!.frames[1]!); frame.active = [7];
