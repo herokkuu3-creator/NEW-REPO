@@ -17,7 +17,8 @@ export const visualTitleSchema = z.string().trim().min(3).max(160).transform(tit
 });
 export const visualFrameSchema = z.object({
   label: z.string().min(2).max(48), items: z.array(z.string().max(24)).min(1).max(8),
-  active: z.array(z.number().int().min(0).max(7)).max(8),
+  active: z.preprocess(value => typeof value === 'number' ? [value] : value,
+    z.array(z.number().int().min(0).max(7)).max(8)),
   state: z.string().min(1).max(64), metric: z.string().min(1).max(40), note: z.string().max(76),
 }).strict();
 export const visualPlanSchema = z.object({

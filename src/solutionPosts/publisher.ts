@@ -36,14 +36,15 @@ const listSchema = z.object({ ugcArticleSolutionArticles: z.object({
 }) });
 
 /** Bounded scan. If the full list cannot be checked, publication requires manual reconciliation. */
-async function existingPost(api: LeetCodeApi, context: SubmissionContext) {
+async function existingPost(api: LeetCodeApi, context: SubmissionContext, expectedTitle?: string) {
   for (let page = 0; page < 10; page++) {
     const result = await api.graphql(ACCOUNT_SOLUTION_ARTICLES_QUERY, { questionSlug: context.slug,
       skip: page * 100, first: 100 }, listSchema);
     if (result.ugcArticleSolutionArticles.edges.some(e => e.node.author?.userName.toLowerCase() !== context.username.toLowerCase())) {
       throw new PostError('ACCOUNT_SOLUTION_FILTER_UNVERIFIED');
     }
-    const found = result.ugcArticleSolutionArticles.edges.find(e => e.node.author?.userName.toLowerCase() === context.username.toLowerCase());
+    const found = result.ugcArticleSolutionArticles.edges.find(e => e.node.author?.userName.toLowerCase() === context.username.toLowerCase() &&
+      (expectedTitle === undefined || e.node.title === expectedTitle));
     if (found) return `https://leetcode.com/problems/${context.slug}/solutions/${found.node.topicId}/${found.node.slug}/`;
     if (!result.ugcArticleSolutionArticles.pageInfo.hasNextPage) return null;
   }
@@ -178,7 +179,11 @@ export async function publishPost(id: string) {
           summary: post.title!, thumbnail: '', tags: [],
         } }, publishSchema);
         const response = result.ugcArticlePublishSolution;
-        if (response.error || !response.article) throw new PostError('POST_API_REJECTED');
+        if (response.error || !response.article) {
+          logger.warn({ postId: id, reason: String(response.error ?? 'NO_ARTICLE_RETURNED')
+            .replace(/(?:fc-|sk-|cc_)[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 500) }, 'solution article publication API rejected');
+          throw new PostError('POST_API_REJECTED');
+        }
         const url = `https://leetcode.com/problems/${context.slug}/solutions/${response.article.topicId}/${response.article.slug}/`;
         if (!validSolutionUrl(url, context.slug)) throw new PostError('POST_URL_UNVERIFIED');
         post = await prisma.solutionPost.update({ where: { id }, data: { publishedUrl: url } });
@@ -187,7 +192,11 @@ export async function publishPost(id: string) {
         logger.info({ postId: id, url, transport: 'api', executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
           revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication verified');
         return post;
-      } catch {
+      } catch (error) {
+        logger.warn({ postId: id, errorName: error instanceof Error ? error.name : 'Unknown',
+          failure: error instanceof PostError ? error.code : error instanceof z.ZodError ? 'PUBLICATION_RESPONSE_SCHEMA' : 'PUBLICATION_REQUEST_OR_VERIFICATION_FAILED',
+          paths: error instanceof z.ZodError ? error.issues.map(issue => issue.path.join('.')) : undefined },
+        'solution article publication outcome uncertain');
         return prisma.solutionPost.update({ where: { id }, data: { lastError: 'PUBLICATION_UNCERTAIN_RECONCILE_FIRST' } });
       }
     }
@@ -217,18 +226,22 @@ export async function publishPost(id: string) {
 }
 
 /** Operator supplies the candidate URL after an uncertain result. Only positive verification completes it. */
-export async function reconcilePost(id: string, url: string) {
+export async function reconcilePost(id: string, url?: string) {
   const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
   if (post.status !== 'PUBLISHING' || !post.title) throw new PostError('NOT_A_PENDING_PUBLICATION');
   const context = contextSchema.parse(JSON.parse(post.context));
-  if (!validSolutionUrl(url, context.slug)) throw new PostError('POST_URL_UNVERIFIED');
+  if (url && !validSolutionUrl(url, context.slug)) throw new PostError('POST_URL_UNVERIFIED');
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
   return withAccount(account, async (api, page, username) => {
     await checkEligibility(api, context, username);
     // The operator's local browser may be able to open the UI while Render's
     // browser is blocked. Exact content, topic and authenticated author must
     // still be independently verified through LeetCode's API.
-    await verifyPublishedContent(api, url, context, post.title!, post.markdown!);
-    return move(post, 'PUBLISHED', { publishedUrl: url, publishedAt: new Date(), lastError: null });
+    const candidate = url ?? await existingPost(api, context, post.title!);
+    if (!candidate) throw new PostError('PUBLICATION_NOT_FOUND_RECONCILE_LATER');
+    await verifyPublishedContent(api, candidate, context, post.title!, post.markdown!);
+    logger.info({ postId: id, url: candidate, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
+      revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication reconciled');
+    return move(post, 'PUBLISHED', { publishedUrl: candidate, publishedAt: new Date(), lastError: null });
   });
 }

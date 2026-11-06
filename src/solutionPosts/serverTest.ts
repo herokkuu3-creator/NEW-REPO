@@ -36,7 +36,7 @@ export async function configureServerTest(accountId: string | null) {
 export async function readServerTest(id: string) {
   const row = await prisma.systemState.findUniqueOrThrow({ where: { key: jobKey(id) } });
   const job = JSON.parse(row.value);
-  if (job.status === 'DEFERRED' && job.postId) {
+  if ((job.status === 'DEFERRED' || job.postStatus === 'PUBLISHING') && job.postId) {
     const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id: job.postId } });
     if (post.status === 'PUBLISHED') {
       Object.assign(job, { status: 'PUBLISHED', stage: 'finished', postStatus: post.status, url: post.publishedUrl,

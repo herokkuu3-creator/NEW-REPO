@@ -270,12 +270,12 @@ export async function generateArticle(router: AIModelRouter, context: Submission
     return directFrame.success ? { frame: directFrame.data } : value;
   }, z.object({ frame: visualFrameSchema }).strict());
   const visual1Start = await runStage('concept animation first frame',
-    'Return {title,caption,theme,frame} for visual-1. Use theme aurora or sunset. Explain the key observation on the minimum valid input lengths, at most 1-2 items per collection unless constraints forbid this. Prefer small nonnegative values when valid. Represent relevant values in 1-8 short items; active is zero-based. Include label,state,metric,note. Keep values brief.', frameMetadataSchema);
+    'Return {title,caption,theme,frame} for visual-1. Use theme aurora or sunset. Explain the key observation on the minimum valid input lengths, at most 1-2 items per collection unless constraints forbid this. Prefer small nonnegative values when valid. Show the state BEFORE the first relevant comparison/update, leaving that operation for the next frame. Represent relevant values in 1-8 short items; active is an integer array such as [0], never a scalar. Include label,state,metric,note. Keep values brief.', frameMetadataSchema);
   const visual1Next = await runStage('concept animation next frame',
     `Return {frame} only. Advance the exact source algorithm from this first frame: ${JSON.stringify(visual1Start.frame)}. Keep the same items; change active/state/metric/note to show its real next algorithm state.`,
     nextFrameSchema);
   const visual2Start = await runStage('dry-run animation first frame',
-    `Return {title,caption,theme,frame} for visual-2. Use theme ocean or violet. Animate the exact source on the same input as this dry run: ${dryRun.markdown}. Use 1-8 short items and zero-based active indices. Include label,state,metric,note. Keep values brief.`, frameMetadataSchema);
+    `Return {title,caption,theme,frame} for visual-2. Use theme ocean or violet. Animate the exact source on the same input as this dry run: ${dryRun.markdown}. Show the state BEFORE the next comparison/update, leaving that operation for frame two. Use 1-8 short items; active is an integer array such as [0], never a scalar. Include label,state,metric,note. Keep values brief.`, frameMetadataSchema);
   const visual2Next = await runStage('dry-run animation next frame',
     `Return {frame} only. Advance the exact source from this first frame: ${JSON.stringify(visual2Start.frame)}. Keep the same items; change active/state/metric/note to show its real next state or output.`,
     nextFrameSchema);

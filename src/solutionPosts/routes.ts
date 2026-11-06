@@ -213,7 +213,7 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     });
     scoped.post('/admin/solutions/:id/reconcile', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);
-      const { url } = z.object({ url: z.string().url() }).strict().parse(req.body);
+      const { url } = z.object({ url: z.string().url().optional() }).strict().parse(req.body ?? {});
       const post = await reconcilePost(id, url); return { id, status: post.status, url: post.publishedUrl };
     });
     scoped.post('/admin/solutions/:id/reserve-browser', async req => {

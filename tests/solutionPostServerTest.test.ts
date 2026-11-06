@@ -1,9 +1,10 @@
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ rows: new Map<string, string>(), generate: vi.fn(), approve: vi.fn(), publish: vi.fn(),
-  release: vi.fn(), lease: vi.fn(), run: { accountId: 'a', state: 'SUCCESS', submissionStatus: 'Accepted', submissionId: '123' } }));
+  post: null as any, release: vi.fn(), lease: vi.fn(), run: { accountId: 'a', state: 'SUCCESS', submissionStatus: 'Accepted', submissionId: '123' } }));
 vi.mock('../src/database/prisma', () => ({ prisma: {
   account: { findUniqueOrThrow: async () => ({ id: 'a', status: 'ACTIVE' }) },
   dailyRun: { findUniqueOrThrow: async () => h.run },
+  solutionPost: { findUniqueOrThrow: async () => h.post },
   systemState: {
     findUnique: async ({ where }: any) => h.rows.has(where.key) ? { value: h.rows.get(where.key) } : null,
     findUniqueOrThrow: async ({ where }: any) => ({ value: h.rows.get(where.key) }),
@@ -68,4 +69,10 @@ it('allows only one concurrent test and never publishes a rejected draft', async
   finish({ id: 'post', status: 'FAILED', lastError: 'TECHNICAL_REVIEW_FAILED' });
   await vi.waitFor(async () => expect((await readServerTest(job.id)).status).toBe('FAILED'));
   expect(h.approve).not.toHaveBeenCalled(); expect(h.publish).not.toHaveBeenCalled();
+});
+it('reflects a positively reconciled publication without replaying its request', async () => {
+  h.rows.set('solution-post-server-test:job:reconciled', JSON.stringify({ status: 'FAILED', postStatus: 'PUBLISHING', postId: 'post' }));
+  h.post = { status: 'PUBLISHED', publishedUrl: 'https://leetcode.com/result', publishedAt: new Date() };
+  expect(await readServerTest('reconciled')).toMatchObject({ status: 'PUBLISHED', postStatus: 'PUBLISHED', url: h.post.publishedUrl });
+  expect(h.publish).not.toHaveBeenCalled();
 });

@@ -416,6 +416,19 @@ describe('AI model routing', () => {
     const review = JSON.parse((api.chat.completions.create.mock.calls[9]![0] as any).messages[1].content);
     expect(review.article.visuals[0].title).toBe(result.visuals[0]!.title);
   });
+  it('normalizes a single highlighted index without changing its numeric value or skipping review', async () => {
+    const api = client(); const responses = stagedResponses(article);
+    const start = JSON.parse(responses[5]!.choices[0]!.message.content);
+    start.frame.active = 0;
+    responses[5] = complete(JSON.stringify(start));
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
+    const result = await generateArticle(new AIModelRouter(options, api as never), context, []);
+    expect(result.visuals[0]!.frames[0]!.active).toEqual([0]);
+    expect(result.reviewModel).toBe('terra');
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(10);
+    const broken = structuredClone(result.article); broken.visuals[0]!.frames[0]!.active = [7];
+    expect(() => validateArticle(JSON.stringify(broken), context)).toThrow('Active index is outside');
+  });
   it('gives retries their prior corrections while keeping the new reviewer independent', async () => {
     const api = client(); const responses = stagedResponses(article);
     api.chat.completions.create.mockImplementation(async () => responses.shift() as never);

@@ -106,6 +106,20 @@ describe('authorized solution publishing', () => {
     expect((await reconcilePost('post1', h.url)).status).toBe('PUBLISHED');
     expect(h.click).toHaveBeenCalledTimes(1);
   });
+  it('finds an uncertain article by exact title on the server and verifies its body without republishing', async () => {
+    h.row.status = 'PUBLISHING'; h.duplicate = true;
+    const post = await reconcilePost('post1');
+    expect(post.status).toBe('PUBLISHED'); expect(post.publishedUrl).toBe(h.url);
+    expect(h.click).not.toHaveBeenCalled();
+    expect(h.api.graphql.mock.calls.every((call: any[]) => !call[0].includes('mutation '))).toBe(true);
+  });
+  it('retains uncertainty when its exact article cannot be found or its content differs', async () => {
+    h.row.status = 'PUBLISHING';
+    await expect(reconcilePost('post1')).rejects.toThrow('PUBLICATION_NOT_FOUND');
+    h.duplicate = true; h.verifyFailure = true;
+    await expect(reconcilePost('post1')).rejects.toThrow();
+    expect(h.row.status).toBe('PUBLISHING'); expect(h.click).not.toHaveBeenCalled();
+  });
   it('retains an uncertain state if clicking times out', async () => {
     h.click.mockRejectedValueOnce(new Error('timed out'));
     expect((await publishPost('post1')).status).toBe('PUBLISHING');
