@@ -6,13 +6,17 @@ export const diagramLayouts = ['strip', 'ledger', 'focus'] as const;
 export const presentationSchema = z.object({
   layout: z.enum(articleLayouts), diagrams: z.tuple([z.enum(diagramLayouts), z.enum(diagramLayouts)]),
   themes: z.tuple([z.enum(['aurora', 'sunset', 'ocean', 'violet']), z.enum(['aurora', 'sunset', 'ocean', 'violet'])]),
+  codePlacement: z.enum(['end', 'after-approach']).default('end'),
+  costStyle: z.enum(['standard', 'bullets', 'compact']).default('standard'),
 });
 export type ArticlePresentation = z.infer<typeof presentationSchema>;
 const themes = ['aurora', 'sunset', 'ocean', 'violet'] as const;
 export function presentationVariant(index: number): ArticlePresentation {
   return { layout: articleLayouts[index % articleLayouts.length]!,
     diagrams: [diagramLayouts[index % 3]!, diagramLayouts[(index + 1) % 3]!],
-    themes: [themes[index % 4]!, themes[(index + 2) % 4]!] };
+    themes: [themes[index % 4]!, themes[(index + 2) % 4]!],
+    codePlacement: Math.floor(index / 6) % 2 ? 'after-approach' : 'end',
+    costStyle: (['standard', 'bullets', 'compact'] as const)[Math.floor(index / 12) % 3]! };
 }
 
 /** A durable assignment avoids identical neighboring accounts and survives retries. */

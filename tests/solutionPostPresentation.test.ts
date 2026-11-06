@@ -35,6 +35,13 @@ it('rejects the full question name and long title fragments but permits a techni
   expect(titleIncludesQuestionName('✨ Distance Value Between Two Arrays, Quickly', {
     title: 'Find the Distance Value Between Two Arrays', slug: 'find-the-distance-value-between-two-arrays' })).toBe(true);
 });
+it('gives a fifteen-account batch distinct reading structures, not only different colors', () => {
+  const draft = articleSchema.parse({ title: '✨ One Lookup Can Reveal the Missing Partner',
+    sections: ['intuition', 'approach', 'correctness', 'dryRun', 'takeaways'].map(kind => ({ kind, heading: kind, markdown: 'A short useful explanation of the decision.' })),
+    time: { bound: 'O(n)', reason: 'One pass visits n input items.' }, space: { bound: 'O(n)', reason: 'The table holds n input items.' } });
+  const formats = Array.from({ length: 15 }, (_, index) => renderArticle(draft, { ...context, presentation: presentationVariant(index) }));
+  expect(new Set(formats).size).toBe(15);
+});
 it('renders different diagram geometries and animated highlights without adding numeric states', async () => {
   const base = visualPlanSchema.parse({ id: 'visual-1', after: 'intuition', title: 'Watch the lookup', caption: 'Follow the active candidate.',
     frames: [

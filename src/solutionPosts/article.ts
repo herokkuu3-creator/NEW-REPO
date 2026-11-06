@@ -167,13 +167,21 @@ export function renderArticle(article: Article, context: SubmissionContext, asse
     return [block, ...visuals].join('\n\n');
   });
   const separator = layout === 'questions' || layout === 'interview' ? '\n\n' : '\n\n---\n\n';
-  const costs = layout === 'questions' || layout === 'example-first' ?
+  const costs = context.presentation?.costStyle === 'bullets' ?
+    `\n\n### Resources\n\n- **Time:** \`${article.time.bound}\`. ${safeCell(article.time.reason)}\n- **Space:** \`${article.space.bound}\`. ${safeCell(article.space.reason)}` :
+    context.presentation?.costStyle === 'compact' ?
+    `\n\n> **Cost at a glance:** time \`${article.time.bound}\`; space \`${article.space.bound}\`.\n\n${safeCell(article.time.reason)} ${safeCell(article.space.reason)}` :
+    layout === 'questions' || layout === 'example-first' ?
     `\n\n### The cost\n\n**Time:** \`${article.time.bound}\` — ${safeCell(article.time.reason)}\n\n**Extra space:** \`${article.space.bound}\` — ${safeCell(article.space.reason)}` :
     `\n\n## ⏱️ Complexity\n\n| | Cost | Why |\n|---|---|---|\n` +
     `| Time | \`${article.time.bound}\` | ${safeCell(article.time.reason)} |\n` +
     `| Space | \`${article.space.bound}\` | ${safeCell(article.space.reason)} |`;
-  return sections.join(separator) + costs +
-    `\n\n## 💻 Accepted code\n\n${fence}${language}\n${context.code}\n${fence}\n`;
+  const codeBlock = `\n\n## 💻 Accepted code\n\n${fence}${language}\n${context.code}\n${fence}\n`;
+  if (context.presentation?.codePlacement === 'after-approach') {
+    sections.splice(ordered.findIndex(s => s.kind === 'approach') + 1, 0, costs + codeBlock);
+    return sections.join(separator);
+  }
+  return sections.join(separator) + costs + codeBlock;
 }
 
 export async function generateArticle(router: AIModelRouter, context: SubmissionContext,
