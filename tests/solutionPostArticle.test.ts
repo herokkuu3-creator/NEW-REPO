@@ -404,12 +404,13 @@ describe('AI model routing', () => {
   it('shortens cosmetic animation headings before review without touching the traced states', async () => {
     const api = client(); const responses = stagedResponses(article);
     const start = JSON.parse(responses[5]!.choices[0]!.message.content);
-    start.title = 'A deliberately descriptive animation heading that is too long for a small mobile card';
+    start.title = '📊 A deliberately descriptive animation heading that is too long for a small mobile card';
     responses[5] = complete(JSON.stringify(start));
     api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
     const result = await generateArticle(new AIModelRouter(options, api as never), context, []);
     expect(result.visuals[0]!.title.length).toBeLessThanOrEqual(48);
     expect(result.visuals[0]!.title).toMatch(/…$/);
+    expect(result.visuals[0]!.title).not.toContain('📊');
     expect(result.visuals[0]!.frames).toEqual(article.visuals[0]!.frames);
     expect(result.title).toBe(article.title);
     expect(api.chat.completions.create).toHaveBeenCalledTimes(10);

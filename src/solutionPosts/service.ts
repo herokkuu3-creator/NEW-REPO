@@ -18,6 +18,7 @@ import { OutputValidationError } from './router';
 import { ensurePost, move } from './store';
 import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, maskSolutionApiKey, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
+import { startArticleWorkKeepAlive } from './keepAlive';
 
 export class PostError extends Error {
   constructor(public readonly code: string, public readonly details?: {
@@ -131,6 +132,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     retryCount: force && post.retryCount >= 4 ? 1 : { increment: 1 } });
   logger.info({ postId: post.id, accountId: post.accountId, retryCount: post.retryCount,
     explicitRetry: force, previousError: post.lastError }, 'solution article generation claimed');
+  const stopKeepAlive = startArticleWorkKeepAlive();
   try {
     // Context comes only from a verified accepted DailyRun; publishing rechecks eligibility and identity.
     const recent = await prisma.solutionPost.findMany({ where: { OR: [{ accountId: post.accountId }, { problemSlug: post.problemSlug }],
@@ -179,7 +181,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
         error: post.lastError }, 'solution article generation failed');
     }
     return post;
-  }
+  } finally { stopKeepAlive(); }
 }
 
 export async function generateForRun(accountId: string, runId: string, force = false): Promise<SolutionPost> {

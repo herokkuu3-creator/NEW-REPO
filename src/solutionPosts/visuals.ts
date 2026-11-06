@@ -5,6 +5,8 @@ export const visualThemes = ['aurora', 'sunset', 'ocean', 'violet'] as const;
 // Animation headings are display labels; their complete explanation stays in
 // the caption. Shorten benign overflows without changing any traced values.
 export const visualTitleSchema = z.string().trim().min(3).max(160).transform(title => {
+  // Native SVG fonts do not include color emoji; keep diagram headings legible.
+  title = title.replace(/[\p{Extended_Pictographic}\p{Regional_Indicator}\uFE0F\uFE0E\u200D]/gu, '').trim();
   if (title.length <= 48) return title;
   let prefix = '';
   for (const character of title) {
@@ -14,7 +16,7 @@ export const visualTitleSchema = z.string().trim().min(3).max(160).transform(tit
   const boundary = prefix.lastIndexOf(' ');
   if (boundary >= 24) prefix = prefix.slice(0, boundary);
   return prefix.trimEnd() + '…';
-});
+}).pipe(z.string().min(3).max(48));
 export const visualFrameSchema = z.object({
   label: z.string().min(2).max(48), items: z.array(z.string().max(24)).min(1).max(8),
   active: z.preprocess(value => typeof value === 'number' ? [value] : value,

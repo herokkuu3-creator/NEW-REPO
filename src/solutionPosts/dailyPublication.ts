@@ -5,12 +5,14 @@ import { publishPost } from './publisher';
 import { logger } from '../logger';
 import { config } from '../config';
 import { sendTelegramMessage } from '../notifications/telegram';
+import { startArticleWorkKeepAlive } from './keepAlive';
 
 export const DAILY_PUBLICATION_GAP_MS = 20 * 60 * 1000;
 export const DAILY_PUBLICATION_STATE_KEY = 'solution-post-daily-publication:gate';
 const queuePrefix = 'solution-post-daily-publication:queue:';
 type Gate = { nextAt: number; owner?: string; leaseUntil?: number; lastPostId?: string; lastPublishedAt?: string };
 let draining = false;
+let stopQueueKeepAlive: (() => void) | undefined;
 
 export async function dailyPublicationStatus() {
   const row = await prisma.systemState.findUnique({ where: { key: DAILY_PUBLICATION_STATE_KEY } });
@@ -86,6 +88,9 @@ export async function processDailyPublicationQueue() {
   draining = true;
   try {
     const pending = await prisma.systemState.findMany({ where: { key: { startsWith: queuePrefix } }, orderBy: { updatedAt: 'asc' }, take: 100 });
+    const hasWork = pending.some(row => { try { return (JSON.parse(row.value).failures ?? 0) < 4; } catch { return false; } });
+    if (hasWork && !stopQueueKeepAlive) stopQueueKeepAlive = startArticleWorkKeepAlive();
+    else if (!hasWork && stopQueueKeepAlive) { stopQueueKeepAlive(); stopQueueKeepAlive = undefined; }
     for (const row of pending) {
       try {
         const { postId, failures = 0 } = JSON.parse(row.value);

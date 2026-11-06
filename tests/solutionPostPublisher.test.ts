@@ -120,6 +120,13 @@ describe('authorized solution publishing', () => {
     expect(h.api.graphql.mock.calls.every((call: any[]) => !call[0].includes('mutation '))).toBe(true);
     expect(h.row.status).toBe('DRAFT_READY'); expect(h.click).not.toHaveBeenCalled();
   });
+  it('checks basic verification status when schema discovery is unavailable', async () => {
+    h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [] } })
+      .mockRejectedValueOnce(Error('schema discovery unavailable'))
+      .mockResolvedValueOnce({ userStatus: { isSignedIn: true, username: 'alice', isVerified: false } });
+    expect(await inspectPublication('post1')).toMatchObject({ scanComplete: true, accountStatus: { isVerified: false } });
+    expect(h.api.graphql.mock.calls.every((call: any[]) => !call[0].includes('mutation '))).toBe(true);
+  });
   it('retains uncertainty when its exact article cannot be found or its content differs', async () => {
     h.row.status = 'PUBLISHING';
     await expect(reconcilePost('post1')).rejects.toThrow('PUBLICATION_NOT_FOUND');

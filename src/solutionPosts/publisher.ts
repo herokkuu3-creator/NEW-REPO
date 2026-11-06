@@ -267,6 +267,7 @@ export async function inspectPublication(id: string) {
     }
     let accountStatus: Record<string, unknown> = {};
     let statusFields: string[] = [];
+    let statusProbeError: string | undefined;
     try {
       const root = await api.graphql('query { __schema { queryType { fields { name type { name ofType { name } } } } } }', {}, z.object({ __schema: z.any() }));
       const status = root.__schema?.queryType?.fields?.find((field: { name: string }) => field.name === 'userStatus');
@@ -278,7 +279,15 @@ export async function inspectPublication(id: string) {
         if (allowed.length) accountStatus = (await api.graphql(`query { userStatus { ${allowed.join(' ')} } }`, {}, z.object({ userStatus: z.record(z.unknown()) }))).userStatus;
       }
     } catch { /* account article evidence remains available if schema discovery is disabled */ }
+    if (!statusFields.length) {
+      try {
+        accountStatus = (await api.graphql('query { userStatus { isSignedIn username isVerified } }', {},
+          z.object({ userStatus: z.object({ isSignedIn: z.boolean(), username: z.string().nullable(), isVerified: z.boolean() }) }))).userStatus ?? {};
+      } catch (error) {
+        statusProbeError = error instanceof LeetCodeHttpError ? error.message.slice(0, 500) : 'ACCOUNT_STATUS_QUERY_UNAVAILABLE';
+      }
+    }
     return { executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local', revision: process.env.RENDER_GIT_COMMIT ?? null,
-      postId: id, status: post.status, username, articles, scanComplete, accountStatus, statusFields };
+      postId: id, status: post.status, username, articles, scanComplete, accountStatus, statusFields, statusProbeError };
   });
 }
