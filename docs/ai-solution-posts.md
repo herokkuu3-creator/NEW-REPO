@@ -149,6 +149,12 @@ Daily publication uses a durable queue and a cross-process compare-and-swap gate
 
 The authenticated server-test endpoint accepts optional `publicationMode: "daily" | "manual"` (default manual). Daily mode exercises the same queue as the bot. A test result can be `DEFERRED` while its reviewed draft waits; polling later resolves it to `PUBLISHED` after the queue completes it. The temporary test control does not change selected-account preferences.
 
+Staged generation preserves the last rejected draft and concrete review issues for an explicit retry. This feedback is supplied to the writer; the fresh reviewer receives only the current article and exact source/problem. Configured reasoning models handle factual repairs and verdicts. Bounded validation feedback corrects overlong repairs before model fallback. Oversized diagram headings and scalar highlight indices are normalized without changing traced values; the complete article is still independently reviewed. Reasoning budgets and request/generation leases account for hidden reasoning tokens. Repeated transport failures temporarily cool down that model without rotating otherwise valid keys.
+
+Active generation and eligible queued work share a scoped Render health heartbeat. It stops when the work finishes; it does not wake an already sleeping service for the 06:00 schedule. The external wake setup below remains necessary on a sleeping free service. Publication reservations survive an exception after the remote request. A failed API response triggers a read-only search and exact verification before returning an uncertain result; it never repeats the mutation. `/admin/solutions/:id/reconcile` accepts `{}` to perform the same positive reconciliation later. `GET /admin/solutions/:id/publication-check` provides read-only account/article diagnostics. Missing or mismatched articles remain protected `PUBLISHING` records.
+
+Two further server publications with different presentations and a measured 45-minute gap are recorded in `docs/solution-article-variation-verification-2026-11-06.md`.
+
 ## 06:00 recovery and server diagnostics
 
 The combined workflow completes daily code submissions for **all selected accounts before AI article generation**. Every accepted event requires the matching daily slug, `SUCCESS`, a submission ID, and an `Accepted` verdict. Existing accepted code is reused on article retries. A published manual article cannot suppress the daily code submission. Expired sessions get the same stored-credential refresh as the ordinary daily worker.

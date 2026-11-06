@@ -199,7 +199,20 @@ export async function publishPost(id: string) {
           failure: error instanceof PostError ? error.code : error instanceof z.ZodError ? 'PUBLICATION_RESPONSE_SCHEMA' : 'PUBLICATION_REQUEST_OR_VERIFICATION_FAILED',
           paths: error instanceof z.ZodError ? error.issues.map(issue => issue.path.join('.')) : undefined },
         'solution article publication outcome uncertain');
-        return prisma.solutionPost.update({ where: { id }, data: { lastError: 'PUBLICATION_UNCERTAIN_RECONCILE_FIRST' } });
+        const uncertain = await prisma.solutionPost.update({ where: { id }, data: { lastError: 'PUBLICATION_UNCERTAIN_RECONCILE_FIRST' } });
+        // A lost mutation response can still have created the article. Recover
+        // only through positive read-only evidence; never send another mutation.
+        try {
+          const candidate = uncertain.publishedUrl ?? await existingPost(api, context, post.title!);
+          if (candidate) {
+            await verifyPublishedContent(api, candidate, context, post.title!, post.markdown!);
+            const reconciled = await move(uncertain, 'PUBLISHED', { publishedUrl: candidate, publishedAt: new Date(), lastError: null });
+            logger.info({ postId: id, url: candidate, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
+              revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication reconciled after response failure');
+            return reconciled;
+          }
+        } catch { /* retain the protected result when the article cannot be positively verified */ }
+        return uncertain;
       }
     }
     preparationStage = 'editor';

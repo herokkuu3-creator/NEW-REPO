@@ -69,6 +69,14 @@ describe('authorized solution publishing', () => {
     expect(h.api.graphql.mock.calls.filter((call: any[]) => call[0].includes('mutation '))).toHaveLength(1);
     expect(h.page.goto).not.toHaveBeenCalled(); expect(h.click).not.toHaveBeenCalled();
   });
+  it('recovers a lost publication response through exact read-only verification without a second mutation', async () => {
+    config.solutionPosts.publishTransport = 'api';
+    h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [] } })
+      .mockImplementationOnce(async () => { h.clicked = true; throw Error('response lost after creation'); });
+    expect(await publishPost('post1')).toMatchObject({ status: 'PUBLISHED', publishedUrl: h.url, lastError: null });
+    expect(h.api.graphql.mock.calls.filter((call: any[]) => call[0].includes('mutation '))).toHaveLength(1);
+    expect(h.page.goto).not.toHaveBeenCalled(); expect(h.click).not.toHaveBeenCalled();
+  });
   it('reserves local browser publication atomically and verifies it through the API without opening Render UI', async () => {
     expect((await reserveBrowserPublication('post1', h.row.approvedHash)).status).toBe('PUBLISHING');
     await expect(reserveBrowserPublication('post1', h.row.approvedHash)).rejects.toThrow();
