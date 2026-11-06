@@ -63,6 +63,7 @@ export function validateArticle(text: string, context: SubmissionContext, recent
     const index = visual.id === 'visual-1' ? 0 : 1;
     visual.layout = context.presentation!.diagrams[index];
     visual.theme = context.presentation!.themes[index];
+    visual.motion = context.presentation!.motions?.[index];
   });
   if (titleIncludesQuestionName(article.title, context)) throw new OutputValidationError('QUESTION_NAME_IN_TITLE');
   if (new Set(article.sections.map(s => s.kind)).size !== 5) throw new OutputValidationError('MISSING_CONCEPT');

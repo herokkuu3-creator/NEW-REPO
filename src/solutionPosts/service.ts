@@ -113,13 +113,14 @@ export async function createPostRouter(correlation: { postId?: string; accountId
 }
 
 export async function generatePost(context: SubmissionContext, router?: AIModelRouter, force = false): Promise<SolutionPost> {
-  context = { ...context, presentation: context.presentation ?? await reserveArticlePresentation(context.accountId, context.slug) };
+  context = { ...context, presentation: context.presentation?.visualVersion === 2 ? context.presentation :
+    await reserveArticlePresentation(context.accountId, context.slug) };
   let post = await ensurePost(context);
   if (!['PENDING', 'RETRY_PENDING'].includes(post.status)) return post;
   checkGenerationBudget(post, force);
   // Use the immutable original snapshot when a later submission for the same problem exists.
   const originalContext = contextSchema.parse(JSON.parse(post.context));
-  const savedContext = { ...originalContext, presentation: originalContext.presentation ?? context.presentation };
+  const savedContext = { ...originalContext, presentation: originalContext.presentation?.visualVersion === 2 ? originalContext.presentation : context.presentation };
   if (hash(savedContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
   const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs),
     isSageProvider(config.solutionPosts.baseUrl) ? SAGE_REPAIR_TIMEOUT_MS : 0);

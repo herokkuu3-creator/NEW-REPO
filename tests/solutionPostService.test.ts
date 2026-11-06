@@ -24,7 +24,7 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
 } }));
 vi.mock('../src/solutionPosts/article', async orig => ({ ...(await orig() as object), generateArticle: h.generation }));
 vi.mock('../src/solutionPosts/presentation', async orig => ({ ...(await orig() as object),
-  reserveArticlePresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['strip', 'ledger'], themes: ['aurora', 'ocean'] })) }));
+  reserveArticlePresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 2, motions: ['scan', 'slide'] })) }));
 vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn(), verifyHostedVisualAssets: h.verifyVisuals }));
 vi.mock('playwright', () => ({ chromium: { launch: h.launch } }));
 vi.mock('../src/browser/sessionCheck', () => ({ checkSession: h.checkSession }));
@@ -106,6 +106,16 @@ describe('solution workflow and persistence', () => {
     h.run.date = 'manual:3820:2026-10-15';
     const loaded = await loadContext('a', 'run1');
     expect(loaded.challengeDate).toBe('2026-10-15');
+  });
+  it('upgrades a retry from legacy visual styling without altering its original accepted source', async () => {
+    await generatePost(context, {} as never);
+    h.row.status = 'RETRY_PENDING';
+    h.row.context = JSON.stringify({ ...context, presentation: { layout: 'notebook', diagrams: ['ledger', 'focus'], themes: ['aurora', 'ocean'] } });
+    h.generation.mockClear();
+    expect((await generatePost(context, {} as never)).status).toBe('AWAITING_APPROVAL');
+    const saved = JSON.parse(h.row.context);
+    expect(saved.presentation).toMatchObject({ visualVersion: 2, diagrams: ['timeline', 'rail'] });
+    expect(saved.code).toBe(context.code); expect(h.row.codeHash).toBe(hash(context.code));
   });
   it('persists all-model failure without changing the accepted run', async () => {
     h.generation.mockRejectedValue(new RoutingError([{ model: 'terra', attempt: 1, outcome: 'TIMEOUT', elapsedMs: 1000 }]));

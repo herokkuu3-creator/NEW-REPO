@@ -9,6 +9,10 @@ vi.mock('../src/database/prisma', () => ({ prisma: { systemState: {
 import { reserveArticlePresentation, presentationVariant } from '../src/solutionPosts/presentation';
 import { articleSchema, contextSchema, renderArticle, titleIncludesQuestionName } from '../src/solutionPosts/article';
 import { renderVisualGif, renderVisualFrame, visualPlanSchema } from '../src/solutionPosts/visuals';
+import { visualPreviewPlans } from '../src/solutionPosts/visualSamples';
+import { visualDimensions } from '../src/solutionPosts/visualRenderer';
+import { accountDiagramLayouts } from '../src/solutionPosts/visualStyles';
+import { createHash } from 'node:crypto';
 const context = contextSchema.parse({ accountId: 'a', username: 'a', problemId: '1', slug: 'two-sum', title: 'Two Sum',
   difficulty: 'Easy', problem: 'An example', submissionId: '1', code: 'class Solution {};', language: 'cpp', challengeDate: '2026-11-06' });
 beforeEach(() => h.states.clear());
@@ -16,6 +20,14 @@ it('assigns different layouts and diagrams across accounts while keeping retries
   const [a, b] = await Promise.all([reserveArticlePresentation('a', 'two-sum'), reserveArticlePresentation('b', 'two-sum')]);
   expect(a.layout).not.toBe(b.layout); expect(a.diagrams).not.toEqual(b.diagrams);
   expect(await reserveArticlePresentation('a', 'two-sum')).toEqual(a);
+  expect(await reserveArticlePresentation('a', 'a-different-problem')).toEqual(a);
+});
+it('reserves unique primary geometries and palettes for fifteen accounts across different problems', async () => {
+  const assigned = await Promise.all(Array.from({ length: 15 }, (_, index) => reserveArticlePresentation(`account-${index}`, `problem-${index}`)));
+  expect(new Set(assigned.map(item => item.diagrams[0])).size).toBe(15);
+  expect(new Set(assigned.map(item => item.themes[0])).size).toBe(15);
+  expect(assigned.every(item => item.diagrams[0] !== item.diagrams[1] && item.themes[0] !== item.themes[1])).toBe(true);
+  for (const [index, saved] of assigned.entries()) expect(await reserveArticlePresentation(`account-${index}`, 'tomorrows-problem')).toEqual(saved);
 });
 it('uses different section order, hierarchy, and complexity formatting with exact source retained', () => {
   const draft = articleSchema.parse({ title: '✨ One Lookup Can Reveal the Missing Partner',
@@ -58,3 +70,36 @@ it('renders different diagram geometries and animated highlights without adding 
   }
   expect(new Set(rendered).size).toBe(3);
 });
+it('renders all fifteen families as distinct real animations on identical example data', async () => {
+  const pixels = new Set<string>(); const shapes = new Set<string>(); const animations = new Set<string>();
+  for (let index = 0; index < 15; index++) {
+    const presentation = presentationVariant(index); const plan = visualPreviewPlans(presentation)[0]!;
+    expect(plan.layout).toBe(accountDiagramLayouts[index]);
+    const bytes = await renderVisualGif(plan); const metadata = await sharp(bytes, { animated: true }).metadata();
+    animations.add(createHash('sha256').update(bytes).digest('hex'));
+    const second = await renderVisualGif(visualPreviewPlans(presentation)[1]!);
+    animations.add(createHash('sha256').update(second).digest('hex'));
+    expect([metadata.width, metadata.pageHeight]).toEqual(visualDimensions(plan));
+    expect(metadata.pages).toBe(6); expect(metadata.loop).toBe(0); expect(bytes.length).toBeLessThan(500000);
+    const rgba = await sharp(bytes, { page: 0, pages: 1 }).raw().toBuffer();
+    pixels.add(createHash('sha256').update(rgba).digest('hex'));
+    // Repaint every composition with one palette too: geometry must differ.
+    const sameColor = await sharp(Buffer.from(renderVisualFrame({ ...plan, theme: 'paper', motion: 'scan' }, 0))).raw().toBuffer();
+    shapes.add(createHash('sha256').update(sameColor).digest('hex'));
+    expect(renderVisualFrame(plan, 0, .25)).not.toBe(renderVisualFrame(plan, 0, 1));
+  }
+  expect(pixels.size).toBe(15); expect(shapes.size).toBe(15); expect(animations.size).toBe(30);
+}, 90000);
+it('keeps eight-state, eight-value traces inside the media budget in every family', async () => {
+  for (let index = 0; index < 15; index++) {
+    const plan = visualPreviewPlans(presentationVariant(index))[0]!;
+    plan.frames = Array.from({ length: 8 }, (_, i) => ({ label: `Verified trace step ${i}`,
+      items: Array.from({ length: 8 }, (_, j) => `array[${j}] = 123456789012`), active: [i],
+      state: `step=${i}; current state has several named values to show clearly`,
+      metric: 'comparisons=1234567; remaining=123456',
+      note: 'A longer explanatory note must fit without clipping or hiding the trace.' }));
+    const bytes = await renderVisualGif(plan);
+    expect((await sharp(bytes, { animated: true }).metadata()).pages).toBe(24);
+    expect(bytes.length).toBeLessThan(500000);
+  }
+}, 90000);

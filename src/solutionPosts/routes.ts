@@ -18,6 +18,7 @@ import { probeSageApi, askSage } from '../ai/sageProbe';
 import { logger } from '../logger';
 import { configureServerTest, readServerTest, startServerTest } from './serverTest';
 import { dailyPublicationStatus } from './dailyPublication';
+import { createAccountVisualPreview } from './visualPreview';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
   app.register(async scoped => {
@@ -49,6 +50,10 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     scoped.post('/admin/solutions/test-control', async req => {
       const body = z.object({ accountId: z.string().min(1).nullable() }).strict().parse(req.body);
       return configureServerTest(body.accountId);
+    });
+    scoped.post('/admin/solutions/visual-preview', async req => {
+      const { accountId } = z.object({ accountId: z.string().min(1) }).strict().parse(req.body);
+      return createAccountVisualPreview(accountId);
     });
     scoped.post('/admin/solutions/server-tests', async (req, reply) => {
       const body = z.object({ runId: z.string().min(1), publicationMode: z.enum(['daily', 'manual']).default('manual') }).strict().parse(req.body);

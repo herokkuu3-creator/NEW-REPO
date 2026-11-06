@@ -1,7 +1,9 @@
 import { z } from 'zod';
+import { diagramLayouts, visualThemes, visualMotions, accountDiagramLayouts } from './visualStyles';
+import { renderAccountVisualFrame, visualDimensions } from './visualRenderer';
 
 export const sectionKinds = ['intuition', 'approach', 'correctness', 'dryRun', 'takeaways'] as const;
-export const visualThemes = ['aurora', 'sunset', 'ocean', 'violet'] as const;
+export { visualThemes } from './visualStyles';
 // Animation headings are display labels; their complete explanation stays in
 // the caption. Shorten benign overflows without changing any traced values.
 export const visualTitleSchema = z.string().trim().min(3).max(160).transform(title => {
@@ -27,7 +29,8 @@ export const visualPlanSchema = z.object({
   id: z.string().regex(/^visual-[12]$/), after: z.enum(sectionKinds),
   title: visualTitleSchema, caption: z.string().min(5).max(160),
   theme: z.enum(visualThemes).default('aurora'),
-  layout: z.enum(['strip', 'ledger', 'focus']).optional(),
+  layout: z.enum(diagramLayouts).optional(),
+  motion: z.enum(visualMotions).optional(),
   frames: z.array(visualFrameSchema).min(2).max(8),
 }).superRefine((plan, ctx) => {
   for (const [i, frame] of plan.frames.entries()) if (frame.active.some(n => n >= frame.items.length)) {
@@ -62,8 +65,9 @@ const palettes = {
 
 /** Original code-drawn diagrams: no fetched media, AI-generated URLs, or executable SVG markup. */
 export function renderVisualFrame(plan: VisualPlan, frameIndex: number, phase = 1): string {
+  if ((accountDiagramLayouts as readonly string[]).includes(plan.layout ?? '')) return renderAccountVisualFrame(plan, frameIndex, phase);
   const frame = plan.frames[frameIndex]!;
-  const colors = palettes[plan.theme];
+  const colors = palettes[plan.theme as keyof typeof palettes] ?? palettes.aurora;
   const width = 720; const height = 360;
   const gap = 12; const box = Math.min(144, (width - 72 - gap * (frame.items.length - 1)) / frame.items.length);
   const left = (width - (box * frame.items.length + gap * (frame.items.length - 1))) / 2;
@@ -109,7 +113,7 @@ export function renderVisualFrame(plan: VisualPlan, frameIndex: number, phase = 
 }
 
 function renderAlternateFrame(plan: VisualPlan, frameIndex: number, phase: number, progress: number): string {
-  const frame = plan.frames[frameIndex]!; const c = palettes[plan.theme];
+  const frame = plan.frames[frameIndex]!; const c = palettes[plan.theme as keyof typeof palettes] ?? palettes.aurora;
   const lines = (value: string, width: number) => {
     const chars = Array.from(value); const out: string[] = [];
     for (let i = 0; i < chars.length; i += width) out.push(chars.slice(i, i + width).join(''));
@@ -154,19 +158,25 @@ export async function renderVisualGif(input: VisualPlan): Promise<Buffer> {
   const plan = visualPlanSchema.parse(input);
   const [{ default: sharp }, { GIFEncoder, quantize, applyPalette }] = await Promise.all([import('sharp'), import('gifenc')]);
   const gif = GIFEncoder();
+  const [width, height] = visualDimensions(plan);
   // Process sequentially so a worker never retains a full animation of RGBA frames in memory.
   for (let i = 0; i < plan.frames.length; i++) {
     const phases = plan.layout ? [.25, .65, 1] : [1];
     for (const phase of phases) {
     const rgba = await sharp(Buffer.from(renderVisualFrame(plan, i, phase))).ensureAlpha().raw().toBuffer();
     const palette = quantize(rgba, 64);
-    gif.writeFrame(applyPalette(rgba, palette), 720, 360, { palette, repeat: 0,
+    gif.writeFrame(applyPalette(rgba, palette), width, height, { palette, repeat: 0,
       delay: phase < 1 ? (phase === .25 ? 120 : 160) :
         (i === plan.frames.length - 1 ? 2300 : 1450) - (plan.layout ? 280 : 0) });
     }
   }
   gif.finish();
-  const result = Buffer.from(gif.bytes());
+  let result: Buffer = Buffer.from(gif.bytes());
+  // Long traces use larger canvases. Lossless inter-frame optimisation retains
+  // every reviewed state and playback delay instead of dropping trace steps.
+  if (result.length > 500000) result = await sharp(result, { animated: true }).gif({
+    effort: 7, colours: 64, dither: 0, interFrameMaxError: 0, interPaletteMaxError: 0,
+  }).toBuffer();
   if (result.length > 500000) throw new Error('Visual exceeds the media budget');
   return result;
 }
