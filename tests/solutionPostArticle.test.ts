@@ -156,8 +156,8 @@ describe('AI model routing', () => {
     const api = client(); api.chat.completions.create.mockResolvedValue(complete('42'));
     await new AIModelRouter({ ...options, baseUrl: 'https://discovery-api.intern-ai.org.cn/v1' }, api as never)
       .generate([], JSON.parse, 4096, true, 'technical review repair');
-    expect(api.chat.completions.create.mock.calls[0]![0]).toMatchObject({ max_tokens: 8192 });
-    expect(api.chat.completions.create.mock.calls[0]![1]).toEqual({ timeout: 180000 });
+    expect(api.chat.completions.create.mock.calls[0]![0]).toMatchObject({ max_tokens: 16384 });
+    expect(api.chat.completions.create.mock.calls[0]![1]).toEqual({ timeout: 300000 });
   });
   it('waits for a conservative Sage cooldown when a 429 has no Retry-After', async () => {
     const api = client(); const sleep = vi.fn(async () => {});
@@ -167,6 +167,17 @@ describe('AI model routing', () => {
       .generate([], JSON.parse, 4096, true, 'technical review repair');
     expect(sleep).toHaveBeenCalledWith(60000);
     expect(result.attempts[0]).toMatchObject({ outcome: 'HTTP_429', retryAfterMs: 60000 });
+  });
+  it('cools down a repeatedly timing-out Sage model across article stages and routers', async () => {
+    const api = client(); api.models.list.mockResolvedValue({ data: [{ id: 'offline-reviewer' }, { id: 'online-reviewer' }] });
+    api.chat.completions.create.mockRejectedValueOnce(new OpenAI.APIConnectionTimeoutError())
+      .mockRejectedValueOnce(new OpenAI.APIConnectionTimeoutError()).mockResolvedValue(complete('42'));
+    const opts = { ...options, baseUrl: 'https://discovery-api.intern-ai.org.cn/v1', models: ['offline-reviewer', 'online-reviewer'] };
+    await new AIModelRouter(opts, api as never, async () => {}).generate([], JSON.parse, 1024, true, 'technical review');
+    const next = await new AIModelRouter(opts, api as never, async () => {}).generate([], JSON.parse, 4096, true, 'technical review repair');
+    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as any).model))
+      .toEqual(['offline-reviewer', 'offline-reviewer', 'online-reviewer', 'online-reviewer']);
+    expect(next.attempts[0]).toMatchObject({ model: 'offline-reviewer', outcome: 'MODEL_TEMPORARILY_UNAVAILABLE', attempt: 0 });
   });
   it('applies per-model timeouts and handles a timeout with bounded retry', async () => {
     const api = client(); const sleep = vi.fn(async () => {});

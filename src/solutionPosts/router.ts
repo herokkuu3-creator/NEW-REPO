@@ -7,6 +7,8 @@ import { isBazaarLinkProvider, isSageProvider, solutionPostProviderHeaders } fro
 // in this process, with a little headroom for diagnostics. Never enable paid fallback.
 let nextBazaarFreeRequestAt = 0;
 let bazaarFreeBlockedUntil = 0;
+const sageModelHealth = new Map<string, { failures: number; until: number; lastFailureAt: number }>();
+const SAGE_MODEL_COOLDOWN_MS = 30 * 60 * 1000;
 
 export interface RouterOptions {
   apiKey: string;
@@ -111,6 +113,13 @@ export class AIModelRouter {
           const record = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'UNAVAILABLE' };
           attempts.push(record); this.onAttempt(record); continue;
         }
+        const healthKey = `${new URL(this.options.baseUrl).origin}:${model}`;
+        const blockedUntil = sageReasoning ? sageModelHealth.get(healthKey)?.until ?? 0 : 0;
+        if (blockedUntil > Date.now()) {
+          const record: ModelAttempt = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, stage,
+            outcome: 'MODEL_TEMPORARILY_UNAVAILABLE', deferred: true, retryAfterMs: blockedUntil - Date.now() };
+          attempts.push(record); this.onAttempt(record); lastFailureReason = record.outcome; continue;
+        }
         // Sage Inkstone reasoning models (deepseek, qwen3.8) spend a large
         // portion of max_tokens on internal reasoning_content. The visible
         // JSON output only appears after reasoning finishes. A 512-token
@@ -119,8 +128,10 @@ export class AIModelRouter {
         // reasoning AND the actual structured JSON output.
         // A full-article repair needs output plus reasoning headroom, but
         // reserving 6x its 4096-token output can itself trip provider TPM limits.
-        let attemptMaxTokens = sageReasoning ? Math.min(Math.max(maxTokens * 2,
-          stage?.startsWith('technical review') ? 8192 : 4096), 16384) : maxTokens;
+        const fullRepair = stage === 'technical review repair';
+        const tokenCeiling = fullRepair ? 32768 : 16384;
+        let attemptMaxTokens = sageReasoning ? Math.min(Math.max(maxTokens * (fullRepair ? 4 : 2),
+          stage?.startsWith('technical review') ? 8192 : 4096), tokenCeiling) : maxTokens;
         for (let n = 0; n <= this.options.retries; n++) {
           const started = Date.now();
           const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0,
@@ -150,8 +161,9 @@ export class AIModelRouter {
             const response = await client.chat.completions.create(
               request as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
             { timeout: sageReasoning && stage?.startsWith('technical review') ?
-              Math.max(this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs, 180000) :
+              Math.max(this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs, fullRepair ? 300000 : 180000) :
               this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs });
+            if (sageReasoning) sageModelHealth.delete(healthKey);
             record.usage = response.usage;
             const cost = (response as unknown as { cost?: unknown }).cost;
             if (typeof cost === 'number' && Number.isFinite(cost)) record.cost = cost;
@@ -167,6 +179,12 @@ export class AIModelRouter {
             return { value, model, attempts };
           } catch (error) {
             Object.assign(record, httpFailureDetails(error));
+            if (sageReasoning && (error instanceof OpenAI.APIConnectionError || (record.httpStatus ?? 0) >= 500)) {
+              const old = sageModelHealth.get(healthKey);
+              const failures = (old && Date.now() - old.lastFailureAt <= SAGE_MODEL_COOLDOWN_MS ? old.failures : 0) + 1;
+              sageModelHealth.set(healthKey, { failures, until: failures >= 2 ? Date.now() + SAGE_MODEL_COOLDOWN_MS : 0,
+                lastFailureAt: Date.now() });
+            }
             if (sageReasoning && record.httpStatus === 429 && record.retryAfterMs == null) record.retryAfterMs = 60000;
             if (!record.deferred && record.httpStatus === 429 && isBazaarLinkProvider(this.options.baseUrl)) {
               bazaarFreeBlockedUntil = Math.max(bazaarFreeBlockedUntil, Date.now() + (record.retryAfterMs ?? 1000));
@@ -187,11 +205,12 @@ export class AIModelRouter {
             attempts.push(record); this.onAttempt(record);
           }
           if (record.outcome === 'PROVIDER_ACCESS_BLOCKED') throw new RoutingError(attempts, record.outcome);
+          if (sageReasoning && (sageModelHealth.get(healthKey)?.until ?? 0) > Date.now()) break;
           // Some reasoning/free-tier models occasionally stop at their token
           // boundary even for short structured outputs. Retry that response
           // once under the configured bounded retry budget.
           if (record.outcome === 'INCOMPLETE_OUTPUT' && (/openrouter\.ai/i.test(this.options.baseUrl) || sageReasoning)) {
-            attemptMaxTokens = Math.min(attemptMaxTokens * 2, sageReasoning ? 16384 : 2048);
+            attemptMaxTokens = Math.min(attemptMaxTokens * 2, sageReasoning ? tokenCeiling : 2048);
           }
           transient ||= record.outcome === 'INCOMPLETE_OUTPUT';
           if (exhausted || !transient || n === this.options.retries) break;

@@ -137,6 +137,18 @@ The API publisher was successfully exercised on Render on 6 November 2026, inclu
 
 Verification results for this implementation are recorded in `docs/ai-solution-post-verification.md`.
 
+## Account presentation and daily publication spacing (6 November 2026)
+
+New generations reserve a durable presentation per account/problem in `SystemState`. A batch rotates through notebook, reader questions, example-first, recipe, interview, and field-guide layouts; code placement and resource-summary formatting add structural variation for larger batches. Assignment survives retries. The accepted source remains unchanged. Titles must use an original insight/technique hook: full question names and long verbatim fragments are rejected during generation and before publication. Recent titles from the account and the same problem guide variation across accounts.
+
+Each article's two reviewed animation plans receive different code-rendered treatments (strip, value ledger, or focus) and complementary palettes. Highlight/progress subframes animate between readable holds without inventing intermediate numeric states. Renderer-generated media remains content addressed and subject to the existing public GIF checks.
+
+Daily publication uses a durable queue and a cross-process compare-and-swap gate. A verified daily publication sets the next eligible time to at least 20 minutes later. Waiting drafts remain approved and are not regenerated; cooldowns do not consume automatic generation retry budgets. The queue drains every minute and on restart, including before the 06:00 generation schedule. If Render sleeps, a delayed wake can postpone publication but cannot shorten the minimum gap. An uncertain request also reserves a conservative gap and is never replayed automatically.
+
+`/dailysolution`, scheduled daily runs, and CLI daily runs use this queue. `/manualsolution` (including its daily-problem option), explicit manual publication, and CLI publish remain immediate. The bot reports queued drafts and sends the article link after delayed publication. Voting is not automated.
+
+The authenticated server-test endpoint accepts optional `publicationMode: "daily" | "manual"` (default manual). Daily mode exercises the same queue as the bot. A test result can be `DEFERRED` while its reviewed draft waits; polling later resolves it to `PUBLISHED` after the queue completes it. The temporary test control does not change selected-account preferences.
+
 ## 06:00 recovery and server diagnostics
 
 The combined workflow completes daily code submissions for **all selected accounts before AI article generation**. Every accepted event requires the matching daily slug, `SUCCESS`, a submission ID, and an `Accepted` verdict. Existing accepted code is reused on article retries. A published manual article cannot suppress the daily code submission. Expired sessions get the same stored-credential refresh as the ordinary daily worker.
