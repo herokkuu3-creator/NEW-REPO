@@ -1,7 +1,7 @@
 import { Page } from 'playwright';
 import { z } from 'zod';
 import { prisma } from '../database/prisma';
-import { LeetCodeApi } from '../leetcode/apiClient';
+import { LeetCodeApi, LeetCodeHttpError } from '../leetcode/apiClient';
 import { contextSchema, hash, SubmissionContext, titleIncludesQuestionName } from './article';
 import { move } from './store';
 import { PostError, withAccount } from './service';
@@ -194,6 +194,8 @@ export async function publishPost(id: string) {
         return post;
       } catch (error) {
         logger.warn({ postId: id, errorName: error instanceof Error ? error.name : 'Unknown',
+          httpStatus: error instanceof LeetCodeHttpError ? error.status : undefined,
+          reason: error instanceof LeetCodeHttpError ? error.message.replace(/(?:fc-|sk-|cc_)[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 500) : undefined,
           failure: error instanceof PostError ? error.code : error instanceof z.ZodError ? 'PUBLICATION_RESPONSE_SCHEMA' : 'PUBLICATION_REQUEST_OR_VERIFICATION_FAILED',
           paths: error instanceof z.ZodError ? error.issues.map(issue => issue.path.join('.')) : undefined },
         'solution article publication outcome uncertain');
@@ -243,5 +245,40 @@ export async function reconcilePost(id: string, url?: string) {
     logger.info({ postId: id, url: candidate, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
       revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication reconciled');
     return move(post, 'PUBLISHED', { publishedUrl: candidate, publishedAt: new Date(), lastError: null });
+  });
+}
+
+/** Read-only server diagnostics; never repeats a mutation or exposes session cookies. */
+export async function inspectPublication(id: string) {
+  const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
+  const context = contextSchema.parse(JSON.parse(post.context));
+  const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
+  return withAccount(account, async (api, _page, username) => {
+    if (username.toLowerCase() !== context.username.toLowerCase()) throw new PostError('ACCOUNT_IDENTITY_MISMATCH');
+    const articles: Array<{ title: string; url: string }> = [];
+    let scanComplete = false;
+    for (let page = 0; page < 10; page++) {
+      const result = await api.graphql(ACCOUNT_SOLUTION_ARTICLES_QUERY, { questionSlug: context.slug, skip: page * 100, first: 100 }, listSchema);
+      for (const { node } of result.ugcArticleSolutionArticles.edges) {
+        if (node.author?.userName.toLowerCase() !== username.toLowerCase()) throw new PostError('ACCOUNT_SOLUTION_FILTER_UNVERIFIED');
+        articles.push({ title: node.title, url: `https://leetcode.com/problems/${context.slug}/solutions/${node.topicId}/${node.slug}/` });
+      }
+      if (!result.ugcArticleSolutionArticles.pageInfo.hasNextPage) { scanComplete = true; break; }
+    }
+    let accountStatus: Record<string, unknown> = {};
+    let statusFields: string[] = [];
+    try {
+      const root = await api.graphql('query { __schema { queryType { fields { name type { name ofType { name } } } } } }', {}, z.object({ __schema: z.any() }));
+      const status = root.__schema?.queryType?.fields?.find((field: { name: string }) => field.name === 'userStatus');
+      const name = status?.type?.name ?? status?.type?.ofType?.name;
+      if (typeof name === 'string') {
+        const type = await api.graphql('query($name:String!) { __type(name:$name) { fields { name } } }', { name }, z.object({ __type: z.any() }));
+        statusFields = (type.__type?.fields ?? []).map((field: { name: string }) => field.name);
+        const allowed = ['isSignedIn', 'username', 'isVerified', 'isEmailVerified', 'isBanned', 'isBlocked'].filter(field => statusFields.includes(field));
+        if (allowed.length) accountStatus = (await api.graphql(`query { userStatus { ${allowed.join(' ')} } }`, {}, z.object({ userStatus: z.record(z.unknown()) }))).userStatus;
+      }
+    } catch { /* account article evidence remains available if schema discovery is disabled */ }
+    return { executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local', revision: process.env.RENDER_GIT_COMMIT ?? null,
+      postId: id, status: post.status, username, articles, scanComplete, accountStatus, statusFields };
   });
 }

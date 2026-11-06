@@ -15,7 +15,7 @@ vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error 
   withAccount: vi.fn(async (_account, action) => action(h.api, h.page, 'alice')) }));
 import { hash } from '../src/solutionPosts/article';
 import { config } from '../src/config';
-import { prepareEditor, publishPost, reconcilePost, reserveBrowserPublication, validSolutionUrl } from '../src/solutionPosts/publisher';
+import { prepareEditor, publishPost, reconcilePost, reserveBrowserPublication, validSolutionUrl, inspectPublication } from '../src/solutionPosts/publisher';
 const context = { accountId: 'a', username: 'alice', problemId: '1', slug: 'example', title: 'Example', difficulty: 'Easy',
   problem: 'Example problem', submissionId: '456', language: 'cpp', code: 'class Solution {};', challengeDate: '2026-10-15' };
 const markdown = '## Teach with sets\n\nAn educational explanation.\n\n```cpp\nclass Solution {};\n```\n';
@@ -112,6 +112,13 @@ describe('authorized solution publishing', () => {
     expect(post.status).toBe('PUBLISHED'); expect(post.publishedUrl).toBe(h.url);
     expect(h.click).not.toHaveBeenCalled();
     expect(h.api.graphql.mock.calls.every((call: any[]) => !call[0].includes('mutation '))).toBe(true);
+  });
+  it('inspects the authenticated account articles without any mutation', async () => {
+    h.duplicate = true;
+    const check = await inspectPublication('post1');
+    expect(check).toMatchObject({ username: 'alice', scanComplete: true, articles: [{ title: 'Teach with sets', url: h.url }] });
+    expect(h.api.graphql.mock.calls.every((call: any[]) => !call[0].includes('mutation '))).toBe(true);
+    expect(h.row.status).toBe('DRAFT_READY'); expect(h.click).not.toHaveBeenCalled();
   });
   it('retains uncertainty when its exact article cannot be found or its content differs', async () => {
     h.row.status = 'PUBLISHING';
