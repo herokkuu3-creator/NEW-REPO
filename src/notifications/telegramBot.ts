@@ -20,12 +20,32 @@ import {
   getAccountById,
   listAccounts,
   listEnabledAccounts,
+  parseStoredStorageState,
+  patchAccount,
   saveAccount,
 } from '../database/accounts';
-import { saveEncryptedCredentials } from '../security/credentialStore';
+import { findCredentialsForAccount, saveEncryptedCredentials } from '../security/credentialStore';
 import { loginToLeetCode } from '../leetcode/auth';
+import {
+  clearLeetCodeLoginCooldownsForTests,
+  findStoredLeetCodeAccount,
+  formatRemainingTtl,
+  getLeetCodeLoginCooldown,
+  recordLeetCodeLoginCooldown,
+  verifyStoredLeetCodeAccount,
+  withSingleFlightLogin,
+} from '../leetcode/sessionManager';
+import { extractSessionIdentity } from '../browser/sessionIdentity';
+import { getRecoveryService, hasRecoveryService } from '../recovery/runtime';
+import {
+  cancelAllLeetCodePairingSessions,
+  createLeetCodePairingSession,
+  formatTelegramPairingPrompt,
+  getLatestPendingLeetCodePairingSession,
+  type CreatedLeetCodePairingSession,
+} from '../leetcode/loginHandoff';
 import { loginToCodeforces } from '../codeforces/auth';
-import { verifyAndRefreshAllSessions } from '../security/sessionAutoRefresh';
+import { refreshLeetCodeAccount, verifyAndRefreshAllSessions } from '../security/sessionAutoRefresh';
 import { describeIngest, ingestCookiePayload, Validator } from '../accounts/ingest';
 import { ACCOUNT_LABEL_RE } from '../browser/sessionIdentity';
 import { detectSessionSite, ingestCodeforcesSession, describeCodeforcesIngest } from '../codeforces/session';
@@ -552,12 +572,17 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
   // Handle active interactive login prompt (/lclogin or /cflogin)
   if (activeLoginPrompt) {
     if (text === '/cancel' || lowerText === 'cancel') {
+      cancelAllLeetCodePairingSessions();
       activeLoginPrompt = null;
       await reply('✖️ Login process cancelled.');
       return;
     }
 
-    if (activeLoginPrompt.step === 'awaiting_identifier') {
+    // If the user sends a slash command (like /accounts or /status) while awaiting identifier,
+    // exit the optional fallback prompt and execute the slash command normally.
+    if (activeLoginPrompt.step === 'awaiting_identifier' && text.startsWith('/')) {
+      activeLoginPrompt = null;
+    } else if (activeLoginPrompt.step === 'awaiting_identifier') {
       const identifier = text.trim();
       if (!identifier || identifier.startsWith('/')) {
         await reply('⚠️ Please send a valid username or email address (not a command), or /cancel to abort.');
@@ -576,7 +601,7 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       return;
     }
 
-    if (activeLoginPrompt.step === 'awaiting_password') {
+    if (activeLoginPrompt && activeLoginPrompt.step === 'awaiting_password') {
       if (!msg.text || !text || text.startsWith('/')) {
         await reply('Send your password as text, or /cancel to abort. Commands are not treated as passwords.');
         return;
@@ -716,18 +741,48 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       case '/lc_login':
       case '/leetcodelogin':
       case '/leetcode_login': {
-        if (activeLeetCodeLogin) { await reply('A LeetCode login is running. Use /cancel or wait for its result.'); return; }
-        const label = commandArg ? commandArg.trim() : undefined;
-        activeLoginPrompt = {
-          site: 'leetcode',
-          step: 'awaiting_identifier',
-          label,
-        };
-        const labelNote = label ? ` for account <code>${escapeHtml(label)}</code>` : '';
+        if (activeLeetCodeLogin) {
+          await reply('A LeetCode login is running. Use /cancel or wait for its result.');
+          return;
+        }
+        await handleLeetCodeLoginCommand(commandArg ? commandArg.trim() : undefined);
+        return;
+      }
+      case '/recover':
+      case '/recoveraccount': {
+        if (!commandArg) {
+          await reply('Usage: /recover <account label> — sends a fresh single-use recovery link for that account.');
+          return;
+        }
+        const outcome = await getRecoveryService().requestRecovery(commandArg.trim());
+        if (outcome === 'unknown_account') await reply(`No stored LeetCode account matches "${commandArg.trim()}". See /accounts.`);
+        else if (outcome === 'in_progress') await reply('A recovery browser session for that account is already running.');
+        else await reply('🔗 Recovery link sent (single-use).');
+        return;
+      }
+      case '/recoveries':
+      case '/recovery_status': {
+        const lines = await getRecoveryService().describeOpen();
         await replyHtml(
-          `🔐 <b>LeetCode Interactive Login</b>${labelNote}\n\n` +
-          `Please reply with your LeetCode <b>username or email address</b>:\n` +
-          `<i>(Send /cancel anytime to abort)</i>`,
+          lines.length === 0
+            ? '✅ No LeetCode accounts are waiting for recovery.'
+            : `<b>Pending LeetCode recoveries</b>\n${lines.map((l) => `• ${escapeHtml(l)}`).join('\n')}`,
+        );
+        return;
+      }
+      case '/cancelrecovery':
+      case '/cancel_recovery': {
+        if (!commandArg) {
+          await reply('Usage: /cancelrecovery <account label>');
+          return;
+        }
+        const outcome = await getRecoveryService().cancelByLabel(commandArg.trim());
+        await reply(
+          outcome === 'cancelled'
+            ? '🛑 Recovery cancelled; its link is revoked and reminders stopped.'
+            : outcome === 'none'
+              ? 'That account has no open recovery.'
+              : `No stored LeetCode account matches "${commandArg.trim()}".`,
         );
         return;
       }
@@ -757,7 +812,7 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
         return;
       case '/renew': {
         if (!commandArg) {
-          pendingRenewalLabel = undefined;
+          pendingRenewalLabel = pendingLeetCodeVerificationHandoff?.label;
           pendingRangePrompt = false;
           pendingPromptType = null;
           await reply(RENEW_INSTRUCTIONS);
@@ -768,6 +823,9 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
           return;
         }
         pendingRenewalLabel = commandArg;
+        if (pendingLeetCodeVerificationHandoff) {
+          pendingLeetCodeVerificationHandoff.label = commandArg;
+        }
         await reply(`🏷️ Renewing the "${commandArg}" account. Send its cookie export (text or file) in your next message. /cancel aborts.`);
         return;
       }
@@ -1084,10 +1142,21 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       case '/cancel_queue':
         await reply(handleClearQueue());
         return;
-      case '/cancel':
+      case '/cancel': {
+        const cancelledPairings = cancelAllLeetCodePairingSessions();
+        const hadPendingRenewal = Boolean(
+          pendingRenewalLabel || pendingLeetCodeVerificationHandoff || cancelledPairings > 0,
+        );
         pendingRenewalLabel = undefined;
+        pendingLeetCodeVerificationHandoff = null;
         pendingRangePrompt = false;
         pendingPromptType = null;
+        if (activeLeetCodeLogin) {
+          activeLeetCodeLogin.abort();
+          activeLeetCodeLogin = null;
+          await reply('✖️ Active LeetCode login cancelled.');
+          return;
+        }
         if (activeLoginPrompt) {
           activeLoginPrompt = null;
           await reply('✖️ Login process cancelled.');
@@ -1111,12 +1180,17 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
           await handleCancelCodeChefRange();
           return;
         }
+        if (hadPendingRenewal) {
+          await reply('✖️ Pending session renewal cancelled.');
+          return;
+        }
         await reply(
           currentRangeJob()
             ? '❌ No renewal is in progress. To stop the question-range job, send /cancelrange.'
             : '❌ No renewal is in progress. When you are ready, send /renew (or /renew <label>) and then the cookies.',
         );
         return;
+      }
       default:
         await reply('🤔 Unknown command. Available: /lclogin, /cflogin, /checksessions, /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /capsolver, /capsolverstatus, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /startqueue, /queuestatus, /clearqueue, /cancel, /help');
         return;
@@ -1224,7 +1298,7 @@ export interface CookieMessageResult {
  */
 export async function processCookieMessage(
   payload: string,
-  opts: { label?: string; fileName?: string; validator?: Validator } = {},
+  opts: { label?: string; fileName?: string; validate?: boolean; validator?: Validator } = {},
 ): Promise<CookieMessageResult> {
   const detected = detectSessionSite(payload, opts.fileName);
 
@@ -1258,17 +1332,43 @@ export async function processCookieMessage(
     };
   }
 
+  const handoff = pendingLeetCodeVerificationHandoff;
+  const effectiveOpts = handoff
+    ? {
+        ...opts,
+        label: opts.label ?? handoff.label,
+        validate: opts.validate ?? true,
+      }
+    : opts;
+
   // Default/fallback path is deliberately the existing LeetCode ingestion.
-  // This preserves all current LeetCode /renew behavior.
-  const result = await ingestCookiePayload(payload, opts);
+  // When completing a /lclogin verification handoff, live server validation runs automatically.
+  const result = await ingestCookiePayload(payload, effectiveOpts);
   if (!result.ok) {
     return { stored: false, site: 'leetcode', text: `${opts.fileName ? `${opts.fileName}: ` : ''}${describeIngest(result)}` };
   }
+
+  let handoffNotice = '';
+  if (handoff) {
+    pendingLeetCodeVerificationHandoff = null;
+    pendingRenewalLabel = undefined;
+    if (result.status === AccountStatus.ACTIVE) {
+      clearLeetCodeLoginCooldownsForTests();
+      const verifiedUsername = result.username || handoff.identifier;
+      await saveEncryptedCredentials('leetcode', result.label, {
+        username: verifiedUsername,
+        password: handoff.password,
+        label: result.label,
+      });
+      handoffNotice = `\n🔐 Verified live on server & encrypted credentials saved for ${result.label}.`;
+    }
+  }
+
   const total = (await listAccounts()).length;
   return {
     stored: true,
     site: 'leetcode',
-    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}\n\n📊 LeetCode accounts stored: ${total}. Send more files to add more — /accounts lists them.`,
+    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}${handoffNotice}\n\n📊 LeetCode accounts stored: ${total}. Send more files to add more — /accounts lists them.`,
   };
 }
 
@@ -6205,6 +6305,15 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
 /** Pending /renew <label> target — consumed by the next cookie payload. */
 let pendingRenewalLabel: string | undefined;
 
+export interface PendingLeetCodeVerificationHandoff {
+  label: string;
+  identifier: string;
+  password: string;
+  createdAt: number;
+}
+
+let pendingLeetCodeVerificationHandoff: PendingLeetCodeVerificationHandoff | null = null;
+
 export interface PendingLoginState {
   site: 'leetcode' | 'codeforces';
   step: 'awaiting_identifier' | 'awaiting_password';
@@ -6223,6 +6332,161 @@ export function setActiveLoginPrompt(state: PendingLoginState | null): void {
   activeLoginPrompt = state;
 }
 
+export function getPendingRenewalLabel(): string | undefined {
+  return pendingRenewalLabel;
+}
+
+export function setPendingRenewalLabel(label: string | undefined): void {
+  pendingRenewalLabel = label;
+}
+
+export function getPendingLeetCodeVerificationHandoff(): PendingLeetCodeVerificationHandoff | null {
+  return pendingLeetCodeVerificationHandoff;
+}
+
+export function setPendingLeetCodeVerificationHandoff(state: PendingLeetCodeVerificationHandoff | null): void {
+  pendingLeetCodeVerificationHandoff = state;
+  if (state === null) {
+    clearLeetCodeLoginCooldownsForTests();
+  }
+}
+
+export function getActiveLeetCodePairingSession(): CreatedLeetCodePairingSession | null {
+  return getLatestPendingLeetCodePairingSession();
+}
+
+function getAccountTtlBadge(account: AccountRecord): string {
+  const parsed = parseStoredStorageState(account.storageState);
+  if (!parsed.ok) return 'invalid cookie state';
+  const identity = extractSessionIdentity(parsed.state, Math.floor(Date.now() / 1000));
+  if (identity.expiresAt === undefined) return 'session cookie';
+  const remaining = Math.max(0, Math.round(identity.expiresAt - Date.now() / 1000));
+  return formatRemainingTtl(remaining);
+}
+
+/**
+ * Autonomous Server-Side `/lclogin` Orchestrator:
+ *
+ * 1. If `/lclogin` (no argument) is invoked and accounts are already configured in PostgreSQL:
+ *    - Runs autonomous server-side verification (`refreshLeetCodeAccount`) across all stored
+ *      LeetCode accounts via the GraphQL `userStatus` API (without opening `/accounts/login/`
+ *      when the stored session is already valid).
+ *    - Reports active accounts, verified usernames, and remaining JWT TTLs immediately.
+ * 2. If `/lclogin <label>` is invoked:
+ *    - First checks if `<label>` already has a valid stored session on the server (`verifyStoredLeetCodeAccount`).
+ *      If valid, reuses it immediately without asking for a password or opening a browser.
+ *    - Otherwise, if encrypted credentials are stored for `<label>`, executes autonomous server-side
+ *      re-login immediately without asking the user to type a password.
+ *    - Only prompts for username/password if no valid session or stored credentials exist.
+ */
+export async function handleLeetCodeLoginCommand(
+  labelArg?: string,
+  replyFunc: (text: string) => Promise<void> = replyHtml,
+): Promise<void> {
+  const label = labelArg?.trim() || undefined;
+
+  if (!label) {
+    const accounts = (await listAccounts().catch(() => [])).filter(
+      (a) => a.status !== AccountStatus.DISABLED,
+    );
+    if (accounts.length > 0) {
+      await replyFunc(
+        `🤖 <b>Autonomous Server-Side LeetCode Authentication</b>\n` +
+        `<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n` +
+        `🔎 Verifying <b>${accounts.length}</b> stored LeetCode account(s) on Render via GraphQL <code>userStatus</code>…`,
+      );
+
+      let validCount = 0;
+      let refreshedCount = 0;
+      let attentionCount = 0;
+      const accountLines: string[] = [];
+
+      for (const acc of accounts) {
+        const outcome = await refreshLeetCodeAccount(acc);
+        const latest = (await getAccountById(acc.id).catch(() => null)) ?? acc;
+        const ttl = getAccountTtlBadge(latest);
+        const userTag = outcome.username || latest.username ? ` (<code>${escapeHtml(outcome.username || latest.username || '')}</code>)` : '';
+        if (outcome.status === 'valid') {
+          validCount += 1;
+          accountLines.push(`🟢 <b>${escapeHtml(acc.label)}</b>${userTag} — <i>ACTIVE · TTL ${escapeHtml(ttl)}</i>`);
+        } else if (outcome.status === 'refreshed') {
+          refreshedCount += 1;
+          accountLines.push(`🔄 <b>${escapeHtml(acc.label)}</b>${userTag} — <i>Auto-refreshed via stored credentials · TTL ${escapeHtml(ttl)}</i>`);
+        } else {
+          attentionCount += 1;
+          accountLines.push(`🟠 <b>${escapeHtml(acc.label)}</b>${userTag} — <i>${escapeHtml((outcome.error ?? outcome.status).slice(0, 90))}</i>`);
+        }
+      }
+
+      const summaryHeader =
+        attentionCount === 0
+          ? `✅ <b>Autonomous Server Authentication Active (${validCount + refreshedCount}/${accounts.length} Ready)</b>`
+          : `⚠️ <b>Server Authentication Report (${validCount + refreshedCount}/${accounts.length} Ready, ${attentionCount} Need Attention)</b>`;
+
+      await replyFunc(
+        [
+          summaryHeader,
+          '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+          `• 🟢 Active via stored session: <b>${validCount}</b>`,
+          `• 🔄 Auto-refreshed via credentials: <b>${refreshedCount}</b>`,
+          `• ⚠️ Needs attention: <b>${attentionCount}</b>`,
+          '',
+          ...accountLines,
+          '',
+          `💡 <i>All daily challenges, check-ins (+1 LeetCoin), contest rewards, and range submissions execute 100% server-side via authenticated GraphQL/REST APIs without opening the browser login page.</i>`,
+          `<i>To add or authenticate a specific account label, send <code>/lclogin &lt;label&gt;</code>.</i>`,
+        ].join('\n'),
+      );
+      return;
+    }
+  }
+
+  if (label) {
+    const existing = await findStoredLeetCodeAccount(label);
+    if (existing) {
+      const verified = await verifyStoredLeetCodeAccount(existing, { maxAttempts: 2, baseBackoffMs: 300 });
+      if (verified.authenticated && verified.username) {
+        const ttl = formatRemainingTtl(verified.remainingTtlSeconds);
+        await replyFunc(
+          `✅ <b>Account Already Authenticated on Server!</b>\n` +
+          `<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n` +
+          `• Account label: <code>${escapeHtml(existing.label)}</code>\n` +
+          `• Verified username: <code>${escapeHtml(verified.username)}</code>\n` +
+          `• Status: <b>ACTIVE</b> (verified live via LeetCode GraphQL <code>userStatus</code>)\n` +
+          `• Session TTL remaining: <code>${escapeHtml(ttl)}</code>\n` +
+          (verified.cookiesRotated ? `• 🔄 Session cookies automatically rotated & persisted to PostgreSQL.\n` : '') +
+          `\n<i>No browser login needed — this account is ready for autonomous daily and range submissions.</i>`,
+        );
+        return;
+      }
+
+      const storedCreds = await findCredentialsForAccount('leetcode', existing);
+      if (storedCreds) {
+        await handleExecuteLogin('leetcode', existing.label, storedCreds.username, storedCreds.password, replyFunc);
+        return;
+      }
+    } else {
+      const storedCredsByLabel = await findCredentialsForAccount('leetcode', { label, username: label });
+      if (storedCredsByLabel) {
+        await handleExecuteLogin('leetcode', label, storedCredsByLabel.username, storedCredsByLabel.password, replyFunc);
+        return;
+      }
+    }
+  }
+
+  activeLoginPrompt = {
+    site: 'leetcode',
+    step: 'awaiting_identifier',
+    label,
+  };
+  const labelNote = label ? ` for account <code>${escapeHtml(label)}</code>` : '';
+  await replyFunc(
+    `🔐 <b>LeetCode Server-Side Login</b>${labelNote}\n\n` +
+    `Please reply with your LeetCode <b>username or email address</b>:\n` +
+    `<i>(If a valid session already exists on the server for this account, it will be verified and reused automatically without triggering Cloudflare. Send /cancel anytime to abort.)</i>`,
+  );
+}
+
 export async function handleExecuteLogin(
   site: 'leetcode' | 'codeforces',
   label: string,
@@ -6238,31 +6502,159 @@ export async function handleExecuteLogin(
   if (controller) activeLeetCodeLogin = controller;
   const siteName = site === 'leetcode' ? 'LeetCode' : 'Codeforces';
   try {
+    if (site === 'leetcode') {
+      // 1. Autonomous Session Reuse First:
+      // Check if the server already holds a valid session for this label or identifier
+      // via lightweight GraphQL userStatus BEFORE launching Chromium or hitting /accounts/login/.
+      const existingAccount =
+        (await findStoredLeetCodeAccount(label)) ??
+        (await findStoredLeetCodeAccount(identifier));
+      if (existingAccount) {
+        const verified = await verifyStoredLeetCodeAccount(existingAccount, {
+          maxAttempts: 2,
+          baseBackoffMs: 300,
+        });
+        if (verified.authenticated && verified.username) {
+          cancelAllLeetCodePairingSessions();
+          pendingLeetCodeVerificationHandoff = null;
+          pendingRenewalLabel = undefined;
+          await saveEncryptedCredentials('leetcode', existingAccount.label, {
+            username: verified.username,
+            password,
+            label: existingAccount.label,
+          });
+          const ttl = formatRemainingTtl(verified.remainingTtlSeconds);
+          await replyFunc(
+            `✅ <b>LeetCode Session Verified on Server (Zero-Browser Reuse)!</b>\n` +
+            `• Authenticated as: <code>${escapeHtml(verified.username)}</code>\n` +
+            `• Account label: <code>${escapeHtml(existingAccount.label)}</code>\n` +
+            `• Status: <b>ACTIVE</b> (TTL: <code>${escapeHtml(ttl)}</code>)\n` +
+            `• Encrypted credentials updated in PostgreSQL for autonomous maintenance.\n` +
+            `• Bypassed <code>/accounts/login/</code> completely by reusing the active server session.`,
+          );
+          return;
+        }
+      }
+
+      // 2. Check Server Login Cooldown to avoid hammering Cloudflare /accounts/login/
+      const cooldown = await getLeetCodeLoginCooldown(label);
+      if (cooldown.coolingDown) {
+        const mins = Math.max(1, Math.ceil(cooldown.remainingSeconds / 60));
+        await replyFunc(
+          `⏳ <b>LeetCode Login Cooldown Active (${mins}m remaining)</b>\n` +
+          `• Account label: <code>${escapeHtml(label)}</code>\n` +
+          `• Reason: Cloudflare blocked headless datacenter login on <code>/accounts/login/</code> (<code>${escapeHtml(cooldown.code ?? 'VERIFICATION_REQUIRED')}</code>).\n` +
+          `• The server enforces a cooldown so repeated login attempts do not rate-limit or lock out the account.`,
+        );
+        return;
+      }
+    }
+
     await replyFunc(
       `🔄 <b>Logging in to ${siteName}...</b>\n` +
       `• Account label: <code>${escapeHtml(label)}</code>\n` +
       `• Identifier: <code>${escapeHtml(identifier)}</code>\n\n` +
-      (site === 'leetcode' ? '<i>Checking the normal login flow. Browser verification may require /renew.</i>' : '<i>Starting account authentication…</i>'),
+      (site === 'leetcode'
+        ? '<i>Executing autonomous server-side authentication…</i>'
+        : '<i>Starting account authentication…</i>'),
     );
 
     if (site === 'leetcode') {
-      const res = await loginToLeetCode(identifier, password, {
-        signal: controller!.signal,
-        onProgress: async (msg) => {
-          await replyFunc(escapeHtml(msg)).catch(() => undefined);
-        },
-      });
+      const res = await withSingleFlightLogin(label, () =>
+        loginToLeetCode(identifier, password, {
+          signal: controller!.signal,
+          onProgress: async (msg) => {
+            await replyFunc(escapeHtml(msg)).catch(() => undefined);
+          },
+        }),
+      );
 
       if (!res.ok || !res.storageState) {
+        if (res.code === 'VERIFICATION_REQUIRED') {
+          await recordLeetCodeLoginCooldown(
+            label,
+            res.code,
+            res.error || 'Cloudflare verification required on /accounts/login/',
+          );
+
+          if (hasRecoveryService()) {
+            try {
+              // 1. Securely save encrypted credentials so the server-side recovery portal can autofill them
+              await saveEncryptedCredentials('leetcode', label, {
+                username: identifier,
+                password,
+                label,
+              }).catch((err) => {
+                logger.warn({ err: errText(err), label }, 'Failed to save encrypted credentials during verification prompt');
+              });
+
+              // 2. Ensure an account record exists in database
+              let account = await findStoredLeetCodeAccount(label).catch(() => null);
+              if (!account) {
+                await saveAccount(label, JSON.stringify({ cookies: [], origins: [] }), {
+                  username: identifier,
+                  status: AccountStatus.EXPIRED,
+                }).catch(() => undefined);
+                account = await findStoredLeetCodeAccount(label).catch(() => null);
+              } else if (account.status === AccountStatus.ACTIVE) {
+                await patchAccount(account.id, {
+                  status: AccountStatus.EXPIRED,
+                  lastError: 'Cloudflare verification required',
+                }).catch(() => undefined);
+              }
+
+              // 3. Trigger server-hosted remote interactive recovery portal
+              const recoverySvc = getRecoveryService();
+              if (recoverySvc && account) {
+                const outcome = await recoverySvc.requestRecovery(account.label).catch(() => null);
+                if (outcome === 'sent') {
+                  await replyFunc(
+                    `🛡️ <b>Cloudflare Verification Required</b>\n` +
+                    `• Account: <code>${escapeHtml(label)}</code>\n` +
+                    `• Credentials have been encrypted and stored in PostgreSQL.\n` +
+                    `• A single-use server recovery link has been issued above.\n\n` +
+                    `<i>Tap <b>Reconnect Account</b> above to complete verification. The server will automatically fill your password, verify identity, and store the active session.</i>`,
+                  );
+                  return;
+                }
+              }
+            } catch (recErr) {
+              logger.warn({ err: errText(recErr), label }, 'Recovery portal dispatch bypassed; falling back to pairing prompt');
+            }
+          }
+
+          pendingRenewalLabel = label;
+          pendingLeetCodeVerificationHandoff = {
+            label,
+            identifier,
+            password,
+            createdAt: Date.now(),
+          };
+          const pairingSession = createLeetCodePairingSession({
+            label,
+            identifier,
+            password,
+          });
+          await replyFunc(
+            formatTelegramPairingPrompt(pairingSession, {
+              reason: 'verification_required',
+              diagnosticError: res.error || 'Browser verification required.',
+            }) +
+              `\n\n<i>(Server login cooldown armed for 30m to prevent Cloudflare rate-limiting. Optional recovery: <code>/renew</code> is also armed for <code>${escapeHtml(label)}</code>.)</i>`,
+          );
+          return;
+        }
         await replyFunc(
           `❌ <b>LeetCode Login Failed:</b>\n` +
           `<i>${escapeHtml(res.error || 'Authentication timed out or failed.')}</i>\n\n` +
-          (res.code === 'VERIFICATION_REQUIRED' ? 'Sign in in your browser and import the session with <code>/renew</code>.' :
-            `Diagnostic: <code>${escapeHtml(res.code ?? 'LOGIN_FAILED')}</code>. Retry <code>/lclogin</code> or use <code>/renew</code>.`),
+          `Diagnostic: <code>${escapeHtml(res.code ?? 'LOGIN_FAILED')}</code>. Retry <code>/lclogin</code> or use <code>/renew</code>.`,
         );
         return;
       }
 
+      cancelAllLeetCodePairingSessions();
+      pendingLeetCodeVerificationHandoff = null;
+      pendingRenewalLabel = undefined;
       const username = res.username || identifier;
       await saveEncryptedCredentials('leetcode', label, {
         username,

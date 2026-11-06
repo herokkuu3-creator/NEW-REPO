@@ -22,6 +22,8 @@ import {
   patchAccount,
 } from '../database/accounts';
 import { refreshLeetCodeAccount } from '../security/sessionAutoRefresh';
+import { persistRotatedCookiesFromContext } from '../leetcode/sessionManager';
+import { reportAccountSessionDown } from '../recovery/runtime';
 import { AccountOutcome, buildReport, RunReport, summarizeReport } from './report';
 import { BrowserSession, launchWithStorageStateObject } from '../browser/playwright';
 import { claimContestReward } from '../leetcode/contestReward';
@@ -389,6 +391,7 @@ async function runForAccount(
           checked: true,
         });
         logger.warn({ label }, 'account session REJECTED by LeetCode — skipping');
+        void reportAccountSessionDown(account.id);
         return {
           label,
           username: account.username,
@@ -457,6 +460,7 @@ async function runForAccount(
     // a stored accepted submission ID for the account.
     const existing = await findRunByDate(account.id, today);
     if (shouldSkipExistingDailyRun(existing, forceRun, renewalTriggered, daily.slug)) {
+      await persistRotatedCookiesFromContext(account, state.state, activeSession.context);
       logger.info(
         { label, today, problemSlug: daily.slug, submissionId: existing?.submissionId, renewalTriggered },
         'current LeetCode daily already accepted — skipping submission',
@@ -600,6 +604,7 @@ async function runForAccount(
       }
     }
 
+    await persistRotatedCookiesFromContext(account, state.state, activeSession.context);
     const resultOutcome = contestReward.claimed ? { ...outcome, coinsCollected: true } : outcome;
     return (checkinResult.checkedIn || checkinResult.awarded) ? { ...resultOutcome, dailyCheckin: true } : resultOutcome;
   } catch (err) {

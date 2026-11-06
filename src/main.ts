@@ -13,6 +13,7 @@ import { startTelegramBot } from './notifications/telegramBot';
 import { startCodeforcesScheduler, triggerCodeforcesRun } from './codeforces/worker';
 import { startCodeChefScheduler } from './codechef/worker';
 import { startMorningSessionCheckScheduler } from './security/sessionAutoRefresh';
+import { getRecoveryService, startRecoveryScheduler } from './recovery/runtime';
 import { startSolutionPostScheduler } from './solutionPosts/scheduler';
 import { verifySolutionProviderOnBoot } from './solutionPosts/providerDiagnostics';
 
@@ -49,17 +50,21 @@ async function main(): Promise<void> {
 
   await connectDatabase();
 
+  // Session recovery: a restored session resumes automation immediately (accepted accounts are skipped by dedupe).
+  const recovery = getRecoveryService({ onRecovered: () => triggerRun('session-renewal') });
   const app = await startHealthServer({
     triggerRun,
     isRunInProgress,
     runSubmission: () => runSubmissionNow(TRIGGER_SUBMISSION_REASON),
     triggerCodeforcesRun,
+    recovery,
   });
   const stopScheduler = startScheduler();
   const stopTelegramBot = startTelegramBot();
   const stopCodeforcesScheduler = startCodeforcesScheduler();
   const stopCodeChefScheduler = startCodeChefScheduler();
   const stopMorningSessionCheck = startMorningSessionCheckScheduler();
+  const stopRecovery = startRecoveryScheduler(recovery);
   const stopSolutionPosts = startSolutionPostScheduler();
   void verifySolutionProviderOnBoot().catch(() => logger.warn('solution provider startup probe could not complete'));
 
@@ -70,6 +75,7 @@ async function main(): Promise<void> {
     stopCodeforcesScheduler();
     stopCodeChefScheduler();
     stopMorningSessionCheck();
+    stopRecovery();
     stopSolutionPosts();
     await app.close().catch(() => undefined);
     await disconnectDatabase().catch(() => undefined);

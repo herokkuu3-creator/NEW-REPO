@@ -20,9 +20,9 @@ export interface LeetCodeLoginOptions {
   onProgress?: (status: string) => Promise<void> | void;
 }
 
-const LOGIN_URL = 'https://leetcode.com/accounts/login/';
-const USERNAME = 'input#id_login, input[name="username"], input[name="login"], input[autocomplete="username"], input[placeholder*="Username" i], input[placeholder*="E-mail" i]';
-const PASSWORD = 'input#id_password, input[name="password"], input[type="password"]';
+export const LOGIN_URL = 'https://leetcode.com/accounts/login/';
+export const USERNAME = 'input#id_login, input[name="username"], input[name="login"], input[autocomplete="username"], input[placeholder*="Username" i], input[placeholder*="E-mail" i]';
+export const PASSWORD = 'input#id_password, input[name="password"], input[type="password"]';
 const VERIFICATION_MESSAGE = 'Verification is required on LeetCode. Sign in in your browser, then use /renew to import the authenticated session.';
 
 class LoginFailure extends Error {
@@ -30,7 +30,7 @@ class LoginFailure extends Error {
 }
 
 /** Read-only inspection: no fabricated tokens, clearance cookies, or button overrides. */
-async function verificationState(page: Page): Promise<'none' | 'required'> {
+export async function verificationState(page: Page): Promise<'none' | 'required'> {
   return page.evaluate(() => {
     if (/just a moment|checking your browser|security verification/i.test(document.title) ||
       document.querySelector('#challenge-running, #challenge-form, #cf-challenge-running')) return 'required';
@@ -43,7 +43,7 @@ async function verificationState(page: Page): Promise<'none' | 'required'> {
 }
 
 /** A verified server identity is mandatory; a cookie or homepage redirect is insufficient. */
-async function signedInUser(page: Page, timeoutMs: number): Promise<string | null> {
+export async function signedInUser(page: Page, timeoutMs: number): Promise<string | null> {
   return page.evaluate(async timeout => {
     try {
       const response = await fetch('/graphql/', {

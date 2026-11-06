@@ -28,8 +28,17 @@ import { RunReport, summarizeReport } from '../scheduler/report';
 import { isoLocal } from '../time';
 import { PIN_COOKIE, PinGate, pinPage, readPinFromEnv, safeNext } from './pinGate';
 import { registerSolutionPostRoutes } from '../solutionPosts/routes';
+import type { RecoveryService } from '../recovery/service';
+import { registerRecoveryRoutes } from '../recovery/routes';
+import { runRemoteBrowserPoc } from '../recovery/poc';
 import { registerVisualAssetRoutes } from '../solutionPosts/visualStore';
 import { probeSageApi, askSage, sageConsoleHtml } from '../ai/sageProbe';
+import {
+  completeLeetCodePairingSession,
+  getLeetCodePairingSession,
+  renderLeetCodePairingPortalHtml,
+  resolvePublicBaseUrl,
+} from '../leetcode/loginHandoff';
 
 /**
  * Health + minimal admin API.
@@ -50,6 +59,8 @@ export interface ApiHooks {
   /** Runs the submission for every account and resolves with the report (null = run already in progress). */
   runSubmission: () => Promise<RunReport | null>;
   triggerCodeforcesRun?: (reason: string) => Promise<{ started: boolean; message: string }>;
+  /** LeetCode session recovery (portal + admin diagnostics). */
+  recovery?: RecoveryService;
 }
 
 /** Shape of a Playwright storageState file — validated, never logged. */
@@ -184,6 +195,118 @@ export async function startHealthServer(
 
   registerSolutionPostRoutes(app, requireAdmin);
   registerVisualAssetRoutes(app);
+
+  // --- LeetCode session recovery portal + admin diagnostics ------------------
+  if (hooks.recovery) {
+    const recovery = hooks.recovery;
+    registerRecoveryRoutes(app, recovery);
+    app.get('/admin/recovery', async (req, reply) => {
+      if (!requireAdmin(req.headers.authorization)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
+      return { ok: true, open: await recovery.describeOpen() };
+    });
+    app.post('/admin/recovery/monitor', async (req, reply) => {
+      if (!requireAdmin(req.headers.authorization)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
+      return { ok: true, summary: await recovery.monitorAccounts() };
+    });
+    // Proof of concept FROM THIS SERVER'S NETWORK: how do LeetCode/Cloudflare treat the remote browser?
+    app.post('/admin/recovery/poc', async (req, reply) => {
+      if (!requireAdmin(req.headers.authorization)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
+      if (recovery.activeSessionCount > 0) return reply.code(409).send({ ok: false, error: 'a recovery session is active' });
+      const { screenshot, ...result } = await runRemoteBrowserPoc({ settleMs: 12_000 });
+      return { ok: true, result, frameBytes: screenshot?.length ?? 0 };
+    });
+  }
+
+  // --- Telegram-initiated LeetCode interactive pairing routes (/lclogin) -----
+  app.get('/auth/leetcode/:token', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    reply.header('X-Robots-Tag', 'noindex, nofollow');
+    const { token } = req.params as { token: string };
+    const now = Date.now();
+    const session = getLeetCodePairingSession(token, now);
+
+    if (!session) {
+      return reply
+        .code(404)
+        .type('text/html; charset=utf-8')
+        .send(renderLeetCodePairingPortalHtml(null, 'invalid'));
+    }
+
+    if (session.status === 'completed' || session.status === 'completing') {
+      return reply
+        .code(409)
+        .type('text/html; charset=utf-8')
+        .send(renderLeetCodePairingPortalHtml(null, 'used'));
+    }
+
+    if (session.status === 'cancelled') {
+      return reply
+        .code(410)
+        .type('text/html; charset=utf-8')
+        .send(renderLeetCodePairingPortalHtml(null, 'cancelled'));
+    }
+
+    if (session.status === 'expired' || now >= session.expiresAt) {
+      return reply
+        .code(410)
+        .type('text/html; charset=utf-8')
+        .send(renderLeetCodePairingPortalHtml(null, 'expired'));
+    }
+
+    const baseUrl = resolvePublicBaseUrl();
+    const pairingUrl = `${baseUrl}/auth/leetcode/${session.token}`;
+    const viewSession = {
+      ...session,
+      pairingUrl,
+      companionCommand: `npm run auth:login -- "${pairingUrl}"`,
+      expiresInMinutes: Math.max(1, Math.ceil((session.expiresAt - now) / 60_000)),
+    };
+
+    return reply
+      .code(200)
+      .type('text/html; charset=utf-8')
+      .send(renderLeetCodePairingPortalHtml(viewSession));
+  });
+
+  app.post('/auth/leetcode/:token', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    reply.header('X-Robots-Tag', 'noindex, nofollow');
+    const { token } = req.params as { token: string };
+    const outcome = await completeLeetCodePairingSession(token, req.body);
+
+    if (!outcome.ok) {
+      return reply.code(outcome.httpStatus).send({
+        ok: false,
+        code: outcome.code,
+        error: outcome.error,
+        label: outcome.label ?? null,
+        username: outcome.username ?? null,
+        localVerifiedUsername: outcome.localVerifiedUsername ?? null,
+        accountStatus: outcome.accountStatus ?? null,
+        serverVerified: outcome.serverVerified ?? false,
+        localVsServerMismatch: outcome.localVsServerMismatch ?? false,
+      });
+    }
+
+    const trigger = await hooks.triggerRun('session-renewal').catch(() => ({
+      started: false,
+      message: 'not started',
+    }));
+
+    return reply.code(200).send({
+      ok: true,
+      label: outcome.label,
+      username: outcome.username,
+      localVerifiedUsername: outcome.localVerifiedUsername,
+      accountStatus: outcome.accountStatus,
+      serverVerified: outcome.serverVerified,
+      localVsServerMismatch: outcome.localVsServerMismatch,
+      cookieCount: outcome.cookieCount,
+      detail: outcome.detail,
+      runStarted: trigger.started,
+      runMessage: trigger.message,
+    });
+  });
 
   // Sage Inkstone (Intern-AI) Console and API endpoints
   app.get('/sage', async (_req, reply) => {

@@ -17,6 +17,7 @@
         "codechef:seed": "tsx scripts/seed-codechef-sessions.ts",
         "dev": "tsx watch src/main.ts",
         "auth:setup": "tsx scripts/auth-setup.ts",
+        "auth:login": "tsx scripts/auth-setup.ts",
         "run:now": "tsx scripts/run-now.ts",
         "solution:post": "tsx scripts/solution-post.ts",
         "prisma:generate": "prisma generate",

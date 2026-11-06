@@ -57,7 +57,7 @@ export async function validateCookiesAgainstLeetcode(
   try {
     const isHeadless = config.browser.headless;
     browser = await chromium.launch({
-      headless: isHeadless ? false : false,
+      headless: isHeadless,
       args: buildLaunchArgs(isHeadless),
     });
     const context = await browser.newContext({

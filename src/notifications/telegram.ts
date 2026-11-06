@@ -7,6 +7,8 @@ import { logger } from '../logger';
 export interface TelegramMessageOptions {
   parseMode?: 'HTML' | 'MarkdownV2';
   disableWebPagePreview?: boolean;
+  /** Telegram reply_markup (e.g. an inline keyboard with URL buttons). */
+  replyMarkup?: unknown;
 }
 
 export async function sendTelegramMessage(text: string, options: TelegramMessageOptions = {}): Promise<boolean> {
@@ -24,6 +26,7 @@ export async function sendTelegramMessage(text: string, options: TelegramMessage
         text,
         disable_web_page_preview: options.disableWebPagePreview ?? true,
         ...(options.parseMode ? { parse_mode: options.parseMode } : {}),
+        ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
       }),
       signal: AbortSignal.timeout(15_000),
     });

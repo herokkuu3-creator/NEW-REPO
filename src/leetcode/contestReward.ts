@@ -5,6 +5,7 @@ import { checkSession } from '../browser/sessionCheck';
 import { launchWithStorageStateObject } from '../browser/playwright';
 import { LeetCodeApi } from './apiClient';
 import { claimDailyCheckin } from './dailyCheckin';
+import { persistRotatedCookiesFromContext } from './sessionManager';
 import { logger } from '../logger';
 
 export interface ContestRewardResult {
@@ -92,6 +93,7 @@ export async function claimContestRewardForAccount(account: AccountRecord): Prom
     }
     const checkin = await claimDailyCheckin(api, account.label);
     const reward = await claimContestReward(api, account.label);
+    await persistRotatedCookiesFromContext(account, parsed.state, session.context);
     return {
       ...reward,
       checkedIn: checkin.checkedIn,

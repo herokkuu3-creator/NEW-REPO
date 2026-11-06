@@ -8,6 +8,12 @@ import { LeetCodeApi } from '../leetcode/apiClient';
 import { launchWithStorageStateObject } from '../browser/playwright';
 import { findCredentialsForAccount } from './credentialStore';
 import { loginToLeetCode } from '../leetcode/auth';
+import {
+  getLeetCodeLoginCooldown,
+  persistRotatedCookiesFromContext,
+  recordLeetCodeLoginCooldown,
+  withSingleFlightLogin,
+} from '../leetcode/sessionManager';
 import { loginToCodeforces } from '../codeforces/auth';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { config } from '../config';
@@ -40,6 +46,9 @@ async function checkLeetCodeSessionLive(account: AccountRecord): Promise<{ authe
     if (!session) return { authenticated: false, cause: 'browser-launch-failed' };
     const api = new LeetCodeApi(session.context);
     const result = await checkSession(api);
+    if (result.authenticated) {
+      await persistRotatedCookiesFromContext(account, parsed.state, session.context);
+    }
     return result;
   } catch (err) {
     return { authenticated: false, cause: err instanceof Error ? err.message : String(err) };
@@ -92,8 +101,24 @@ export async function refreshLeetCodeAccount(account: AccountRecord): Promise<Ac
     };
   }
 
+  const cooldown = await getLeetCodeLoginCooldown(account.label);
+  if (cooldown.coolingDown) {
+    const mins = Math.max(1, Math.ceil(cooldown.remainingSeconds / 60));
+    const msg = `Server login cooldown active (${mins}m remaining after ${cooldown.code ?? 'VERIFICATION_REQUIRED'})`;
+    logger.info({ label: account.label, remainingSeconds: cooldown.remainingSeconds }, 'Skipping redundant LeetCode login during cooldown');
+    return {
+      site: 'leetcode',
+      label: account.label,
+      username: account.username,
+      status: 'failed',
+      error: msg,
+    };
+  }
+
   logger.info({ label: account.label, username: creds.username }, 'Attempting automated LeetCode re-login with stored credentials');
-  const loginRes = await loginToLeetCode(creds.username, creds.password);
+  const loginRes = await withSingleFlightLogin(account.label, () =>
+    loginToLeetCode(creds.username, creds.password),
+  );
 
   if (loginRes.ok && loginRes.storageState) {
     await saveAccount(account.label, JSON.stringify(loginRes.storageState), {
@@ -107,6 +132,14 @@ export async function refreshLeetCodeAccount(account: AccountRecord): Promise<Ac
       username: loginRes.username ?? creds.username,
       status: 'refreshed',
     };
+  }
+
+  if (loginRes.code === 'VERIFICATION_REQUIRED' || loginRes.code === 'LOGIN_RATE_LIMITED') {
+    await recordLeetCodeLoginCooldown(
+      account.label,
+      loginRes.code,
+      loginRes.error ?? 'Cloudflare verification required',
+    );
   }
 
   const errDetail = loginRes.error ?? 'Auto-relogin failed';

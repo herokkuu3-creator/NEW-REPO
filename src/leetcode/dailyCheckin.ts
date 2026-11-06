@@ -4,6 +4,7 @@ import { parseStoredStorageState } from '../database/accounts';
 import { checkSession } from '../browser/sessionCheck';
 import { launchWithStorageStateObject } from '../browser/playwright';
 import { LeetCodeApi } from './apiClient';
+import { persistRotatedCookiesFromContext } from './sessionManager';
 import { logger } from '../logger';
 
 export interface DailyCheckinResult {
@@ -96,7 +97,9 @@ export async function claimDailyCheckinForAccount(account: AccountRecord): Promi
     if (!check.authenticated) {
       return { checkedIn: false, error: 'LeetCode session is not authenticated; renew this account first' };
     }
-    return await claimDailyCheckin(api, account.label);
+    const res = await claimDailyCheckin(api, account.label);
+    await persistRotatedCookiesFromContext(account, parsed.state, session.context);
+    return res;
   } catch (err) {
     return { checkedIn: false, error: err instanceof Error ? err.message : String(err) };
   } finally {

@@ -26,6 +26,7 @@ model Account {
   runs          DailyRun[]
   solutionPosts SolutionPost[]
   solutionPreference SolutionPostPreference?
+  recoveries    AccountRecovery[]
 
   @@index([status])
 }
@@ -256,3 +257,41 @@ enum CodeChefAccountStatus {
   DISABLED
 }
 
+
+/// Per-account LeetCode session recovery state machine.
+/// RECOVERY_PENDING -> AWAITING_VERIFICATION -> VERIFYING -> RECOVERED
+///                  \-> RECOVERY_FAILED -> (next reminder re-arms) RECOVERY_PENDING
+/// At most ONE open recovery per account (partial unique index in migration 0007).
+/// Only a SHA-256 hash of the one-time token is stored, never the token itself,
+/// and never a password or cookie.
+model AccountRecovery {
+  id                String         @id @default(cuid())
+  accountId         String
+  account           Account        @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  status            RecoveryStatus @default(RECOVERY_PENDING)
+  reason            String // EXPIRED | REJECTED
+  telegramChatId    String
+  tokenHash         String?        @unique
+  tokenExpiresAt    DateTime?
+  tokenUsedAt       DateTime?
+  lastNotifiedAt    DateTime?
+  nextReminderAt    DateTime?
+  attemptCount      Int            @default(0)
+  lastErrorCategory String?
+  lastError         String?        @db.Text
+  recoveredAt       DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  @@index([status, nextReminderAt])
+  @@index([accountId])
+}
+
+enum RecoveryStatus {
+  RECOVERY_PENDING
+  AWAITING_VERIFICATION
+  VERIFYING
+  RECOVERY_FAILED
+  RECOVERED
+  CANCELLED
+}
