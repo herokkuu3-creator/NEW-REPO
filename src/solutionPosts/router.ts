@@ -9,6 +9,8 @@ let nextBazaarFreeRequestAt = 0;
 let bazaarFreeBlockedUntil = 0;
 const sageModelHealth = new Map<string, { failures: number; until: number; lastFailureAt: number }>();
 const SAGE_MODEL_COOLDOWN_MS = 30 * 60 * 1000;
+export const SAGE_REPAIR_TIMEOUT_MS = 300000;
+export const SAGE_REVIEW_TIMEOUT_MS = 180000;
 
 export interface RouterOptions {
   apiKey: string;
@@ -161,7 +163,8 @@ export class AIModelRouter {
             const response = await client.chat.completions.create(
               request as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
             { timeout: sageReasoning && stage?.startsWith('technical review') ?
-              Math.max(this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs, fullRepair ? 300000 : 180000) :
+              Math.max(this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs,
+                fullRepair ? SAGE_REPAIR_TIMEOUT_MS : SAGE_REVIEW_TIMEOUT_MS) :
               this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs });
             if (sageReasoning) sageModelHealth.delete(healthKey);
             record.usage = response.usage;

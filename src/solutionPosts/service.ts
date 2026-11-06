@@ -8,7 +8,7 @@ import { parseStoredStorageState } from '../database/accounts';
 import { checkSession } from '../browser/sessionCheck';
 import { LeetCodeApi } from '../leetcode/apiClient';
 import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallenge';
-import { AIModelRouter, RoutingError } from './router';
+import { AIModelRouter, RoutingError, SAGE_REPAIR_TIMEOUT_MS } from './router';
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { isSageProvider } from '../config/solutionPostProvider';
 import { reserveArticlePresentation } from './presentation';
@@ -117,7 +117,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   const originalContext = contextSchema.parse(JSON.parse(post.context));
   const savedContext = { ...originalContext, presentation: originalContext.presentation ?? context.presentation };
   if (hash(savedContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
-  const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs));
+  const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs),
+    isSageProvider(config.solutionPosts.baseUrl) ? SAGE_REPAIR_TIMEOUT_MS : 0);
   const leaseMs = config.solutionPosts.aiProvider === 'firecrawl' ? 6 * FIRECRAWL_STAGE_BUDGET_MS + 120000 :
     2 * Math.max(1, config.solutionPosts.models.length) * (config.solutionPosts.retries + 1) * (maxTimeout + 8000) + 120000;
   // Reset an explicitly renewed attempt budget in the same CAS that claims
