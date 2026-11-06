@@ -24,9 +24,11 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 
 const PROFILE_DIR = path.resolve(process.cwd(), 'local-auth/browser-profile');
 const STORAGE_STATE = path.resolve(process.cwd(), 'local-auth/storage-state.json');
+const COOKIES_TXT = path.resolve(process.cwd(), 'local-auth/cookies.txt');
 const MAX_WAIT_MINUTES = 10;
 
 export interface CompanionCliArgs {
@@ -47,7 +49,7 @@ export function parseCompanionCliArgs(argv: string[]): CompanionCliArgs {
       pairingUrl = arg.slice(arg.indexOf('=') + 1).trim();
       continue;
     }
-    if (/^https?:\/\/\S+\/auth\/leetcode\/[A-Za-z0-9_-]+/i.test(arg)) {
+    if (/^https?:\/\/\S+\/auth\/(?:leetcode|recover)\/\S+/i.test(arg)) {
       pairingUrl = arg;
     }
   }
@@ -91,127 +93,182 @@ export async function pushSessionToPairingEndpoint(
   return { httpStatus: res.status, body };
 }
 
+function copyToWindowsClipboard(text: string): boolean {
+  if (process.platform !== 'win32' || !text) return false;
+  try {
+    const proc = spawn('clip');
+    proc.stdin.write(text);
+    proc.stdin.end();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function main(): Promise<void> {
   const { pairingUrl } = parseCompanionCliArgs(process.argv.slice(2));
   fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  fs.mkdirSync(path.dirname(COOKIES_TXT), { recursive: true });
 
-  console.log('─'.repeat(70));
-  console.log(pairingUrl ? 'LeetCode Telegram Pairing Companion' : 'LeetCode auth setup');
-  console.log(`Profile dir:      ${PROFILE_DIR}`);
-  console.log(`Storage state:    ${STORAGE_STATE}`);
+  const hasSystemChrome =
+    process.platform === 'win32' &&
+    (fs.existsSync('C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe') ||
+      fs.existsSync('C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe') ||
+      fs.existsSync(path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe')));
+
+  console.log('═'.repeat(70));
+  console.log('   LEETCODE LOCAL BROWSER AUTHENTICATION');
+  console.log('═'.repeat(70));
+  console.log(`• Browser:        ${hasSystemChrome ? 'Google Chrome (native system)' : 'Chromium'}`);
+  console.log(`• Profile dir:    ${PROFILE_DIR}`);
+  console.log(`• Network:        Your local residential IP (bypasses Cloudflare datacenter blocks)`);
   if (pairingUrl) {
-    console.log(`Pairing endpoint: ${pairingUrl}`);
+    console.log(`• Server sync:    ${pairingUrl}`);
   }
-  console.log('─'.repeat(70));
-  console.log('A Chromium window will open. Log into LeetCode and complete any');
-  console.log('Cloudflare verification check if prompted.');
-  console.log(`You have ${MAX_WAIT_MINUTES} minutes. The window closes itself once`);
-  console.log('authentication is detected.');
-  console.log('─'.repeat(70));
+  console.log('═'.repeat(70));
+  console.log('Opening browser window on your screen now...');
+  console.log('Log into LeetCode (any Turnstile checkbox will pass cleanly on your network).');
+  console.log('The window will automatically close and save your cookies once you are logged in.');
+  console.log('═'.repeat(70));
 
   const context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: false,
+    channel: hasSystemChrome ? 'chrome' : undefined,
     viewport: { width: 1280, height: 900 },
     locale: 'en-US',
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--start-maximized',
+    ],
+    ignoreDefaultArgs: ['--enable-automation'],
   });
 
   const page = context.pages()[0] ?? (await context.newPage());
   await page.goto('https://leetcode.com/accounts/login/', {
     waitUntil: 'domcontentloaded',
     timeout: 60_000,
-  });
+  }).catch(() => undefined);
 
   const deadline = Date.now() + MAX_WAIT_MINUTES * 60_000;
   let username: string | null = null;
 
   while (Date.now() < deadline) {
-    await page.waitForTimeout(3_000);
+    await page.waitForTimeout(2_500);
     username = await detectSignedInUser(page).catch(() => null);
     if (username) break;
   }
 
   if (!username) {
     console.error(`\n✗ No signed-in session detected within ${MAX_WAIT_MINUTES} minutes.`);
-    console.error('  The profile directory was kept — run the command again');
-    console.error('  and finish logging in; the window resumes where you left off.');
-    await context.close();
+    console.error('  Run the command again whenever you want to log in.');
+    await context.close().catch(() => undefined);
     process.exit(1);
   }
 
   await context.storageState({ path: STORAGE_STATE });
-  await context.close();
 
-  console.log('─'.repeat(70));
-  console.log(`✓ Local browser verified as: ${username}`);
-  console.log(`✓ Browser profile saved:     ${PROFILE_DIR}`);
-  console.log(`✓ Storage state saved:       ${STORAGE_STATE}`);
-  console.log('─'.repeat(70));
+  const cookies = await context.cookies(['https://leetcode.com']);
+  const sessionCookie = cookies.find((c) => c.name === 'LEETCODE_SESSION');
+  const csrfCookie = cookies.find((c) => c.name === 'csrftoken');
+
+  let cookieHeader = '';
+  if (sessionCookie && csrfCookie) {
+    cookieHeader = `LEETCODE_SESSION=${sessionCookie.value}; csrftoken=${csrfCookie.value}`;
+  } else if (sessionCookie) {
+    cookieHeader = `LEETCODE_SESSION=${sessionCookie.value}`;
+  }
+
+  fs.writeFileSync(COOKIES_TXT, cookieHeader, 'utf8');
+  const copied = copyToWindowsClipboard(cookieHeader);
+
+  await context.close().catch(() => undefined);
+
+  console.log('\n' + '═'.repeat(70));
+  console.log(`✅ LOGIN DETECTED & VERIFIED AS: ${username}`);
+  console.log('═'.repeat(70));
+  console.log(`• Profile:        ${PROFILE_DIR}`);
+  console.log(`• Storage state:  ${STORAGE_STATE}`);
+  console.log(`• Cookie file:    ${COOKIES_TXT}`);
+  if (copied) {
+    console.log(`• Clipboard:      📋 COPIED TO CLIPBOARD AUTOMATICALLY!`);
+  }
+  console.log('═'.repeat(70));
+  console.log('👉 RESTORE YOUR TELEGRAM BOT INSTANTLY:');
+  console.log('   In your Telegram chat with the bot, send:');
+  console.log('');
+  console.log(`   /renew ${cookieHeader}`);
+  console.log('');
+  if (copied) {
+    console.log('   (Your cookies are already copied to your clipboard — just press Ctrl+V!)');
+  }
+  console.log('═'.repeat(70));
 
   if (pairingUrl) {
-    console.log('Uploading authenticated session to your Telegram bot server...');
+    console.log('Syncing authenticated session to your server...');
     const rawState = fs.readFileSync(STORAGE_STATE, 'utf8');
-    const { httpStatus, body } = await pushSessionToPairingEndpoint(pairingUrl, rawState, username);
+    const uploadOutcome = await pushSessionToPairingEndpoint(pairingUrl, rawState, username).catch((err) => ({
+      httpStatus: 500,
+      body: { ok: false, error: err instanceof Error ? err.message : String(err) } as PairingUploadResponse,
+    }));
+    const { httpStatus, body } = uploadOutcome;
 
     if (httpStatus === 200 && body.ok) {
-      console.log(`✓ Server verified LeetCode account "${body.username ?? username}" (status: ${body.accountStatus ?? 'ACTIVE'})!`);
-      console.log('✓ Check your Telegram chat for the "✅ LeetCode login successful!" confirmation.');
-      console.log('─'.repeat(70));
+      console.log(`✓ Server verified account "${body.username ?? username}" (status: ${body.accountStatus ?? 'ACTIVE'})!`);
+      console.log('✓ Check Telegram for confirmation.');
+      console.log('═'.repeat(70));
       return;
     }
 
-    if (body.localVsServerMismatch) {
-      console.warn(`⚠ Local vs. Server mismatch detected (HTTP ${httpStatus}):`);
-      console.warn(`  • Local browser session:  ACTIVE (verified as "${username}")`);
-      console.warn(`  • Server check (Render):  ${body.accountStatus ?? 'REJECTED'}`);
-      console.warn(`  • Detail:                 ${body.error ?? 'Transferred session rejected by LeetCode on server.'}`);
-      console.warn('  • Your local session at ./local-auth/storage-state.json is ready for local runs (`npm run run:now`).');
-      console.log('─'.repeat(70));
-      process.exit(2);
-    }
-
-    console.error(`✗ Pairing upload failed (HTTP ${httpStatus}): ${body.error ?? 'Unknown error'}`);
-    console.log('─'.repeat(70));
-    process.exit(1);
+    console.warn(`Note on server upload (HTTP ${httpStatus}): ${body.error ?? 'Uploaded locally; use /renew in bot'}`);
+    console.log('═'.repeat(70));
   }
-
-  console.log('Next steps:');
-  console.log('  • Run `/lclogin` in Telegram and pass the pairing URL to `npm run auth:login -- <url>`');
-  console.log('  • Or run locally immediately with `npm run run:now`');
-  console.log('─'.repeat(70));
 }
 
-/**
- * Same-origin GraphQL userStatus check from inside the page — the script
- * learns only the username, never any credential.
- */
 async function detectSignedInUser(page: import('playwright').Page): Promise<string | null> {
-  const url = page.url();
-  if (!url.startsWith('https://leetcode.com') || url.includes('/accounts/')) {
-    await page
-      .goto('https://leetcode.com/', { waitUntil: 'domcontentloaded', timeout: 30_000 })
-      .catch(() => undefined);
-  }
-  const result = await page.evaluate(async () => {
+  try {
+    const cookies = await page.context().cookies(['https://leetcode.com']);
+    const session = cookies.find((c) => c.name === 'LEETCODE_SESSION' && c.value && c.value.length > 20);
+    if (!session) return null;
+
+    // Check GraphQL userStatus inside page context (no redirects or reloads!)
+    const username = await page.evaluate(async () => {
+      try {
+        const res = await fetch('https://leetcode.com/graphql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            query: 'query { userStatus { isSignedIn username } }',
+            variables: {},
+          }),
+        });
+        const json = (await res.json()) as {
+          data?: { userStatus?: { isSignedIn?: boolean; username?: string | null } };
+        };
+        const u = json.data?.userStatus;
+        return u?.isSignedIn ? (u.username ?? 'unknown') : null;
+      } catch {
+        return null;
+      }
+    });
+
+    if (username) return username;
+
+    // Fallback: parse JWT payload from session cookie
     try {
-      const res = await fetch('https://leetcode.com/graphql', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({
-          query: 'query { userStatus { isSignedIn username } }',
-          variables: {},
-        }),
-      });
-      const json = (await res.json()) as {
-        data?: { userStatus?: { isSignedIn?: boolean; username?: string | null } };
-      };
-      const u = json.data?.userStatus;
-      return u?.isSignedIn ? (u.username ?? 'unknown') : null;
+      const parts = session.value.split('.');
+      if (parts.length >= 2 && parts[1]) {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+        if (payload?.username) return String(payload.username);
+      }
     } catch {
-      return null;
+      // ignore
     }
-  });
-  return result;
+
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 if (require.main === module) {
