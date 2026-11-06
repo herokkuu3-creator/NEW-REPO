@@ -2,6 +2,19 @@ import { z } from 'zod';
 
 export const sectionKinds = ['intuition', 'approach', 'correctness', 'dryRun', 'takeaways'] as const;
 export const visualThemes = ['aurora', 'sunset', 'ocean', 'violet'] as const;
+// Animation headings are display labels; their complete explanation stays in
+// the caption. Shorten benign overflows without changing any traced values.
+export const visualTitleSchema = z.string().trim().min(3).max(160).transform(title => {
+  if (title.length <= 48) return title;
+  let prefix = '';
+  for (const character of title) {
+    if (prefix.length + character.length > 47) break;
+    prefix += character;
+  }
+  const boundary = prefix.lastIndexOf(' ');
+  if (boundary >= 24) prefix = prefix.slice(0, boundary);
+  return prefix.trimEnd() + '…';
+});
 export const visualFrameSchema = z.object({
   label: z.string().min(2).max(48), items: z.array(z.string().max(24)).min(1).max(8),
   active: z.array(z.number().int().min(0).max(7)).max(8),
@@ -9,7 +22,7 @@ export const visualFrameSchema = z.object({
 }).strict();
 export const visualPlanSchema = z.object({
   id: z.string().regex(/^visual-[12]$/), after: z.enum(sectionKinds),
-  title: z.string().min(3).max(48), caption: z.string().min(5).max(160),
+  title: visualTitleSchema, caption: z.string().min(5).max(160),
   theme: z.enum(visualThemes).default('aurora'),
   layout: z.enum(['strip', 'ledger', 'focus']).optional(),
   frames: z.array(visualFrameSchema).min(2).max(8),

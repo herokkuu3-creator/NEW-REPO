@@ -54,3 +54,14 @@ it('serializes concurrent replicas and does not replay an uncertain publication'
   await publishDailyPost('b');
   expect((await dailyPublicationStatus()).nextEligibleAt).toBe(new Date(Date.now() + DAILY_PUBLICATION_GAP_MS).toISOString());
 });
+it('preserves the reservation when a post-request database failure prevents saving the outcome', async () => {
+  h.publish.mockImplementationOnce(async () => {
+    h.posts.set('a', { id: 'a', status: 'PUBLISHING' });
+    throw Error('database unavailable after mutation');
+  });
+  await expect(publishDailyPost('a')).rejects.toThrow('database unavailable');
+  expect((await dailyPublicationStatus()).nextEligibleAt).toBe(new Date(Date.now() + 30 * 60 * 1000).toISOString());
+  vi.setSystemTime(Date.now() + DAILY_PUBLICATION_GAP_MS);
+  expect((await publishDailyPost('b')).lastError).toBe('DAILY_PUBLICATION_COOLDOWN');
+  expect(h.publish).toHaveBeenCalledTimes(1);
+});

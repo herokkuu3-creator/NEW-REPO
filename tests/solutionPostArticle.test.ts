@@ -149,13 +149,13 @@ describe('AI model routing', () => {
     const error = await new AIModelRouter(options, api as never).generate([], JSON.parse).catch(e => e);
     expect(error).toBeInstanceOf(RoutingError); expect(error.lastFailure).toBe('EMPTY_OUTPUT');
   });
-  it('uses the configured reviewer for verdicts and writer order for repairs', async () => {
+  it('uses the configured reasoning models for verdicts and factual repairs', async () => {
     const api = client(); api.chat.completions.create.mockResolvedValue(complete('42'));
     const router = new AIModelRouter({ ...options, reviewModels: ['not-configured', 'luna'] }, api as never);
     await router.generate([], JSON.parse, 512, true, 'technical review');
     await router.generate([], JSON.parse, 512, true, 'technical review repair');
     await router.generate([], JSON.parse, 512, true, 'title and intuition');
-    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as any).model)).toEqual(['luna', 'terra', 'terra']);
+    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as any).model)).toEqual(['luna', 'luna', 'terra']);
   });
   it('bounds full-article reasoning reservations and permits the longer server review', async () => {
     const api = client(); api.chat.completions.create.mockResolvedValue(complete('42'));
@@ -400,6 +400,32 @@ describe('AI model routing', () => {
     expect(result.visuals[0]?.frames[1]).toEqual(article.visuals[0]!.frames[1]);
     const system = (api.chat.completions.create.mock.calls[5]![0] as any).messages[0].content;
     expect(system).toContain('each item at most 24'); expect(system).toContain('caption 5-160');
+  });
+  it('shortens cosmetic animation headings before review without touching the traced states', async () => {
+    const api = client(); const responses = stagedResponses(article);
+    const start = JSON.parse(responses[5]!.choices[0]!.message.content);
+    start.title = 'A deliberately descriptive animation heading that is too long for a small mobile card';
+    responses[5] = complete(JSON.stringify(start));
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
+    const result = await generateArticle(new AIModelRouter(options, api as never), context, []);
+    expect(result.visuals[0]!.title.length).toBeLessThanOrEqual(48);
+    expect(result.visuals[0]!.title).toMatch(/…$/);
+    expect(result.visuals[0]!.frames).toEqual(article.visuals[0]!.frames);
+    expect(result.title).toBe(article.title);
+    expect(api.chat.completions.create).toHaveBeenCalledTimes(10);
+    const review = JSON.parse((api.chat.completions.create.mock.calls[9]![0] as any).messages[1].content);
+    expect(review.article.visuals[0].title).toBe(result.visuals[0]!.title);
+  });
+  it('gives retries their prior corrections while keeping the new reviewer independent', async () => {
+    const api = client(); const responses = stagedResponses(article);
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
+    const priorFailure = { markdown: 'Previously rejected prose', issues: ['An early exit proves a clash, not safety.'] };
+    await generateArticle(new AIModelRouter(options, api as never), context, [], undefined, priorFailure);
+    const generation = JSON.parse((api.chat.completions.create.mock.calls[0]![0] as any).messages[1].content);
+    const review = JSON.parse((api.chat.completions.create.mock.calls[9]![0] as any).messages[1].content);
+    expect(generation.priorFailure).toEqual(priorFailure);
+    expect(review.priorFailure).toBeUndefined();
+    expect(review.source).not.toHaveProperty('priorFailure');
   });
   it.each([false, true])('resolves both GIFs after review and keeps trace tables only for offline fallback: %s', async hostFails => {
     const draft = structuredClone(article);

@@ -57,7 +57,9 @@ export async function publishDailyPost(id: string, now = new Date()): Promise<So
     logger.info({ postId: id, ...await dailyPublicationStatus() }, 'daily article queued for publication spacing');
     return { ...post, lastError: 'DAILY_PUBLICATION_COOLDOWN' };
   }
-  let next: Gate = claim.gate;
+  // Keep the conservative reservation if publication throws. A database error
+  // can occur after the remote mutation even when its outcome cannot be saved.
+  let next: Gate = JSON.parse(claim.value);
   try {
     post = await publishPost(id);
     if (post.status === 'PUBLISHED' || post.status === 'PUBLISHING') {
@@ -69,7 +71,7 @@ export async function publishDailyPost(id: string, now = new Date()): Promise<So
       logger.info({ postId: id, publishedAt: next.lastPublishedAt,
         nextEligibleAt: new Date(next.nextAt).toISOString(), minimumGapMs: DAILY_PUBLICATION_GAP_MS },
       'daily article publication slot completed');
-    }
+    } else next = claim.gate;
     if (['PUBLISHED', 'PUBLISHING', 'SKIPPED'].includes(post.status)) await prisma.systemState.deleteMany({ where: { key } });
     return post;
   } finally {

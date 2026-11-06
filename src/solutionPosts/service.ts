@@ -96,8 +96,8 @@ export async function createPostRouter(correlation: { postId?: string; accountId
     pool.lastFailure === 'HTTP_401' ? 'AI_AUTHENTICATION_FAILED' :
       pool.lastFailure === 'HTTP_402_BILLING_REQUIRED' ? 'AI_BILLING_REQUIRED' : 'AI_KEYS_EXHAUSTED');
   // Live MiniMax reviews produced contradictory arithmetic and fed those errors
-  // back into repairs. Use reasoning models for verdicts and the configured
-  // writer order for repairs; every repaired draft still receives a new review.
+  // back into repairs. Use reasoning models for factual repairs and verdicts;
+  // every repaired draft still receives a fresh, independent review request.
   // Prefer the reviewer that returned usable verdicts in production. DeepSeek
   // remains an allowed fallback when Qwen is unavailable.
   const reviewModels = isSageProvider(config.solutionPosts.baseUrl) ?
@@ -138,9 +138,16 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
       orderBy: { createdAt: 'desc' }, take: 8 });
     post = await move(post, 'GENERATING', { lastError: null });
     const activeRouter = router ?? await createPostRouter({ postId: post.id, accountId: post.accountId });
+    let priorFailure: { markdown: string; issues: string[] } | undefined;
+    try {
+      const feedback = (JSON.parse(post.attempts ?? '[]') as Array<{ reviewIssues?: string[] }>).reverse().find(a => a.reviewIssues?.length);
+      if (post.markdown && feedback?.reviewIssues) priorFailure = {
+        markdown: post.markdown.replace(savedContext.code, '[exact accepted source supplied separately]'), issues: feedback.reviewIssues,
+      };
+    } catch { /* an unreadable historical diagnostic must not prevent a clean generation */ }
     const article = await generateArticle(activeRouter, savedContext,
       recent.map(r => ({ style: r.style ?? '', title: r.title ?? '' })),
-      plans => storeVisualAssets(plans, config.api.publicUrl));
+      plans => storeVisualAssets(plans, config.api.publicUrl), priorFailure);
     // Public posts must contain the two independently generated, durable GIFs.
     // Never degrade a scheduled post to trace tables: that makes a successful
     // generation look complete while silently dropping the required visuals.

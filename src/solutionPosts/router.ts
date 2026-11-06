@@ -108,7 +108,7 @@ export class AIModelRouter {
       }
       let exhausted = false;
       const sageReasoning = isSageProvider(this.options.baseUrl);
-      const modelOrder = stage === 'technical review' && this.options.reviewModels?.length ?
+      const modelOrder = stage?.startsWith('technical review') && this.options.reviewModels?.length ?
         this.options.reviewModels.filter(model => this.options.models.includes(model)) : this.options.models;
       for (const model of [...new Set(modelOrder)]) {
         if (!available.has(model)) {

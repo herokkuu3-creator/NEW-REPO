@@ -146,6 +146,20 @@ describe('solution workflow and persistence', () => {
     expect(post.markdown).toBe(output.markdown); expect(post.approvedHash).toBeNull();
     expect(post.attempts).toContain('terra');
   });
+  it('reuses stored rejection feedback on retry without duplicating the accepted source in prompts', async () => {
+    const issues = ['The early break proves invalidity, not safety.'];
+    h.generation.mockRejectedValueOnce(new ArticleReviewError([{ model: 'terra', attempt: 1,
+      outcome: 'TECHNICAL_REVIEW_REJECTED', elapsedMs: 1, reviewIssues: issues }],
+    { title: output.title, markdown: output.markdown, style: output.style, model: output.model }, 'TECHNICAL_REVIEW_REJECTED'));
+    const failed = await generatePost(context, {} as never);
+    await move(failed, 'RETRY_PENDING');
+    h.generation.mockClear();
+    expect((await generatePost(context, {} as never)).status).toBe('AWAITING_APPROVAL');
+    const feedback = h.generation.mock.calls[0]![4];
+    expect(feedback.issues).toEqual(issues);
+    expect(feedback.markdown).not.toContain(context.code);
+    expect(h.generation.mock.calls[0]![1].code).toBe(context.code);
+  });
   it('uses CAS to permit one generation when triggered simultaneously', async () => {
     const results = await Promise.allSettled([generatePost(context, {} as never), generatePost(context, {} as never)]);
     expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
