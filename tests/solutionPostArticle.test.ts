@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import OpenAI from 'openai';
 import { AIModelRouter, RoutingError } from '../src/solutionPosts/router';
-import { articleSchema, contextSchema, generateArticle, renderArticle, selectStyle, validateArticle } from '../src/solutionPosts/article';
+import { articleSchema, compactArticlePrompt, contextSchema, generateArticle, renderArticle, selectStyle, validateArticle } from '../src/solutionPosts/article';
 
 export const context = contextSchema.parse({ accountId: 'a', username: 'alice', problemId: '1', slug: 'example',
   title: 'Distinct squares', difficulty: 'Easy', problem: 'Sum squares of distinct counts of all subarrays.',
@@ -48,6 +48,11 @@ function stagedResponses(draft: typeof article, review = '{"approved":true,"issu
 }
 
 describe('solution articles', () => {
+  it('keeps article-title length instructions out of animation metadata stages', () => {
+    const prompt = compactArticlePrompt(context, 'visual storytelling', [], { name: 'concept animation first frame', request: 'Return animation metadata.' });
+    expect(prompt).toContain('animation titles are 3-48 characters');
+    expect(prompt).not.toContain('35-80');
+  });
   it('preserves source bytes including CRLF and trailing newlines exactly once', () => {
     const result = renderArticle(article, context);
     expect(result.split(context.code)).toHaveLength(2);
@@ -144,19 +149,28 @@ describe('AI model routing', () => {
     const error = await new AIModelRouter(options, api as never).generate([], JSON.parse).catch(e => e);
     expect(error).toBeInstanceOf(RoutingError); expect(error.lastFailure).toBe('EMPTY_OUTPUT');
   });
-  it('uses the configured review model order for both verdicts and repairs', async () => {
+  it('uses the configured reviewer for verdicts and writer order for repairs', async () => {
     const api = client(); api.chat.completions.create.mockResolvedValue(complete('42'));
     const router = new AIModelRouter({ ...options, reviewModels: ['not-configured', 'luna'] }, api as never);
     await router.generate([], JSON.parse, 512, true, 'technical review');
     await router.generate([], JSON.parse, 512, true, 'technical review repair');
     await router.generate([], JSON.parse, 512, true, 'title and intuition');
-    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as any).model)).toEqual(['luna', 'luna', 'terra']);
+    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as any).model)).toEqual(['luna', 'terra', 'terra']);
   });
   it('bounds full-article reasoning reservations and permits the longer server review', async () => {
     const api = client(); api.chat.completions.create.mockResolvedValue(complete('42'));
     await new AIModelRouter({ ...options, baseUrl: 'https://discovery-api.intern-ai.org.cn/v1' }, api as never)
       .generate([], JSON.parse, 4096, true, 'technical review repair');
     expect(api.chat.completions.create.mock.calls[0]![0]).toMatchObject({ max_tokens: 16384 });
+    expect(api.chat.completions.create.mock.calls[0]![1]).toEqual({ timeout: 300000 });
+  });
+  it('leaves reasoning headroom for the complete technical verdict', async () => {
+    const api = client();
+    api.chat.completions.create.mockResolvedValueOnce({ choices: [{ finish_reason: 'length', message: { content: '' } }] })
+      .mockResolvedValueOnce(complete('{"approved":true,"issues":[]}'));
+    await new AIModelRouter({ ...options, baseUrl: 'https://discovery-api.intern-ai.org.cn/v1' }, api as never, async () => {})
+      .generate([], JSON.parse, 1024, true, 'technical review');
+    expect(api.chat.completions.create.mock.calls.map(call => (call[0] as any).max_tokens)).toEqual([16384, 32768]);
     expect(api.chat.completions.create.mock.calls[0]![1]).toEqual({ timeout: 300000 });
   });
   it('waits for a conservative Sage cooldown when a 429 has no Retry-After', async () => {

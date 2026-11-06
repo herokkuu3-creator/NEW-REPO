@@ -96,10 +96,13 @@ export async function createPostRouter(correlation: { postId?: string; accountId
     pool.lastFailure === 'HTTP_401' ? 'AI_AUTHENTICATION_FAILED' :
       pool.lastFailure === 'HTTP_402_BILLING_REQUIRED' ? 'AI_BILLING_REQUIRED' : 'AI_KEYS_EXHAUSTED');
   // Live MiniMax reviews produced contradictory arithmetic and fed those errors
-  // back into repairs. Use the configured reasoning models for this gate and
-  // its repairs; never add an unconfigured provider/model or skip the review.
+  // back into repairs. Use reasoning models for verdicts and the configured
+  // writer order for repairs; every repaired draft still receives a new review.
+  // Prefer the reviewer that returned usable verdicts in production. DeepSeek
+  // remains an allowed fallback when Qwen is unavailable.
   const reviewModels = isSageProvider(config.solutionPosts.baseUrl) ?
-    config.solutionPosts.models.filter(model => /^deepseek-|^qwen/i.test(model)) : undefined;
+    config.solutionPosts.models.filter(model => /^deepseek-|^qwen/i.test(model))
+      .sort((a, b) => Number(/^qwen/i.test(b)) - Number(/^qwen/i.test(a))) : undefined;
   return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys, reviewModels }, undefined, undefined,
     attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'),
     async (failedKey, reason) => {

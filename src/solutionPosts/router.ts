@@ -10,7 +10,7 @@ let bazaarFreeBlockedUntil = 0;
 const sageModelHealth = new Map<string, { failures: number; until: number; lastFailureAt: number }>();
 const SAGE_MODEL_COOLDOWN_MS = 30 * 60 * 1000;
 export const SAGE_REPAIR_TIMEOUT_MS = 300000;
-export const SAGE_REVIEW_TIMEOUT_MS = 180000;
+export const SAGE_REVIEW_TIMEOUT_MS = 300000;
 
 export interface RouterOptions {
   apiKey: string;
@@ -108,7 +108,7 @@ export class AIModelRouter {
       }
       let exhausted = false;
       const sageReasoning = isSageProvider(this.options.baseUrl);
-      const modelOrder = stage?.startsWith('technical review') && this.options.reviewModels?.length ?
+      const modelOrder = stage === 'technical review' && this.options.reviewModels?.length ?
         this.options.reviewModels.filter(model => this.options.models.includes(model)) : this.options.models;
       for (const model of [...new Set(modelOrder)]) {
         if (!available.has(model)) {
@@ -131,9 +131,10 @@ export class AIModelRouter {
         // A full-article repair needs output plus reasoning headroom, but
         // reserving 6x its 4096-token output can itself trip provider TPM limits.
         const fullRepair = stage === 'technical review repair';
-        const tokenCeiling = fullRepair ? 32768 : 16384;
+        const fullReview = stage === 'technical review';
+        const tokenCeiling = fullRepair || fullReview ? 32768 : 16384;
         let attemptMaxTokens = sageReasoning ? Math.min(Math.max(maxTokens * (fullRepair ? 4 : 2),
-          stage?.startsWith('technical review') ? 8192 : 4096), tokenCeiling) : maxTokens;
+          fullReview ? 16384 : fullRepair ? 8192 : 4096), tokenCeiling) : maxTokens;
         for (let n = 0; n <= this.options.retries; n++) {
           const started = Date.now();
           const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0,
