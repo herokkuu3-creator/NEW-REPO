@@ -636,7 +636,7 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       await reply('✖️ Command queuing cancelled.');
       return;
     }
-    const isInteractiveCommand = /^\/(?:cfrange|cf_range|cfbatch|cf_batch|ccrange|cc_range|ccbatch|cc_batch|questionrangesubmission|question_range_submission|rangesubmission|completeincomplete|complete_incomplete|solveincomplete|solve_incomplete|incomplete)\b/.test(text.toLowerCase());
+    const isInteractiveCommand = /^\/(?:cfrange|cf_range|cfbatch|cf_batch|ccrange|cc_range|ccbatch|cc_batch|questionrangesubmission|question_range_submission|rangesubmission|completeincomplete|complete_incomplete|solveincomplete|solve_incomplete|incomplete|unsolved|solveunsolved|solve_unsolved)\b/.test(text.toLowerCase());
     if (!isInteractiveCommand) {
       const handled = await handleQueueCommandInput(text);
       if (handled) {
@@ -1060,6 +1060,9 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       case '/solveincomplete':
       case '/solve_incomplete':
       case '/incomplete':
+      case '/unsolved':
+      case '/solveunsolved':
+      case '/solve_unsolved':
         pendingPromptType = null;
         await handleIncompleteQuestionsCommand(commandArg, defaultRemovalDeps, defaultRangeUiDeps, msg.chat.id);
         return;
@@ -1947,15 +1950,21 @@ async function sendDailySolutionPicker(): Promise<void> {
   await defaultCoinClaimUiDeps.send(picker.text, picker.buttons);
 }
 
-function solutionStageText(stage: string, error?: string, previousError?: string): string {
+function solutionStageText(stage: string, error?: string, previousError?: string, detail?: string): string {
   switch (stage) {
     case 'starting': return '⏳ Starting…';
     case 'resolving_daily': return '🔎 Finding today’s problem…';
     case 'submitting': return '📤 Submitting solution…';
     case 'accepted': return '✅ Solution accepted; preparing article…';
-    case 'generating_article': return '✍️ Generating verified-GIF article…';
-    case 'publishing_article': return '📮 Posting article to LeetCode…';
-    case 'published': return '✅ Solution and article published';
+    case 'generating_article': return detail ? `✍️ ${escapeHtml(detail)}` : '✍️ Generating verified-GIF article…';
+    case 'drafting_intuition': return detail ? `💡 ${escapeHtml(detail)}` : '💡 Drafting title & intuition observation…';
+    case 'drafting_approach': return detail ? `📝 ${escapeHtml(detail)}` : '📝 Drafting approach & complexities…';
+    case 'planning_animations': return detail ? `🎬 ${escapeHtml(detail)}` : '🎬 Designing visual animation frames…';
+    case 'technical_review': return detail ? `🔍 ${escapeHtml(detail)}` : '🔍 AI technical review in progress…';
+    case 'rendering_gifs': return detail ? `🎨 ${escapeHtml(detail)}` : '🎨 Rendering animation GIFs…';
+    case 'draft_ready': return detail ? `✨ ${escapeHtml(detail)}` : '✨ Article draft ready with verified GIFs';
+    case 'publishing_article': return '📮 Posting article to LeetCode with tags…';
+    case 'published': return '🚀 Published to LeetCode with tags · Upvotes scheduled';
     case 'article_ready': return '📝 Article generated and awaiting review';
     case 'publication_queued': return '⏳ Reviewed article queued; daily posts are spaced at least 20 minutes apart.';
     case 'skipped': return error === 'ACCOUNT_JOB_IN_PROGRESS' ? '⏳ Another run is processing this account; this run skipped it.' :
@@ -1980,8 +1989,8 @@ function solutionStageText(stage: string, error?: string, previousError?: string
         ? '❌ Firecrawl rejected its key (HTTP 401). Check FIRECRAWL_API_KEY in the server environment.'
         : '❌ The article provider rejected the key (HTTP 401). Save a key issued by that provider with /setsolutionkeys, then verify with /testsolkey.';
       if (error.startsWith('AI_ERROR:')) {
-        const detail = error.slice('AI_ERROR:'.length).trim();
-        return `❌ ${escapeHtml(detail.slice(0, 140))}`;
+        const d = error.slice('AI_ERROR:'.length).trim();
+        return `❌ ${escapeHtml(d.slice(0, 140))}`;
       }
       if (error === 'AI_MODELS_EXHAUSTED') {
         return '❌ AI models exhausted or billing verification required. Run /testsolkey to check.';
@@ -1989,20 +1998,39 @@ function solutionStageText(stage: string, error?: string, previousError?: string
       if (error === 'AI_KEYS_EXHAUSTED') return '❌ No usable article keys remain. Run /testsolkey for the provider’s rejection reason.';
       return `❌ ${escapeHtml(error.slice(0, 140))}`;
     }
-    default: return '⏳ Queued…';
+    default: return detail ? `⏳ ${escapeHtml(detail)}` : '⏳ Queued…';
   }
+}
+
+interface AccountWorkflowState {
+  stage: string;
+  error?: string;
+  previousError?: string;
+  detail?: string;
+  milestones: string[];
 }
 
 function renderSolutionWorkflowProgress(
   title: string,
   accounts: AccountRecord[],
-  states: ReadonlyMap<string, { stage: string; error?: string; previousError?: string }>,
+  states: ReadonlyMap<string, AccountWorkflowState>,
 ): string {
   const lines = [`🏆 <b>${title}</b>`, '<code>━━━━━━━━━━━━━━━━━━━━</code>', ''];
   accounts.forEach((account, index) => {
     const state = states.get(account.id);
     lines.push(`👤 <b>Account ${index + 1}/${accounts.length} · ${escapeHtml(accountName(account))}</b>`);
-    lines.push(`└ ${solutionStageText(state?.stage ?? 'queued', state?.error, state?.previousError)}`);
+    const milestones = state?.milestones ?? [];
+    if (milestones.length > 0) {
+      const visibleMilestones = milestones.length > 5 ? milestones.slice(-5) : milestones;
+      if (milestones.length > 5) {
+        lines.push(`├ … ${milestones.length - 5} earlier completed step(s)`);
+      }
+      for (const m of visibleMilestones) {
+        lines.push(`├ ✅ ${escapeHtml(m)}`);
+      }
+    }
+    lines.push(`└ ${solutionStageText(state?.stage ?? 'queued', state?.error, state?.previousError, state?.detail)}`);
+    lines.push('');
   });
   return lines.join('\n').slice(0, 3900);
 }
@@ -2012,7 +2040,7 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
   const description = questionNumber ? `question #${questionNumber}` : 'today’s daily question';
   const accounts = (await listEnabledAccounts()).filter(account => accountIds.includes(account.id));
   if (accounts.length !== accountIds.length) { await reply('⚠️ One or more selected accounts are no longer available. Open the picker again.'); return; }
-  const states = new Map<string, { stage: string; error?: string; previousError?: string }>(accounts.map(account => [account.id, { stage: 'queued' }]));
+  const states = new Map<string, AccountWorkflowState>(accounts.map(account => [account.id, { stage: 'queued', milestones: [] }]));
   const title = questionNumber ? `QUESTION #${questionNumber} + SOLUTION ARTICLE` : 'DAILY SUBMISSION + SOLUTION ARTICLE';
   let rendered = renderSolutionWorkflowProgress(title, accounts, states);
   let messageId: number | undefined;
@@ -2024,22 +2052,93 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
   } catch {
     await reply(`🚀 Starting ${description} for ${accountIds.length} selected account(s). Progress updates will be logged.`);
   }
-  const update = async (event: { accountId: string; stage: string; error?: string; previousError?: string }) => {
-    states.set(event.accountId, { stage: event.stage, error: event.error, previousError: event.previousError });
+
+  let lastEditTime = 0;
+  let pendingTimer: NodeJS.Timeout | null = null;
+  const EDIT_GAP_MS = 1200;
+
+  const flushEdit = async () => {
+    if (!messageId) return;
     const next = renderSolutionWorkflowProgress(title, accounts, states);
-    if (!messageId || next === rendered) return;
+    if (next === rendered) return;
     rendered = next;
     try {
-      await tgApi('editMessageText', { chat_id: config.telegram.chatId, message_id: messageId, text: next,
-        parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: { inline_keyboard: [] } });
+      await tgApi('editMessageText', {
+        chat_id: config.telegram.chatId, message_id: messageId, text: next,
+        parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: { inline_keyboard: [] },
+      });
+      lastEditTime = Date.now();
     } catch (error) {
-      // Progress delivery must never interrupt the submit/article transaction.
-      logger.warn({ err: errText(error), stage: event.stage }, 'telegram solution workflow progress edit failed');
+      logger.warn({ err: errText(error) }, 'telegram solution workflow progress edit failed');
     }
+  };
+
+  const scheduleEdit = (immediate = false) => {
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
+    const elapsed = Date.now() - lastEditTime;
+    if (immediate || elapsed >= EDIT_GAP_MS) {
+      void flushEdit();
+    } else {
+      pendingTimer = setTimeout(() => {
+        void flushEdit();
+      }, EDIT_GAP_MS - elapsed);
+    }
+  };
+
+  const update = async (event: { accountId: string; stage: string; detail?: string; error?: string; previousError?: string }) => {
+    const prev = states.get(event.accountId) ?? { stage: 'queued', milestones: [] };
+    const milestones = [...prev.milestones];
+    const addMilestone = (m: string) => {
+      if (!milestones.includes(m)) milestones.push(m);
+    };
+
+    if (['submitting', 'accepted', 'generating_article', 'drafting_intuition', 'publishing_article', 'published'].includes(event.stage)) {
+      addMilestone('Problem identified');
+    }
+    if (['accepted', 'generating_article', 'drafting_intuition', 'drafting_approach', 'planning_animations', 'technical_review', 'rendering_gifs', 'draft_ready', 'publishing_article', 'published'].includes(event.stage)) {
+      addMilestone('C++ solution submitted & accepted');
+    }
+    if (['drafting_approach', 'planning_animations', 'technical_review', 'rendering_gifs', 'draft_ready', 'publishing_article', 'published'].includes(event.stage)) {
+      addMilestone('Problem intuition & core observation formulated');
+    }
+    if (['planning_animations', 'technical_review', 'rendering_gifs', 'draft_ready', 'publishing_article', 'published'].includes(event.stage)) {
+      addMilestone('Approach & complexities drafted');
+    }
+    if (['technical_review', 'rendering_gifs', 'draft_ready', 'publishing_article', 'published'].includes(event.stage)) {
+      addMilestone('Visual animation frames designed');
+    }
+    if (['rendering_gifs', 'draft_ready', 'publishing_article', 'published'].includes(event.stage)) {
+      addMilestone('AI technical review passed');
+    }
+    if (['draft_ready', 'publishing_article', 'published'].includes(event.stage)) {
+      addMilestone('Animation GIFs rendered & uploaded');
+    }
+    if (event.stage === 'published') {
+      addMilestone('Article published to LeetCode with tags');
+    }
+
+    states.set(event.accountId, {
+      stage: event.stage,
+      detail: event.detail,
+      error: event.error,
+      previousError: event.previousError,
+      milestones,
+    });
+
+    const isTerminal = ['published', 'failed', 'skipped', 'article_ready'].includes(event.stage);
+    scheduleEdit(isTerminal);
   };
   void (async () => {
     const results = questionNumber ? await runManualQuestion(questionNumber, accountIds, new Date(), update) :
       await runCombined(accountIds, new Date(), update, { retryFailedGeneration: true, publicationMode });
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
+    await flushEdit();
     const done = results.filter(result => result.status === 'PUBLISHED').length;
     const failed = results.filter(result => result.status === 'FAILED').length;
     const skipped = results.filter(result => result.status === 'SKIPPED').length;
@@ -2047,6 +2146,11 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
     const acceptedArticleFailed = results.filter(result => result.status === 'FAILED' && result.error === 'AI_MODELS_EXHAUSTED').length;
     await reply(`🏁 ${questionNumber ? `Question #${questionNumber}` : 'Daily workflow'} finished: ${done} published · ${failed} article/workflow failed · ${skipped} skipped${pending ? ` · ${pending} draft/pending` : ''}.${acceptedArticleFailed ? ` ${acceptedArticleFailed} stopped at article generation; accepted code was retained.` : ''}`);
   })().catch(async error => {
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
+    await flushEdit();
     await reply(`⚠️ Daily solution workflow failed: ${errText(error)}`).catch(() => undefined);
   });
 }
@@ -6222,7 +6326,10 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
     case '/complete_incomplete':
     case '/solveincomplete':
     case '/solve_incomplete':
-    case '/incomplete': {
+    case '/incomplete':
+    case '/unsolved':
+    case '/solveunsolved':
+    case '/solve_unsolved': {
       await handleIncompleteQuestionsCommand(commandArg, defaultRemovalDeps, defaultRangeUiDeps, config.telegram.chatId);
       return;
     }

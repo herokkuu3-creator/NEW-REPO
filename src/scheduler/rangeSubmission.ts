@@ -1086,8 +1086,26 @@ async function solveOne(
     if (!q.questionId) return err('LeetCode returned no question id');
     const questionId = q.questionId;
 
-    const cpp = q.codeSnippets.find((s) => s.langSlug === 'cpp');
-    if (!cpp) return err('no C++ for this question');
+    const cpp = q.codeSnippets?.find((s) => s.langSlug === 'cpp');
+    if (!cpp) {
+      logger.info({ question: n, slug }, 'range question has no C++ editor/snippet - skipping non-C++ question');
+      if (progressCtx) {
+        void deps.onProgress?.({
+          phase: 'premium',
+          label: progressCtx.label,
+          username: progressCtx.username,
+          accIndex: progressCtx.accIndex,
+          accTotal: progressCtx.accTotal,
+          stepIndex: progressCtx.stepIndex,
+          stepTotal: progressCtx.stepTotal,
+          questionNumber: n,
+          questionTitle,
+          slug,
+          verdict: 'Skipped (no C++ editor)',
+        });
+      }
+      return { outcome: { number: n, status: 'premium', detail: 'no C++ for this question' }, touchedLeetCode: true, blocked: false };
+    }
     const problem: ParsedProblem = { starterCode: cpp.code } as ParsedProblem;
 
     // 3) Obtain solution:

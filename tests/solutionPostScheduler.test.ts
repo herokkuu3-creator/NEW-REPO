@@ -185,7 +185,7 @@ describe('daily AI drafts', () => {
     }));
     const events: any[] = [];
     const results = await runCombined(['a'], new Date('2026-10-15T00:30:00Z'), event => { events.push(event); });
-    expect(h.retry).toHaveBeenCalledWith('post-a', false);
+    expect(h.retry).toHaveBeenCalledWith('post-a', false, expect.any(Function));
     expect(results[0]).toMatchObject({ postId: 'post-a', error: 'GENERATION_RETRY_LIMIT', previousError: 'AI_PROVIDER_ACCESS_BLOCKED' });
     expect(events.at(-1)).toMatchObject({ stage: 'failed', previousError: 'AI_PROVIDER_ACCESS_BLOCKED' });
     expect(h.publish).not.toHaveBeenCalled();

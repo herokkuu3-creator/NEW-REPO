@@ -321,6 +321,20 @@ export async function executeDailyRun(
     await setSystemState(SystemKeys.lastReport, JSON.stringify(report));
     await notifyMultiRunReport(report);
     logger.info({ summary: summarizeReport(report) }, 'multi-account daily run finished');
+
+    const anyIncomplete = outcomes.some(o => o.kind !== 'solved' && o.kind !== 'skipped');
+    if (anyIncomplete) {
+      let retry = { date: today, count: 0, lastAttemptAt: Date.now() };
+      try {
+        const raw = await getSystemState(SystemKeys.dailyRetryState);
+        const parsed = raw ? JSON.parse(raw) as { date?: unknown; count?: unknown; lastAttemptAt?: unknown } : null;
+        if (parsed?.date === today && Number.isInteger(parsed.count)) {
+          retry.count = Number(parsed.count);
+        }
+      } catch {}
+      await setSystemState(SystemKeys.dailyRetryState, JSON.stringify(retry));
+    }
+
     return report;
   } finally {
     runInProgress = false;
@@ -1030,7 +1044,8 @@ export function startScheduler(): () => void {
   };
 }
 
-const DAILY_RETRY_LIMIT = 10;
+export const DAILY_RETRY_LIMIT = 5;
+export const DAILY_RETRY_GAP_MS = 60 * 60 * 1000; // 1 hour gap between retry attempts
 
 async function triggerDailyRetry(): Promise<void> {
   if (runInProgress) return;
@@ -1045,21 +1060,34 @@ async function triggerDailyRetry(): Promise<void> {
   }));
   if (!incomplete.some(Boolean)) return;
 
-  let retry = { date: today, count: 0 };
+  let retry = { date: today, count: 0, lastAttemptAt: 0 };
   try {
     const raw = await getSystemState(SystemKeys.dailyRetryState);
-    const parsed = raw ? JSON.parse(raw) as { date?: unknown; count?: unknown } : null;
-    if (parsed?.date === today && Number.isInteger(parsed.count) && Number(parsed.count) >= 0) {
-      retry.count = Number(parsed.count);
+    const parsed = raw ? JSON.parse(raw) as { date?: unknown; count?: unknown; lastAttemptAt?: unknown } : null;
+    if (parsed?.date === today) {
+      if (Number.isInteger(parsed.count) && Number(parsed.count) >= 0) {
+        retry.count = Number(parsed.count);
+      }
+      if (typeof parsed.lastAttemptAt === 'number' && parsed.lastAttemptAt > 0) {
+        retry.lastAttemptAt = parsed.lastAttemptAt;
+      }
     }
   } catch {
     // A malformed retry marker is safe to reset for today's recovery window.
   }
   if (retry.count >= DAILY_RETRY_LIMIT) return;
 
+  const now = Date.now();
+  if (retry.lastAttemptAt > 0 && now - retry.lastAttemptAt < DAILY_RETRY_GAP_MS) {
+    const remainingMin = Math.ceil((DAILY_RETRY_GAP_MS - (now - retry.lastAttemptAt)) / 60000);
+    logger.debug({ today, count: retry.count, remainingMin }, 'waiting for 1 hour gap before daily retry');
+    return;
+  }
+
   const trigger = await triggerRun('cron-retry');
   if (!trigger.started) return;
   retry.count += 1;
+  retry.lastAttemptAt = Date.now();
   await setSystemState(SystemKeys.dailyRetryState, JSON.stringify(retry));
-  logger.info({ today, attempt: retry.count, limit: DAILY_RETRY_LIMIT }, 'LeetCode daily retry scheduled');
+  logger.info({ today, attempt: retry.count, limit: DAILY_RETRY_LIMIT, nextRetryGapHours: 1 }, 'LeetCode daily retry scheduled');
 }

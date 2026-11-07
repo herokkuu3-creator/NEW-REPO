@@ -38,6 +38,10 @@ const questionSchema = z.object({
     codeSnippets: z
       .array(z.object({ lang: z.string(), langSlug: z.string(), code: z.string() }))
       .nullable(),
+    topicTags: z
+      .array(z.object({ name: z.string(), slug: z.string() }))
+      .nullable()
+      .optional(),
     isPaidOnly: z.boolean(),
   }),
 });
@@ -72,6 +76,7 @@ const QUESTION_QUERY = `
       content
       exampleTestcases
       metaData
+      topicTags { name slug }
       codeSnippets { lang langSlug code }
     }
   }
@@ -100,6 +105,7 @@ export interface RawQuestionData {
   exampleTestcases: string;
   metaData: Record<string, unknown> | null;
   codeSnippets: { lang: string; langSlug: string; code: string }[];
+  topicTags?: { name: string; slug: string }[];
 }
 
 export class DailyProblemNotFoundError extends Error {
@@ -160,5 +166,6 @@ export async function fetchQuestionData(
     exampleTestcases: q.exampleTestcases ?? '',
     metaData,
     codeSnippets: q.codeSnippets ?? [],
+    topicTags: q.topicTags ?? [],
   };
 }

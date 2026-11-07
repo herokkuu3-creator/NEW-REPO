@@ -13,7 +13,7 @@ import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { isSageProvider } from '../config/solutionPostProvider';
 import { reserveArticlePresentation } from './presentation';
 import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
-import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext } from './article';
+import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext, StageCallback } from './article';
 import { OutputValidationError } from './router';
 import { ensurePost, move } from './store';
 import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
@@ -77,7 +77,8 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
     }
     return contextSchema.parse({ accountId, username, problemId: question.questionId, slug: run.problemSlug,
       title: run.title, difficulty: run.difficulty, problem: question.contentHtml,
-      submissionId: run.submissionId, language: run.language, code: run.solution, challengeDate: contextDate });
+      submissionId: run.submissionId, language: run.language, code: run.solution,
+      challengeDate: contextDate, topicTags: question.topicTags ?? [] });
   });
 }
 
@@ -112,7 +113,7 @@ export async function createPostRouter(correlation: { postId?: string; accountId
     });
 }
 
-export async function generatePost(context: SubmissionContext, router?: AIModelRouter, force = false): Promise<SolutionPost> {
+export async function generatePost(context: SubmissionContext, router?: AIModelRouter, force = false, onStage?: StageCallback): Promise<SolutionPost> {
   context = { ...context, presentation: context.presentation?.visualVersion === 2 ? context.presentation :
     await reserveArticlePresentation(context.accountId, context.slug) };
   let post = await ensurePost(context);
@@ -150,7 +151,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     } catch { /* an unreadable historical diagnostic must not prevent a clean generation */ }
     const article = await generateArticle(activeRouter, savedContext,
       recent.map(r => ({ style: r.style ?? '', title: r.title ?? '' })),
-      plans => storeVisualAssets(plans, config.api.publicUrl), priorFailure);
+      plans => storeVisualAssets(plans, config.api.publicUrl), priorFailure, onStage);
     // Public posts must contain the two independently generated, durable GIFs.
     // Never degrade a scheduled post to trace tables: that makes a successful
     // generation look complete while silently dropping the required visuals.
@@ -185,7 +186,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   } finally { stopKeepAlive(); }
 }
 
-export async function generateForRun(accountId: string, runId: string, force = false): Promise<SolutionPost> {
+export async function generateForRun(accountId: string, runId: string, force = false, onStage?: StageCallback): Promise<SolutionPost> {
   const run = await prisma.dailyRun.findUniqueOrThrow({ where: { id: runId } });
   if (run.accountId !== accountId) throw new PostError('ACCOUNT_IDENTITY_MISMATCH');
   const existing = await prisma.solutionPost.findUnique({ where: { accountId_problemSlug_intent: {
@@ -193,14 +194,14 @@ export async function generateForRun(accountId: string, runId: string, force = f
   } } });
   if (existing && !['PENDING', 'RETRY_PENDING'].includes(existing.status)) {
     if (force && existing.status === 'FAILED') {
-      return retryPost(existing.id, true);
+      return retryPost(existing.id, true, onStage);
     }
     return existing;
   }
-  return generatePost(await loadContext(accountId, runId), undefined, force);
+  return generatePost(await loadContext(accountId, runId), undefined, force, onStage);
 }
 
-export async function retryPost(id: string, force = false): Promise<SolutionPost> {
+export async function retryPost(id: string, force = false, onStage?: StageCallback): Promise<SolutionPost> {
   let post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
   if (!['FAILED', 'RETRY_PENDING'].includes(post.status)) throw new PostError('NOT_RETRYABLE');
   checkGenerationBudget(post, force);
@@ -211,7 +212,7 @@ export async function retryPost(id: string, force = false): Promise<SolutionPost
   if (!run) throw new PostError('SUBMISSION_CONTEXT_MISSING');
   const verified = await loadContext(post.accountId, run.id);
   if (hash(verified.code) !== post.codeHash || verified.slug !== context.slug) throw new PostError('SOURCE_INTEGRITY_FAILED');
-  return generatePost(context, undefined, force);
+  return generatePost(context, undefined, force, onStage);
 }
 
 /** When API keys are renewed or reset, unlock any posts stalled on key errors or retry limits. */

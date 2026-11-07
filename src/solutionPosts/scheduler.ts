@@ -51,6 +51,12 @@ export type SolutionWorkflowStage =
   | 'submitting'
   | 'accepted'
   | 'generating_article'
+  | 'drafting_intuition'
+  | 'drafting_approach'
+  | 'planning_animations'
+  | 'technical_review'
+  | 'rendering_gifs'
+  | 'draft_ready'
   | 'publishing_article'
   | 'published'
   | 'article_ready'
@@ -65,6 +71,7 @@ export interface SolutionWorkflowProgress {
   submissionId?: string;
   postId?: string;
   status?: string;
+  detail?: string;
   error?: string;
   previousError?: string;
 }
@@ -116,13 +123,16 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
         update: { problemSlug: capture.slug, title: capture.title, difficulty: capture.difficulty, language: capture.language,
           solution: capture.code, submissionId, submissionStatus: 'Accepted', state: 'SUCCESS', error: null },
       });
-      await reportProgress(onProgress, { accountId: account.id, stage: 'generating_article', questionNumber, submissionId });
+      await reportProgress(onProgress, { accountId: account.id, stage: 'generating_article', questionNumber, submissionId, detail: 'Starting article generation & visual planning…' });
       const existing = await prisma.solutionPost.findUnique({ where: {
         accountId_problemSlug_intent: { accountId: account.id, problemSlug: capture.slug, intent: 'community-solution' },
       } });
+      const onStage = onProgress ? (stage: string, detail?: string) => {
+        void reportProgress(onProgress, { accountId: account.id, stage: stage as any, questionNumber, submissionId, detail });
+      } : undefined;
       let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status)
-        ? await retryPost(existing.id, true)
-        : await generateForRun(account.id, run.id, true);
+        ? (onStage ? await retryPost(existing.id, true, onStage) : await retryPost(existing.id, true))
+        : (onStage ? await generateForRun(account.id, run.id, true, onStage) : await generateForRun(account.id, run.id, true));
       if (post.status === 'FAILED') {
         const error = post.lastError || 'GENERATION_FAILED';
         results.push({ accountId: account.id, postId: post.id, status: 'FAILED', error });
@@ -235,10 +245,13 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
         accountId_problemSlug_intent: { accountId, problemSlug: run.slug, intent: 'community-solution' },
       } });
       // Never resubmit accepted code for generation retries. Uncertain publications are left for reconciliation.
-      await reportProgress(onProgress, { accountId, stage: 'generating_article', submissionId: run.submissionId });
+      await reportProgress(onProgress, { accountId, stage: 'generating_article', submissionId: run.submissionId, detail: 'Starting article generation & visual planning…' });
+      const onStage = onProgress ? (stage: string, detail?: string) => {
+        void reportProgress(onProgress, { accountId, stage: stage as any, submissionId: run.submissionId, detail });
+      } : undefined;
       let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status) ?
-        await retryPost(existing.id, options.retryFailedGeneration === true) :
-        await generateForRun(accountId, run.runId, options.retryFailedGeneration === true);
+        (onStage ? await retryPost(existing.id, options.retryFailedGeneration === true, onStage) : await retryPost(existing.id, options.retryFailedGeneration === true)) :
+        (onStage ? await generateForRun(accountId, run.runId, options.retryFailedGeneration === true, onStage) : await generateForRun(accountId, run.runId, options.retryFailedGeneration === true));
       if (['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING', 'PUBLISHING'].includes(post.status)) {
         results.push({ accountId, postId: post.id, status: 'SKIPPED', error: 'ACCOUNT_JOB_IN_PROGRESS' });
         await reportProgress(onProgress, { accountId, stage: 'skipped', postId: post.id, error: 'ACCOUNT_JOB_IN_PROGRESS' });

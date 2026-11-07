@@ -21,6 +21,7 @@ export const contextSchema = z.object({
   submissionId: z.string().regex(/^\d+$/), language: z.enum(['cpp', 'python3', 'javascript', 'typescript', 'java', 'c', 'csharp', 'golang', 'rust']),
   code: z.string().min(1).max(100000), challengeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   presentation: presentationSchema.optional(),
+  topicTags: z.array(z.object({ name: z.string(), slug: z.string() })).optional().default([]),
 });
 export type SubmissionContext = z.infer<typeof contextSchema>;
 const complexity = z.object({ bound: z.string().max(220).regex(/^O\([^\n`<>]{1,100}\)(?: (?:expected|amortized|average|worst-case))?(?:, O\([^\n`<>]{1,100}\) (?:expected|amortized|average|worst-case))?$/), reason: z.string().min(10).max(220) });
@@ -186,10 +187,58 @@ export function renderArticle(article: Article, context: SubmissionContext, asse
   return sections.join(separator) + costs + codeBlock;
 }
 
+export type StageCallback = (stage: string, detail?: string) => void | Promise<void>;
+
+/**
+ * Detects algorithm topics, problem tags, and language tags to tag LeetCode solution articles.
+ */
+export function buildArticleTags(context: SubmissionContext, markdown?: string): string[] {
+  const tags: string[] = [];
+  const lang = (context.language || 'cpp').toLowerCase();
+  const langSlug = lang === 'cpp' ? 'cpp' : lang === 'python3' ? 'python3' : lang;
+  tags.push(langSlug);
+
+  for (const t of context.topicTags ?? []) {
+    if (t?.slug) tags.push(t.slug.toLowerCase().trim());
+  }
+
+  const corpus = `${context.code}\n${markdown ?? ''}\n${context.problem ?? ''}`.toLowerCase();
+  const featurePatterns: Array<[RegExp, string]> = [
+    [/\bsliding\s*window\b/i, 'sliding-window'],
+    [/\btwo\s*pointers?\b/i, 'two-pointers'],
+    [/\bbinary\s*search\b|\blower_bound\b|\bupper_bound\b/i, 'binary-search'],
+    [/\bdynamic\s*programming\b|\bmemoiz|\bdp\[/i, 'dynamic-programming'],
+    [/\bpriority[_\s]*queue\b|\bmin[-_\s]*heap\b|\bmax[-_\s]*heap\b|\bheap\b/i, 'heap-priority-queue'],
+    [/\bunordered_map\b|\bunordered_set\b|\bhash[_\s]*table\b|\bhash[_\s]*map\b/i, 'hash-table'],
+    [/\bmonotonic[_\s]*stack\b|\bstack</i, 'stack'],
+    [/\bmonotonic[_\s]*queue\b|\bdeque</i, 'queue'],
+    [/\bprefix[_\s]*sum\b|\bpartial_sum\b/i, 'prefix-sum'],
+    [/\bbreadth[_\s]*first|\bbfs\b/i, 'breadth-first-search'],
+    [/\bdepth[_\s]*first|\bdfs\b/i, 'depth-first-search'],
+    [/\bbinary[_\s]*tree\b|\btree\b/i, 'tree'],
+    [/\bgraph\b|\badjacency\b/i, 'graph'],
+    [/\bgreedy\b/i, 'greedy'],
+    [/\bbit[_\s]*manipulation\b|\bbitmask\b/i, 'bit-manipulation'],
+    [/\bmath\b|\bcombinatorics\b/i, 'math'],
+    [/\bsort\b|\bsorting\b/i, 'sorting'],
+    [/\btrie\b/i, 'trie'],
+    [/\bbacktrack/i, 'backtracking'],
+    [/\bunion[_\s]*find\b|\bdisjoint[_\s]*set\b|\bdsu\b/i, 'union-find'],
+  ];
+
+  for (const [pattern, slug] of featurePatterns) {
+    if (pattern.test(corpus) && !tags.includes(slug)) {
+      tags.push(slug);
+    }
+  }
+
+  return [...new Set(tags)];
+}
+
 export async function generateArticle(router: AIModelRouter, context: SubmissionContext,
   recent: Array<{ style: string; title: string }>, resolveVisuals?: VisualResolver,
-  priorFailure?: { markdown: string; issues: string[] }) {
-  if (router instanceof FirecrawlAgentRouter) return generateAgentArticle(router, context, recent, resolveVisuals);
+  priorFailure?: { markdown: string; issues: string[] }, onStage?: StageCallback) {
+  if (router instanceof FirecrawlAgentRouter) return generateAgentArticle(router, context, recent, resolveVisuals, onStage);
   const style = selectStyle(context, recent.map(r => r.style));
   const attempts: ModelAttempt[] = [];
   const models: string[] = [];
@@ -251,10 +300,12 @@ export async function generateArticle(router: AIModelRouter, context: Submission
       priorParts[name] = repaired.value; return repaired.value;
     }
   };
+  await onStage?.('drafting_intuition', 'Drafting title & intuition observation…');
   const intro = await runStage('title and intuition',
     'Return {title, section}. title: 35-80 characters, one or two relevant emojis, memorable and truthful. section is {heading,markdown}; markdown is a string. Intuition: 1-2 short sentences, at most 24 words, identifying the key observation in the supplied source algorithm. Avoid bland title paraphrases.',
     z.object({ title: articleSchema.shape.title.refine(title => !titleIncludesQuestionName(title, context),
       'Do not include the question name; use an original technique/invariant hook.'), section: sectionSchema }).strict());
+  await onStage?.('drafting_approach', 'Drafting approach & time/space complexity…');
   const approach = await runStage('approach and complexity',
     'Return {section,time,space}. section MUST be {"heading":"...","markdown":"- First action\\n- Second action\\n- Third action"}; markdown is one string, not an object. Use at most 32 words total. time and space each are {bound,reason}; define n and m consistently, include ALL preprocessing/sorting costs and auxiliary recursion/sort stack space. Keep each reason to one short line.',
     z.object({ section: sectionSchema, time: complexity, space: complexity }).strict(), 640);
@@ -270,11 +321,13 @@ export async function generateArticle(router: AIModelRouter, context: Submission
     const directFrame = visualFrameSchema.safeParse(value);
     return directFrame.success ? { frame: directFrame.data } : value;
   }, z.object({ frame: visualFrameSchema }).strict());
+  await onStage?.('planning_animations', 'Designing animation frames for concept GIF…');
   const visual1Start = await runStage('concept animation first frame',
     'Return {title,caption,theme,frame} for visual-1. Use theme aurora or sunset. Explain the key observation on the minimum valid input lengths, at most 1-2 items per collection unless constraints forbid this. Prefer small nonnegative values when valid. Show the state BEFORE the first relevant comparison/update, leaving that operation for the next frame. Represent relevant values in 1-8 short items; active is an integer array such as [0], never a scalar. Include label,state,metric,note. Keep values brief.', frameMetadataSchema);
   const visual1Next = await runStage('concept animation next frame',
     `Return {frame} only. Advance the exact source algorithm from this first frame: ${JSON.stringify(visual1Start.frame)}. Keep the same items; change active/state/metric/note to show its real next algorithm state.`,
     nextFrameSchema);
+  await onStage?.('planning_animations', 'Designing animation frames for dry-run GIF…');
   const visual2Start = await runStage('dry-run animation first frame',
     `Return {title,caption,theme,frame} for visual-2. Use theme ocean or violet. Animate the exact source on the same input as this dry run: ${dryRun.markdown}. Show the state BEFORE the next comparison/update, leaving that operation for frame two. Use 1-8 short items; active is an integer array such as [0], never a scalar. Include label,state,metric,note. Keep values brief.`, frameMetadataSchema);
   const visual2Next = await runStage('dry-run animation next frame',
@@ -317,6 +370,7 @@ export async function generateArticle(router: AIModelRouter, context: Submission
   // A valid rejection is feedback, not a model/protocol failure. Repair the
   // rejected content before requesting another verdict; never shop for approval.
   for (let round = 0; round < 3; round++) {
+    await onStage?.('technical_review', `Running independent AI technical review (round ${round + 1})…`);
     const draft = () => ({ title: article.title, markdown: renderArticle(article, context), style,
       model: [...new Set(models)].join(',') });
     const review = await router.generate([
@@ -336,6 +390,7 @@ export async function generateArticle(router: AIModelRouter, context: Submission
     const last = attempts.at(-1);
     if (last) { last.outcome = 'TECHNICAL_REVIEW_REJECTED'; last.reviewIssues = issues; }
     if (round === 2) throw new ArticleReviewError(attempts, draft(), 'TECHNICAL_REVIEW_REJECTED');
+    await onStage?.('technical_review', 'Review requested fixes; repairing article draft…');
     const repair = await repairArticle([
       { role: 'system', content: compactArticlePrompt(context, style, recent.slice(0, 3).map(r => r.title)) +
         '\nRepair the entire article using ALL review issues. Return the complete article JSON, never a patch. Recompute every arithmetic value; follow early exits exactly. Keep the exact submitted algorithm and all unflagged correct content. Define n and m consistently. Include preprocessing and sort stack costs. Both frames of each animation MUST use the same input and successive real code states. Keep input fixed while correcting a trace; if too large, replace the complete dry run AND its animation together with a minimum valid example. Use short labels. Do not merely reword an incorrect claim. Do not embed the source code in prose.' },
@@ -349,8 +404,10 @@ export async function generateArticle(router: AIModelRouter, context: Submission
   let assets: VisualAsset[] = [];
   let visualFallback = false;
   if (resolveVisuals && article.visuals.length) {
+    await onStage?.('rendering_gifs', 'Rendering verified animation frames to GIFs…');
     try { assets = await resolveVisuals(article.visuals); } catch { visualFallback = true; }
   }
+  await onStage?.('draft_ready', 'Animation GIFs rendered & hosted; article draft ready');
   return { title: article.title, markdown: renderArticle(article, context, assets), style, model,
     article, visuals: article.visuals, assets, visualFallback: visualFallback || assets.length < article.visuals.length,
     attempts, reviewModel };
@@ -361,7 +418,7 @@ export async function generateArticle(router: AIModelRouter, context: Submission
 // one repair and one additional review are allowed, with the same checks as the
 // staged generator and no fallback to a different provider.
 async function generateAgentArticle(router: FirecrawlAgentRouter, context: SubmissionContext,
-  recent: Array<{ style: string; title: string }>, resolveVisuals?: VisualResolver) {
+  recent: Array<{ style: string; title: string }>, resolveVisuals?: VisualResolver, onStage?: StageCallback) {
   const style = selectStyle(context, recent.map(r => r.style));
   const attempts: ModelAttempt[] = [];
   const source = { title: context.title, difficulty: context.difficulty, problem: context.problem,

@@ -60,6 +60,7 @@ export async function fetchIncompleteQuestions(
   api: IncompleteQuestionsApi,
   count: number,
   pageSize = 50,
+  categorySlug = 'algorithms',
 ): Promise<IncompleteQuestion[]> {
   const result: IncompleteQuestion[] = [];
   const targetCount = Math.max(1, count);
@@ -69,7 +70,7 @@ export async function fetchIncompleteQuestions(
     const data = await api.graphql(
       INCOMPLETE_QUESTION_LIST_QUERY,
       {
-        categorySlug: '',
+        categorySlug,
         skip,
         limit: pageSize,
         filters: {

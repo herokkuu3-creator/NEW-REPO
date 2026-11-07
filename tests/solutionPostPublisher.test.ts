@@ -9,7 +9,8 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
       if (where.status !== h.row.status || where.updatedAt !== h.row.updatedAt) return { count: 0 };
       Object.assign(h.row, data, { updatedAt: new Date() }); return { count: 1 };
     }) },
-  account: { findUniqueOrThrow: vi.fn(async () => ({ id: 'a' })) },
+  account: { findUniqueOrThrow: vi.fn(async () => ({ id: 'a' })), findMany: vi.fn(async () => []) },
+  systemState: { upsert: vi.fn(), updateMany: vi.fn(), findUnique: vi.fn() },
 } }));
 vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error { constructor(code: string) { super(code); } },
   withAccount: vi.fn(async (_account, action) => action(h.api, h.page, 'alice')) }));
@@ -55,7 +56,7 @@ describe('authorized solution publishing', () => {
     expect(result.status).toBe('PUBLISHED'); expect(result.publishedUrl).toBe(h.url);
     const mutation = h.api.graphql.mock.calls.find((call: any[]) => call[0].includes('mutation ugcArticlePublishSolution'));
     expect(mutation[1].data).toEqual({ questionSlug: context.slug, title: h.row.title, content: markdown,
-      summary: h.row.title, thumbnail: '', tags: [] });
+      summary: h.row.title, thumbnail: '', tags: ['cpp'] });
     expect(h.page.goto).not.toHaveBeenCalled(); expect(h.click).not.toHaveBeenCalled();
     await publishPost('post1');
     expect(h.api.graphql.mock.calls.filter((call: any[]) => call[0].includes('mutation '))).toHaveLength(1);

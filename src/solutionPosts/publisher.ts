@@ -2,7 +2,8 @@ import { Page } from 'playwright';
 import { z } from 'zod';
 import { prisma } from '../database/prisma';
 import { LeetCodeApi, LeetCodeHttpError } from '../leetcode/apiClient';
-import { contextSchema, hash, SubmissionContext, titleIncludesQuestionName } from './article';
+import { contextSchema, hash, SubmissionContext, titleIncludesQuestionName, buildArticleTags } from './article';
+import { scheduleSolutionArticleUpvotes } from './upvote';
 import { move } from './store';
 import { PostError, withAccount } from './service';
 import { UGC_SOLUTION_ARTICLE_QUERY } from '../solutions/communitySolutions';
@@ -102,6 +103,26 @@ export async function prepareEditor(page: Page, context: SubmissionContext, titl
     return models.length === 1 ? models[0]!.getValue() : null;
   });
   if (saved !== markdown || await titleInput.inputValue() !== title) throw new PostError('EDITOR_CONTENT_MISMATCH');
+  try {
+    const tagBtn = page.getByRole('button', { name: /tag/i }).first();
+    if (await tagBtn.isVisible({ timeout: 1500 })) {
+      await tagBtn.click();
+      await page.waitForTimeout(400);
+      const tagOptions = page.locator('div[role="option"], div[role="menuitem"], li, button');
+      const langOption = tagOptions.filter({ hasText: /^c\+\+$/i }).first();
+      if (await langOption.isVisible({ timeout: 1000 })) {
+        await langOption.click();
+      }
+      const relatedOptions = tagOptions.filter({ hasText: /related/i });
+      const count = await relatedOptions.count();
+      for (let i = 0; i < Math.min(count, 5); i++) {
+        await relatedOptions.nth(i).click().catch(() => undefined);
+      }
+      await page.keyboard.press('Escape');
+    }
+  } catch (err) {
+    logger.debug({ err }, 'browser tag selection skipped or completed');
+  }
   if (!await page.getByRole('button', { name: 'Post', exact: true }).isEnabled()) throw new PostError('PUBLISHING_UNAVAILABLE');
 }
 
@@ -174,9 +195,11 @@ export async function publishPost(id: string) {
       // automatic repeat or a second attempt through the browser transport.
       post = await move(post, 'PUBLISHING');
       try {
+        const tags = buildArticleTags(context, post.markdown!);
+        logger.info({ postId: id, tags }, 'publishing solution article with tags');
         const result = await api.graphql(PUBLISH_SOLUTION_MUTATION, { data: {
           questionSlug: context.slug, title: post.title!, content: post.markdown!,
-          summary: post.title!, thumbnail: '', tags: [],
+          summary: post.title!, thumbnail: '', tags,
         } }, publishSchema);
         const response = result.ugcArticlePublishSolution;
         if (response.error || !response.article) {
@@ -191,6 +214,7 @@ export async function publishPost(id: string) {
         post = await move(post, 'PUBLISHED', { publishedAt: new Date(), lastError: null });
         logger.info({ postId: id, url, transport: 'api', executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
           revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication verified');
+        void scheduleSolutionArticleUpvotes(post).catch((upErr) => logger.warn({ postId: id, err: upErr }, 'failed to schedule article upvotes'));
         return post;
       } catch (error) {
         logger.warn({ postId: id, errorName: error instanceof Error ? error.name : 'Unknown',
@@ -224,7 +248,9 @@ export async function publishPost(id: string) {
       await page.waitForURL(url => validSolutionUrl(url.toString(), context.slug), { timeout: 30000 });
       post = await prisma.solutionPost.update({ where: { id }, data: { publishedUrl: page.url() } });
       await verifyPublished(api, page, post.publishedUrl!, context, post.title!, post.markdown!);
-      return await move(post, 'PUBLISHED', { publishedAt: new Date(), lastError: null });
+      post = await move(post, 'PUBLISHED', { publishedAt: new Date(), lastError: null });
+      void scheduleSolutionArticleUpvotes(post).catch((upErr) => logger.warn({ postId: id, err: upErr }, 'failed to schedule article upvotes'));
+      return post;
     } catch {
       // Do not transition to FAILED: a retry could produce a duplicate public post.
       return prisma.solutionPost.update({ where: { id }, data: { lastError: 'PUBLICATION_UNCERTAIN_RECONCILE_FIRST' } });
