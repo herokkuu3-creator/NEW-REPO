@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import { request as playwrightRequest } from 'playwright';
 import { logger } from '../logger';
 import { AccountRecord, getAccountById, listEnabledAccounts, parseStoredStorageState } from '../database/accounts';
-import { LeetCodeApi, looksLikeChallenge, isSubmissionLimitError, SubmissionOutcome } from '../leetcode/apiClient';
+import { LeetCodeApi, looksLikeChallenge, isSubmissionLimitError, leetCodeRequestFailure, SubmissionOutcome } from '../leetcode/apiClient';
 import { fetchQuestionData, RawQuestionData } from '../leetcode/dailyChallenge';
 import { checkSession, SessionCheckResult } from '../browser/sessionCheck';
 import { fetchWalkcccPage, signatureMatchesStarter, WalkcccError, WalkcccPage } from '../solutions/walkccc';
@@ -887,6 +887,7 @@ async function runAccountRange(
 
       // Blocked handling: a streak means LeetCode is refusing this IP/session.
       blockedStreak = blocked ? blockedStreak + 1 : 0;
+      if (!blocked) cooledDown = false;
       if (blockedStreak >= deps.blockedStreakLimit) {
         if (cooledDown) {
           result.stoppedEarly = 'blocked';
@@ -968,12 +969,15 @@ async function solveOneWithRetries(
 ): Promise<OneOutcome> {
   let touched = false;
   for (let attempt = 0; ; attempt++) {
-    const r = await solveOne(n, api, deps, usedCommunityUuids, progressCtx);
+    const r = await solveOne(n, api, deps, usedCommunityUuids, progressCtx, signal);
     touched ||= r.touchedLeetCode;
     if (r.submissionLimit) return { ...r, touchedLeetCode: touched };
     if (!r.blocked) return { ...r, touchedLeetCode: touched };
     const wait = deps.blockedBackoffMs[attempt];
-    if (wait === undefined) return { ...r, touchedLeetCode: touched }; // retries exhausted
+    if (wait === undefined) {
+      if (progressCtx) void deps.onProgress?.({ ...progressCtx, phase: 'error', questionNumber: n, detail: r.outcome?.detail });
+      return { ...r, touchedLeetCode: touched };
+    }
     logger.warn({ question: n, attempt: attempt + 1, waitMs: wait }, 'LeetCode blocked the request - backing off before retrying');
     await deps.sleep(wait, signal);
     if (signal.aborted) return { outcome: null, touchedLeetCode: touched, blocked: true };
@@ -987,9 +991,12 @@ async function solveOne(
   deps: RangeDeps,
   usedCommunityUuids?: Set<string>,
   progressCtx?: RangeProgressContext,
+  signal?: AbortSignal,
 ): Promise<{ outcome: QuestionResult; touchedLeetCode: boolean; blocked: boolean; submissionLimit?: boolean }> {
   let questionTitle: string | null = null;
   let slug: string | null = null;
+  let stage = 'question';
+  let submittedId: string | undefined;
 
   const err = (detail: string, touched = true, blocked = false) => {
     if (progressCtx) {
@@ -1168,6 +1175,24 @@ async function solveOne(
       usedCommunityUuids.add(chosenUuid);
     }
 
+    // Retry verdict reads against the SAME ID; a polling failure must never
+    // restart the irreversible submission or choose another source solution.
+    const readVerdict = async (id: string) => {
+      stage = 'verdict'; submittedId = id;
+      for (let attempt = 0; ; attempt++) {
+        try { return await api.awaitResult(id, slug!); }
+        catch (error) {
+          const failure = leetCodeRequestFailure(error);
+          logger.warn({ question: n, account: progressCtx?.label, stage, submissionId: id, category: failure.category }, 'range verdict request failed');
+          const wait = deps.blockedBackoffMs[attempt];
+          if (!looksLikeChallenge(error) || wait === undefined || signal?.aborted) throw error;
+          if (progressCtx) void deps.onProgress?.({ ...progressCtx, phase: 'blocked', questionNumber: n, questionTitle: questionTitle!, slug: slug!,
+            submissionId: id, detail: `${failure.detail}; retrying verdict only` });
+          await deps.sleep(wait, signal ?? new AbortController().signal);
+          if (signal?.aborted) throw Error('Verdict polling cancelled; submission already sent');
+        }
+      }
+    };
     // 4) Submit with comment-stripping fallback + judge failure fallback
     const submitCode = async (code: string) => {
       const strippedCode = stripCppComments(code);
@@ -1189,6 +1214,7 @@ async function solveOne(
         });
       }
 
+      stage = 'submit';
       const subId = await api.submit({ slug: slug!, questionId, lang: 'cpp', code: codeToTryFirst });
 
       if (progressCtx) {
@@ -1207,15 +1233,16 @@ async function solveOne(
         });
       }
 
-      let verdict = await api.awaitResult(subId, slug!);
+      let verdict = await readVerdict(subId);
 
       if (useStripped && shouldRetryWithOriginal(verdict.statusDisplay)) {
         logger.warn(
           { question: n, slug, verdict: verdict.statusDisplay },
           'comment-stripped code failed with compile/runtime error; retrying with original code',
         );
+        stage = 'submit';
         const retrySubId = await api.submit({ slug: slug!, questionId, lang: 'cpp', code });
-        verdict = await api.awaitResult(retrySubId, slug!);
+        verdict = await readVerdict(retrySubId);
         return { verdict, submissionId: retrySubId, code };
       }
 
@@ -1334,6 +1361,14 @@ async function solveOne(
       blocked: false,
     };
   } catch (e) {
+    const failure = leetCodeRequestFailure(e);
+    logger.warn({ account: progressCtx?.label, question: n, slug, stage, submissionId: submittedId,
+      category: failure.category, reason: failure.detail }, 'range request failed');
+    if (submittedId) {
+      const detail = `Submission #${submittedId} sent; verdict unconfirmed: ${failure.detail}`;
+      const result = err(detail);
+      return { ...result, outcome: { ...result.outcome, submissionId: submittedId }, blocked: false };
+    }
     if (isSubmissionLimitError(e)) {
       const msg = `LeetCode submission limit reached: ${shortErr(e)}`;
       if (progressCtx) {
@@ -1371,10 +1406,12 @@ async function solveOne(
           questionNumber: n,
           questionTitle: questionTitle ?? slug ?? undefined,
           slug: slug ?? undefined,
-          detail: 'blocked by LeetCode',
+          detail: failure.detail,
         });
       }
-      return err('blocked by LeetCode', true, true);
+      // The temporary notice is an active status, not a completed-question
+      // error. Emit the final error only after bounded retries are exhausted.
+      return { outcome: { number: n, status: 'error', detail: failure.detail }, touchedLeetCode: true, blocked: true };
     }
     return err(shortErr(e));
   }

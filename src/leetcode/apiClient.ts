@@ -29,6 +29,21 @@ export class LeetCodeHttpError extends Error {
   }
 }
 
+export function leetCodeRequestFailure(err: unknown): { category: string; detail: string } {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (isSubmissionLimitError(err)) return { category: 'submission-limit', detail: 'LeetCode explicitly reported a submission quota' };
+  if (/csrf|csrftoken/i.test(msg)) return { category: 'session-csrf', detail: 'Server session CSRF token rejected; refresh the account session' };
+  if (/not.*(?:signed|logged).*in|unauthenticated|authentication|session.*expired/i.test(msg) || (err instanceof LeetCodeHttpError && err.status === 401)) {
+    return { category: 'session-auth', detail: 'Server session requires authentication' };
+  }
+  const html = /<!doctype|<html|cloudflare|cf-chl|just a moment/i.test(msg);
+  if ((err instanceof LeetCodeHttpError && err.status === 429) || /too (?:many requests|fast)|submit.{0,20}(?:too often|too frequently)|try again.{0,12}(?:seconds?|minutes?)/i.test(msg)) return { category: 'rate-limit', detail: 'Server request rate limited; no daily quota confirmed' + (err instanceof LeetCodeHttpError && err.status === 429 ? ' (HTTP 429)' : '') };
+  if (html) return { category: 'challenge', detail: 'Server received a verification page; no account submission quota confirmed' };
+  if (err instanceof LeetCodeHttpError && err.status === 403) return { category: 'access-denied', detail: 'Server request denied (HTTP 403); no account submission quota confirmed' };
+  if (/no submission_id/.test(msg)) return { category: 'unknown-submit-response', detail: 'Submission response had no ID; outcome needs reconciliation' };
+  return { category: 'request-failed', detail: 'Server request failed' };
+}
+
 /**
  * Detects LeetCode account-level submission limit / daily quota errors.
  * Note: Cloudflare rate limits / HTML interstitials (e.g. submit HTTP 429: <!DOCTYPE html>)
@@ -40,19 +55,19 @@ export function isSubmissionLimitError(err: unknown): boolean {
   if (/<!DOCTYPE|<html|<head|cloudflare|cf-chl|just a moment/i.test(msg)) {
     return false;
   }
-  return (
-    /submission limit|submissions limit|daily limit|daily submission|maximum number of submissions|submission quota|quota exceeded/i.test(
-      msg,
-    )
-  );
+  // A temporary submission-frequency limit is not evidence of a daily quota.
+  return /\b(?:today|daily|per day|24[ -]?hours?)\b/i.test(msg) &&
+    /submission.{0,35}(?:limit|quota)|(?:limit|quota).{0,35}submission|daily limit|quota exceeded/i.test(msg);
 }
 
 /** A 403, 429, or non-JSON/HTML body from LeetCode or Cloudflare usually means an interstitial or challenge block. */
 export function looksLikeChallenge(err: unknown): boolean {
   if (isSubmissionLimitError(err)) return false;
+  if (leetCodeRequestFailure(err).category === 'rate-limit') return true;
+  if (/csrf|csrftoken|not.*(?:signed|logged).*in|session.*expired/i.test(err instanceof Error ? err.message : String(err))) return false;
   if (err instanceof LeetCodeHttpError) {
     if (err.status === 403 || err.status === 429) return true;
-    if (/non-JSON body|no submission_id/i.test(err.message)) return true;
+    if (/non-JSON body/i.test(err.message)) return true;
   }
   const msg = err instanceof Error ? err.message : String(err);
   if (/<!DOCTYPE|<html|<head|cloudflare|cf-chl|just a moment/i.test(msg)) return true;

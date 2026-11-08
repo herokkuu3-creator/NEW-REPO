@@ -32,6 +32,7 @@ import type { RecoveryService } from '../recovery/service';
 import { registerRecoveryRoutes } from '../recovery/routes';
 import { runRemoteBrowserPoc } from '../recovery/poc';
 import { registerVisualAssetRoutes } from '../solutionPosts/visualStore';
+import { registerRangeDiagnostics } from '../scheduler/rangeDiagnostics';
 import { probeSageApi, askSage, sageConsoleHtml } from '../ai/sageProbe';
 import {
   completeLeetCodePairingSession,
@@ -195,6 +196,7 @@ export async function startHealthServer(
 
   registerSolutionPostRoutes(app, requireAdmin);
   registerVisualAssetRoutes(app);
+  registerRangeDiagnostics(app, requireAdmin);
 
   // --- LeetCode session recovery portal + admin diagnostics ------------------
   if (hooks.recovery) {

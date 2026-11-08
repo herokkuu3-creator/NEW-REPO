@@ -95,6 +95,8 @@ describe('handleQuestionRangeTrigger', () => {
           accounts: fakeAccounts,
           done: (async () => {
             // Simulate progression
+            await progressCallback?.({ phase: 'blocked', label: 'acc-one', username: 'user_one', accIndex: 0, accTotal: 1,
+              stepIndex: 1, stepTotal: 2, questionNumber: 3800, detail: 'Server request rate limited (HTTP 429)' });
             await progressCallback?.({
               phase: 'processing',
               label: 'acc-one',
@@ -165,6 +167,8 @@ describe('handleQuestionRangeTrigger', () => {
       expect(results).toHaveLength(1);
       // Last edit should show Finished summary
       const lastEdit = edits.at(-1);
+      expect(lastEdit).not.toContain('Server request paused');
+      expect(lastEdit).not.toContain('Blocked by LeetCode');
       expect(lastEdit).toContain('Finished:</b> 1 accepted');
       expect(lastEdit).toContain('✅ [1/2] <code>#3800 Two Sum</code> — <b>Accepted</b> · #998877');
     }

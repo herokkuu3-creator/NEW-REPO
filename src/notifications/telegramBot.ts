@@ -5092,6 +5092,9 @@ export async function handleQuestionRangeTrigger(
     const stepPrefix = event.stepTotal && event.stepTotal > 1 ? `[${event.stepIndex}/${event.stepTotal}] ` : '';
     const qName = event.questionTitle ? ` ${event.questionTitle}` : '';
     const qTag = `<code>#${event.questionNumber}${escapeHtml(qName)}</code>`;
+    // A transient request failure is not a permanent account status. Clear it
+    // when the engine progresses again, including after a successful retry.
+    if (event.phase !== 'blocked' && sec.accountStatus?.includes('Server request paused')) sec.accountStatus = undefined;
 
     switch (event.phase) {
       case 'checking':
@@ -5147,8 +5150,8 @@ export async function handleQuestionRangeTrigger(
         break;
       }
       case 'blocked': {
-        sec.activeLine = '🧱 LeetCode rate-limit / challenge blocked';
-        sec.accountStatus = '🧱 Blocked by LeetCode';
+        sec.activeLine = `⏳ ${stepPrefix}${qTag} — ${escapeHtml(event.detail ?? 'Server request paused; retrying')}`;
+        sec.accountStatus = '⏳ Server request paused';
         break;
       }
       case 'cancelled': {
@@ -5178,6 +5181,8 @@ export async function handleQuestionRangeTrigger(
           const results = await res.done;
           for (const s of accountSections.values()) {
             s.activeLine = undefined;
+            const result = results.find(r => r.label === s.label);
+            if (result?.stoppedEarly === 'blocked') s.accountStatus = '⏸️ Server requests still denied after retry and cooldown; remaining questions not attempted';
           }
           const sum = { accepted: 0, failed: 0, error: 0, premium: 0 };
           for (const r of results) {
@@ -5217,6 +5222,8 @@ export async function handleQuestionRangeTrigger(
       const results = await res.done;
       for (const sec of accountSections.values()) {
         sec.activeLine = undefined;
+        const result = results.find(r => r.label === sec.label);
+        if (result?.stoppedEarly === 'blocked') sec.accountStatus = '⏸️ Server requests still denied after retry and cooldown; remaining questions not attempted';
       }
       const sum = { accepted: 0, failed: 0, error: 0, premium: 0 };
       for (const r of results) {

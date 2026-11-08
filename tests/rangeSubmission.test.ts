@@ -224,12 +224,13 @@ describe('range engine', () => {
     expect(s).toContain('• Wrong Answer: #201');
     expect(s).toContain('🔒 Premium (locked): 1 — #202');
     expect(s).toContain('⚠️ Error: 1');
-    expect(s).toContain('• blocked by LeetCode: #203');
+    expect(s).toContain('verdict unconfirmed');
     expect(s).toMatch(/⏱️ Took /);
   });
 
   it('retries blocked questions with back-off, cools down, then stops the account early', async () => {
     const session = makeSession(() => 'block403', []);
+    session.api.question = async () => { throw new LeetCodeHttpError('GraphQL HTTP 403', 403); };
     const { deps, sleeps } = makeDeps(session, [acc('a1')], {
       blockedStreakLimit: 2,
       blockedCooldownMs: 600_000,
@@ -243,6 +244,50 @@ describe('range engine', () => {
     expect(sleeps.slice(0, 3)).toEqual([10, 20, 40]);
     // …and exactly one long cool-down once two in a row were blocked.
     expect(sleeps.filter((ms) => ms === 600_000)).toHaveLength(1);
+  });
+  it('retries verdict reads using one submission ID and never submits again after a read failure', async () => {
+    const log: string[] = []; const session = makeSession(() => 'accepted', log);
+    const original = session.api.awaitResult; const ids: string[] = []; const events: any[] = [];
+    session.api.awaitResult = async (id, slug) => {
+      ids.push(id);
+      if (ids.length < 3) throw new LeetCodeHttpError('GraphQL HTTP 429', 429);
+      return original(id, slug);
+    };
+    const { deps } = makeDeps(session, [acc('a1')], { onProgress: event => { events.push(event); } });
+    const run = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
+    expect((await run.done)[0]!.results[0]!.status).toBe('accepted');
+    expect(log.filter(x => x.startsWith('submit:'))).toHaveLength(1);
+    expect(ids).toEqual(['s200', 's200', 's200']);
+    expect(events.filter(e => e.phase === 'error')).toHaveLength(0);
+  });
+  it('preserves an unconfirmed submitted ID when all verdict retries fail and continues without resubmitting', async () => {
+    const log: string[] = []; const session = makeSession(() => 'block403', log);
+    const { deps } = makeDeps(session, [acc('a1')]);
+    const run = await startRangeJob({ from: 200, to: 201 }, 'a1', deps);
+    const result = (await run.done)[0]!;
+    expect(result.stoppedEarly).toBeUndefined();
+    expect(result.results.map(r => r.submissionId)).toEqual(['s200', 's201']);
+    expect(log.filter(x => x.startsWith('submit:'))).toHaveLength(2);
+    expect(result.results.every(r => r.detail?.includes('verdict unconfirmed'))).toBe(true);
+  });
+  it('does not turn recovered metadata throttling into completed errors', async () => {
+    const session = makeSession(() => 'accepted', []); const question = session.api.question; let calls = 0;
+    session.api.question = async slug => { if (++calls === 1) throw new LeetCodeHttpError('GraphQL HTTP 429', 429); return question(slug); };
+    const events: any[] = []; const { deps } = makeDeps(session, [acc('a1')], { onProgress: event => { events.push(event); } });
+    const run = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
+    expect((await run.done)[0]!.results[0]!.status).toBe('accepted');
+    expect(events.filter(e => e.phase === 'error')).toHaveLength(0);
+    expect(events.find(e => e.phase === 'blocked').detail).toContain('429');
+  });
+  it('reports a stale CSRF session as a session error without challenge retries or a quota claim', async () => {
+    const session = makeSession(() => 'accepted', []);
+    session.api.submit = vi.fn(async () => { throw new LeetCodeHttpError('submit HTTP 403: CSRF verification failed', 403); });
+    const { deps, sleeps } = makeDeps(session, [acc('a1')]);
+    const run = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
+    const result = (await run.done)[0]!;
+    expect(result.stoppedEarly).toBeUndefined();
+    expect(session.api.submit).toHaveBeenCalledTimes(1); expect(sleeps).toEqual([]);
+    expect(result.results[0]!.detail).toContain('CSRF');
   });
 
   it('transient LeetCode errors (500) are plain errors, never blocks', async () => {
