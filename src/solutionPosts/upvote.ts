@@ -88,6 +88,9 @@ export interface AccountUpvoteResult {
 }
 
 const activeUpvoteJobs = new Set<string>();
+// Serialize jobs across posts so several recovered posts never run concurrently.
+let upvoteChain: Promise<void> = Promise.resolve();
+const MAX_RECOVERY_ATTEMPTS = 3;
 
 function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -234,7 +237,74 @@ export async function upvoteArticleWithSession(
   throw new Error('UPVOTE_NOT_VERIFIED_ON_LEETCODE');
 }
 
+const PER_ACCOUNT_TIMEOUT_MS = 90_000;
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+/**
+ * Lightweight authenticated GraphQL client built from the account's stored
+ * cookies. No browser launch — the same endpoint LeetCode's own frontend calls.
+ */
+export function cookieGraphqlClient(account: Account): { graphql: LeetCodeApi['graphql'] } | null {
+  let cookies: Array<{ name: string; value: string; domain?: string }> = [];
+  try { cookies = (JSON.parse(account.storageState) as { cookies?: typeof cookies }).cookies ?? []; } catch { return null; }
+  const lc = cookies.filter(c => !c.domain || /leetcode\.com$/i.test(c.domain.replace(/^\./, '')));
+  const session = lc.find(c => c.name === 'LEETCODE_SESSION')?.value;
+  const csrf = lc.find(c => c.name === 'csrftoken')?.value;
+  if (!session || !csrf) return null;
+  const cookieHeader = lc.map(c => `${c.name}=${c.value}`).join('; ');
+  const graphql = (async (query: string, variables: Record<string, unknown>, schema: z.ZodTypeAny) => {
+    const res = await fetch('https://leetcode.com/graphql/', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json', 'x-csrftoken': csrf, cookie: cookieHeader,
+        referer: 'https://leetcode.com/', origin: 'https://leetcode.com', 'user-agent': UA,
+      },
+      body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const text = await res.text();
+    let body: { data?: unknown; errors?: Array<{ message: string }> };
+    try { body = JSON.parse(text); } catch { throw new Error(`GRAPHQL_NON_JSON_HTTP_${res.status}`); }
+    if (body.errors?.length) throw new Error(`GRAPHQL_ERROR: ${body.errors.map(e => e.message).join('; ').slice(0, 120)}`);
+    return schema.parse(body.data);
+  }) as unknown as LeetCodeApi['graphql'];
+  return { graphql };
+}
+
+const userStatusSchema = z.object({ userStatus: z.object({ isSignedIn: z.boolean(), username: z.string().nullable().optional() }) });
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label}_TIMEOUT`)), ms);
+    p.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
+  });
+}
+
 export async function upvoteSolutionArticleWithAccount(
+  account: Account,
+  topicId: number,
+  publishedUrl?: string | null,
+): Promise<AccountUpvoteResult> {
+  // Primary: direct cookie GraphQL (fast, no Chromium).
+  const client = cookieGraphqlClient(account);
+  if (client) {
+    try {
+      return await withTimeout((async () => {
+        const status = await client.graphql('query { userStatus { isSignedIn username } }', {}, userStatusSchema);
+        if (!status.userStatus.isSignedIn) throw new PostError('AUTHENTICATION_REQUIRED');
+        const username = status.userStatus.username ?? account.username ?? account.label;
+        return upvoteArticleWithSession(client as unknown as LeetCodeApi, undefined, topicId, publishedUrl, username);
+      })(), PER_ACCOUNT_TIMEOUT_MS, 'UPVOTE');
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.warn({ accountId: account.id, err: msg }, 'cookie GraphQL upvote failed; trying browser session');
+      if (msg === 'UPVOTE_NOT_VERIFIED_ON_LEETCODE') throw error;
+    }
+  }
+  return withTimeout(upvoteWithBrowser(account, topicId, publishedUrl), PER_ACCOUNT_TIMEOUT_MS * 2, 'UPVOTE_BROWSER');
+}
+
+async function upvoteWithBrowser(
   account: Account,
   topicId: number,
   publishedUrl?: string | null,
@@ -331,12 +401,14 @@ export async function scheduleSolutionArticleUpvotes(
   }
 
   const stateKey = `solution-post-upvotes:${post.id}`;
-  if (!options.force && typeof prisma.systemState?.findUnique === 'function') {
-    const existingState = await prisma.systemState.findUnique({ where: { key: stateKey } }).catch(() => null);
+  let previousAttempts = 0;
+  if (typeof prisma.systemState?.findUnique === 'function') {
+    const existingState = await Promise.resolve(prisma.systemState.findUnique({ where: { key: stateKey } })).catch(() => null);
     if (existingState) {
       try {
-        const parsed = JSON.parse(existingState.value) as { status?: string; verified?: boolean; verifiedCount?: number };
-        if (parsed.status === 'COMPLETED' && parsed.verified === true && (parsed.verifiedCount ?? 0) > 0) {
+        const parsed = JSON.parse(existingState.value) as { status?: string; verified?: boolean; verifiedCount?: number; attempts?: number };
+        previousAttempts = parsed.attempts ?? 0;
+        if (!options.force && parsed.status === 'COMPLETED' && parsed.verified === true && (parsed.verifiedCount ?? 0) > 0) {
           logger.info({ postId: post.id, topicId, verifiedCount: parsed.verifiedCount }, 'upvotes already verified for this post');
           return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
         }
@@ -391,6 +463,7 @@ export async function scheduleSolutionArticleUpvotes(
     verified: false,
     verifiedCount: 0,
     failedCount: 0,
+    attempts: previousAttempts + 1,
     scheduledAt: new Date().toISOString(),
     startAt: new Date(Date.now() + initialDelay).toISOString(),
   };
@@ -415,8 +488,8 @@ export async function scheduleSolutionArticleUpvotes(
 
   activeUpvoteJobs.add(post.id);
 
-  // Background execution with keep-alive so Render never spins down mid-schedule
-  void (async () => {
+  // Background execution, serialized globally, with keep-alive so Render never spins down mid-schedule
+  const runJob = async () => {
     const stopKeepAlive = startArticleWorkKeepAlive();
     let verifiedCount = 0;
     let failedCount = 0;
@@ -571,7 +644,8 @@ export async function scheduleSolutionArticleUpvotes(
       activeUpvoteJobs.delete(post.id);
       stopKeepAlive();
     }
-  })();
+  };
+  upvoteChain = upvoteChain.then(runJob, runJob);
 
   return { scheduled: true, count: otherAccounts.length || totalAccounts, initialDelayMs: initialDelay, accountGapMs: gap };
 }
@@ -596,13 +670,14 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
     for (const post of recentPublished) {
       if (!post.publishedUrl || activeUpvoteJobs.has(post.id)) continue;
       const stateKey = `solution-post-upvotes:${post.id}`;
-      const existing = await prisma.systemState.findUnique({ where: { key: stateKey } }).catch(() => null);
+      const existing = await Promise.resolve(prisma.systemState.findUnique({ where: { key: stateKey } })).catch(() => null);
       if (existing) {
         try {
-          const parsed = JSON.parse(existing.value) as { verified?: boolean; verifiedCount?: number };
+          const parsed = JSON.parse(existing.value) as { verified?: boolean; verifiedCount?: number; attempts?: number };
           if (parsed.verified === true && (parsed.verifiedCount ?? 0) > 0) {
             continue;
           }
+          if ((parsed.attempts ?? 0) >= MAX_RECOVERY_ATTEMPTS) continue;
         } catch {
           // Re-run if corrupt
         }
@@ -611,7 +686,8 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
         { postId: post.id, problemSlug: post.problemSlug, publishedUrl: post.publishedUrl },
         'recovering unverified coordinated upvotes for published solution article',
       );
-      await scheduleSolutionArticleUpvotes(post, { force: true });
+      // Article is already older than the initial delay; keep only the 1-minute gap.
+      await scheduleSolutionArticleUpvotes(post, { force: true, initialDelayMs: 0 });
     }
   } catch (err) {
     logger.warn(
