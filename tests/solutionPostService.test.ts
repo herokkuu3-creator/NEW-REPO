@@ -177,24 +177,24 @@ describe('solution workflow and persistence', () => {
   });
   it('keeps the automatic four-attempt guard and exposes the original failure without altering it', async () => {
     await generatePost(context, {} as never);
-    Object.assign(h.row, { status: 'FAILED', retryCount: 4, lastError: 'AI_PROVIDER_ACCESS_BLOCKED' });
+    Object.assign(h.row, { status: 'FAILED', retryCount: 5, lastError: 'AI_PROVIDER_ACCESS_BLOCKED' });
     h.generation.mockClear();
     await expect(retryPost('post1')).rejects.toMatchObject({ code: 'GENERATION_RETRY_LIMIT', details: {
-      postId: 'post1', retryCount: 4, previousError: 'AI_PROVIDER_ACCESS_BLOCKED',
+      postId: 'post1', retryCount: 5, previousError: 'AI_PROVIDER_ACCESS_BLOCKED',
     } });
-    expect(h.row).toMatchObject({ status: 'FAILED', retryCount: 4, lastError: 'AI_PROVIDER_ACCESS_BLOCKED' });
+    expect(h.row).toMatchObject({ status: 'FAILED', retryCount: 5, lastError: 'AI_PROVIDER_ACCESS_BLOCKED' });
     expect(h.generation).not.toHaveBeenCalled();
   });
   it('allows an explicit retry after four failures and reports the current configuration error', async () => {
     await generatePost(context, {} as never);
-    Object.assign(h.row, { status: 'FAILED', retryCount: 4, lastError: 'OLD_PROVIDER_ERROR' });
+    Object.assign(h.row, { status: 'FAILED', retryCount: 5, lastError: 'OLD_PROVIDER_ERROR' });
     const post = await retryPost('post1', true);
     expect(post).toMatchObject({ status: 'FAILED', retryCount: 1, lastError: 'AI_CONFIGURATION_REQUIRED' });
     expect(h.run).toMatchObject({ state: 'SUCCESS', submissionId: '123', solution: context.code });
   });
   it('atomically renews an exhausted recovered post once under simultaneous explicit retries', async () => {
     await generatePost(context, {} as never);
-    Object.assign(h.row, { status: 'RETRY_PENDING', retryCount: 4, lastError: 'TWO_PUBLIC_GIFS_REQUIRED' });
+    Object.assign(h.row, { status: 'RETRY_PENDING', retryCount: 5, lastError: 'TWO_PUBLIC_GIFS_REQUIRED' });
     h.generation.mockClear();
     const results = await Promise.allSettled([generatePost(context, {} as never, true), generatePost(context, {} as never, true)]);
     expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
@@ -203,17 +203,17 @@ describe('solution workflow and persistence', () => {
   });
   it('does not reset an exhausted budget if the stored accepted source fails verification', async () => {
     await generatePost(context, {} as never);
-    Object.assign(h.row, { status: 'FAILED', retryCount: 4 });
+    Object.assign(h.row, { status: 'FAILED', retryCount: 5 });
     h.run.solution = 'a different accepted source';
     await expect(retryPost('post1', true)).rejects.toThrow('SOURCE_INTEGRITY_FAILED');
-    expect(h.row.retryCount).toBe(4);
+    expect(h.row.retryCount).toBe(5);
   });
   it.each(['PUBLISHING', 'PUBLISHED', 'AWAITING_APPROVAL'])('never resets or replays a %s post on explicit retry', async status => {
     await generatePost(context, {} as never);
-    Object.assign(h.row, { status, retryCount: 4 });
+    Object.assign(h.row, { status, retryCount: 5 });
     h.generation.mockClear();
     await expect(retryPost('post1', true)).rejects.toThrow('NOT_RETRYABLE');
-    expect(h.row).toMatchObject({ status, retryCount: 4 });
+    expect(h.row).toMatchObject({ status, retryCount: 5 });
     expect(h.generation).not.toHaveBeenCalled();
   });
   it('requires a matching content hash before approval', async () => {

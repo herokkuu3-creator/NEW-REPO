@@ -88,9 +88,14 @@ export interface AccountUpvoteResult {
 }
 
 const activeUpvoteJobs = new Set<string>();
-// Serialize jobs across posts so several recovered posts never run concurrently.
-let upvoteChain: Promise<void> = Promise.resolve();
-const MAX_RECOVERY_ATTEMPTS = 3;
+interface UpvoteQueueItem {
+  post: UpvoteTarget;
+  options: { initialDelayMs?: number; accountGapMs?: number; force?: boolean };
+  authorAccount?: Account | null;
+  otherAccounts?: Account[];
+}
+const upvoteQueue: UpvoteQueueItem[] = [];
+let isProcessingQueue = false;
 
 function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -240,10 +245,6 @@ export async function upvoteArticleWithSession(
 const PER_ACCOUNT_TIMEOUT_MS = 90_000;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-/**
- * Lightweight authenticated GraphQL client built from the account's stored
- * cookies. No browser launch — the same endpoint LeetCode's own frontend calls.
- */
 export function cookieGraphqlClient(account: Account): { graphql: LeetCodeApi['graphql'] } | null {
   let cookies: Array<{ name: string; value: string; domain?: string }> = [];
   try { cookies = (JSON.parse(account.storageState) as { cookies?: typeof cookies }).cookies ?? []; } catch { return null; }
@@ -285,7 +286,6 @@ export async function upvoteSolutionArticleWithAccount(
   topicId: number,
   publishedUrl?: string | null,
 ): Promise<AccountUpvoteResult> {
-  // Primary: direct cookie GraphQL (fast, no Chromium).
   const client = cookieGraphqlClient(account);
   if (client) {
     try {
@@ -372,10 +372,241 @@ function renderUpvoteProgressBoard(params: {
 }
 
 /**
- * Schedules and verifies solution article upvotes across ALL enabled accounts:
- * 1. Author account (where the article is posted) upvotes IMMEDIATELY (0 delay) and verifies via GraphQL.
- * 2. All other enabled accounts start 5 minutes after publication, with a 1-minute gap between each account,
- *    verifying every single upvote via LeetCode's GraphQL `myReactionType === 'UPVOTE'` and live `reactions` count.
+ * Executes the complete upvote sequence for one article from start to finish.
+ * Only one article executes at a time.
+ */
+async function executeUpvoteWorkflow(
+  post: UpvoteTarget,
+  options: { initialDelayMs?: number; accountGapMs?: number; force?: boolean } = {},
+  passedAuthorAccount?: Account | null,
+  passedOtherAccounts?: Account[],
+): Promise<void> {
+  const initialDelay = options.initialDelayMs ?? UPVOTE_INITIAL_DELAY_MS;
+  const gap = options.accountGapMs ?? UPVOTE_ACCOUNT_GAP_MS;
+  const topicId = extractTopicIdFromUrl(post.publishedUrl!);
+  if (!topicId) return;
+
+  const stateKey = `solution-post-upvotes:${post.id}`;
+
+  // Fetch author account and other accounts
+  let authorAccount: Account | null = passedAuthorAccount !== undefined ? passedAuthorAccount : null;
+  if (passedAuthorAccount === undefined) {
+    if (typeof prisma.account?.findFirst === 'function') {
+      authorAccount = await prisma.account
+        .findFirst({
+          where: { id: post.accountId, status: { not: 'DISABLED' } },
+        })
+        .catch(() => null);
+    } else if (typeof prisma.account?.findUniqueOrThrow === 'function') {
+      authorAccount = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } }).catch(() => null);
+      if (authorAccount && (authorAccount.id !== post.accountId || authorAccount.status === 'DISABLED')) {
+        authorAccount = null;
+      }
+    }
+  }
+
+  let otherAccounts: Account[] = passedOtherAccounts ?? [];
+  if (passedOtherAccounts === undefined) {
+    const fetched = await prisma.account
+      .findMany({
+        where: {
+          id: { not: post.accountId },
+          status: { not: 'DISABLED' },
+        },
+        orderBy: { createdAt: 'asc' },
+      })
+      .catch(() => []);
+    otherAccounts = fetched || [];
+  }
+
+  const totalAccounts = (authorAccount ? 1 : 0) + otherAccounts.length;
+  if (totalAccounts === 0) return;
+
+  const jobState = {
+    postId: post.id,
+    topicId,
+    publishedUrl: post.publishedUrl,
+    authorAccountId: post.accountId,
+    accountIds: [...(authorAccount ? [authorAccount.id] : []), ...otherAccounts.map((a) => a.id)],
+    status: 'RUNNING',
+    verified: false,
+    verifiedCount: 0,
+    failedCount: 0,
+    attempts: 1,
+    scheduledAt: new Date().toISOString(),
+    startAt: new Date().toISOString(),
+  };
+
+  await prisma.systemState.upsert({
+    where: { key: stateKey },
+    create: { key: stateKey, value: JSON.stringify(jobState) },
+    update: { value: JSON.stringify(jobState) },
+  });
+
+  const stopKeepAlive = startArticleWorkKeepAlive();
+  let verifiedCount = 0;
+  let failedCount = 0;
+  let liveUpvoteCount = 0;
+  const entries: string[] = [];
+  let progressMessageId: number | null = null;
+
+  const updateProgressBoard = async (title: string, activeStep: string) => {
+    const text = renderUpvoteProgressBoard({
+      title,
+      problemSlug: post.problemSlug,
+      publishedUrl: post.publishedUrl!,
+      topicId,
+      verifiedCount,
+      failedCount,
+      totalAccounts,
+      liveUpvoteCount,
+      entries,
+      activeStep,
+    });
+    if (progressMessageId) {
+      await editTelegramMessage(progressMessageId, text, { parseMode: 'HTML' }).catch(() => undefined);
+    } else if (typeof sendTelegramMessageWithId === 'function') {
+      progressMessageId = await sendTelegramMessageWithId(text, { parseMode: 'HTML' }).catch(() => null);
+      if (!progressMessageId) {
+        await sendTelegramMessage(text, { parseMode: 'HTML' }).catch(() => undefined);
+      }
+    } else {
+      await sendTelegramMessage(text, { parseMode: 'HTML' }).catch(() => undefined);
+    }
+  };
+
+  try {
+    // 1. Author Account upvotes immediately (0s delay)
+    if (authorAccount) {
+      const authorLabel = authorAccount.label || authorAccount.username || authorAccount.id;
+      await updateProgressBoard(
+        'COORDINATED SOLUTION UPVOTING',
+        `⏳ Upvoting immediately with author account (${escapeHtml(authorLabel)})…`,
+      );
+
+      try {
+        logger.info({ accountId: authorAccount.id, label: authorLabel, topicId }, 'executing immediate author self-upvote');
+        const res = await upvoteSolutionArticleWithAccount(authorAccount, topicId, post.publishedUrl);
+        verifiedCount++;
+        liveUpvoteCount = Math.max(liveUpvoteCount, res.upvoteCount);
+        entries.push(`✅ <code>${escapeHtml(authorLabel)}</code> (Author · Immediate) — Verified (⬆️ ${res.upvoteCount})`);
+      } catch (authorErr) {
+        failedCount++;
+        const msg = authorErr instanceof Error ? authorErr.message : String(authorErr);
+        entries.push(`❌ <code>${escapeHtml(authorLabel)}</code> (Author) — Failed (${escapeHtml(msg.slice(0, 60))})`);
+        logger.warn({ accountId: authorAccount.id, label: authorLabel, topicId, err: msg }, 'immediate author upvote failed');
+      }
+    }
+
+    // 2. Wait 5 minutes before other accounts start upvoting ("after 5 min next upvote should cast")
+    if (otherAccounts.length > 0 && initialDelay > 0) {
+      await updateProgressBoard(
+        'COORDINATED SOLUTION UPVOTING',
+        `⏳ Waiting ${Math.round(initialDelay / 60000)}m before next upvote (${otherAccounts.length} account(s) pending)…`,
+      );
+      await new Promise((r) => setTimeout(r, initialDelay));
+    }
+
+    // 3. Upvote with each remaining account sequentially (1 minute gap)
+    for (let i = 0; i < otherAccounts.length; i++) {
+      const account = otherAccounts[i]!;
+      const label = account.label || account.username || account.id;
+      await updateProgressBoard(
+        'COORDINATED SOLUTION UPVOTING',
+        `⏳ Upvoting & verifying with <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length})…`,
+      );
+
+      try {
+        logger.info({ accountId: account.id, label, index: i + 1, total: otherAccounts.length, topicId }, 'executing coordinated upvote');
+        const res = await upvoteSolutionArticleWithAccount(account, topicId, post.publishedUrl);
+        verifiedCount++;
+        liveUpvoteCount = Math.max(liveUpvoteCount, res.upvoteCount);
+        entries.push(`✅ <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length}) — Verified (⬆️ ${res.upvoteCount})`);
+      } catch (accountErr) {
+        failedCount++;
+        const msg = accountErr instanceof Error ? accountErr.message : String(accountErr);
+        entries.push(`❌ <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length}) — Failed (${escapeHtml(msg.slice(0, 60))})`);
+        logger.warn({ accountId: account.id, label, err: msg }, 'failed to upvote or verify with account; proceeding to next');
+      }
+
+      if (i < otherAccounts.length - 1 && gap > 0) {
+        const nextAccount = otherAccounts[i + 1]!;
+        const nextLabel = nextAccount.label || nextAccount.username || nextAccount.id;
+        await updateProgressBoard(
+          'COORDINATED SOLUTION UPVOTING',
+          `⏳ Waiting ${Math.round(gap / 60000)}m before next account (${i + 2}/${otherAccounts.length} · <code>${escapeHtml(nextLabel)}</code>)…`,
+        );
+        await new Promise((r) => setTimeout(r, gap));
+      }
+    }
+
+    const allVerified = verifiedCount > 0 && failedCount === 0;
+    const finalStep = allVerified
+      ? `🎉 All ${verifiedCount}/${totalAccounts} upvote(s) verified on LeetCode (⬆️ ${liveUpvoteCount})`
+      : `⚠️ Finished: ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed (⬆️ ${liveUpvoteCount})`;
+
+    await updateProgressBoard(
+      allVerified ? 'COORDINATED UPVOTES VERIFIED' : 'COORDINATED UPVOTES FINISHED',
+      finalStep,
+    );
+
+    await sendTelegramMessage(
+      allVerified
+        ? `🎉 <b>Coordinated Upvotes Verified:</b> ${verifiedCount}/${totalAccounts} account(s) verified · ⬆️ Live Article Upvotes: <b>${liveUpvoteCount}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`
+        : `⚠️ <b>Coordinated Upvotes Finished:</b> ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed · ⬆️ Live Article Upvotes: <b>${liveUpvoteCount}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`,
+      { parseMode: 'HTML' },
+    ).catch(() => undefined);
+
+    await prisma.systemState.updateMany({
+      where: { key: stateKey },
+      data: {
+        value: JSON.stringify({
+          ...jobState,
+          status: 'COMPLETED',
+          verified: verifiedCount > 0 && failedCount === 0,
+          verifiedCount,
+          failedCount,
+          liveUpvoteCount,
+          finishedAt: new Date().toISOString(),
+        }),
+      },
+    });
+  } finally {
+    stopKeepAlive();
+  }
+}
+
+/**
+ * Sequential queue drainer:
+ * Ensures only ONE article executes upvoting at a time.
+ * The next account's article only starts once all upvoting is completely finished for the current article.
+ */
+async function processUpvoteQueue(): Promise<void> {
+  if (isProcessingQueue) return;
+  isProcessingQueue = true;
+  try {
+    while (upvoteQueue.length > 0) {
+      const item = upvoteQueue.shift()!;
+      activeUpvoteJobs.add(item.post.id);
+      try {
+        await executeUpvoteWorkflow(item.post, item.options, item.authorAccount, item.otherAccounts);
+      } catch (err) {
+        logger.error({ postId: item.post.id, err: err instanceof Error ? err.message : String(err) }, 'coordinated upvote worker failed');
+      } finally {
+        activeUpvoteJobs.delete(item.post.id);
+      }
+    }
+  } finally {
+    isProcessingQueue = false;
+  }
+}
+
+/**
+ * Schedules solution article upvoting for an account's published article.
+ * Guarantees:
+ * - Upvoting only happens a single time per article/account.
+ * - Author casts immediately, then 5-minute wait before next upvote casts.
+ * - Once all upvoting is done for this article, next upvoting starts for next account.
  */
 export async function scheduleSolutionArticleUpvotes(
   post: UpvoteTarget,
@@ -395,21 +626,21 @@ export async function scheduleSolutionArticleUpvotes(
     return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
   }
 
-  if (activeUpvoteJobs.has(post.id)) {
-    logger.info({ postId: post.id, topicId }, 'coordinated upvote job already running in-memory for this post');
+  // Single time guarantee: never re-schedule if already running or queued
+  if (activeUpvoteJobs.has(post.id) || upvoteQueue.some((item) => item.post.id === post.id)) {
+    logger.info({ postId: post.id, topicId }, 'upvote job already active or queued for this post');
     return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
   }
 
   const stateKey = `solution-post-upvotes:${post.id}`;
-  let previousAttempts = 0;
   if (typeof prisma.systemState?.findUnique === 'function') {
     const existingState = await Promise.resolve(prisma.systemState.findUnique({ where: { key: stateKey } })).catch(() => null);
     if (existingState) {
       try {
-        const parsed = JSON.parse(existingState.value) as { status?: string; verified?: boolean; verifiedCount?: number; attempts?: number };
-        previousAttempts = parsed.attempts ?? 0;
-        if (!options.force && parsed.status === 'COMPLETED' && parsed.verified === true && (parsed.verifiedCount ?? 0) > 0) {
-          logger.info({ postId: post.id, topicId, verifiedCount: parsed.verifiedCount }, 'upvotes already verified for this post');
+        const parsed = JSON.parse(existingState.value) as { status?: string; verified?: boolean; attempts?: number };
+        // If already completed or attempted, never run again (single time guarantee)
+        if (!options.force && (parsed.status === 'COMPLETED' || (parsed.attempts ?? 0) >= 1)) {
+          logger.info({ postId: post.id, topicId }, 'upvotes already processed for this post; single time rule applied');
           return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
         }
       } catch {
@@ -418,14 +649,9 @@ export async function scheduleSolutionArticleUpvotes(
     }
   }
 
-  // Fetch author account (if enabled) and other enabled accounts
   let authorAccount: Account | null = null;
   if (typeof prisma.account?.findFirst === 'function') {
-    authorAccount = await prisma.account
-      .findFirst({
-        where: { id: post.accountId, status: { not: 'DISABLED' } },
-      })
-      .catch(() => null);
+    authorAccount = await prisma.account.findFirst({ where: { id: post.accountId, status: { not: 'DISABLED' } } }).catch(() => null);
   } else if (typeof prisma.account?.findUniqueOrThrow === 'function') {
     authorAccount = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } }).catch(() => null);
     if (authorAccount && (authorAccount.id !== post.accountId || authorAccount.status === 'DISABLED')) {
@@ -434,10 +660,7 @@ export async function scheduleSolutionArticleUpvotes(
   }
 
   const otherAccounts = await prisma.account.findMany({
-    where: {
-      id: { not: post.accountId },
-      status: { not: 'DISABLED' },
-    },
+    where: { id: { not: post.accountId }, status: { not: 'DISABLED' } },
     orderBy: { createdAt: 'asc' },
   });
 
@@ -447,252 +670,78 @@ export async function scheduleSolutionArticleUpvotes(
     return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
   }
 
-  // Preserve backward compatibility for tests that pass no authorAccount in findFirst and 0 otherAccounts
   if (otherAccounts.length === 0 && !authorAccount) {
     logger.info({ postId: post.id }, 'no other accounts available to upvote solution');
     return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
   }
 
-  const jobState = {
-    postId: post.id,
-    topicId,
-    publishedUrl: post.publishedUrl,
-    authorAccountId: post.accountId,
-    accountIds: [...(authorAccount ? [authorAccount.id] : []), ...otherAccounts.map((a) => a.id)],
-    status: 'SCHEDULED',
-    verified: false,
-    verifiedCount: 0,
-    failedCount: 0,
-    attempts: previousAttempts + 1,
-    scheduledAt: new Date().toISOString(),
-    startAt: new Date(Date.now() + initialDelay).toISOString(),
-  };
-
-  await prisma.systemState.upsert({
-    where: { key: stateKey },
-    create: { key: stateKey, value: JSON.stringify(jobState) },
-    update: { value: JSON.stringify(jobState) },
-  });
-
   logger.info(
-    {
-      postId: post.id,
-      topicId,
-      authorIncluded: Boolean(authorAccount),
-      otherAccountCount: otherAccounts.length,
-      initialDelayMs: initialDelay,
-      gapMs: gap,
-    },
-    'coordinated solution upvoting scheduled',
+    { postId: post.id, topicId, totalAccounts, initialDelayMs: initialDelay, gapMs: gap },
+    'enqueued solution article upvote job',
   );
 
-  activeUpvoteJobs.add(post.id);
-
-  // Background execution, serialized globally, with keep-alive so Render never spins down mid-schedule
-  const runJob = async () => {
-    const stopKeepAlive = startArticleWorkKeepAlive();
-    let verifiedCount = 0;
-    let failedCount = 0;
-    let liveUpvoteCount = 0;
-    const entries: string[] = [];
-    let progressMessageId: number | null = null;
-
-    const updateProgressBoard = async (title: string, activeStep: string) => {
-      const text = renderUpvoteProgressBoard({
-        title,
-        problemSlug: post.problemSlug,
-        publishedUrl: post.publishedUrl!,
-        topicId,
-        verifiedCount,
-        failedCount,
-        totalAccounts,
-        liveUpvoteCount,
-        entries,
-        activeStep,
-      });
-      if (progressMessageId) {
-        await editTelegramMessage(progressMessageId, text, { parseMode: 'HTML' }).catch(() => undefined);
-      } else if (typeof sendTelegramMessageWithId === 'function') {
-        progressMessageId = await sendTelegramMessageWithId(text, { parseMode: 'HTML' }).catch(() => null);
-        if (!progressMessageId) {
-          await sendTelegramMessage(text, { parseMode: 'HTML' }).catch(() => undefined);
-        }
-      } else {
-        await sendTelegramMessage(text, { parseMode: 'HTML' }).catch(() => undefined);
-      }
-    };
-
-    try {
-      await updateProgressBoard(
-        'COORDINATED SOLUTION UPVOTING',
-        authorAccount
-          ? `⏳ Upvoting immediately with author account (${escapeHtml(authorAccount.label || authorAccount.id)})…`
-          : `⏳ Scheduled ${otherAccounts.length} account(s) to start in ${Math.round(initialDelay / 60000)}m (1m gap)…`,
-      );
-
-      // Step 1: Immediate self-upvote by the author account (0 delay)
-      if (authorAccount) {
-        const authorLabel = authorAccount.label || authorAccount.username || authorAccount.id;
-        try {
-          logger.info({ accountId: authorAccount.id, label: authorLabel, topicId }, 'executing immediate author self-upvote');
-          const res = await upvoteSolutionArticleWithAccount(authorAccount, topicId, post.publishedUrl);
-          verifiedCount++;
-          liveUpvoteCount = Math.max(liveUpvoteCount, res.upvoteCount);
-          entries.push(
-            `✅ <code>${escapeHtml(authorLabel)}</code> (Author · Immediate) — Verified (⬆️ ${res.upvoteCount})`,
-          );
-          logger.info(
-            { accountId: authorAccount.id, label: authorLabel, topicId, upvoteCount: res.upvoteCount, method: res.method },
-            'verified immediate author self-upvote',
-          );
-        } catch (authorErr) {
-          failedCount++;
-          const msg = authorErr instanceof Error ? authorErr.message : String(authorErr);
-          entries.push(`❌ <code>${escapeHtml(authorLabel)}</code> (Author) — Failed (${escapeHtml(msg.slice(0, 60))})`);
-          logger.warn({ accountId: authorAccount.id, label: authorLabel, topicId, err: msg }, 'immediate author upvote failed');
-        }
-      }
-
-      // Step 2: Wait 5 minutes before other accounts start upvoting
-      if (otherAccounts.length > 0 && initialDelay > 0) {
-        await updateProgressBoard(
-          'COORDINATED SOLUTION UPVOTING',
-          `⏳ Waiting ${Math.round(initialDelay / 60000)}m before ${otherAccounts.length} remaining account(s) upvote (1m gap)…`,
-        );
-        await new Promise((r) => setTimeout(r, initialDelay));
-      }
-
-      // Step 3: Sequential upvoting across all other accounts with 1-minute gap
-      for (let i = 0; i < otherAccounts.length; i++) {
-        const account = otherAccounts[i]!;
-        const label = account.label || account.username || account.id;
-        await updateProgressBoard(
-          'COORDINATED SOLUTION UPVOTING',
-          `⏳ Upvoting & verifying with <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length})…`,
-        );
-
-        try {
-          logger.info(
-            { accountId: account.id, label, index: i + 1, total: otherAccounts.length, topicId },
-            'executing coordinated upvote',
-          );
-          const res = await upvoteSolutionArticleWithAccount(account, topicId, post.publishedUrl);
-          verifiedCount++;
-          liveUpvoteCount = Math.max(liveUpvoteCount, res.upvoteCount);
-          entries.push(
-            `✅ <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length}) — Verified (⬆️ ${res.upvoteCount})`,
-          );
-          logger.info(
-            { accountId: account.id, label, topicId, upvoteCount: res.upvoteCount, method: res.method },
-            'verified coordinated account upvote',
-          );
-        } catch (accountErr) {
-          failedCount++;
-          const msg = accountErr instanceof Error ? accountErr.message : String(accountErr);
-          entries.push(`❌ <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length}) — Failed (${escapeHtml(msg.slice(0, 60))})`);
-          logger.warn(
-            { accountId: account.id, label, err: msg },
-            'failed to upvote or verify with account; proceeding to next',
-          );
-        }
-
-        if (i < otherAccounts.length - 1 && gap > 0) {
-          const nextAccount = otherAccounts[i + 1]!;
-          const nextLabel = nextAccount.label || nextAccount.username || nextAccount.id;
-          await updateProgressBoard(
-            'COORDINATED SOLUTION UPVOTING',
-            `⏳ Waiting ${Math.round(gap / 60000)}m before next account (${i + 2}/${otherAccounts.length} · <code>${escapeHtml(nextLabel)}</code>)…`,
-          );
-          await new Promise((r) => setTimeout(r, gap));
-        }
-      }
-
-      const allVerified = verifiedCount > 0 && failedCount === 0;
-      const finalStep = allVerified
-        ? `🎉 All ${verifiedCount}/${totalAccounts} upvote(s) verified on LeetCode (⬆️ ${liveUpvoteCount})`
-        : `⚠️ Finished: ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed (⬆️ ${liveUpvoteCount})`;
-
-      await updateProgressBoard(
-        allVerified ? 'COORDINATED UPVOTES VERIFIED' : 'COORDINATED UPVOTES FINISHED',
-        finalStep,
-      );
-
-      await sendTelegramMessage(
-        allVerified
-          ? `🎉 <b>Coordinated Upvotes Verified:</b> ${verifiedCount}/${totalAccounts} account(s) verified · ⬆️ Live Article Upvotes: <b>${liveUpvoteCount}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`
-          : `⚠️ <b>Coordinated Upvotes Finished:</b> ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed · ⬆️ Live Article Upvotes: <b>${liveUpvoteCount}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`,
-        { parseMode: 'HTML' },
-      ).catch(() => undefined);
-
-      await prisma.systemState.updateMany({
-        where: { key: stateKey },
-        data: {
-          value: JSON.stringify({
-            ...jobState,
-            status: 'COMPLETED',
-            verified: verifiedCount > 0 && failedCount === 0,
-            verifiedCount,
-            failedCount,
-            liveUpvoteCount,
-            finishedAt: new Date().toISOString(),
-          }),
-        },
-      });
-    } catch (err) {
-      logger.error({ postId: post.id, err: err instanceof Error ? err.message : String(err) }, 'coordinated upvote worker failed');
-    } finally {
-      activeUpvoteJobs.delete(post.id);
-      stopKeepAlive();
-    }
-  };
-  upvoteChain = upvoteChain.then(runJob, runJob);
+  upvoteQueue.push({ post, options, authorAccount, otherAccounts });
+  void processUpvoteQueue();
 
   return { scheduled: true, count: otherAccounts.length || totalAccounts, initialDelayMs: initialDelay, accountGapMs: gap };
 }
 
 /**
- * Boot recovery: checks recently published solution articles (last 48 hours) and schedules
- * verified coordinated upvoting for any post whose upvotes have not yet been verified.
+ * Boot recovery: strictly checks published solution articles from TODAY only (Asia/Kolkata timezone).
+ * Ensures:
+ * - Articles from past days are NEVER picked up or spammed.
+ * - Articles that have already completed upvoting or have been attempted are skipped.
+ * - Queued articles execute one by one in sequence.
  */
 export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
   if (typeof prisma.solutionPost?.findMany !== 'function') return;
   try {
-    const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000);
-    const recentPublished = await prisma.solutionPost.findMany({
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(now);
+    const y = parts.find((p) => p.type === 'year')?.value;
+    const m = parts.find((p) => p.type === 'month')?.value;
+    const d = parts.find((p) => p.type === 'day')?.value;
+    const todayStart = new Date(`${y}-${m}-${d}T00:00:00+05:30`);
+
+    const todayPublished = await prisma.solutionPost.findMany({
       where: {
         status: 'PUBLISHED',
         publishedUrl: { not: null },
-        publishedAt: { gte: cutoff },
+        publishedAt: { gte: todayStart },
       },
       orderBy: { publishedAt: 'asc' },
     });
 
-    for (const post of recentPublished) {
-      if (!post.publishedUrl || activeUpvoteJobs.has(post.id)) continue;
+    for (const post of todayPublished) {
+      if (!post.publishedUrl) continue;
       const stateKey = `solution-post-upvotes:${post.id}`;
       const existing = await Promise.resolve(prisma.systemState.findUnique({ where: { key: stateKey } })).catch(() => null);
       if (existing) {
         try {
-          const parsed = JSON.parse(existing.value) as { verified?: boolean; verifiedCount?: number; attempts?: number };
-          if (parsed.verified === true && (parsed.verifiedCount ?? 0) > 0) {
+          const parsed = JSON.parse(existing.value) as { status?: string; verified?: boolean; attempts?: number };
+          // Single time rule: if already completed or attempted, never repeat
+          if (parsed.status === 'COMPLETED' || (parsed.attempts ?? 0) >= 1) {
             continue;
           }
-          if ((parsed.attempts ?? 0) >= MAX_RECOVERY_ATTEMPTS) continue;
         } catch {
           // Re-run if corrupt
         }
       }
       logger.info(
         { postId: post.id, problemSlug: post.problemSlug, publishedUrl: post.publishedUrl },
-        'recovering unverified coordinated upvotes for published solution article',
+        'recovering today unverified solution article upvote',
       );
-      // Article is already older than the initial delay; keep only the 1-minute gap.
-      await scheduleSolutionArticleUpvotes(post, { force: true, initialDelayMs: 0 });
+      await scheduleSolutionArticleUpvotes(post, { force: false });
     }
   } catch (err) {
     logger.warn(
       { err: err instanceof Error ? err.message : String(err) },
-      'failed to inspect recently published articles for upvote recovery',
+      'failed to inspect today published articles for upvote recovery',
     );
   }
 }

@@ -26,8 +26,10 @@ export class PostError extends Error {
   }) { super(code); }
 }
 
+export const SOLUTION_POST_RETRY_LIMIT = 5;
+
 function checkGenerationBudget(post: SolutionPost, force: boolean): void {
-  if (post.retryCount < 4) return;
+  if (post.retryCount < SOLUTION_POST_RETRY_LIMIT) return;
   const details = { postId: post.id, retryCount: post.retryCount, previousError: post.lastError };
   logger.warn({ accountId: post.accountId, ...details, explicitRetry: force },
     force ? 'solution article retry explicitly requested' : 'solution article automatic retry budget exhausted');
@@ -131,7 +133,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   // generation. A separate unconditional update can reset another worker's job.
   post = await move(post, 'CHECKING_ELIGIBILITY', { leaseUntil: new Date(Date.now() + leaseMs),
     context: JSON.stringify(savedContext),
-    retryCount: force && post.retryCount >= 4 ? 1 : { increment: 1 } });
+    retryCount: force && post.retryCount >= SOLUTION_POST_RETRY_LIMIT ? 1 : { increment: 1 } });
   logger.info({ postId: post.id, accountId: post.accountId, retryCount: post.retryCount,
     explicitRetry: force, previousError: post.lastError }, 'solution article generation claimed');
   const stopKeepAlive = startArticleWorkKeepAlive();
@@ -229,6 +231,7 @@ export async function resetFailedSolutionPostRetries(): Promise<number> {
         { lastError: 'AI_PROVIDER_ACCESS_BLOCKED' },
         { lastError: 'AI_AUTHENTICATION_FAILED' },
         { lastError: { startsWith: 'AI_ERROR:' } },
+        { lastError: 'TECHNICAL_REVIEW_FAILED' },
       ],
     },
     data: {
@@ -236,9 +239,10 @@ export async function resetFailedSolutionPostRetries(): Promise<number> {
       retryCount: 0,
     },
   });
-  // Credentials can be repaired after the four automatic attempts. Reset the
+  // Credentials can be repaired after the automatic attempts. Reset the
   // matching scheduler budget too; resetting only posts leaves the schedule stuck.
   await prisma.systemState.deleteMany({ where: { key: { startsWith: 'solution-post-schedule-budget:' } } });
+  await prisma.systemState.deleteMany({ where: { key: { startsWith: 'solution-post-schedule-attempt-at:' } } });
   return updated.count;
 }
 

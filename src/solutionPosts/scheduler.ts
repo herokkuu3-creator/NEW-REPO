@@ -19,6 +19,8 @@ import { SAGE_REPAIR_TIMEOUT_MS } from './router';
 export const POST_CRON = '0 6 * * *';
 export const POST_TIMEZONE = 'Asia/Kolkata';
 export const SCHEDULE_STATE_KEY = 'solution-post-scheduler:last-tick';
+export const SOLUTION_POST_RETRY_LIMIT = 5;
+export const SOLUTION_POST_RETRY_GAP_MS = 60 * 60 * 1000; // 1 hour gap between retry attempts
 let scheduledRunInProgress = false;
 export function afterPostSchedule(now: Date): boolean {
   const parts = new Intl.DateTimeFormat('en-US', { timeZone: POST_TIMEZONE, hour: '2-digit', hourCycle: 'h23' }).formatToParts(now);
@@ -178,18 +180,50 @@ export async function acquireDailyLease(accountId: string, date: string) {
   return async () => { await prisma.systemState.deleteMany({ where: { key, value } }); };
 }
 
-async function reserveScheduledAttempt(accountId: string, date: string): Promise<boolean> {
-  const key = `solution-post-schedule-budget:${accountId}:${date}`;
-  const old = await prisma.systemState.findUnique({ where: { key } });
-  const count = old ? Number(old.value) : 0;
-  if (!Number.isInteger(count) || count < 0 || count >= 4) return false;
-  if (old) return (await prisma.systemState.updateMany({ where: { key, value: old.value },
-    data: { value: String(count + 1) } })).count === 1;
-  try { await prisma.systemState.create({ data: { key, value: '1' } }); return true; }
-  catch (error) {
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return false;
-    throw error;
+async function reserveScheduledAttempt(accountId: string, date: string, now = new Date()): Promise<boolean> {
+  const budgetKey = `solution-post-schedule-budget:${accountId}:${date}`;
+  const timeKey = `solution-post-schedule-attempt-at:${accountId}:${date}`;
+
+  const [oldBudget, oldTime] = await Promise.all([
+    prisma.systemState.findUnique({ where: { key: budgetKey } }),
+    prisma.systemState.findUnique({ where: { key: timeKey } }),
+  ]);
+
+  const count = oldBudget ? Number(oldBudget.value) : 0;
+  if (!Number.isInteger(count) || count < 0 || count >= SOLUTION_POST_RETRY_LIMIT) return false;
+
+  const lastAttemptAt = oldTime ? Number(oldTime.value) : 0;
+  if (count > 0 && lastAttemptAt > 0) {
+    const elapsed = now.getTime() - lastAttemptAt;
+    if (elapsed < SOLUTION_POST_RETRY_GAP_MS) {
+      return false; // Minimum 1-hour gap between retries
+    }
   }
+
+  const nextCount = String(count + 1);
+  let claimed = false;
+  if (oldBudget) {
+    claimed = (await prisma.systemState.updateMany({ where: { key: budgetKey, value: oldBudget.value }, data: { value: nextCount } })).count === 1;
+  } else {
+    try {
+      await prisma.systemState.create({ data: { key: budgetKey, value: nextCount } });
+      claimed = true;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return false;
+      throw error;
+    }
+  }
+
+  if (claimed) {
+    const timeVal = String(now.getTime());
+    await prisma.systemState.upsert({
+      where: { key: timeKey },
+      create: { key: timeKey, value: timeVal },
+      update: { value: timeVal },
+    }).catch(() => undefined);
+  }
+
+  return claimed;
 }
 
 /** Each selected account is independent. Existing daily worker handles code submission unchanged. */
@@ -328,10 +362,18 @@ export async function runScheduledSolutionPosts(now = new Date()) {
       const post = posts.find(p => p.accountId === id && p.problemSlug === run.problemSlug);
       if (!post) return true;
       if (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(post.status)) return config.solutionPosts.autoPublish;
-      return ['PENDING', 'RETRY_PENDING', 'FAILED'].includes(post.status) && post.retryCount < 4;
+      if (!['PENDING', 'RETRY_PENDING', 'FAILED'].includes(post.status)) return false;
+      if (post.retryCount >= SOLUTION_POST_RETRY_LIMIT) return false;
+
+      // If the post failed, enforce 1-hour gap since last attempt/update
+      if (post.status === 'FAILED' && post.updatedAt) {
+        const elapsed = now.getTime() - new Date(post.updatedAt).getTime();
+        if (elapsed < SOLUTION_POST_RETRY_GAP_MS) return false;
+      }
+      return true;
     });
     const pendingIds: string[] = [];
-    for (const id of eligibleIds) if (await reserveScheduledAttempt(id, today)) pendingIds.push(id);
+    for (const id of eligibleIds) if (await reserveScheduledAttempt(id, today, now)) pendingIds.push(id);
     if (!pendingIds.length) {
       await saveState({ status: 'IDLE', selected: ids.length, eligible: eligibleIds.length,
         reason: !ids.length ? 'NO_SELECTED_ACCOUNTS' : eligibleIds.length ? 'DAILY_RETRY_LIMIT' : 'NO_PENDING_WORK' });

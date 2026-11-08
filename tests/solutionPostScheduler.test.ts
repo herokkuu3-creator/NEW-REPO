@@ -179,9 +179,9 @@ describe('daily AI drafts', () => {
   });
   it('preserves the original failure in progress when an automatic combined run exhausts its budget', async () => {
     h.accounts = [h.accounts[0]];
-    h.posts = [{ id: 'post-a', accountId: 'a', status: 'FAILED', retryCount: 4 }];
+    h.posts = [{ id: 'post-a', accountId: 'a', status: 'FAILED', retryCount: 5 }];
     h.retry.mockRejectedValue(new PostError('GENERATION_RETRY_LIMIT', {
-      postId: 'post-a', retryCount: 4, previousError: 'AI_PROVIDER_ACCESS_BLOCKED',
+      postId: 'post-a', retryCount: 5, previousError: 'AI_PROVIDER_ACCESS_BLOCKED',
     }));
     const events: any[] = [];
     const results = await runCombined(['a'], new Date('2026-10-15T00:30:00Z'), event => { events.push(event); });
@@ -192,22 +192,27 @@ describe('daily AI drafts', () => {
   });
   it('keeps cron from force-resetting exhausted article records', async () => {
     h.accounts = [h.accounts[0]]; h.preferences = [{ accountId: 'a', enabled: true }];
-    h.posts = [{ accountId: 'a', problemSlug: 'today', status: 'FAILED', retryCount: 4 }];
+    h.posts = [{ accountId: 'a', problemSlug: 'today', status: 'FAILED', retryCount: 5 }];
     expect((await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'))).status).toBe('IDLE');
     expect(h.retry).not.toHaveBeenCalled(); expect(h.generate).not.toHaveBeenCalled();
   });
   it('bounds restart/recovery retries per account and day in durable state', async () => {
-    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-10-15T00:30:00Z'));
+    let nowMs = new Date('2026-10-15T00:30:00Z').getTime();
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date(nowMs));
     h.accounts = [h.accounts[0]]; h.preferences = [{ accountId: 'a', enabled: true }];
     const stop = startSolutionPostScheduler();
     try {
       await vi.waitFor(() => expect(h.generate).toHaveBeenCalledTimes(1));
-      for (let n = 2; n <= 4; n++) {
+      for (let n = 2; n <= 5; n++) {
+        nowMs += 61 * 60 * 1000;
+        vi.setSystemTime(new Date(nowMs));
         h.timers[1]!(); await vi.waitFor(() => expect(h.generate).toHaveBeenCalledTimes(n));
       }
+      nowMs += 61 * 60 * 1000;
+      vi.setSystemTime(new Date(nowMs));
       h.timers[1]!(); await new Promise(r => setTimeout(r, 30));
-      expect(h.generate).toHaveBeenCalledTimes(4);
-      expect(h.locks.get('solution-post-schedule-budget:a:2026-10-15')).toBe('4');
+      expect(h.generate).toHaveBeenCalledTimes(5);
+      expect(h.locks.get('solution-post-schedule-budget:a:2026-10-15')).toBe('5');
     } finally { stop(); vi.useRealTimers(); }
   });
   it('recovers a completed draft that has not yet been published', async () => {
