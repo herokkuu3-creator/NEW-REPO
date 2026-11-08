@@ -289,6 +289,27 @@ describe('range engine', () => {
     expect(session.api.submit).toHaveBeenCalledTimes(1); expect(sleeps).toEqual([]);
     expect(result.results[0]!.detail).toContain('CSRF');
   });
+  it('renews an expired mid-range session once and continues the same question', async () => {
+    const old = makeSession(() => 'accepted', []); const nextLog: string[] = []; const next = makeSession(() => 'accepted', nextLog);
+    old.api.submit = vi.fn(async () => { throw new LeetCodeHttpError('CSRF verification failed', 403); });
+    const refreshAccount = vi.fn(async () => ({ status: 'refreshed' as const, site: 'leetcode' as const, label: 'a1', username: 'userX' }));
+    const { deps } = makeDeps(old, [acc('a1')], { refreshAccount, openSession: vi.fn().mockResolvedValueOnce(old).mockResolvedValue(next) });
+    const run = await startRangeJob({ from: 200, to: 201 }, 'a1', deps);
+    expect((await run.done)[0]!.results.every(r => r.status === 'accepted')).toBe(true);
+    expect(refreshAccount).toHaveBeenCalledTimes(1); expect(old.api.submit).toHaveBeenCalledTimes(1);
+    expect(nextLog.filter(s => s.startsWith('submit:'))).toEqual(['submit:slug-200', 'submit:slug-201']);
+  });
+  it('does not renew forever or use a different account after session rejection', async () => {
+    const old = makeSession(() => 'accepted', []); const next = makeSession(() => 'accepted', []);
+    old.api.submit = vi.fn(async () => { throw new LeetCodeHttpError('CSRF verification failed', 403); });
+    next.api.checkSession = async () => ({ authenticated: true, username: 'another-user' });
+    next.api.submit = vi.fn();
+    const refreshAccount = vi.fn(async () => ({ status: 'refreshed' as const, site: 'leetcode' as const, label: 'a1', username: 'userX' }));
+    const { deps } = makeDeps(old, [acc('a1')], { refreshAccount, openSession: vi.fn().mockResolvedValueOnce(old).mockResolvedValue(next) });
+    const run = await startRangeJob({ from: 200, to: 200 }, 'a1', deps);
+    expect((await run.done)[0]!.results[0]!.status).toBe('error');
+    expect(refreshAccount).toHaveBeenCalledTimes(1); expect(next.api.submit).not.toHaveBeenCalled();
+  });
 
   it('transient LeetCode errors (500) are plain errors, never blocks', async () => {
     const session = makeSession((n) => (n === 200 ? 'submitFail' : 'accepted'), []);

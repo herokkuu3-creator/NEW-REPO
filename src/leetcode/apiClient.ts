@@ -23,10 +23,17 @@ export class LeetCodeHttpError extends Error {
   constructor(
     message: string,
     public readonly status?: number,
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = 'LeetCodeHttpError';
   }
+}
+
+export function parseRetryAfter(value: string | undefined, now = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const delay = /^\d+(?:\.\d+)?$/.test(value) ? Number(value) * 1000 : Date.parse(value) - now;
+  return Number.isFinite(delay) ? Math.max(0, delay) : undefined;
 }
 
 export function leetCodeRequestFailure(err: unknown): { category: string; detail: string } {
@@ -235,7 +242,7 @@ export class LeetCodeApi {
     const status = res.status();
     const body = await res.text();
     if (status !== 200) {
-      throw new LeetCodeHttpError(`GraphQL HTTP ${status}`, status);
+      throw new LeetCodeHttpError(`GraphQL HTTP ${status}`, status, parseRetryAfter(res.headers()['retry-after']));
     }
 
     let json: unknown;
@@ -307,6 +314,7 @@ export class LeetCodeApi {
       throw new LeetCodeHttpError(
         `submit HTTP ${status}${detail ? `: ${detail}` : ''}`,
         status,
+        parseRetryAfter(res.headers()['retry-after']),
       );
     }
 

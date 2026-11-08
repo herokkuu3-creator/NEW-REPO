@@ -4,6 +4,7 @@ import { request as playwrightRequest } from 'playwright';
 import { logger } from '../logger';
 import { AccountRecord, getAccountById, listEnabledAccounts, parseStoredStorageState } from '../database/accounts';
 import { LeetCodeApi, looksLikeChallenge, isSubmissionLimitError, leetCodeRequestFailure, SubmissionOutcome } from '../leetcode/apiClient';
+import { RangeRequestGate } from './rangeRequestGate';
 import { fetchQuestionData, RawQuestionData } from '../leetcode/dailyChallenge';
 import { checkSession, SessionCheckResult } from '../browser/sessionCheck';
 import { fetchWalkcccPage, signatureMatchesStarter, WalkcccError, WalkcccPage } from '../solutions/walkccc';
@@ -181,7 +182,7 @@ export interface RangeDeps {
   questionOrder?: (numbers: readonly number[], accountId: string) => number[];
   listAccounts(): Promise<AccountRecord[]>;
   getAccount(id: string): Promise<AccountRecord | null>;
-  openSession(account: AccountRecord): Promise<RangeSession>;
+  openSession(account: AccountRecord, signal?: AbortSignal): Promise<RangeSession>;
   refreshAccount?(account: AccountRecord): Promise<AccountRefreshOutcome | null>;
   /** The walkccc page for a question number: the slug (and often the solution). */
   getPage(questionNumber: number): Promise<WalkcccPage>;
@@ -683,7 +684,7 @@ async function runAccountRange(
 
   let session!: RangeSession;
   try {
-    session = await deps.openSession(account);
+    session = await deps.openSession(account, signal);
   } catch (err) {
     let recovered = false;
     if (deps.refreshAccount) {
@@ -694,7 +695,7 @@ async function runAccountRange(
         if (updated) {
           account = updated;
           try {
-            session = await deps.openSession(account);
+            session = await deps.openSession(account, signal);
             recovered = true;
           } catch {
             // failed again
@@ -742,7 +743,7 @@ async function runAccountRange(
         if (updated) {
           account = updated;
           await session.close().catch(() => undefined);
-          session = await deps.openSession(account);
+          session = await deps.openSession(account, signal);
           check = await session.api.checkSession();
         }
       }
@@ -855,6 +856,24 @@ async function runAccountRange(
           signal,
           usedUuids,
           progressCtx,
+          async () => {
+            if (!deps.refreshAccount) return null;
+            const renewal = await deps.refreshAccount(account).catch(() => null);
+            if (renewal?.status !== 'refreshed' && renewal?.status !== 'valid') return null;
+            const updated = await deps.getAccount(account.id);
+            if (!updated) return null;
+            const replacement = await deps.openSession(updated, signal);
+            let identity: SessionCheckResult;
+            try { identity = await replacement.api.checkSession(); }
+            catch (error) { await replacement.close().catch(() => undefined); throw error; }
+            if (!identity.authenticated || !identity.username ||
+              (result.username && identity.username.toLowerCase() !== result.username.toLowerCase())) {
+              await replacement.close(); return null;
+            }
+            await session.close().catch(() => undefined);
+            account = updated; session = replacement;
+            return replacement.api;
+          },
         );
       } finally {
         reservations.release(n);
@@ -957,6 +976,7 @@ interface OneOutcome {
   touchedLeetCode: boolean;
   blocked: boolean;
   submissionLimit?: boolean;
+  sessionFailure?: boolean;
 }
 
 async function solveOneWithRetries(
@@ -966,13 +986,23 @@ async function solveOneWithRetries(
   signal: AbortSignal,
   usedCommunityUuids?: Set<string>,
   progressCtx?: RangeProgressContext,
+  renewSession?: () => Promise<RangeApi | null>,
 ): Promise<OneOutcome> {
   let touched = false;
+  let renewed = false;
   for (let attempt = 0; ; attempt++) {
     const r = await solveOne(n, api, deps, usedCommunityUuids, progressCtx, signal);
     touched ||= r.touchedLeetCode;
+    if (r.sessionFailure && !renewed && renewSession && !signal.aborted) {
+      renewed = true;
+      const replacement = await renewSession().catch(() => null);
+      if (replacement) { api = replacement; continue; }
+    }
     if (r.submissionLimit) return { ...r, touchedLeetCode: touched };
-    if (!r.blocked) return { ...r, touchedLeetCode: touched };
+    if (!r.blocked) {
+      if (r.sessionFailure && progressCtx) void deps.onProgress?.({ ...progressCtx, phase: 'error', questionNumber: n, detail: r.outcome?.detail });
+      return { ...r, touchedLeetCode: touched };
+    }
     const wait = deps.blockedBackoffMs[attempt];
     if (wait === undefined) {
       if (progressCtx) void deps.onProgress?.({ ...progressCtx, phase: 'error', questionNumber: n, detail: r.outcome?.detail });
@@ -992,7 +1022,7 @@ async function solveOne(
   usedCommunityUuids?: Set<string>,
   progressCtx?: RangeProgressContext,
   signal?: AbortSignal,
-): Promise<{ outcome: QuestionResult; touchedLeetCode: boolean; blocked: boolean; submissionLimit?: boolean }> {
+): Promise<{ outcome: QuestionResult; touchedLeetCode: boolean; blocked: boolean; submissionLimit?: boolean; sessionFailure?: boolean }> {
   let questionTitle: string | null = null;
   let slug: string | null = null;
   let stage = 'question';
@@ -1215,6 +1245,7 @@ async function solveOne(
       }
 
       stage = 'submit';
+      if (signal?.aborted) throw Error('Range cancelled before submission');
       const subId = await api.submit({ slug: slug!, questionId, lang: 'cpp', code: codeToTryFirst });
 
       if (progressCtx) {
@@ -1368,6 +1399,9 @@ async function solveOne(
       const detail = `Submission #${submittedId} sent; verdict unconfirmed: ${failure.detail}`;
       const result = err(detail);
       return { ...result, outcome: { ...result.outcome, submissionId: submittedId }, blocked: false };
+    }
+    if (failure.category === 'session-csrf' || failure.category === 'session-auth') {
+      return { outcome: { number: n, status: 'error', detail: failure.detail }, touchedLeetCode: true, blocked: false, sessionFailure: true };
     }
     if (isSubmissionLimitError(e)) {
       const msg = `LeetCode submission limit reached: ${shortErr(e)}`;
@@ -1561,9 +1595,10 @@ function shortErr(err: unknown): string {
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const serverRangeGate = new RangeRequestGate();
 
 /** One HTTP session (no browser) carrying the account's own cookies. */
-async function openRequestSession(account: AccountRecord): Promise<RangeSession> {
+async function openRequestSession(account: AccountRecord, signal?: AbortSignal): Promise<RangeSession> {
   const state = parseStoredStorageState(account.storageState);
   if (!state.ok) throw new Error(state.error);
   const ctx = await playwrightRequest.newContext({
@@ -1580,15 +1615,21 @@ async function openRequestSession(account: AccountRecord): Promise<RangeSession>
     },
   };
   const api = new LeetCodeApi(cookieJar as never);
+  const cancelled = new AbortController();
+  const guarded = async <T>(submit: boolean, action: () => Promise<T>): Promise<T> => {
+    await serverRangeGate.wait(submit, abortableSleep, signal ?? cancelled.signal);
+    try { return await action(); }
+    catch (error) { serverRangeGate.observe(error); throw error; }
+  };
   return {
     api: {
-      checkSession: () => checkSession(api),
-      question: (slug) => fetchQuestionData(api, slug),
-      submit: (p) => api.submitSolution(p),
-      awaitResult: (id, slug) => api.awaitSubmission(id, slug),
-      graphql: (q, v, s) => api.graphql(q, v, s as never),
+      checkSession: () => guarded(false, () => checkSession(api)),
+      question: (slug) => guarded(false, () => fetchQuestionData(api, slug)),
+      submit: (p) => guarded(true, () => api.submitSolution(p)),
+      awaitResult: (id, slug) => guarded(false, () => api.awaitSubmission(id, slug)),
+      graphql: (q, v, s) => guarded(false, () => api.graphql(q, v, s as never)),
     },
-    close: () => ctx.dispose(),
+    close: () => { cancelled.abort(); return ctx.dispose(); },
   };
 }
 
