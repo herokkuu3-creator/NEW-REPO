@@ -343,7 +343,7 @@ async function sendSessionRefreshTelegramNotification(summary: SessionRefreshSum
     lines.push(`📊 Status: ${summary.valid} valid · ${summary.refreshed} auto-refreshed · ${summary.expiredWithoutCreds + summary.failed} attention needed`);
   }
 
-  await sendTelegramMessage(lines.join('\n')).catch(() => undefined);
+  await sendTelegramMessage(lines.join('\n'), { parseMode: 'HTML' }).catch(() => undefined);
 }
 
 /**

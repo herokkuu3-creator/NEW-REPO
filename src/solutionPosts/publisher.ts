@@ -233,6 +233,7 @@ export async function publishPost(id: string) {
             const reconciled = await move(uncertain, 'PUBLISHED', { publishedUrl: candidate, publishedAt: new Date(), lastError: null });
             logger.info({ postId: id, url: candidate, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
               revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication reconciled after response failure');
+            void scheduleSolutionArticleUpvotes(reconciled).catch((upErr) => logger.warn({ postId: id, err: upErr }, 'failed to schedule article upvotes'));
             return reconciled;
           }
         } catch { /* retain the protected result when the article cannot be positively verified */ }
@@ -283,7 +284,9 @@ export async function reconcilePost(id: string, url?: string) {
     await verifyPublishedContent(api, candidate, context, post.title!, post.markdown!);
     logger.info({ postId: id, url: candidate, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
       revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication reconciled');
-    return move(post, 'PUBLISHED', { publishedUrl: candidate, publishedAt: new Date(), lastError: null });
+    const reconciled = await move(post, 'PUBLISHED', { publishedUrl: candidate, publishedAt: new Date(), lastError: null });
+    void scheduleSolutionArticleUpvotes(reconciled).catch((upErr) => logger.warn({ postId: id, err: upErr }, 'failed to schedule article upvotes'));
+    return reconciled;
   });
 }
 

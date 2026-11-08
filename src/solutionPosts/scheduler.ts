@@ -12,6 +12,7 @@ import { publishPost } from './publisher';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
 import { publishDailyPost, processDailyPublicationQueue } from './dailyPublication';
+import { recoverUnverifiedArticleUpvotes } from './upvote';
 import { isSageProvider } from '../config/solutionPostProvider';
 import { SAGE_REPAIR_TIMEOUT_MS } from './router';
 
@@ -350,9 +351,12 @@ export async function runScheduledSolutionPosts(now = new Date()) {
     await saveState({ status: 'FINISHED', finishedAt: new Date().toISOString(), results });
     logger.info({ results, timezone: POST_TIMEZONE, autoPublish: config.solutionPosts.autoPublish }, 'daily solution article workflow finished');
     if (config.telegram.enabled) {
+      const publishedCount = results.filter(r => r.status === 'PUBLISHED').length;
       const failures = results.filter(r => r.status === 'FAILED');
-      await sendTelegramMessage(`06:00 IST daily workflow: ${results.filter(r => r.status === 'PUBLISHED').length} article(s) published; ${failures.length} failed.` +
-        (failures.length ? '\n' + failures.map(r => `${r.accountId}: ${r.error ?? 'WORKFLOW_FAILED'}`).join('\n') : '')).catch(() => undefined);
+      if (publishedCount > 0 || failures.length > 0) {
+        await sendTelegramMessage(`06:00 IST daily workflow: ${publishedCount} article(s) published; ${failures.length} failed.` +
+          (failures.length ? '\n' + failures.map(r => `${r.accountId}: ${r.error ?? 'WORKFLOW_FAILED'}`).join('\n') : '')).catch(() => undefined);
+      }
     }
     return { status: 'FINISHED' as const, results };
   } catch (error) {
@@ -364,7 +368,10 @@ export async function runScheduledSolutionPosts(now = new Date()) {
 }
 
 export function startSolutionPostScheduler(): () => void {
-  const tick = () => void runScheduledSolutionPosts();
+  const tick = () => {
+    void runScheduledSolutionPosts();
+    void recoverUnverifiedArticleUpvotes().catch(() => undefined);
+  };
   // The recovery timer also catches up after a restart; uniqueness and leases arbitrate multiple processes.
   const daily = cron.schedule(POST_CRON, tick, { timezone: POST_TIMEZONE });
   const recovery = cron.schedule('*/10 * * * *', tick, { timezone: POST_TIMEZONE });

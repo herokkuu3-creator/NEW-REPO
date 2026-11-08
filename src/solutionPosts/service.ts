@@ -51,7 +51,7 @@ export async function withAccount<T>(account: Account,
     const api = new LeetCodeApi(context);
     const session = await checkSession(api);
     if (!session.authenticated || !session.username) throw new PostError('AUTHENTICATION_REQUIRED');
-    if (!account.username || session.username.toLowerCase() !== account.username.toLowerCase()) {
+    if (account.username && session.username.toLowerCase() !== account.username.toLowerCase()) {
       throw new PostError('ACCOUNT_IDENTITY_MISMATCH');
     }
     return await action(api, page, session.username);

@@ -42,6 +42,53 @@ export async function sendTelegramMessage(text: string, options: TelegramMessage
   }
 }
 
+export async function sendTelegramMessageWithId(text: string, options: TelegramMessageOptions = {}): Promise<number | null> {
+  const { botToken, chatId, enabled } = config.telegram;
+  if (!enabled) return null;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        disable_web_page_preview: options.disableWebPagePreview ?? true,
+        ...(options.parseMode ? { parse_mode: options.parseMode } : {}),
+        ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { result?: { message_id?: number } };
+    return data?.result?.message_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function editTelegramMessage(messageId: number, text: string, options: TelegramMessageOptions = {}): Promise<boolean> {
+  const { botToken, chatId, enabled } = config.telegram;
+  if (!enabled) return false;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        text,
+        disable_web_page_preview: options.disableWebPagePreview ?? true,
+        ...(options.parseMode ? { parse_mode: options.parseMode } : {}),
+        ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Sends a photo (e.g. a Cloudflare diagnostics screenshot). Important on
  * Render's free tier, where the filesystem is ephemeral and the on-disk
