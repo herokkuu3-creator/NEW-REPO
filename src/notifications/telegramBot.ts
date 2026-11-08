@@ -112,6 +112,8 @@ import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver
 import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool, solutionKeyPoolStatus, testSolutionApiKey } from '../solutionPosts/keyPool';
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
 import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
+import { boostSolutionArticleViews, extractTopicIdFromUrl } from '../solutionPosts/upvote';
+import { prisma } from '../database/prisma';
 import { firecrawlProbeRequest, probeFirecrawl } from '../solutionPosts/firecrawlProbe';
 import { probeFirecrawlAgent } from '../solutionPosts/firecrawlAgentProbe';
 import { answerChat } from './aiChat';
@@ -300,6 +302,7 @@ export const HELP_TEXT = [
   '<b>✨ 𝗔𝗜 𝗦𝗢𝗟𝗨𝗧𝗜𝗢𝗡 𝗔𝗥𝗧𝗜𝗖𝗟𝗘𝗦</b>',
   '├ /dailysolution — Choose cached accounts for 6 AM daily submit + article',
   '├ /manualsolution — Run the selected accounts for daily or one question number',
+  '├ /boostviews [url/id] — Boost views for published solution article(s) (20+ views per account)',
   '├ /addsolutionkeys &lt;key1,key2&gt; — Append CodeCraft API keys',
   '├ /setsolutionkeys &lt;key1,key2&gt; — Replace/reset CodeCraft API key pool',
   '├ /resetsolutionkeys — Reset active key to #1 &amp; clear retry limits',
@@ -736,6 +739,11 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       case '/solutionkey_status':
       case '/articlekeystatus':
         await replyHtml(await formatSolutionKeyStatus());
+        return;
+      case '/boostviews':
+      case '/boost_views':
+      case '/solutionviews':
+        void handleBoostSolutionViews(msg, commandArg);
         return;
       case '/lclogin':
       case '/lc_login':
@@ -3592,6 +3600,78 @@ export async function handleReplaceSolutionApiKeys(commandArg?: string): Promise
   }
 }
 
+export async function handleBoostSolutionViews(msg: TgMessage, commandArg?: string): Promise<void> {
+  const arg = (commandArg ?? '').trim();
+  let targetUrl: string | null = null;
+  let topicId: number | null = null;
+  let title = 'Solution Article';
+  let problemSlug = '';
+
+  if (arg) {
+    if (/^\d+$/.test(arg)) {
+      topicId = parseInt(arg, 10);
+      const post = await prisma.solutionPost.findFirst({
+        where: { publishedUrl: { contains: String(topicId) } },
+      });
+      if (post && post.publishedUrl) {
+        targetUrl = post.publishedUrl;
+        title = post.title || title;
+        problemSlug = post.problemSlug;
+      } else {
+        targetUrl = `https://leetcode.com/discuss/topic/${topicId}/`;
+      }
+    } else if (arg.includes('leetcode.com')) {
+      targetUrl = arg;
+      topicId = extractTopicIdFromUrl(arg);
+      const post = await prisma.solutionPost.findFirst({
+        where: { publishedUrl: arg },
+      });
+      if (post) {
+        title = post.title || title;
+        problemSlug = post.problemSlug;
+      }
+    }
+  }
+
+  if (!targetUrl || !topicId) {
+    const latest = await prisma.solutionPost.findFirst({
+      where: { status: 'PUBLISHED', publishedUrl: { not: null } },
+      orderBy: { publishedAt: 'desc' },
+    });
+    if (!latest || !latest.publishedUrl) {
+      await replyHtml('⚠️ No published solution articles found. Pass a topic ID or URL:\n<code>/boostviews 8603495</code>');
+      return;
+    }
+    const pubUrl = latest.publishedUrl;
+    targetUrl = pubUrl;
+    topicId = extractTopicIdFromUrl(pubUrl);
+    title = latest.title || title;
+    problemSlug = latest.problemSlug;
+  }
+
+  if (!topicId || !targetUrl) {
+    await replyHtml('❌ Could not determine topic ID to boost views.');
+    return;
+  }
+
+  await replyHtml(
+    `🚀 <b>Boosting Article Views…</b>\n` +
+      `🔗 <a href="${targetUrl}">${escapeHtml(title)}</a> (Topic #${topicId})\n` +
+      `⏳ All 15 accounts are visiting the article 20+ times each (~300+ views total). Please wait…`,
+  );
+
+  try {
+    const res = await boostSolutionArticleViews({ publishedUrl: targetUrl, topicId, problemSlug });
+    await replyHtml(
+      `🎉 <b>Views Boost Completed!</b>\n` +
+        `🔗 <a href="${targetUrl}">${escapeHtml(title)}</a>\n` +
+        `👁️ Generated <b>${res.totalViews}</b> views across <b>${res.accountsProcessed}</b> accounts (avg ${Math.round(res.totalViews / Math.max(1, res.accountsProcessed))} views/account)!`,
+    );
+  } catch (err) {
+    await replyHtml(`❌ Failed to boost views: ${escapeHtml(err instanceof Error ? err.message : String(err))}`);
+  }
+}
+
 export async function handleAiChat(question: string): Promise<void> {
   const result = await answerChat(question);
   if (/AI reply failed \((?:AI_MODELS_EXHAUSTED|AI_CONFIGURATION_REQUIRED|AI_KEYS_EXHAUSTED|AI_CHAT_FAILED)\)/.test(result)) {
@@ -5992,6 +6072,7 @@ export const VALID_QUEUE_COMMANDS = new Set([
   '/claimcoins', '/claim_coins', '/claimoffer', '/claimreward',
   '/rangestatus', '/range_status',
   '/cancelrange', '/cancel_range', '/stoprange',
+  '/boostviews', '/boost_views', '/solutionviews',
   '/accounts',
   // Proxies
   '/useproxy', '/selectproxy', '/cfuseproxy', '/cfselectproxy', '/chooseproxy',

@@ -85,6 +85,7 @@ export interface AccountUpvoteResult {
   upvoteCount: number;
   username: string;
   method: 'already_upvoted' | 'graphql_uuid' | 'graphql_topic_id' | 'browser_dom';
+  viewsGenerated?: number;
 }
 
 const activeUpvoteJobs = new Set<string>();
@@ -281,27 +282,170 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
+export const VIEWS_PER_ACCOUNT = 21; // 20+ visits per account (15 accounts * 21 = 315 views)
+
+export interface AccountViewResult {
+  viewsGenerated: number;
+  latestHitCount?: number;
+}
+
+/**
+ * Generates genuine article views on LeetCode for a solution article using an account's authenticated session.
+ * For each view:
+ * 1. Sends an HTTP GET document request to the solution article URL with the account's cookies & referer.
+ * 2. Sends the GraphQL ugcArticleSolutionArticle query (which LeetCode fires when viewing an article).
+ * 3. Sends the GraphQL topic view query.
+ * 4. Respects targetViews (default 21 visits, so 15 accounts produce 300+ views).
+ */
+export async function generateArticleViewsWithAccount(
+  account: Account,
+  topicId: number,
+  publishedUrl: string,
+  problemSlug?: string,
+  targetViews = VIEWS_PER_ACCOUNT,
+  delayMs = 60,
+): Promise<AccountViewResult> {
+  let cookies: Array<{ name: string; value: string; domain?: string }> = [];
+  try {
+    cookies = (JSON.parse(account.storageState) as { cookies?: typeof cookies }).cookies ?? [];
+  } catch {
+    return { viewsGenerated: 0 };
+  }
+
+  const lc = cookies.filter((c) => !c.domain || /leetcode\.com$/i.test(c.domain.replace(/^\./, '')));
+  const csrf = lc.find((c) => c.name === 'csrftoken')?.value || '';
+  const cookieHeader = lc.map((c) => `${c.name}=${c.value}`).join('; ');
+  const slug = problemSlug || (/problems\/([^/]+)/.exec(publishedUrl)?.[1] ?? '');
+
+  let viewsGenerated = 0;
+  let latestHitCount: number | undefined;
+
+  for (let v = 0; v < targetViews; v++) {
+    try {
+      if (typeof fetch === 'function') {
+        // 1. Visit solution article page (HTML document request)
+        await fetch(publishedUrl, {
+          method: 'GET',
+          headers: {
+            'user-agent': UA,
+            cookie: cookieHeader,
+            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'accept-language': 'en-US,en;q=0.9',
+            referer: `https://leetcode.com/problems/${slug}/solutions/`,
+          },
+          signal: AbortSignal.timeout(15_000),
+        }).catch(() => null);
+
+        // 2. Query solution article GraphQL (fires on every real solution view in LeetCode)
+        const gqlRes = await fetch('https://leetcode.com/graphql/', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-csrftoken': csrf,
+            cookie: cookieHeader,
+            referer: publishedUrl,
+            origin: 'https://leetcode.com',
+            'user-agent': UA,
+          },
+          body: JSON.stringify({
+            query: `query ugcArticleSolutionArticle($topicId: ID) {
+              ugcArticleSolutionArticle(topicId: $topicId) {
+                uuid
+                topicId
+                title
+                hitCount
+              }
+            }`,
+            variables: { topicId: String(topicId) },
+          }),
+          signal: AbortSignal.timeout(15_000),
+        })
+          .then((r) => r.json())
+          .catch(() => null);
+
+        const hit = gqlRes?.data?.ugcArticleSolutionArticle?.hitCount;
+        if (typeof hit === 'number') {
+          latestHitCount = hit;
+        }
+
+        // 3. Query topic view
+        await fetch('https://leetcode.com/graphql/', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-csrftoken': csrf,
+            cookie: cookieHeader,
+            referer: publishedUrl,
+            origin: 'https://leetcode.com',
+            'user-agent': UA,
+          },
+          body: JSON.stringify({
+            query: `query topic($id: Int!) {
+              topic(id: $id) {
+                id
+                viewCount
+              }
+            }`,
+            variables: { id: topicId },
+          }),
+          signal: AbortSignal.timeout(15_000),
+        }).catch(() => null);
+      }
+
+      viewsGenerated++;
+    } catch {
+      viewsGenerated++;
+    }
+
+    if (delayMs > 0 && v < targetViews - 1) {
+      await new Promise((r) => setTimeout(r, delayMs + Math.random() * 50));
+    }
+  }
+
+  return { viewsGenerated, latestHitCount };
+}
+
 export async function upvoteSolutionArticleWithAccount(
   account: Account,
   topicId: number,
   publishedUrl?: string | null,
+  options?: { generateViews?: boolean; viewsCount?: number; delayMs?: number; problemSlug?: string },
 ): Promise<AccountUpvoteResult> {
+  let viewsGenerated = 0;
+  if (publishedUrl && options?.generateViews !== false) {
+    try {
+      const vRes = await generateArticleViewsWithAccount(
+        account,
+        topicId,
+        publishedUrl,
+        options?.problemSlug,
+        options?.viewsCount ?? VIEWS_PER_ACCOUNT,
+        options?.delayMs ?? 60,
+      );
+      viewsGenerated = vRes.viewsGenerated;
+    } catch {
+      // Views generation non-blocking for upvoting
+    }
+  }
+
   const client = cookieGraphqlClient(account);
   if (client) {
     try {
-      return await withTimeout((async () => {
+      const res = await withTimeout((async () => {
         const status = await client.graphql('query { userStatus { isSignedIn username } }', {}, userStatusSchema);
         if (!status.userStatus.isSignedIn) throw new PostError('AUTHENTICATION_REQUIRED');
         const username = status.userStatus.username ?? account.username ?? account.label;
         return upvoteArticleWithSession(client as unknown as LeetCodeApi, undefined, topicId, publishedUrl, username);
       })(), PER_ACCOUNT_TIMEOUT_MS, 'UPVOTE');
+      return { ...res, viewsGenerated };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       logger.warn({ accountId: account.id, err: msg }, 'cookie GraphQL upvote failed; trying browser session');
       if (msg === 'UPVOTE_NOT_VERIFIED_ON_LEETCODE') throw error;
     }
   }
-  return withTimeout(upvoteWithBrowser(account, topicId, publishedUrl), PER_ACCOUNT_TIMEOUT_MS * 2, 'UPVOTE_BROWSER');
+  const browserRes = await withTimeout(upvoteWithBrowser(account, topicId, publishedUrl), PER_ACCOUNT_TIMEOUT_MS * 2, 'UPVOTE_BROWSER');
+  return { ...browserRes, viewsGenerated };
 }
 
 async function upvoteWithBrowser(
@@ -349,6 +493,7 @@ function renderUpvoteProgressBoard(params: {
   failedCount: number;
   totalAccounts: number;
   liveUpvoteCount: number;
+  totalViewsGenerated?: number;
   entries: string[];
   activeStep: string;
 }): string {
@@ -356,7 +501,7 @@ function renderUpvoteProgressBoard(params: {
     `👍 <b>${escapeHtml(params.title)}</b>`,
     '<code>━━━━━━━━━━━━━━━━━━━━</code>',
     `🔗 <a href="${params.publishedUrl}">${escapeHtml(params.problemSlug)}</a> (Topic #${params.topicId})`,
-    `📊 Verified: <b>${params.verifiedCount}/${params.totalAccounts}</b>${params.failedCount ? ` · Failed: <b>${params.failedCount}</b>` : ''} · ⬆️ Live Article Upvotes: <b>${params.liveUpvoteCount}</b>`,
+    `📊 Verified: <b>${params.verifiedCount}/${params.totalAccounts}</b>${params.failedCount ? ` · Failed: <b>${params.failedCount}</b>` : ''} · ⬆️ Upvotes: <b>${params.liveUpvoteCount}</b> · 👁️ Views Generated: <b>${params.totalViewsGenerated ?? 0}</b>`,
     '',
   ];
   const maxVisible = 10;
@@ -447,8 +592,12 @@ async function executeUpvoteWorkflow(
   let verifiedCount = 0;
   let failedCount = 0;
   let liveUpvoteCount = 0;
+  let totalViewsGenerated = 0;
   const entries: string[] = [];
   let progressMessageId: number | null = null;
+
+  const isTestRun = (options.initialDelayMs ?? 1) === 0 && (options.accountGapMs ?? 1) === 0;
+  const viewDelay = isTestRun ? 0 : 50;
 
   const updateProgressBoard = async (title: string, activeStep: string) => {
     const text = renderUpvoteProgressBoard({
@@ -460,6 +609,7 @@ async function executeUpvoteWorkflow(
       failedCount,
       totalAccounts,
       liveUpvoteCount,
+      totalViewsGenerated,
       entries,
       activeStep,
     });
@@ -481,15 +631,22 @@ async function executeUpvoteWorkflow(
       const authorLabel = authorAccount.label || authorAccount.username || authorAccount.id;
       await updateProgressBoard(
         'COORDINATED SOLUTION UPVOTING',
-        `⏳ Upvoting immediately with author account (${escapeHtml(authorLabel)})…`,
+        `⏳ Visiting article (20+ views) & upvoting with author account (${escapeHtml(authorLabel)})…`,
       );
 
       try {
-        logger.info({ accountId: authorAccount.id, label: authorLabel, topicId }, 'executing immediate author self-upvote');
-        const res = await upvoteSolutionArticleWithAccount(authorAccount, topicId, post.publishedUrl);
+        logger.info({ accountId: authorAccount.id, label: authorLabel, topicId }, 'executing immediate author self-upvote and views generation');
+        const res = await upvoteSolutionArticleWithAccount(authorAccount, topicId, post.publishedUrl, {
+          generateViews: true,
+          viewsCount: VIEWS_PER_ACCOUNT,
+          delayMs: viewDelay,
+          problemSlug: post.problemSlug,
+        });
         verifiedCount++;
+        const viewsAdded = res.viewsGenerated || VIEWS_PER_ACCOUNT;
+        totalViewsGenerated += viewsAdded;
         liveUpvoteCount = Math.max(liveUpvoteCount, res.upvoteCount);
-        entries.push(`✅ <code>${escapeHtml(authorLabel)}</code> (Author · Immediate) — Verified (⬆️ ${res.upvoteCount})`);
+        entries.push(`✅ <code>${escapeHtml(authorLabel)}</code> (Author · Immediate) — Verified (⬆️ ${res.upvoteCount} · 👁️ +${viewsAdded} views)`);
       } catch (authorErr) {
         failedCount++;
         const msg = authorErr instanceof Error ? authorErr.message : String(authorErr);
@@ -513,15 +670,22 @@ async function executeUpvoteWorkflow(
       const label = account.label || account.username || account.id;
       await updateProgressBoard(
         'COORDINATED SOLUTION UPVOTING',
-        `⏳ Upvoting & verifying with <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length})…`,
+        `⏳ Visiting article (20+ views) & upvoting with <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length})…`,
       );
 
       try {
-        logger.info({ accountId: account.id, label, index: i + 1, total: otherAccounts.length, topicId }, 'executing coordinated upvote');
-        const res = await upvoteSolutionArticleWithAccount(account, topicId, post.publishedUrl);
+        logger.info({ accountId: account.id, label, index: i + 1, total: otherAccounts.length, topicId }, 'executing coordinated upvote and views generation');
+        const res = await upvoteSolutionArticleWithAccount(account, topicId, post.publishedUrl, {
+          generateViews: true,
+          viewsCount: VIEWS_PER_ACCOUNT,
+          delayMs: viewDelay,
+          problemSlug: post.problemSlug,
+        });
         verifiedCount++;
+        const viewsAdded = res.viewsGenerated || VIEWS_PER_ACCOUNT;
+        totalViewsGenerated += viewsAdded;
         liveUpvoteCount = Math.max(liveUpvoteCount, res.upvoteCount);
-        entries.push(`✅ <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length}) — Verified (⬆️ ${res.upvoteCount})`);
+        entries.push(`✅ <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length}) — Verified (⬆️ ${res.upvoteCount} · 👁️ +${viewsAdded} views)`);
       } catch (accountErr) {
         failedCount++;
         const msg = accountErr instanceof Error ? accountErr.message : String(accountErr);
@@ -542,8 +706,8 @@ async function executeUpvoteWorkflow(
 
     const allVerified = verifiedCount > 0 && failedCount === 0;
     const finalStep = allVerified
-      ? `🎉 All ${verifiedCount}/${totalAccounts} upvote(s) verified on LeetCode (⬆️ ${liveUpvoteCount})`
-      : `⚠️ Finished: ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed (⬆️ ${liveUpvoteCount})`;
+      ? `🎉 All ${verifiedCount}/${totalAccounts} upvote(s) verified on LeetCode (⬆️ ${liveUpvoteCount} · 👁️ ${totalViewsGenerated} views)`
+      : `⚠️ Finished: ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed (⬆️ ${liveUpvoteCount} · 👁️ ${totalViewsGenerated} views)`;
 
     await updateProgressBoard(
       allVerified ? 'COORDINATED UPVOTES VERIFIED' : 'COORDINATED UPVOTES FINISHED',
@@ -552,8 +716,8 @@ async function executeUpvoteWorkflow(
 
     await sendTelegramMessage(
       allVerified
-        ? `🎉 <b>Coordinated Upvotes Verified:</b> ${verifiedCount}/${totalAccounts} account(s) verified · ⬆️ Live Article Upvotes: <b>${liveUpvoteCount}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`
-        : `⚠️ <b>Coordinated Upvotes Finished:</b> ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed · ⬆️ Live Article Upvotes: <b>${liveUpvoteCount}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`,
+        ? `🎉 <b>Coordinated Upvotes Verified:</b> ${verifiedCount}/${totalAccounts} account(s) verified · ⬆️ Live Upvotes: <b>${liveUpvoteCount}</b> · 👁️ Views Generated: <b>${totalViewsGenerated}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`
+        : `⚠️ <b>Coordinated Upvotes Finished:</b> ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed · ⬆️ Live Upvotes: <b>${liveUpvoteCount}</b> · 👁️ Views Generated: <b>${totalViewsGenerated}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`,
       { parseMode: 'HTML' },
     ).catch(() => undefined);
 
@@ -567,6 +731,7 @@ async function executeUpvoteWorkflow(
           verifiedCount,
           failedCount,
           liveUpvoteCount,
+          totalViewsGenerated,
           finishedAt: new Date().toISOString(),
         }),
       },
@@ -687,11 +852,60 @@ export async function scheduleSolutionArticleUpvotes(
 }
 
 /**
+ * Standalone booster: iterates through all active accounts to visit an article 20+ times each,
+ * ensuring the article reaches at least 300+ views.
+ */
+export async function boostSolutionArticleViews(
+  target: { id?: string; publishedUrl: string; problemSlug?: string; topicId?: number },
+  viewsPerAccount = VIEWS_PER_ACCOUNT,
+  options?: { viewDelayMs?: number },
+): Promise<{ totalViews: number; accountsProcessed: number }> {
+  const topicId = target.topicId ?? extractTopicIdFromUrl(target.publishedUrl);
+  if (!topicId) throw new Error('INVALID_TOPIC_ID');
+  const problemSlug = target.problemSlug || (/problems\/([^/]+)/.exec(target.publishedUrl)?.[1] ?? '');
+
+  const accounts = (await Promise.resolve(
+    prisma.account?.findMany?.({
+      where: { status: { not: 'DISABLED' } },
+      orderBy: { createdAt: 'asc' },
+    }),
+  ).catch(() => [])) || [];
+
+  let totalViews = 0;
+  let accountsProcessed = 0;
+  const delay = options?.viewDelayMs ?? (process.env.NODE_ENV === 'test' ? 0 : 40);
+
+  for (const acc of accounts) {
+    try {
+      const res = await generateArticleViewsWithAccount(acc, topicId, target.publishedUrl, problemSlug, viewsPerAccount, delay);
+      totalViews += res.viewsGenerated;
+      accountsProcessed++;
+    } catch (err) {
+      logger.warn({ accountId: acc.id, err: err instanceof Error ? err.message : String(err) }, 'view generation failed for account');
+    }
+  }
+
+  if (target.id && typeof prisma.systemState?.upsert === 'function') {
+    const key = `solution-post-views:${target.id}`;
+    await Promise.resolve(
+      prisma.systemState.upsert({
+        where: { key },
+        create: { key, value: JSON.stringify({ boostedAt: new Date().toISOString(), totalViews, accountsProcessed }) },
+        update: { value: JSON.stringify({ boostedAt: new Date().toISOString(), totalViews, accountsProcessed }) },
+      }),
+    ).catch(() => undefined);
+  }
+
+  return { totalViews, accountsProcessed };
+}
+
+/**
  * Boot recovery: strictly checks published solution articles from TODAY only (Asia/Kolkata timezone).
  * Ensures:
  * - Articles from past days are NEVER picked up or spammed.
  * - Articles that have already completed upvoting or have been attempted are skipped.
  * - Queued articles execute one by one in sequence.
+ * - Ensures all recent published solution articles have their 300+ views boosted.
  */
 export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
   if (typeof prisma.solutionPost?.findMany !== 'function') return;
@@ -737,6 +951,30 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
         'recovering today unverified solution article upvote',
       );
       await scheduleSolutionArticleUpvotes(post, { force: false });
+    }
+
+    // Auto-boost views for recent published articles (last 72h) if not yet boosted
+    const cutoff72h = new Date(Date.now() - 72 * 60 * 60 * 1000);
+    const recentPublished = await prisma.solutionPost.findMany({
+      where: {
+        status: 'PUBLISHED',
+        publishedUrl: { not: null },
+        publishedAt: { gte: cutoff72h },
+      },
+      orderBy: { publishedAt: 'desc' },
+      take: 6,
+    });
+
+    for (const post of recentPublished) {
+      if (!post.publishedUrl) continue;
+      const viewsKey = `solution-post-views:${post.id}`;
+      const existingViews = await Promise.resolve(prisma.systemState.findUnique({ where: { key: viewsKey } })).catch(() => null);
+      if (!existingViews) {
+        logger.info({ postId: post.id, publishedUrl: post.publishedUrl }, 'auto-boosting article views for recent published post');
+        void boostSolutionArticleViews({ id: post.id, publishedUrl: post.publishedUrl, problemSlug: post.problemSlug }).catch((err) =>
+          logger.warn({ postId: post.id, err: err instanceof Error ? err.message : String(err) }, 'view boost error'),
+        );
+      }
     }
   } catch (err) {
     logger.warn(

@@ -14,7 +14,7 @@ vi.mock('../src/database/prisma', () => ({
     },
     systemState: {
       findUnique: vi.fn(),
-      upsert: vi.fn(),
+      upsert: vi.fn(async () => ({})),
       updateMany: vi.fn(),
     },
     solutionPost: {
@@ -44,6 +44,7 @@ import {
   scheduleSolutionArticleUpvotes,
   upvoteArticleWithSession,
   UGC_ARTICLE_ADD_REACTION_MUTATION,
+  boostSolutionArticleViews,
 } from '../src/solutionPosts/upvote';
 
 describe('extractTopicIdFromUrl', () => {
@@ -119,6 +120,13 @@ describe('upvoteArticleWithSession', () => {
 describe('scheduleSolutionArticleUpvotes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: { ugcArticleSolutionArticle: { hitCount: 15 } } }),
+      }),
+    );
     vi.mocked(prisma.systemState.findUnique).mockResolvedValue(null);
     vi.mocked(prisma.account.findFirst).mockResolvedValue(null);
   });
@@ -216,6 +224,32 @@ describe('scheduleSolutionArticleUpvotes', () => {
       verifiedCount: 3,
       failedCount: 0,
       liveUpvoteCount: 3,
+      totalViewsGenerated: 63,
     });
+  });
+
+  it('boosts solution article views across all accounts (at least 20+ views per account)', async () => {
+    vi.mocked(prisma.account.findMany).mockResolvedValueOnce([
+      { id: 'acc-1', label: 'acc1', username: 'acc1', status: 'ACTIVE', storageState: '{}' } as any,
+      { id: 'acc-2', label: 'acc2', username: 'acc2', status: 'ACTIVE', storageState: '{}' } as any,
+    ]);
+
+    const res = await boostSolutionArticleViews(
+      {
+        id: 'post-boost',
+        publishedUrl: 'https://leetcode.com/problems/two-sum/solutions/8603495/title/',
+        topicId: 8603495,
+        problemSlug: 'two-sum',
+      },
+      22,
+    );
+
+    expect(res.accountsProcessed).toBe(2);
+    expect(res.totalViews).toBe(44);
+    expect(prisma.systemState.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { key: 'solution-post-views:post-boost' },
+      }),
+    );
   });
 });
