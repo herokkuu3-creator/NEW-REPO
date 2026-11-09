@@ -96,11 +96,11 @@ services:
       - key: SOLUTION_POST_API_KEY
         value: sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056
       - key: SOLUTION_AI_PROVIDER
-        value: bazaarlink
+        value: sage
       - key: SAGE_API_KEY
         value: sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056
-      - key: BAZAARLINK_API_KEY
-        sync: false
+      - key: SOLUTION_POST_RETRIES
+        value: "3"
       # api = drive LeetCode's GraphQL + submit endpoints (no HTML page loads,
       # so Cloudflare's page-level challenge is not triggered). This is the
       # setting that makes the service work from Render's datacenter IP.

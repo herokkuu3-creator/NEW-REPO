@@ -1,5 +1,5 @@
-export const DEFAULT_SOLUTION_POST_BASE_URL = 'https://api.bazaarlink.ai/v1';
-export const DEFAULT_SOLUTION_POST_MODEL = 'qwen/qwen3.7-flash:free';
+export const DEFAULT_SOLUTION_POST_BASE_URL = 'https://discovery-api.intern-ai.org.cn/v1';
+export const DEFAULT_SOLUTION_POST_MODEL = 'minimax-m3';
 
 export function isBazaarLinkProvider(baseUrl: string): boolean {
   const url = new URL(baseUrl);

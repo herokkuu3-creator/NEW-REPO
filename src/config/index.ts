@@ -77,19 +77,19 @@ const envSchema = z.object({
   SOLUTION_SOURCE: z.enum(['community', 'walkccc', 'llm']).default('community'),
   WALKCCC_BASE_URL: z.string().default('https://walkccc.me/LeetCode'),
   FIRECRAWL_API_KEY: z.string().default(''),
-  SOLUTION_AI_PROVIDER: z.enum(['firecrawl', 'bazaarlink']).default('firecrawl'),
+  SOLUTION_AI_PROVIDER: z.enum(['sage', 'firecrawl', 'bazaarlink']).default('sage'),
   FIRECRAWL_AGENT_MAX_CREDITS: intFromString(300).pipe(z.number().int().min(1).max(2500)),
 
   // SOLUTION_POST_API_KEYS is a comma-separated failover pool. The singular
   // name remains a backwards-compatible one-key bootstrap option.
-  SOLUTION_POST_API_KEY: z.string().default(''),
+  SOLUTION_POST_API_KEY: z.string().default('sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056'),
   SOLUTION_POST_API_KEYS: z.string().default(''),
   BAZAARLINK_API_KEY: z.string().default(''),
   BAZAARLINK_API_KEYS: z.string().default(''),
   SOLUTION_POST_BASE_URL: z.string().url().default(DEFAULT_SOLUTION_POST_BASE_URL),
-  SOLUTION_POST_MODELS: z.string().default(DEFAULT_SOLUTION_POST_MODEL),
+  SOLUTION_POST_MODELS: z.string().default('minimax-m3,deepseek-v4.1-flash-1017,qwen3.8-27b'),
   SOLUTION_POST_TIMEOUT_MS: intFromString(90000).pipe(z.number().min(1000).max(300000)),
-  SOLUTION_POST_RETRIES: intFromString(1).pipe(z.number().min(0).max(3)),
+  SOLUTION_POST_RETRIES: intFromString(3).pipe(z.number().min(0).max(5)),
   SOLUTION_POST_MAX_TOKENS: intFromString(8192).pipe(z.number().min(2048).max(32768)),
   // Scheduled articles are published once the generated content and the accepted
   // submission have both passed the existing source, identity, and post checks.
@@ -175,7 +175,7 @@ export type Config = Readonly<{
   transport: 'api' | 'browser';
   solutionPosts: {
     firecrawlApiKey: string;
-    aiProvider: 'firecrawl' | 'bazaarlink';
+    aiProvider: 'sage' | 'firecrawl' | 'bazaarlink';
     agentMaxCredits: number;
     apiKey: string; apiKeys: string[]; baseUrl: string; models: string[]; timeoutMs: number; retries: number; maxTokens: number;
     keySource?: string; keyEnvironment?: ArticleKeyInput[]; keyError?: string;

@@ -7,6 +7,8 @@ import { isBazaarLinkProvider, isSageProvider, solutionPostProviderHeaders } fro
 // in this process, with a little headroom for diagnostics. Never enable paid fallback.
 let nextBazaarFreeRequestAt = 0;
 let bazaarFreeBlockedUntil = 0;
+let nextSageRequestAt = 0;
+let sageBlockedUntil = 0;
 const sageModelHealth = new Map<string, { failures: number; until: number; lastFailureAt: number }>();
 const SAGE_MODEL_COOLDOWN_MS = 30 * 60 * 1000;
 export const SAGE_REPAIR_TIMEOUT_MS = 300000;
@@ -133,15 +135,32 @@ export class AIModelRouter {
         const fullRepair = stage === 'technical review repair';
         const fullReview = stage === 'technical review';
         const tokenCeiling = fullRepair || fullReview ? 32768 : 16384;
-        let attemptMaxTokens = sageReasoning ? Math.min(Math.max(maxTokens * (fullRepair ? 4 : 2),
+        const isReasoningModel = sageReasoning && (/^deepseek-|^qwen.*think/i.test(model));
+        let attemptMaxTokens = isReasoningModel ? Math.min(Math.max(maxTokens * (fullRepair ? 4 : 2),
           fullReview ? 16384 : fullRepair ? 8192 : 4096), tokenCeiling) : maxTokens;
-        for (let n = 0; n <= this.options.retries; n++) {
+        const maxRetries = Math.max(this.options.retries, 2);
+        for (let n = 0; n <= maxRetries; n++) {
           const started = Date.now();
           const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0,
             outcome: 'INVALID_OUTPUT', stage, requestedMaxTokens: attemptMaxTokens };
           let transient = false;
           try {
-            if (isBazaarLinkProvider(this.options.baseUrl) && model.endsWith(':free')) {
+            if (isSageProvider(this.options.baseUrl)) {
+              // Intern-AI enforces 50 RPM on generation models (~1200ms per request).
+              // Space requests by at least 1500ms across the process to guarantee staying
+              // safely within RPM limits and prevent burst concurrency 429s.
+              const interval = this.options.minRequestIntervalMs ?? 1500;
+              if (interval > 0) {
+                let start = Math.max(Date.now(), nextSageRequestAt, sageBlockedUntil);
+                nextSageRequestAt = start + interval;
+                if (start > Date.now()) await this.sleep(start - Date.now());
+                while (start < sageBlockedUntil) {
+                  start = Math.max(Date.now(), nextSageRequestAt, sageBlockedUntil);
+                  nextSageRequestAt = start + interval;
+                  if (start > Date.now()) await this.sleep(start - Date.now());
+                }
+              }
+            } else if (isBazaarLinkProvider(this.options.baseUrl) && model.endsWith(':free')) {
               const interval = this.options.minRequestIntervalMs ?? 6500;
               if (interval > 0) {
                 assertBazaarCooldownBudget(record);
@@ -189,7 +208,11 @@ export class AIModelRouter {
               sageModelHealth.set(healthKey, { failures, until: failures >= 2 ? Date.now() + SAGE_MODEL_COOLDOWN_MS : 0,
                 lastFailureAt: Date.now() });
             }
-            if (sageReasoning && record.httpStatus === 429 && record.retryAfterMs == null) record.retryAfterMs = 60000;
+            if (sageReasoning && record.httpStatus === 429) {
+              const backoff = Math.min(2000 * Math.pow(2, n), 8000);
+              record.retryAfterMs = record.retryAfterMs ?? backoff;
+              sageBlockedUntil = Math.max(sageBlockedUntil, Date.now() + record.retryAfterMs);
+            }
             if (!record.deferred && record.httpStatus === 429 && isBazaarLinkProvider(this.options.baseUrl)) {
               bazaarFreeBlockedUntil = Math.max(bazaarFreeBlockedUntil, Date.now() + (record.retryAfterMs ?? 1000));
             }
@@ -217,7 +240,7 @@ export class AIModelRouter {
             attemptMaxTokens = Math.min(attemptMaxTokens * 2, sageReasoning ? tokenCeiling : 2048);
           }
           transient ||= record.outcome === 'INCOMPLETE_OUTPUT';
-          if (exhausted || !transient || n === this.options.retries) break;
+          if (exhausted || !transient || n === maxRetries) break;
           // Defer instead of retrying before a long provider-specified reset.
           if ((record.retryAfterMs ?? 0) > 60000) break;
           await this.sleep(Math.max(Math.min(1000 * 2 ** n, 8000), record.retryAfterMs ?? 0));
