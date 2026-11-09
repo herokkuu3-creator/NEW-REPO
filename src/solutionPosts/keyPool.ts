@@ -120,13 +120,17 @@ export async function loadSolutionKeyPool(now = new Date()): Promise<SolutionKey
         pool = await persist({ ...pool, keys: [...pool.keys, ...additions], environmentFingerprint,
           providerFingerprint: configuredProvider });
       }
+      if (pool.keys.length === 0 && environmentKeys.length > 0) {
+        pool = await persist({ ...pool, keys: environmentKeys, activeIndex: 0, environmentFingerprint,
+          providerFingerprint: configuredProvider });
+      }
       // Older versions retired a valid BazaarLink or Sage Inkstone key on 429 and
       // skipped it until next month. Restore the most recently retired slot
       // once, preserving earlier authentication/billing retirements.
       if ((bazaarLink || sage) && ['KEY_EXHAUSTED', 'HTTP_429'].includes(pool.lastFailure ?? '') && pool.activeIndex > 0) {
         pool = await persist({ ...pool, activeIndex: pool.activeIndex - 1, lastFailure: undefined });
       }
-      if (sage && pool.keys.length > 0 && pool.activeIndex >= pool.keys.length &&
+      if (pool.keys.length > 0 && pool.activeIndex >= pool.keys.length &&
           !['HTTP_401', 'HTTP_402_BILLING_REQUIRED'].includes(pool.lastFailure ?? '')) {
         pool = await persist({ ...pool, activeIndex: 0, lastFailure: undefined });
       }

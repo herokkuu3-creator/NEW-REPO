@@ -86,6 +86,7 @@ export interface AccountUpvoteResult {
   username: string;
   method: 'already_upvoted' | 'graphql_uuid' | 'graphql_topic_id' | 'browser_dom';
   viewsGenerated?: number;
+  latestHitCount?: number;
 }
 
 const activeUpvoteJobs = new Set<string>();
@@ -289,13 +290,71 @@ export interface AccountViewResult {
   latestHitCount?: number;
 }
 
+export interface LiveSolutionMetrics {
+  topicId: number;
+  hitCount: number;
+  upvotes: number;
+  uuid: string;
+  title?: string;
+  slug?: string;
+}
+
+/**
+ * Fetches genuine, live engagement metrics (views/hitCount and upvotes) directly from LeetCode's public GraphQL API.
+ * This guarantees that reporting reflects real platform data rather than local simulated counters.
+ */
+export async function fetchLiveSolutionMetrics(topicId: number | string): Promise<LiveSolutionMetrics | null> {
+  try {
+    const url = 'https://leetcode.com/graphql/';
+    const query = `query ugcArticleSolutionArticle($topicId: ID) {
+      ugcArticleSolutionArticle(topicId: $topicId) {
+        uuid
+        topicId
+        title
+        slug
+        hitCount
+        reactions {
+          count
+          reactionType
+        }
+      }
+    }`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': UA,
+      },
+      body: JSON.stringify({ query, variables: { topicId: String(topicId) } }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as { data?: { ugcArticleSolutionArticle?: any } };
+    const art = json?.data?.ugcArticleSolutionArticle;
+    if (!art) return null;
+    const upvotes = art.reactions?.find((r: { reactionType: string; count: number }) => r.reactionType === 'UPVOTE')?.count ?? 0;
+    return {
+      topicId: Number(art.topicId),
+      hitCount: typeof art.hitCount === 'number' ? art.hitCount : 0,
+      upvotes,
+      uuid: art.uuid,
+      title: art.title,
+      slug: art.slug,
+    };
+  } catch (err) {
+    logger.warn({ topicId, err: err instanceof Error ? err.message : String(err) }, 'failed to fetch live solution metrics');
+    return null;
+  }
+}
+
 /**
  * Generates genuine article views on LeetCode for a solution article using an account's authenticated session.
  * For each view:
  * 1. Sends an HTTP GET document request to the solution article URL with the account's cookies & referer.
  * 2. Sends the GraphQL ugcArticleSolutionArticle query (which LeetCode fires when viewing an article).
- * 3. Sends the GraphQL topic view query.
- * 4. Respects targetViews (default 21 visits, so 15 accounts produce 300+ views).
+ * 3. Triggers LeetCode's hitResource mutation using the article's uuid to register the view on LeetCode's counter.
+ * 4. Sends the GraphQL topic view query.
+ * 5. Returns both the attempt count and the verified LeetCode hitCount.
  */
 export async function generateArticleViewsWithAccount(
   account: Account,
@@ -363,12 +422,48 @@ export async function generateArticleViewsWithAccount(
           .then((r) => r.json())
           .catch(() => null);
 
-        const hit = gqlRes?.data?.ugcArticleSolutionArticle?.hitCount;
+        const articleData = gqlRes?.data?.ugcArticleSolutionArticle;
+        const hit = articleData?.hitCount;
         if (typeof hit === 'number') {
           latestHitCount = hit;
         }
 
-        // 3. Query topic view
+        // 3. Trigger hitResource mutation (actual view increment mutation used by LeetCode frontend)
+        const uuid = articleData?.uuid;
+        if (uuid) {
+          const hitMutRes = await fetch('https://leetcode.com/graphql/', {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-csrftoken': csrf,
+              cookie: cookieHeader,
+              referer: publishedUrl,
+              origin: 'https://leetcode.com',
+              'user-agent': UA,
+            },
+            body: JSON.stringify({
+              query: `mutation hitResource($entityId: ID!, $entityType: EntityType!) {
+                hitResource(entityId: $entityId, entityType: $entityType) {
+                  ok
+                  error
+                  count
+                }
+              }`,
+              variables: { entityId: uuid, entityType: 'ARTICLE' },
+              operationName: 'hitResource',
+            }),
+            signal: AbortSignal.timeout(15_000),
+          })
+            .then((r) => r.json())
+            .catch(() => null);
+
+          const count = hitMutRes?.data?.hitResource?.count;
+          if (typeof count === 'number') {
+            latestHitCount = count;
+          }
+        }
+
+        // 4. Query topic view
         await fetch('https://leetcode.com/graphql/', {
           method: 'POST',
           headers: {
@@ -493,15 +588,17 @@ function renderUpvoteProgressBoard(params: {
   failedCount: number;
   totalAccounts: number;
   liveUpvoteCount: number;
+  liveHitCount?: number;
   totalViewsGenerated?: number;
   entries: string[];
   activeStep: string;
 }): string {
+  const displayViews = params.liveHitCount ?? params.totalViewsGenerated ?? 0;
   const lines = [
     `👍 <b>${escapeHtml(params.title)}</b>`,
     '<code>━━━━━━━━━━━━━━━━━━━━</code>',
     `🔗 <a href="${params.publishedUrl}">${escapeHtml(params.problemSlug)}</a> (Topic #${params.topicId})`,
-    `📊 Verified: <b>${params.verifiedCount}/${params.totalAccounts}</b>${params.failedCount ? ` · Failed: <b>${params.failedCount}</b>` : ''} · ⬆️ Upvotes: <b>${params.liveUpvoteCount}</b> · 👁️ Views Generated: <b>${params.totalViewsGenerated ?? 0}</b>`,
+    `📊 Verified: <b>${params.verifiedCount}/${params.totalAccounts}</b>${params.failedCount ? ` · Failed: <b>${params.failedCount}</b>` : ''} · ⬆️ Upvotes: <b>${params.liveUpvoteCount}</b> · 👁️ Views: <b>${displayViews}</b>`,
     '',
   ];
   const maxVisible = 10;
@@ -592,6 +689,7 @@ async function executeUpvoteWorkflow(
   let verifiedCount = 0;
   let failedCount = 0;
   let liveUpvoteCount = 0;
+  let liveHitCount = 0;
   let totalViewsGenerated = 0;
   const entries: string[] = [];
   let progressMessageId: number | null = null;
@@ -609,6 +707,7 @@ async function executeUpvoteWorkflow(
       failedCount,
       totalAccounts,
       liveUpvoteCount,
+      liveHitCount: liveHitCount || undefined,
       totalViewsGenerated,
       entries,
       activeStep,
@@ -646,6 +745,9 @@ async function executeUpvoteWorkflow(
         const viewsAdded = res.viewsGenerated || VIEWS_PER_ACCOUNT;
         totalViewsGenerated += viewsAdded;
         liveUpvoteCount = Math.max(liveUpvoteCount, res.upvoteCount);
+        if (typeof res.latestHitCount === 'number') {
+          liveHitCount = Math.max(liveHitCount, res.latestHitCount);
+        }
         entries.push(`✅ <code>${escapeHtml(authorLabel)}</code> (Author · Immediate) — Verified (⬆️ ${res.upvoteCount} · 👁️ +${viewsAdded} views)`);
       } catch (authorErr) {
         failedCount++;
@@ -685,6 +787,9 @@ async function executeUpvoteWorkflow(
         const viewsAdded = res.viewsGenerated || VIEWS_PER_ACCOUNT;
         totalViewsGenerated += viewsAdded;
         liveUpvoteCount = Math.max(liveUpvoteCount, res.upvoteCount);
+        if (typeof res.latestHitCount === 'number') {
+          liveHitCount = Math.max(liveHitCount, res.latestHitCount);
+        }
         entries.push(`✅ <code>${escapeHtml(label)}</code> (${i + 1}/${otherAccounts.length}) — Verified (⬆️ ${res.upvoteCount} · 👁️ +${viewsAdded} views)`);
       } catch (accountErr) {
         failedCount++;
@@ -704,10 +809,18 @@ async function executeUpvoteWorkflow(
       }
     }
 
+    const liveMetrics = await fetchLiveSolutionMetrics(topicId).catch(() => null);
+    if (liveMetrics) {
+      liveUpvoteCount = Math.max(liveUpvoteCount, liveMetrics.upvotes);
+      if (typeof liveMetrics.hitCount === 'number') {
+        liveHitCount = Math.max(liveHitCount, liveMetrics.hitCount);
+      }
+    }
+
     const allVerified = verifiedCount > 0 && failedCount === 0;
     const finalStep = allVerified
-      ? `🎉 All ${verifiedCount}/${totalAccounts} upvote(s) verified on LeetCode (⬆️ ${liveUpvoteCount} · 👁️ ${totalViewsGenerated} views)`
-      : `⚠️ Finished: ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed (⬆️ ${liveUpvoteCount} · 👁️ ${totalViewsGenerated} views)`;
+      ? `🎉 All ${verifiedCount}/${totalAccounts} upvote(s) verified on LeetCode (⬆️ ${liveUpvoteCount} · 👁️ ${liveHitCount || totalViewsGenerated} views)`
+      : `⚠️ Finished: ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed (⬆️ ${liveUpvoteCount} · 👁️ ${liveHitCount || totalViewsGenerated} views)`;
 
     await updateProgressBoard(
       allVerified ? 'COORDINATED UPVOTES VERIFIED' : 'COORDINATED UPVOTES FINISHED',
@@ -716,8 +829,8 @@ async function executeUpvoteWorkflow(
 
     await sendTelegramMessage(
       allVerified
-        ? `🎉 <b>Coordinated Upvotes Verified:</b> ${verifiedCount}/${totalAccounts} account(s) verified · ⬆️ Live Upvotes: <b>${liveUpvoteCount}</b> · 👁️ Views Generated: <b>${totalViewsGenerated}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`
-        : `⚠️ <b>Coordinated Upvotes Finished:</b> ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed · ⬆️ Live Upvotes: <b>${liveUpvoteCount}</b> · 👁️ Views Generated: <b>${totalViewsGenerated}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`,
+        ? `🎉 <b>Coordinated Upvotes Verified:</b> ${verifiedCount}/${totalAccounts} account(s) verified · ⬆️ Live Upvotes: <b>${liveUpvoteCount}</b> · 👁️ Live Views: <b>${liveHitCount || totalViewsGenerated}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`
+        : `⚠️ <b>Coordinated Upvotes Finished:</b> ${verifiedCount}/${totalAccounts} verified · ${failedCount} failed · ⬆️ Live Upvotes: <b>${liveUpvoteCount}</b> · 👁️ Live Views: <b>${liveHitCount || totalViewsGenerated}</b>\n🔗 <a href="${post.publishedUrl}">${escapeHtml(post.problemSlug)}</a>`,
       { parseMode: 'HTML' },
     ).catch(() => undefined);
 
@@ -731,6 +844,7 @@ async function executeUpvoteWorkflow(
           verifiedCount,
           failedCount,
           liveUpvoteCount,
+          liveHitCount,
           totalViewsGenerated,
           finishedAt: new Date().toISOString(),
         }),
@@ -859,7 +973,7 @@ export async function boostSolutionArticleViews(
   target: { id?: string; publishedUrl: string; problemSlug?: string; topicId?: number },
   viewsPerAccount = VIEWS_PER_ACCOUNT,
   options?: { viewDelayMs?: number },
-): Promise<{ totalViews: number; accountsProcessed: number }> {
+): Promise<{ totalViews: number; accountsProcessed: number; liveHitCount?: number }> {
   const topicId = target.topicId ?? extractTopicIdFromUrl(target.publishedUrl);
   if (!topicId) throw new Error('INVALID_TOPIC_ID');
   const problemSlug = target.problemSlug || (/problems\/([^/]+)/.exec(target.publishedUrl)?.[1] ?? '');
@@ -873,30 +987,54 @@ export async function boostSolutionArticleViews(
 
   let totalViews = 0;
   let accountsProcessed = 0;
+  let latestHitCount: number | undefined;
   const delay = options?.viewDelayMs ?? (process.env.NODE_ENV === 'test' ? 0 : 40);
 
   for (const acc of accounts) {
     try {
       const res = await generateArticleViewsWithAccount(acc, topicId, target.publishedUrl, problemSlug, viewsPerAccount, delay);
       totalViews += res.viewsGenerated;
+      if (typeof res.latestHitCount === 'number') {
+        latestHitCount = Math.max(latestHitCount ?? 0, res.latestHitCount);
+      }
       accountsProcessed++;
     } catch (err) {
       logger.warn({ accountId: acc.id, err: err instanceof Error ? err.message : String(err) }, 'view generation failed for account');
     }
   }
 
+  const liveMetrics = await fetchLiveSolutionMetrics(topicId).catch(() => null);
+  const finalHitCount = liveMetrics?.hitCount ?? latestHitCount;
+
   if (target.id && typeof prisma.systemState?.upsert === 'function') {
     const key = `solution-post-views:${target.id}`;
     await Promise.resolve(
       prisma.systemState.upsert({
         where: { key },
-        create: { key, value: JSON.stringify({ boostedAt: new Date().toISOString(), totalViews, accountsProcessed }) },
-        update: { value: JSON.stringify({ boostedAt: new Date().toISOString(), totalViews, accountsProcessed }) },
+        create: {
+          key,
+          value: JSON.stringify({
+            boostedAt: new Date().toISOString(),
+            totalViews,
+            accountsProcessed,
+            liveHitCount: finalHitCount,
+            liveUpvotes: liveMetrics?.upvotes,
+          }),
+        },
+        update: {
+          value: JSON.stringify({
+            boostedAt: new Date().toISOString(),
+            totalViews,
+            accountsProcessed,
+            liveHitCount: finalHitCount,
+            liveUpvotes: liveMetrics?.upvotes,
+          }),
+        },
       }),
     ).catch(() => undefined);
   }
 
-  return { totalViews, accountsProcessed };
+  return { totalViews, accountsProcessed, liveHitCount: finalHitCount };
 }
 
 /**

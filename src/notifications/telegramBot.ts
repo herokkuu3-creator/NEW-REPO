@@ -2045,6 +2045,8 @@ function renderSolutionWorkflowProgress(
 
 async function startDailySolutionWorkflow(accountIds: string[], questionNumber?: number, publicationMode: 'daily' | 'manual' = 'daily'): Promise<void> {
   if (!accountIds.length) { await reply('⚠️ Select at least one account for this workflow.'); return; }
+  await resetFailedSolutionPostRetries().catch(() => 0);
+  await resetSolutionApiKeyPool().catch(() => null);
   const description = questionNumber ? `question #${questionNumber}` : 'today’s daily question';
   const accounts = (await listEnabledAccounts()).filter(account => accountIds.includes(account.id));
   if (accounts.length !== accountIds.length) { await reply('⚠️ One or more selected accounts are no longer available. Open the picker again.'); return; }
@@ -3655,9 +3657,9 @@ export async function handleBoostSolutionViews(msg: TgMessage, commandArg?: stri
   }
 
   await replyHtml(
-    `🚀 <b>Boosting Article Views…</b>\n` +
+    `🚀 <b>Verifying Article Views…</b>\n` +
       `🔗 <a href="${targetUrl}">${escapeHtml(title)}</a> (Topic #${topicId})\n` +
-      `⏳ All 15 accounts are visiting the article 20+ times each (~300+ views total). Please wait…`,
+      `⏳ Visiting and registering article views across accounts (LeetCode 1-hr cooldown applies). Please wait…`,
   );
 
   try {

@@ -45,6 +45,7 @@ import {
   upvoteArticleWithSession,
   UGC_ARTICLE_ADD_REACTION_MUTATION,
   boostSolutionArticleViews,
+  fetchLiveSolutionMetrics,
 } from '../src/solutionPosts/upvote';
 
 describe('extractTopicIdFromUrl', () => {
@@ -251,5 +252,38 @@ describe('scheduleSolutionArticleUpvotes', () => {
         where: { key: 'solution-post-views:post-boost' },
       }),
     );
+  });
+});
+
+describe('fetchLiveSolutionMetrics', () => {
+  it('retrieves live hitCount and upvotes accurately from LeetCode GraphQL', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: {
+            ugcArticleSolutionArticle: {
+              uuid: 'xJPIXDcb',
+              topicId: 8603347,
+              title: 'Clean Two Pointers',
+              slug: 'clean-two-pointers',
+              hitCount: 14,
+              reactions: [{ count: 16, reactionType: 'UPVOTE' }],
+            },
+          },
+        }),
+      }),
+    );
+
+    const metrics = await fetchLiveSolutionMetrics(8603347);
+    expect(metrics).toEqual({
+      topicId: 8603347,
+      hitCount: 14,
+      upvotes: 16,
+      uuid: 'xJPIXDcb',
+      title: 'Clean Two Pointers',
+      slug: 'clean-two-pointers',
+    });
   });
 });

@@ -93,10 +93,11 @@ export async function createPostRouter(correlation: { postId?: string; accountId
   }
   let pool = await loadSolutionKeyPool();
   let activeKeys = activeSolutionApiKeys(pool);
-  if (!activeKeys.length && pool.keys.length > 0 && isSageProvider(config.solutionPosts.baseUrl) &&
+  if (!activeKeys.length && pool.keys.length > 0 &&
       !['HTTP_401', 'HTTP_402_BILLING_REQUIRED'].includes(pool.lastFailure ?? '')) {
     pool = await resetSolutionApiKeyPool().catch(() => ({ ...pool, activeIndex: 0 }));
     activeKeys = activeSolutionApiKeys(pool);
+    if (!activeKeys.length) activeKeys = pool.keys;
   }
   logger.info({ ...correlation, keyPool: { total: pool.keys.length, activeIndex: pool.activeIndex + 1,
     activeKey: activeKeys[0] ? maskSolutionApiKey(activeKeys[0]) : null, stored: pool.stored },
