@@ -120,11 +120,15 @@ export async function loadSolutionKeyPool(now = new Date()): Promise<SolutionKey
         pool = await persist({ ...pool, keys: [...pool.keys, ...additions], environmentFingerprint,
           providerFingerprint: configuredProvider });
       }
-      // Older versions retired a valid BazaarLink key on free-tier 429 and
+      // Older versions retired a valid BazaarLink or Sage Inkstone key on 429 and
       // skipped it until next month. Restore the most recently retired slot
       // once, preserving earlier authentication/billing retirements.
-      if (bazaarLink && ['KEY_EXHAUSTED', 'HTTP_429'].includes(pool.lastFailure ?? '') && pool.activeIndex > 0) {
+      if ((bazaarLink || sage) && ['KEY_EXHAUSTED', 'HTTP_429'].includes(pool.lastFailure ?? '') && pool.activeIndex > 0) {
         pool = await persist({ ...pool, activeIndex: pool.activeIndex - 1, lastFailure: undefined });
+      }
+      if (sage && pool.keys.length > 0 && pool.activeIndex >= pool.keys.length &&
+          !['HTTP_401', 'HTTP_402_BILLING_REQUIRED'].includes(pool.lastFailure ?? '')) {
+        pool = await persist({ ...pool, activeIndex: 0, lastFailure: undefined });
       }
       const period = solutionKeyPeriod(now);
       // A previous month's exhausted quota must not permanently strand the
@@ -307,6 +311,13 @@ export async function testSolutionApiKey(candidateKey?: string, model?: string):
     }
     const completion = await chatRes.json() as { choices?: Array<{ message?: { content?: string } }> };
     const valid = !!completion.choices?.[0]?.message?.content?.trim();
+    if (valid && !candidateKey) {
+      const pool = await loadSolutionKeyPool().catch(() => null);
+      const idx = pool ? pool.keys.indexOf(key) : -1;
+      if (pool && idx >= 0 && (pool.activeIndex > idx || pool.lastFailure)) {
+        await persist({ ...pool, activeIndex: idx, lastFailure: undefined, stored: true }).catch(() => undefined);
+      }
+    }
     return {
       ok: valid,
       keyMasked: masked,

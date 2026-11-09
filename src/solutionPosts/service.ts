@@ -17,7 +17,7 @@ import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionCon
 import { OutputValidationError } from './router';
 import { ensurePost, move } from './store';
 import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
-import { loadSolutionKeyPool, maskSolutionApiKey, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
+import { loadSolutionKeyPool, maskSolutionApiKey, resetSolutionApiKeyPool, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 import { startArticleWorkKeepAlive } from './keepAlive';
 
 export class PostError extends Error {
@@ -91,8 +91,13 @@ export async function createPostRouter(correlation: { postId?: string; accountId
     return new FirecrawlAgentRouter(config.solutionPosts.firecrawlApiKey, config.solutionPosts.agentMaxCredits,
       attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'));
   }
-  const pool = await loadSolutionKeyPool();
-  const activeKeys = activeSolutionApiKeys(pool);
+  let pool = await loadSolutionKeyPool();
+  let activeKeys = activeSolutionApiKeys(pool);
+  if (!activeKeys.length && pool.keys.length > 0 && isSageProvider(config.solutionPosts.baseUrl) &&
+      !['HTTP_401', 'HTTP_402_BILLING_REQUIRED'].includes(pool.lastFailure ?? '')) {
+    pool = await resetSolutionApiKeyPool().catch(() => ({ ...pool, activeIndex: 0 }));
+    activeKeys = activeSolutionApiKeys(pool);
+  }
   logger.info({ ...correlation, keyPool: { total: pool.keys.length, activeIndex: pool.activeIndex + 1,
     activeKey: activeKeys[0] ? maskSolutionApiKey(activeKeys[0]) : null, stored: pool.stored },
     keySource: config.solutionPosts.keySource, keyEnvironment: config.solutionPosts.keyEnvironment }, 'solution article router configured');

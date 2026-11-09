@@ -112,7 +112,7 @@ import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver
 import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool, solutionKeyPoolStatus, testSolutionApiKey } from '../solutionPosts/keyPool';
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
 import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
-import { boostSolutionArticleViews, extractTopicIdFromUrl } from '../solutionPosts/upvote';
+import { boostSolutionArticleViews, extractTopicIdFromUrl, fetchLiveSolutionMetrics } from '../solutionPosts/upvote';
 import { prisma } from '../database/prisma';
 import { firecrawlProbeRequest, probeFirecrawl } from '../solutionPosts/firecrawlProbe';
 import { probeFirecrawlAgent } from '../solutionPosts/firecrawlAgentProbe';
@@ -3662,10 +3662,12 @@ export async function handleBoostSolutionViews(msg: TgMessage, commandArg?: stri
 
   try {
     const res = await boostSolutionArticleViews({ publishedUrl: targetUrl, topicId, problemSlug });
+    const live = await fetchLiveSolutionMetrics(topicId).catch(() => null);
     await replyHtml(
-      `🎉 <b>Views Boost Completed!</b>\n` +
-        `🔗 <a href="${targetUrl}">${escapeHtml(title)}</a>\n` +
-        `👁️ Generated <b>${res.totalViews}</b> views across <b>${res.accountsProcessed}</b> accounts (avg ${Math.round(res.totalViews / Math.max(1, res.accountsProcessed))} views/account)!`,
+      `🎉 <b>Views Verification Completed!</b>\n` +
+        `🔗 <a href="${targetUrl}">${escapeHtml(title)}</a> (Topic #${topicId})\n` +
+        `👁️ LeetCode Live Views: <b>${live?.hitCount ?? res.liveHitCount ?? 'N/A'}</b> | ⬆️ Live Upvotes: <b>${live?.upvotes ?? 'N/A'}</b>\n` +
+        `📊 Accounts Processed: <b>${res.accountsProcessed}</b>`,
     );
   } catch (err) {
     await replyHtml(`❌ Failed to boost views: ${escapeHtml(err instanceof Error ? err.message : String(err))}`);
@@ -3810,9 +3812,13 @@ export async function handleTestSolutionApiKey(commandArg?: string): Promise<voi
   }
   if (result.chatStatus) {
     if (result.ok) {
+      const cleared = await resetFailedSolutionPostRetries().catch(() => 0);
       lines.push(`• <b>POST /v1/chat/completions:</b> 🟢 HTTP 200 OK (model: <code>${result.chatModel}</code>)`);
       lines.push('');
       lines.push('✅ <b>Provider test passed.</b> Authentication and a short response worked. Full articles, GIFs, and publishing have separate validation steps.');
+      if (cleared > 0) {
+        lines.push(`🔄 <b>Auto-recovered:</b> Unlocked <b>${cleared}</b> stalled solution article(s) for retry.`);
+      }
     } else {
       lines.push(`• <b>POST /v1/chat/completions:</b> 🔴 HTTP ${result.chatStatus} (model: <code>${result.chatModel}</code>)`);
       if (result.chatError) lines.push(`  └ <b>Error:</b> <code>${escapeHtml(result.chatError)}</code>`);

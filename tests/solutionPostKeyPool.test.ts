@@ -8,8 +8,10 @@ vi.mock('../src/database/models', () => ({
   setSystemState: vi.fn(async (_key: string, value: string) => { db.value = value; }),
 }));
 
+import OpenAI from 'openai';
 import { appendSolutionApiKeys, loadSolutionKeyPool, maskSolutionApiKey, parseSolutionApiKeys,
   replaceSolutionApiKeys, resetSolutionApiKeyPool, rotateSolutionApiKey, solutionKeyPoolStatus, solutionKeyPeriod, testSolutionApiKey } from '../src/solutionPosts/keyPool';
+import { isKeyExhausted } from '../src/solutionPosts/router';
 import { config } from '../src/config';
 
 describe('solution article API key pool', () => {
@@ -189,5 +191,22 @@ describe('solution article API key pool', () => {
     expect(fetcher.mock.calls[1]![1].headers.Authorization).toBe(
       'Bearer sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056',
     );
+  });
+
+  it('never retires Sage Inkstone keys on HTTP 429 and automatically recovers a wrongly retired Sage slot', async () => {
+    const rateErr = new OpenAI.RateLimitError(429, { error: { message: 'Quota / RPM rate limit exceeded', code: 'insufficient_quota' } }, 'Rate limit', {});
+    expect(isKeyExhausted(rateErr, 'https://discovery-api.intern-ai.org.cn/v1')).toBe(false);
+
+    Object.assign(config.solutionPosts, {
+      baseUrl: 'https://discovery-api.intern-ai.org.cn/v1',
+      apiKeys: [],
+      models: ['minimax-m3'],
+      keyError: undefined,
+    });
+    const initial = await loadSolutionKeyPool();
+    await rotateSolutionApiKey(initial.keys[0]!, 'KEY_EXHAUSTED');
+    const recovered = await loadSolutionKeyPool();
+    expect(recovered.activeIndex).toBe(0);
+    expect(recovered.lastFailure).toBeUndefined();
   });
 });

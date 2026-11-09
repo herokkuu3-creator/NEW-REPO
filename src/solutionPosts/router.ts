@@ -257,9 +257,10 @@ export function isKeyExhausted(error: unknown, baseUrl?: string): boolean {
   const status = api?.status;
   if (status === 401 || status === 402) return true;
   if (status !== 429) return false;
-  // BazaarLink uses 429 for RPM/daily free allowances and spend brakes;
-  // monthly balance/allowance failures use 402. Do not retire a valid key for a month.
-  if (baseUrl && isBazaarLinkProvider(baseUrl)) return false;
+  // BazaarLink and Sage Inkstone (discovery-api.intern-ai.org.cn) use 429 for
+  // RPM/TPM/concurrency and daily free allowances; monthly balance/allowance
+  // failures use 402. Do not retire a valid key for a month on 429.
+  if (baseUrl && (isBazaarLinkProvider(baseUrl) || isSageProvider(baseUrl))) return false;
   const candidate = error as { code?: unknown; type?: unknown; message?: unknown };
   const detail = [candidate.code, candidate.type, candidate.message].filter(v => typeof v === 'string').join(' ').toLowerCase();
   return /quota|credit|balance|billing|payment|monthly|insufficient_funds/.test(detail);

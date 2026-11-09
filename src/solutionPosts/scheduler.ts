@@ -180,7 +180,7 @@ export async function acquireDailyLease(accountId: string, date: string) {
   return async () => { await prisma.systemState.deleteMany({ where: { key, value } }); };
 }
 
-async function reserveScheduledAttempt(accountId: string, date: string, now = new Date()): Promise<boolean> {
+async function reserveScheduledAttempt(accountId: string, date: string, now = new Date(), bypassCooldown = false): Promise<boolean> {
   const budgetKey = `solution-post-schedule-budget:${accountId}:${date}`;
   const timeKey = `solution-post-schedule-attempt-at:${accountId}:${date}`;
 
@@ -190,17 +190,17 @@ async function reserveScheduledAttempt(accountId: string, date: string, now = ne
   ]);
 
   const count = oldBudget ? Number(oldBudget.value) : 0;
-  if (!Number.isInteger(count) || count < 0 || count >= SOLUTION_POST_RETRY_LIMIT) return false;
+  if (!bypassCooldown && (!Number.isInteger(count) || count < 0 || count >= SOLUTION_POST_RETRY_LIMIT)) return false;
 
   const lastAttemptAt = oldTime ? Number(oldTime.value) : 0;
-  if (count > 0 && lastAttemptAt > 0) {
+  if (!bypassCooldown && count > 0 && lastAttemptAt > 0) {
     const elapsed = now.getTime() - lastAttemptAt;
     if (elapsed < SOLUTION_POST_RETRY_GAP_MS) {
       return false; // Minimum 1-hour gap between retries
     }
   }
 
-  const nextCount = String(count + 1);
+  const nextCount = bypassCooldown ? '1' : String(count + 1);
   let claimed = false;
   if (oldBudget) {
     claimed = (await prisma.systemState.updateMany({ where: { key: budgetKey, value: oldBudget.value }, data: { value: nextCount } })).count === 1;
@@ -284,9 +284,10 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
       const onStage = onProgress ? (stage: string, detail?: string) => {
         void reportProgress(onProgress, { accountId, stage: stage as any, submissionId: run.submissionId, detail });
       } : undefined;
+      const forceRetry = options.retryFailedGeneration === true || existing?.lastError === 'AI_KEYS_EXHAUSTED';
       let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status) ?
-        (onStage ? await retryPost(existing.id, options.retryFailedGeneration === true, onStage) : await retryPost(existing.id, options.retryFailedGeneration === true)) :
-        (onStage ? await generateForRun(accountId, run.runId, options.retryFailedGeneration === true, onStage) : await generateForRun(accountId, run.runId, options.retryFailedGeneration === true));
+        (onStage ? await retryPost(existing.id, forceRetry, onStage) : await retryPost(existing.id, forceRetry)) :
+        (onStage ? await generateForRun(accountId, run.runId, forceRetry, onStage) : await generateForRun(accountId, run.runId, forceRetry));
       if (['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING', 'PUBLISHING'].includes(post.status)) {
         results.push({ accountId, postId: post.id, status: 'SKIPPED', error: 'ACCOUNT_JOB_IN_PROGRESS' });
         await reportProgress(onProgress, { accountId, stage: 'skipped', postId: post.id, error: 'ACCOUNT_JOB_IN_PROGRESS' });
@@ -355,6 +356,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
       prisma.dailyRun.findMany({ where: { accountId: { in: ids }, date: today } }),
       prisma.solutionPost.findMany({ where: { accountId: { in: ids } } }),
     ]);
+    const keysExhaustedIds = new Set<string>();
     const eligibleIds = ids.filter(id => {
       const run = runs.find(r => r.accountId === id);
       // A manual/existing article never substitutes for today's accepted code.
@@ -363,6 +365,10 @@ export async function runScheduledSolutionPosts(now = new Date()) {
       if (!post) return true;
       if (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(post.status)) return config.solutionPosts.autoPublish;
       if (!['PENDING', 'RETRY_PENDING', 'FAILED'].includes(post.status)) return false;
+      if (post.status === 'FAILED' && post.lastError === 'AI_KEYS_EXHAUSTED') {
+        keysExhaustedIds.add(id);
+        return true;
+      }
       if (post.retryCount >= SOLUTION_POST_RETRY_LIMIT) return false;
 
       // If the post failed, enforce 1-hour gap since last attempt/update
@@ -373,7 +379,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
       return true;
     });
     const pendingIds: string[] = [];
-    for (const id of eligibleIds) if (await reserveScheduledAttempt(id, today, now)) pendingIds.push(id);
+    for (const id of eligibleIds) if (await reserveScheduledAttempt(id, today, now, keysExhaustedIds.has(id))) pendingIds.push(id);
     if (!pendingIds.length) {
       await saveState({ status: 'IDLE', selected: ids.length, eligible: eligibleIds.length,
         reason: !ids.length ? 'NO_SELECTED_ACCOUNTS' : eligibleIds.length ? 'DAILY_RETRY_LIMIT' : 'NO_PENDING_WORK' });
@@ -383,7 +389,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
     const results = await runCombined(pendingIds, now);
     for (const result of results) {
       // Contention is not an execution failure and must not use up the day's retries.
-      if (['SUBMISSION_WORKER_BUSY', 'ACCOUNT_JOB_IN_PROGRESS', 'DAILY_PUBLICATION_COOLDOWN'].includes(result.error ?? '')) {
+      if (['SUBMISSION_WORKER_BUSY', 'ACCOUNT_JOB_IN_PROGRESS', 'DAILY_PUBLICATION_COOLDOWN', 'AI_KEYS_EXHAUSTED'].includes(result.error ?? '')) {
         const key = `solution-post-schedule-budget:${result.accountId}:${today}`;
         const old = await prisma.systemState.findUnique({ where: { key } });
         if (old) await prisma.systemState.updateMany({ where: { key, value: old.value },
