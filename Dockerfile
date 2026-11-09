@@ -36,7 +36,6 @@ FROM mcr.microsoft.com/playwright:v1.63.0-noble AS runtime
 # Install curl and ca-certificates for network utilities and proxy verification
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
 
-
 ENV NODE_ENV=production \
     HEADLESS=true \
     BROWSER_PROFILE_PATH=/tmp/browser-profile \
@@ -66,11 +65,12 @@ RUN npx playwright install firefox
 # Cloudflare WARP in userspace for the Codeforces submitter (see
 # scripts/start-submitter.sh): wgcf creates a free WARP WireGuard profile and
 # wireproxy exposes it as a local SOCKS5 proxy — no root or TUN device needed.
-ADD https://github.com/ViRb3/wgcf/releases/download/v2.3.0/wgcf_2.3.0_linux_amd64 /usr/local/bin/wgcf
-ADD https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz /tmp/wireproxy.tar.gz
-RUN tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
- && rm /tmp/wireproxy.tar.gz \
+RUN curl --retry 5 --retry-connrefused --retry-delay 3 -fsSL "https://github.com/ViRb3/wgcf/releases/download/v2.3.0/wgcf_2.3.0_linux_amd64" -o /usr/local/bin/wgcf \
+ && curl --retry 5 --retry-connrefused --retry-delay 3 -fsSL "https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz" -o /tmp/wireproxy.tar.gz \
+ && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
+ && rm -f /tmp/wireproxy.tar.gz \
  && chmod 0755 /usr/local/bin/wgcf /usr/local/bin/wireproxy
+
 COPY scripts/start-submitter.sh /app/scripts/start-submitter.sh
 COPY scripts/start-web.sh /app/scripts/start-web.sh
 RUN sed -i 's/\r$//' /app/scripts/start-submitter.sh /app/scripts/start-web.sh && chmod 0755 /app/scripts/start-submitter.sh /app/scripts/start-web.sh
