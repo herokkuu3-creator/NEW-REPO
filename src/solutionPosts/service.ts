@@ -99,6 +99,10 @@ export async function createPostRouter(correlation: { postId?: string; accountId
     activeKeys = activeSolutionApiKeys(pool);
     if (!activeKeys.length) activeKeys = pool.keys;
   }
+  if (pool.keys.length > 1 && !['HTTP_401', 'HTTP_402_BILLING_REQUIRED'].includes(pool.lastFailure ?? '')) {
+    const start = Math.max(0, Math.min(pool.activeIndex ?? 0, pool.keys.length - 1));
+    activeKeys = [...new Set([...pool.keys.slice(start), ...pool.keys.slice(0, start)])];
+  }
   logger.info({ ...correlation, keyPool: { total: pool.keys.length, activeIndex: pool.activeIndex + 1,
     activeKey: activeKeys[0] ? maskSolutionApiKey(activeKeys[0]) : null, stored: pool.stored },
     keySource: config.solutionPosts.keySource, keyEnvironment: config.solutionPosts.keyEnvironment }, 'solution article router configured');

@@ -135,11 +135,9 @@ export class AIModelRouter {
         const fullRepair = stage === 'technical review repair';
         const fullReview = stage === 'technical review';
         const tokenCeiling = fullRepair || fullReview ? 32768 : 16384;
-        const isReasoningModel = sageReasoning && (/^deepseek-|^qwen.*think/i.test(model));
-        let attemptMaxTokens = isReasoningModel ? Math.min(Math.max(maxTokens * (fullRepair ? 4 : 2),
+        let attemptMaxTokens = sageReasoning ? Math.min(Math.max(maxTokens * (fullRepair ? 4 : 2),
           fullReview ? 16384 : fullRepair ? 8192 : 4096), tokenCeiling) : maxTokens;
-        const maxRetries = Math.max(this.options.retries, 2);
-        for (let n = 0; n <= maxRetries; n++) {
+        for (let n = 0; n <= this.options.retries; n++) {
           const started = Date.now();
           const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0,
             outcome: 'INVALID_OUTPUT', stage, requestedMaxTokens: attemptMaxTokens };
@@ -149,7 +147,7 @@ export class AIModelRouter {
               // Intern-AI enforces 50 RPM on generation models (~1200ms per request).
               // Space requests by at least 1500ms across the process to guarantee staying
               // safely within RPM limits and prevent burst concurrency 429s.
-              const interval = this.options.minRequestIntervalMs ?? 1500;
+              const interval = this.options.minRequestIntervalMs ?? (process.env.NODE_ENV === 'test' ? 0 : 1500);
               if (interval > 0) {
                 let start = Math.max(Date.now(), nextSageRequestAt, sageBlockedUntil);
                 nextSageRequestAt = start + interval;
@@ -208,9 +206,8 @@ export class AIModelRouter {
               sageModelHealth.set(healthKey, { failures, until: failures >= 2 ? Date.now() + SAGE_MODEL_COOLDOWN_MS : 0,
                 lastFailureAt: Date.now() });
             }
-            if (sageReasoning && record.httpStatus === 429) {
-              const backoff = Math.min(2000 * Math.pow(2, n), 8000);
-              record.retryAfterMs = record.retryAfterMs ?? backoff;
+            if (sageReasoning && record.httpStatus === 429 && record.retryAfterMs == null) {
+              record.retryAfterMs = 60000;
               sageBlockedUntil = Math.max(sageBlockedUntil, Date.now() + record.retryAfterMs);
             }
             if (!record.deferred && record.httpStatus === 429 && isBazaarLinkProvider(this.options.baseUrl)) {
@@ -240,7 +237,7 @@ export class AIModelRouter {
             attemptMaxTokens = Math.min(attemptMaxTokens * 2, sageReasoning ? tokenCeiling : 2048);
           }
           transient ||= record.outcome === 'INCOMPLETE_OUTPUT';
-          if (exhausted || !transient || n === maxRetries) break;
+          if (exhausted || !transient || n === this.options.retries) break;
           // Defer instead of retrying before a long provider-specified reset.
           if ((record.retryAfterMs ?? 0) > 60000) break;
           await this.sleep(Math.max(Math.min(1000 * 2 ** n, 8000), record.retryAfterMs ?? 0));
@@ -248,10 +245,19 @@ export class AIModelRouter {
         if (exhausted) break;
       }
       if (exhausted) { await this.markExhausted(key, lastFailureReason ?? 'KEY_EXHAUSTED'); continue; }
+      // If the current key hit a rate limit (HTTP 429) and more keys exist, rotate to the next key!
+      if (lastFailureReason === 'HTTP_429' && this.apiKeys.length > 1) {
+        await this.markRotated(key, 'HTTP_429');
+        continue;
+      }
       // The provider answered but no configured model produced valid output. A different key cannot fix that.
       break;
     }
     throw new RoutingError(attempts, lastFailureReason);
+  }
+
+  private async markRotated(key: string, reason: string): Promise<void> {
+    try { await this.onKeyExhausted(key, reason); } catch { /* use next in-memory key even if callback fails */ }
   }
 
   private async markExhausted(key: string, reason: string): Promise<void> {

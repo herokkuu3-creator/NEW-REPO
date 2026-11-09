@@ -10,7 +10,7 @@ vi.mock('../src/database/models', () => ({
 
 import OpenAI from 'openai';
 import { appendSolutionApiKeys, loadSolutionKeyPool, maskSolutionApiKey, parseSolutionApiKeys,
-  replaceSolutionApiKeys, resetSolutionApiKeyPool, rotateSolutionApiKey, solutionKeyPoolStatus, solutionKeyPeriod, testSolutionApiKey } from '../src/solutionPosts/keyPool';
+  removeSolutionApiKey, replaceSolutionApiKeys, resetSolutionApiKeyPool, rotateSolutionApiKey, solutionKeyPoolStatus, solutionKeyPeriod, testSolutionApiKey } from '../src/solutionPosts/keyPool';
 import { isKeyExhausted } from '../src/solutionPosts/router';
 import { config } from '../src/config';
 
@@ -208,5 +208,37 @@ describe('solution article API key pool', () => {
     const recovered = await loadSolutionKeyPool();
     expect(recovered.activeIndex).toBe(0);
     expect(recovered.lastFailure).toBeUndefined();
+  });
+
+  it('rotates round-robin on HTTP 429 across available keys and keeps pool healthy', async () => {
+    await replaceSolutionApiKeys('intern_key_0001,intern_key_0002,intern_key_0003');
+    const pool1 = await loadSolutionKeyPool();
+    expect(pool1.activeIndex).toBe(0);
+
+    const pool2 = await rotateSolutionApiKey('intern_key_0001', 'HTTP_429');
+    expect(pool2.activeIndex).toBe(1);
+    expect(pool2.lastFailure).toBeUndefined();
+
+    const pool3 = await rotateSolutionApiKey('intern_key_0002', 'HTTP_429');
+    expect(pool3.activeIndex).toBe(2);
+    expect(pool3.lastFailure).toBeUndefined();
+
+    // Wraps around from last key to first key
+    const pool4 = await rotateSolutionApiKey('intern_key_0003', 'HTTP_429');
+    expect(pool4.activeIndex).toBe(0);
+    expect(pool4.lastFailure).toBeUndefined();
+  });
+
+  it('removes keys by 1-based index and matching key substring', async () => {
+    await replaceSolutionApiKeys('intern_alpha_001,intern_beta_002,intern_gamma_003');
+    const status1 = await solutionKeyPoolStatus();
+    expect(status1.total).toBe(3);
+
+    const { pool: afterRemove2, removedKey } = await removeSolutionApiKey(2);
+    expect(removedKey).toBe('intern_beta_002');
+    expect(afterRemove2.keys).toEqual(['intern_alpha_001', 'intern_gamma_003']);
+
+    const { pool: afterRemoveStr } = await removeSolutionApiKey('intern_gamma_003');
+    expect(afterRemoveStr.keys).toEqual(['intern_alpha_001']);
   });
 });

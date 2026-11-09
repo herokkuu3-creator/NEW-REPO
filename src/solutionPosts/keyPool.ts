@@ -192,12 +192,62 @@ export async function resetSolutionApiKeyPool(): Promise<SolutionKeyPool> {
   return persist({ keys: current.keys, activeIndex: 0, activePeriod: solutionKeyPeriod(), stored: true });
 }
 
-/** Advance only after an explicit key quota/credential failure. No round-robin on ordinary rate limits. */
+/** Explicit operator action: delete an API key by 1-based position or matching key string. */
+export async function removeSolutionApiKey(target: string | number): Promise<{
+  pool: SolutionKeyPool;
+  removedKey: string;
+  removedIndex: number;
+}> {
+  const current = await loadSolutionKeyPool();
+  if (!current.keys.length) throw new Error('NO_API_KEYS');
+  let index = -1;
+  const targetStr = String(target).trim();
+  if (/^\d+$/.test(targetStr)) {
+    const num = parseInt(targetStr, 10);
+    index = num - 1;
+    if (index < 0 || index >= current.keys.length) {
+      throw new Error(`Key #${num} does not exist. Current pool has ${current.keys.length} key(s).`);
+    }
+  } else {
+    index = current.keys.findIndex(k => k === targetStr || k.includes(targetStr));
+    if (index === -1) {
+      throw new Error(`No key matching "${maskSolutionApiKey(targetStr)}" found.`);
+    }
+  }
+  const removedKey = current.keys[index]!;
+  const newKeys = current.keys.filter((_, i) => i !== index);
+  let newActiveIndex = current.activeIndex;
+  if (index < current.activeIndex) {
+    newActiveIndex = Math.max(0, current.activeIndex - 1);
+  } else if (newActiveIndex >= newKeys.length) {
+    newActiveIndex = Math.max(0, newKeys.length - 1);
+  }
+  const pool = await persist({
+    ...current,
+    keys: newKeys,
+    activeIndex: newActiveIndex,
+    lastFailure: undefined,
+    stored: true,
+  });
+  return { pool, removedKey, removedIndex: index + 1 };
+}
+
+/** Rotate active key. Supports round-robin rotation for HTTP 429 rate limits across available keys. */
 export async function rotateSolutionApiKey(failedKey: string, reason = 'KEY_EXHAUSTED'): Promise<SolutionKeyPool> {
   const current = await loadSolutionKeyPool();
   const position = current.keys.indexOf(failedKey);
   if (position < 0) return current;
-  return persist({ keys: current.keys, activeIndex: Math.max(current.activeIndex, position + 1), activePeriod: current.activePeriod, lastFailure: reason, stored: true });
+  const isRateLimit = reason === 'HTTP_429' || reason === 'AI_RATE_LIMITED';
+  const nextIndex = isRateLimit
+    ? (current.keys.length > 0 ? (position + 1) % current.keys.length : 0)
+    : Math.max(current.activeIndex, position + 1);
+  return persist({
+    keys: current.keys,
+    activeIndex: nextIndex,
+    activePeriod: current.activePeriod,
+    lastFailure: isRateLimit ? undefined : reason,
+    stored: true,
+  });
 }
 
 export async function solutionKeyPoolStatus(): Promise<SolutionKeyPoolStatus> {
@@ -231,11 +281,22 @@ export interface KeyTestResult {
 
 export async function testSolutionApiKey(candidateKey?: string, model?: string): Promise<KeyTestResult> {
   let key: string | undefined;
-  try {
-    const candidates = candidateKey ? parseSolutionApiKeys(candidateKey) : [];
-    if (candidates.length > 1) throw new Error('ONE_KEY_REQUIRED');
-    key = candidates[0];
-  } catch { return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0, error: 'AI_KEY_INPUT_INVALID' }; }
+  const rawArg = candidateKey?.trim();
+  if (rawArg && /^\d+$/.test(rawArg)) {
+    const pool = await loadSolutionKeyPool();
+    const idx = parseInt(rawArg, 10) - 1;
+    if (idx >= 0 && idx < pool.keys.length) {
+      key = pool.keys[idx];
+    } else {
+      return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0, error: `Key #${rawArg} not found in pool (1–${pool.keys.length})` };
+    }
+  } else {
+    try {
+      const candidates = candidateKey ? parseSolutionApiKeys(candidateKey) : [];
+      if (candidates.length > 1) throw new Error('ONE_KEY_REQUIRED');
+      key = candidates[0];
+    } catch { return { ok: false, keyMasked: 'none', modelsStatus: 0, modelsCount: 0, error: 'AI_KEY_INPUT_INVALID' }; }
+  }
   if (!key) {
     const pool = await loadSolutionKeyPool();
     const active = pool.keys.slice(Math.max(0, pool.activeIndex));
@@ -337,5 +398,17 @@ export async function testSolutionApiKey(candidateKey?: string, model?: string):
       failureCategory: err instanceof Error && /Timeout|Abort/.test(err.name) ? 'PROVIDER_TIMEOUT' : 'PROVIDER_NETWORK_ERROR',
       error: 'Provider request did not complete' };
   }
+}
+
+export async function testAllSolutionApiKeys(model?: string): Promise<Array<KeyTestResult & { position: number; active: boolean }>> {
+  const pool = await loadSolutionKeyPool();
+  if (!pool.keys.length) return [];
+  const results: Array<KeyTestResult & { position: number; active: boolean }> = [];
+  for (let i = 0; i < pool.keys.length; i++) {
+    const key = pool.keys[i]!;
+    const res = await testSolutionApiKey(key, model);
+    results.push({ ...res, position: i + 1, active: i === pool.activeIndex });
+  }
+  return results;
 }
 

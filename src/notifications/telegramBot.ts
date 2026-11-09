@@ -109,7 +109,7 @@ import {
   type KeyBalanceResult,
 } from '../codeforces/capzyKeyManager';
 import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver';
-import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool, solutionKeyPoolStatus, testSolutionApiKey } from '../solutionPosts/keyPool';
+import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool, removeSolutionApiKey, solutionKeyPoolStatus, testSolutionApiKey, testAllSolutionApiKeys, maskSolutionApiKey } from '../solutionPosts/keyPool';
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
 import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
 import { boostSolutionArticleViews, extractTopicIdFromUrl, fetchLiveSolutionMetrics } from '../solutionPosts/upvote';
@@ -300,19 +300,17 @@ export const HELP_TEXT = [
   '├ /capsolver &lt;key&gt; — Replace Capzy/CapSolver API keys',
   '└ /capsolverstatus — Check current solver API keys &amp; balances',
   '',
-  '<b>✨ 𝗔𝗜 𝗦𝗢𝗟𝗨𝗧𝗜𝗢𝗡 𝗔𝗥𝗧𝗜𝗖𝗟𝗘𝗦</b>',
+  '<b>✨ 𝗔𝗜 𝗦𝗢𝗟𝗨𝗧𝗜𝗢𝗡 𝗔𝗥𝗧𝗜𝗖𝗟𝗘𝗦 (Intern-AI / Sage)</b>',
   '├ /dailysolution — Choose cached accounts for 6 AM daily submit + article',
   '├ /manualsolution — Run the selected accounts for daily or one question number',
   '├ /boostviews [url/id] — Boost views for published solution article(s) (20+ views per account)',
-  '├ /addsolutionkeys &lt;key1,key2&gt; — Append CodeCraft API keys',
-  '├ /setsolutionkeys &lt;key1,key2&gt; — Replace/reset CodeCraft API key pool',
-  '├ /resetsolutionkeys — Reset active key to #1 &amp; clear retry limits',
-  '├ /testsolkey [key] — Test the configured solution provider key',
-  '├ /testfirecrawl key — Test a Firecrawl scrape from this server (one page)',
-  '├ /testsage [key] — Test Sage Inkstone (Intern-AI) from Render',
+  '├ /addsolkey &lt;key&gt; — Add new Intern-AI API key to rotation pool',
+  '├ /delsolkey &lt;# or key&gt; — Remove an API key from pool (e.g. /delsolkey 2)',
+  '├ /solkeys — Show all API keys &amp; active rotation status',
+  '├ /resetsolkeys — Reset active key to #1 &amp; clear retry limits',
+  '├ /testsolkey [key/#] — Test all or specific Intern-AI key(s)',
   '├ /asksage &lt;question&gt; — Ask Sage Inkstone / Intern-AI directly',
   '├ /ask &lt;question&gt; — Ask the configured AI',
-  '└ /solutionkeystatus — Show masked article-generation key pool',
   '',
   '<b>👨‍🍳 𝗖𝗢𝗗𝗘𝗖𝗛𝗘𝗙 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦</b>',
   '├ /codechef — Run daily CodeChef submission',
@@ -697,6 +695,10 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
         return;
       case '/addsolutionkeys':
       case '/addsolutionkey':
+      case '/addsolkeys':
+      case '/addsolkey':
+      case '/addinternaikey':
+      case '/addkey':
       case '/addarticlekeys':
       case '/addarticlekey':
       case '/solutionkeys':
@@ -704,9 +706,23 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
         await deleteSensitiveTelegramMessage(msg);
         await handleAddSolutionApiKeys(commandArg);
         return;
+      case '/delsolutionkey':
+      case '/delsolutionkeys':
+      case '/delsolkey':
+      case '/delsolkeys':
+      case '/delkey':
+      case '/delkeys':
+      case '/removesolkey':
+      case '/removesolutionkey':
+        await deleteSensitiveTelegramMessage(msg);
+        await handleDeleteSolutionApiKey(commandArg);
+        return;
       case '/setsolutionkeys':
       case '/replacesolutionkeys':
+      case '/setsolkeys':
       case '/resetsolutionkeys':
+      case '/resetsolkeys':
+      case '/resetsolkey':
         await deleteSensitiveTelegramMessage(msg);
         await handleReplaceSolutionApiKeys(commandArg);
         return;
@@ -739,6 +755,9 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       case '/solutionkeystatus':
       case '/solutionkey_status':
       case '/articlekeystatus':
+      case '/solkeys':
+      case '/listsolkeys':
+      case '/keys':
         await replyHtml(await formatSolutionKeyStatus());
         return;
       case '/boostviews':
@@ -3523,17 +3542,29 @@ export async function handleAddCapSolverCommand(commandArg?: string): Promise<vo
 export async function formatSolutionKeyStatus(): Promise<string> {
   const status = await solutionKeyPoolStatus();
   const lines = [
-    '✨ <b>Article-generation API key pool</b>',
+    '✨ <b>Intern-AI Article Key Pool</b>',
     '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
     `Stored keys: <b>${status.total}</b>`,
+    `Active key: <b>${status.active ? `#${status.active}` : 'none'}</b>`,
     `Source: <b>${escapeHtml(status.source)}</b>`,
-    status.active ? `Active key: <b>#${status.active}</b>` : 'Active key: <b>none</b>',
+    `Endpoint: <code>${escapeHtml(config.solutionPosts.baseUrl)}</code>`,
     '',
   ];
-  if (!status.keys.length) lines.push('No article-generation API keys are configured.');
-  else for (const key of status.keys) lines.push(`├ Key #${key.position}: <code>${escapeHtml(key.masked)}</code>${key.active ? ' <b>[ACTIVE]</b>' : ''}`);
+  if (!status.keys.length) {
+    lines.push('No article-generation API keys are configured.');
+  } else {
+    for (const key of status.keys) {
+      lines.push(`├ Key #${key.position}: <code>${escapeHtml(key.masked)}</code>${key.active ? ' <b>[ACTIVE]</b>' : ''}`);
+    }
+  }
   lines.push('');
-  lines.push('💡 <i>/addsolutionkeys accepts one key or comma-separated keys and appends them. Quota/credential exhaustion advances to the next saved key; short rate limits do not rotate the pool.</i>');
+  lines.push('💡 <i>Automatic key rotation is active. If any key receives HTTP 429, the workflow automatically fails over to the next key.</i>');
+  lines.push('');
+  lines.push('<b>Commands:</b>');
+  lines.push('├ <code>/addsolkey &lt;key&gt;</code> — Add key to pool');
+  lines.push('├ <code>/delsolkey &lt;# or key&gt;</code> — Delete key from pool (e.g. /delsolkey 2)');
+  lines.push('├ <code>/testsolkey [#]</code> — Test all keys or key #');
+  lines.push('└ <code>/resetsolkeys</code> — Reset active key to #1');
   return lines.join('\n');
 }
 
@@ -3547,9 +3578,9 @@ export async function handleAddSolutionApiKeys(commandArg?: string): Promise<voi
     pendingQueuePrompt = false;
     await replyHtml([
       await formatSolutionKeyStatus(), '', '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-      '➕ <b>Add CodeCraft API key(s)</b>', '',
+      '➕ <b>Add Intern-AI API Key(s)</b>', '',
       'Send one key or a comma-separated list in your next message. Existing keys stay in order; new keys are appended after them.',
-      'The bot attempts to delete your message after it stores the key. Send /cancel to abort.',
+      'The bot deletes your message after storing the key. Send /cancel to abort.',
     ].join('\n'));
     return;
   }
@@ -3560,14 +3591,36 @@ export async function handleAddSolutionApiKeys(commandArg?: string): Promise<voi
     if (result.added) await resetFailedSolutionPostRetries();
     const status = await solutionKeyPoolStatus();
     await replyHtml([
-      '✅ <b>Article API key(s) saved</b>',
+      '✅ <b>Intern-AI API key(s) added successfully</b>',
       `<b>${result.added}</b> added; <b>${result.duplicates}</b> already present.`,
       `Pool size: <b>${status.total}</b>. ${status.active ? `Active: <b>#${status.active}</b>.` : 'No active key.'}`,
       '',
-      'Keys are encrypted in the bot database and never shown in full. A quota/payment/invalid-key response advances to the next saved key for future article generation.',
+      '🔄 <b>Automatic Failover Enabled:</b> If the current key hits a 429 rate limit or quota boundary, requests immediately rotate to the next key.',
     ].join('\n'));
   } catch (error) {
-    await replyHtml(`❌ <b>Could not save article API keys:</b> ${escapeHtml(error instanceof Error ? error.message : 'invalid input')}`);
+    await replyHtml(`❌ <b>Could not save API keys:</b> ${escapeHtml(error instanceof Error ? error.message : 'invalid input')}`);
+  }
+}
+
+export async function handleDeleteSolutionApiKey(commandArg?: string): Promise<void> {
+  const raw = (commandArg ?? '').trim();
+  if (!raw) {
+    await replyHtml([
+      '🗑️ <b>Delete Intern-AI API Key</b>',
+      'Usage: <code>/delsolkey &lt;position or key&gt;</code> (e.g. <code>/delsolkey 2</code>)',
+      '',
+      await formatSolutionKeyStatus(),
+    ].join('\n'));
+    return;
+  }
+  try {
+    const result = await removeSolutionApiKey(raw);
+    await replyHtml([
+      `🗑️ <b>Key #${result.removedIndex} removed:</b> <code>${escapeHtml(maskSolutionApiKey(result.removedKey))}</code>`,
+      `Remaining keys: <b>${result.pool.keys.length}</b>. Active key: <b>#${result.pool.activeIndex + 1}</b>`,
+    ].join('\n'));
+  } catch (err) {
+    await replyHtml(`❌ <b>Failed to remove key:</b> ${escapeHtml(err instanceof Error ? err.message : String(err))}`);
   }
 }
 
@@ -3799,6 +3852,36 @@ export async function handleTestSolutionApiKey(commandArg?: string): Promise<voi
   }
   const arg = (commandArg ?? '').trim();
   const provider = new URL(config.solutionPosts.baseUrl).hostname;
+
+  if (!arg) {
+    const allResults = await testAllSolutionApiKeys().catch(() => []);
+    if (allResults.length > 1) {
+      const anyOk = allResults.some(r => r.ok);
+      if (anyOk) await resetFailedSolutionPostRetries().catch(() => 0);
+      const hostLabel = process.env.RENDER_EXTERNAL_URL ? 'Render Web Service' : (process.env.RENDER_INSTANCE_ID ? 'Render Container' : 'Local Host');
+      const lines = [
+        `🧪 <b>${escapeHtml(provider)} Key Pool Diagnostics</b>`,
+        '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+        `📍 <b>Host:</b> <code>${escapeHtml(hostLabel)}</code>`,
+        `Testing <b>${allResults.length}</b> configured key(s) in pool…`,
+        '',
+      ];
+      for (const res of allResults) {
+        const activeTag = res.active ? ' <b>[ACTIVE]</b>' : '';
+        const okIcon = res.ok ? '🟢' : '🔴';
+        lines.push(`├ <b>Key #${res.position}:</b> <code>${escapeHtml(res.keyMasked)}</code>${activeTag}`);
+        lines.push(`│ ├ Models: ${res.modelsStatus === 200 ? `🟢 HTTP 200 (${res.modelsCount} models)` : `🔴 HTTP ${res.modelsStatus}`}`);
+        lines.push(`│ └ Chat: ${res.ok ? `🟢 HTTP 200 (${res.chatModel})` : `🔴 HTTP ${res.chatStatus ?? 'ERR'}${res.chatError ? ` — ${escapeHtml(res.chatError.slice(0, 60))}` : ''}`}`);
+      }
+      lines.push('');
+      lines.push(anyOk ? '✅ <b>Verified:</b> Key failover is ready. If active key hits 429, next key is automatically used.' : '❌ All keys in pool failed inference.');
+      lines.push('');
+      lines.push('💡 <i>Test a single key with <code>/testsolkey 1</code> or delete with <code>/delsolkey 2</code>.</i>');
+      await replyHtml(lines.join('\n'));
+      return;
+    }
+  }
+
   await replyHtml(`🔎 <b>Testing ${escapeHtml(provider)} API key…</b>\nChecking models and inference from this server…`);
   const result = await testSolutionApiKey(arg || undefined);
   const hostLabel = process.env.RENDER_EXTERNAL_URL ? 'Render Web Service' : (process.env.RENDER_INSTANCE_ID ? 'Render Container' : 'Local Host');

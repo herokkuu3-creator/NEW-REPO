@@ -238,6 +238,28 @@ describe('AI model routing', () => {
     expect(advanced).not.toHaveBeenCalled();
     expect(api.chat.completions.create.mock.calls).toHaveLength(2);
   });
+  it('rotates to next API key when all retries on the current key hit HTTP 429', async () => {
+    const api1 = client();
+    api1.chat.completions.create.mockRejectedValue(new OpenAI.RateLimitError(429, {}, 'Rate limit exceeded', undefined));
+    const api2 = client();
+    api2.chat.completions.create.mockResolvedValue(complete('recovered_by_key_two'));
+
+    const advanced = vi.fn(async () => {});
+    const router = new AIModelRouter(
+      { ...options, apiKeys: ['key_one_0001', 'key_two_0002'], retries: 0 },
+      undefined,
+      async () => {},
+      () => {},
+      advanced,
+      (key: string) => (key === 'key_one_0001' ? api1 as never : api2 as never),
+    );
+
+    const result = await router.generate([], v => v);
+    expect(result.value).toBe('recovered_by_key_two');
+    expect(advanced).toHaveBeenCalledWith('key_one_0001', 'HTTP_429');
+    expect(api1.chat.completions.create).toHaveBeenCalled();
+    expect(api2.chat.completions.create).toHaveBeenCalled();
+  });
   it('keeps a BazaarLink free-quota 429 active and respects Retry-After', async () => {
     const api = client(); const retired = vi.fn(); const sleep = vi.fn(async () => {});
     api.models.list.mockResolvedValue({ data: [{ id: 'qwen/qwen3.7-flash:free' }] });
