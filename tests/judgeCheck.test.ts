@@ -117,6 +117,23 @@ describe('LeetCodeApi.awaitSubmission', () => {
     expect(out.classification).toBe('ACCEPTED');
   });
 
+  it('recovers a large submission ID through exact history without sending it as a GraphQL Int', async () => {
+    const id = '2192767591';
+    const { ctx, calls } = fakeContext({
+      check: [{ status: 404, body: '' }],
+      graphql: (query) => ({
+        status: 200,
+        body: query.includes('submissionList') ? { data: { submissionList: { submissions: [
+          { id: '2192767592', statusDisplay: 'Wrong Answer' },
+          { id, statusDisplay: 'Accepted', isPending: false },
+        ] } } } : { errors: [{ message: 'Int cannot represent a non 32-bit signed integer' }] },
+      }),
+    });
+    const outcome = await new LeetCodeApi(ctx).awaitSubmission(id, 'slug', 5_000, FAST);
+    expect(outcome).toMatchObject({ submissionId: id, classification: 'ACCEPTED' });
+    expect(calls.graphql).toBe(1);
+  });
+
   it('recovers the verdict from submission history when polling never finalises', async () => {
     const { ctx } = fakeContext({
       check: [{ status: 200, body: { state: 'PENDING' } }],

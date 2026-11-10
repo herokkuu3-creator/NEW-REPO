@@ -279,6 +279,45 @@ describe('range engine', () => {
     expect(events.filter(e => e.phase === 'error')).toHaveLength(0);
     expect(events.find(e => e.phase === 'blocked').detail).toContain('429');
   });
+
+  it('uses Community Solutions first and skips the Walkccc lookup when incomplete discovery supplied the slug', async () => {
+    const session = makeSession(() => 'accepted', []);
+    const code = 'class Solution { public: int main() { return 1; } };';
+    const fetchCommunity = vi.fn(async () => ({ code, uuid: 'community-3029', title: 'Community', sourceUrl: 'example' }));
+    const getPage = vi.fn(async (number: number) => sol(number));
+    const { deps } = makeDeps(session, [acc('a1')], { fetchCommunity, getPage });
+    const run = await startRangeJob({ from: 3029, to: 3029 }, 'a1', deps, {
+      jobType: 'incomplete',
+      resolveQuestions: async () => [{ number: 3029, slug: 'slug-3029' }],
+    });
+    expect((await run.done)[0]!.results[0]).toMatchObject({ number: 3029, status: 'accepted', capture: { code } });
+    expect(fetchCommunity).toHaveBeenCalledTimes(1);
+    expect(getPage).not.toHaveBeenCalled();
+  });
+
+  it('loads Walkccc after Community Solutions has no usable code for a known slug', async () => {
+    const session = makeSession(() => 'accepted', []);
+    const fetchCommunity = vi.fn(async () => { throw new Error('no matching community code'); });
+    const getPage = vi.fn(async (number: number) => sol(number));
+    const { deps } = makeDeps(session, [acc('a1')], { fetchCommunity, getPage });
+    const run = await startRangeJob({ from: 3029, to: 3029 }, 'a1', deps, {
+      jobType: 'incomplete',
+      resolveQuestions: async () => [{ number: 3029, slug: 'slug-3029' }],
+    });
+    expect((await run.done)[0]!.results[0]).toMatchObject({ status: 'accepted', capture: { code: sol(3029).code } });
+    expect(fetchCommunity.mock.invocationCallOrder[0]).toBeLessThan(getPage.mock.invocationCallOrder[0]!);
+  });
+
+  it('keeps an unknown verdict on the original submission even when an alternate solution is available', async () => {
+    const log: string[] = [];
+    const session = makeSession(() => 'accepted', log);
+    session.api.awaitResult = async id => ({ submissionId: id, classification: 'UNKNOWN', statusDisplay: 'PENDING', runtime: null, memory: null, rawStatusMsg: 'judge polling timed out' });
+    const fetchCommunity = vi.fn(async () => ({ code: 'class Solution { public: int main() { return 1; } };', uuid: 'alternate', title: 'Alternate', sourceUrl: 'example' }));
+    const { deps } = makeDeps(session, [acc('a1')], { fetchCommunity });
+    const run = await startRangeJob({ from: 3029, to: 3029 }, 'a1', deps);
+    expect((await run.done)[0]!.results[0]).toMatchObject({ status: 'error', detail: 'judge timeout', submissionId: 's3029' });
+    expect(log.filter(item => item.startsWith('submit:'))).toEqual(['submit:slug-3029']);
+  });
   it('reports a stale CSRF session as a session error without challenge retries or a quota claim', async () => {
     const session = makeSession(() => 'accepted', []);
     session.api.submit = vi.fn(async () => { throw new LeetCodeHttpError('submit HTTP 403: CSRF verification failed', 403); });
@@ -526,13 +565,14 @@ describe('RangeSolutionCache (walkccc lookups shared across accounts)', () => {
     await expect(c1.get(999)).rejects.toBeInstanceOf(WalkcccError);
     expect(miss).toHaveBeenCalledTimes(1);
 
-    const netErr = vi.fn(async () => {
-      throw new Error('socket hang up');
-    });
-    const c2 = new RangeSolutionCache(netErr);
+    const temporaryFailure = vi.fn(async (n: number) => sol(n))
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockRejectedValueOnce(new WalkcccError('walkccc request failed with HTTP 503'));
+    const c2 = new RangeSolutionCache(temporaryFailure);
     await expect(c2.get(5)).rejects.toThrow('socket hang up');
-    await expect(c2.get(5)).rejects.toThrow('socket hang up');
-    expect(netErr).toHaveBeenCalledTimes(2);
+    await expect(c2.get(5)).rejects.toThrow('HTTP 503');
+    await expect(c2.get(5)).resolves.toEqual(sol(5));
+    expect(temporaryFailure).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -543,8 +583,8 @@ describe('message formats', () => {
     expect(formatDuration(5_400_000)).toBe('1h 30m');
   });
 
-  it('estimateAccountMs assumes judge time + the 30 s break per question', () => {
-    expect(estimateAccountMs({ from: 200, to: 400 }, 30_000)).toBe(201 * 38_000);
+  it('estimates the shared submit slots plus the last verdict', () => {
+    expect(estimateAccountMs({ from: 200, to: 400 }, 30_000)).toBe(200 * 30_000 + 8_000);
   });
 
   it('the fatal summary explains why nothing ran', () => {
@@ -623,8 +663,9 @@ describe('Community solutions and slug resolution in range submission', () => {
     expect(submittedCodes[0]).not.toContain('/* comment */');
   });
 
-  it('diversifies community solution candidates across multiple accounts (excludeUuids)', async () => {
+  it('shares public question metadata across accounts while selecting community solutions independently', async () => {
     const session = makeSession(() => 'accepted', []);
+    session.api.question = vi.fn(session.api.question);
     const excludedSeenByAccount: Array<string[]> = [];
 
     const fetchCommunity = vi.fn(async (slug: string, problem: unknown, options?: { excludeUuids?: Set<string> }) => {
@@ -653,6 +694,7 @@ describe('Community solutions and slug resolution in range submission', () => {
     expect(results).toHaveLength(2);
     expect(results[0]!.results[0]!.status).toBe('accepted');
     expect(results[1]!.results[0]!.status).toBe('accepted');
+    expect(session.api.question).toHaveBeenCalledTimes(1);
 
     // First account had empty excludeUuids:
     expect(excludedSeenByAccount[0]).toEqual([]);

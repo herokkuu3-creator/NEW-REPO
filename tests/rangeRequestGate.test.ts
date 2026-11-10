@@ -46,3 +46,20 @@ it('retains actual Retry-After response headers from question and submission end
   await expect(api.graphql('query {}', {}, z.unknown())).rejects.toMatchObject({ status: 429, retryAfterMs: 125000 });
   await expect(api.submitSolution({ slug: 'example', questionId: '1', lang: 'cpp', code: 'source' })).rejects.toMatchObject({ status: 429, retryAfterMs: 125000 });
 });
+
+it('applies a judge 429 to the shared gate before attempting another endpoint', async () => {
+  const gate = new RangeRequestGate();
+  const signal = new AbortController().signal;
+  const dispose = vi.fn(async () => undefined);
+  const get = vi.fn(async () => ({ status: () => 429, text: async () => '{}', headers: () => ({ 'retry-after': '90' }), dispose }));
+  const post = vi.fn();
+  const api = new LeetCodeApi({ request: { get, post }, cookies: async () => [] } as any, {
+    beforeRequest: deadline => gate.wait(false, abortableSleep, signal, undefined, deadline),
+    observe: error => gate.observe(error), signal, timeoutMs: 20_000,
+  });
+  await expect(api.awaitSubmission('2192767591', 'example', 5_000, { firstPollDelayMs: 1 })).rejects.toMatchObject({ status: 429, retryAfterMs: 90_000 });
+  expect(get).toHaveBeenCalledTimes(1);
+  expect(post).not.toHaveBeenCalled();
+  expect(dispose).toHaveBeenCalledTimes(1);
+  await expect(gate.wait(true, abortableSleep, signal, undefined, Date.now() + 80_000)).rejects.toThrow('window expired');
+});

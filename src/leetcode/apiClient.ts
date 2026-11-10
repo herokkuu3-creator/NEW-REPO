@@ -1,4 +1,5 @@
-import { APIRequestContext, BrowserContext } from 'playwright';
+import { APIRequestContext, APIResponse, BrowserContext } from 'playwright';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { z } from 'zod';
 import { logger } from '../logger';
 import { classifyStatusCode, classifyStatusText, SubmissionClassification } from './submission';
@@ -45,7 +46,7 @@ export function leetCodeRequestFailure(err: unknown): { category: string; detail
   }
   const html = /<!doctype|<html|cloudflare|cf-chl|just a moment/i.test(msg);
   if ((err instanceof LeetCodeHttpError && err.status === 429) || /too (?:many requests|fast)|submit.{0,20}(?:too often|too frequently)|try again.{0,12}(?:seconds?|minutes?)/i.test(msg)) return { category: 'rate-limit', detail: 'Server request rate limited; no daily quota confirmed' + (err instanceof LeetCodeHttpError && err.status === 429 ? ' (HTTP 429)' : '') };
-  if (html) return { category: 'challenge', detail: 'Server received a verification page; no account submission quota confirmed' };
+  if (html || (err instanceof LeetCodeHttpError && /non-JSON body/i.test(msg))) return { category: 'challenge', detail: 'Server returned an unexpected page; no account submission quota confirmed' };
   if (err instanceof LeetCodeHttpError && err.status === 403) return { category: 'access-denied', detail: 'Server request denied (HTTP 403); no account submission quota confirmed' };
   if (/no submission_id/.test(msg)) return { category: 'unknown-submit-response', detail: 'Submission response had no ID; outcome needs reconciliation' };
   return { category: 'request-failed', detail: 'Server request failed' };
@@ -215,17 +216,55 @@ export interface AwaitSubmissionOptions {
   pollIntervalMs?: number;
 }
 
+interface LeetCodeRequestPolicy {
+  beforeRequest(deadline?: number): Promise<void>;
+  observe(error: unknown): void;
+  signal: AbortSignal;
+  timeoutMs: number;
+}
+
+async function readResponse(res: APIResponse) {
+  try {
+    return { status: res.status(), text: await res.text(), retryAfterMs: parseRetryAfter(res.headers?.()['retry-after']) };
+  } finally {
+    await res.dispose?.().catch(() => undefined);
+  }
+}
+
 export class LeetCodeApi {
   private readonly request: APIRequestContext;
 
-  constructor(private readonly context: Pick<BrowserContext, 'request' | 'cookies'>) {
+  constructor(
+    private readonly context: Pick<BrowserContext, 'request' | 'cookies'>,
+    private readonly policy?: LeetCodeRequestPolicy,
+  ) {
     this.request = context.request;
+  }
+
+  private async requestOptions(deadline?: number, beforeSend?: () => Promise<void>) {
+    if (beforeSend) await beforeSend();
+    else await this.policy?.beforeRequest(deadline);
+    this.policy?.signal.throwIfAborted();
+    const timeout = Math.min(this.policy?.timeoutMs ?? REQUEST_TIMEOUT_MS, (deadline ?? Infinity) - Date.now());
+    if (timeout <= 0) throw new Error('Judge polling window expired');
+    return { timeout, signal: this.policy?.signal };
+  }
+
+  private fail(error: LeetCodeHttpError): never {
+    this.policy?.observe(error);
+    throw error;
+  }
+
+  private checkVerdictFailure(error: unknown) {
+    this.policy?.signal.throwIfAborted();
+    if (this.policy && looksLikeChallenge(error)) throw error;
   }
 
   async graphql<T>(
     query: string,
     variables: Record<string, unknown>,
     schema: z.ZodType<T>,
+    deadline?: number,
   ): Promise<T> {
     const token = await this.csrfToken();
     const res = await this.request.post(`${ORIGIN}/graphql`, {
@@ -237,12 +276,11 @@ export class LeetCodeApi {
         ...(token ? { 'x-csrftoken': token } : {}),
       },
       data: { query, variables },
-      timeout: REQUEST_TIMEOUT_MS,
+      ...await this.requestOptions(deadline),
     });
-    const status = res.status();
-    const body = await res.text();
+    const { status, text: body, retryAfterMs } = await readResponse(res);
     if (status !== 200) {
-      throw new LeetCodeHttpError(`GraphQL HTTP ${status}`, status, parseRetryAfter(res.headers()['retry-after']));
+      this.fail(new LeetCodeHttpError(`GraphQL HTTP ${status}`, status, retryAfterMs));
     }
 
     let json: unknown;
@@ -250,12 +288,12 @@ export class LeetCodeApi {
       json = JSON.parse(body);
     } catch {
       // An HTML body here is the signature of a bot interstitial.
-      throw new LeetCodeHttpError('GraphQL returned non-JSON body');
+      this.fail(new LeetCodeHttpError('GraphQL returned non-JSON body', status, retryAfterMs));
     }
 
     const errors = (json as { errors?: { message?: string }[] }).errors;
     if (errors && errors.length > 0) {
-      throw new LeetCodeHttpError(`GraphQL error: ${errors[0]?.message ?? 'unknown'}`);
+      this.fail(new LeetCodeHttpError(`GraphQL error: ${errors[0]?.message ?? 'unknown'}`, status, retryAfterMs));
     }
 
     const parsed = schema.safeParse((json as { data?: unknown }).data);
@@ -283,7 +321,7 @@ export class LeetCodeApi {
     questionId: string;
     lang: string;
     code: string;
-  }): Promise<string> {
+  }, beforeSend?: () => Promise<void>): Promise<string> {
     const token = await this.csrfToken();
     if (!token) {
       throw new LeetCodeHttpError(
@@ -304,31 +342,30 @@ export class LeetCodeApi {
         question_id: params.questionId,
         typed_code: params.code,
       },
-      timeout: REQUEST_TIMEOUT_MS,
+      ...await this.requestOptions(undefined, beforeSend),
     });
 
-    const status = res.status();
-    const text = await res.text();
+    const { status, text, retryAfterMs } = await readResponse(res);
     if (status !== 200) {
       const detail = text.replace(/\s+/g, ' ').trim().slice(0, 300);
-      throw new LeetCodeHttpError(
+      this.fail(new LeetCodeHttpError(
         `submit HTTP ${status}${detail ? `: ${detail}` : ''}`,
         status,
-        parseRetryAfter(res.headers()['retry-after']),
-      );
+        retryAfterMs,
+      ));
     }
 
     let json: unknown;
     try {
       json = JSON.parse(text);
     } catch {
-      throw new LeetCodeHttpError('submit returned non-JSON body');
+      this.fail(new LeetCodeHttpError('submit returned non-JSON body', status, retryAfterMs));
     }
-    const id = (json as { submission_id?: number }).submission_id;
-    if (typeof id !== 'number') {
+    const id = (json as { submission_id?: number | string } | null)?.submission_id;
+    if (!((typeof id === 'number' && Number.isSafeInteger(id) && id > 0) || (typeof id === 'string' && /^[1-9]\d*$/.test(id)))) {
       const errMsg = (json as { error?: string })?.error ?? (json as { detail?: string })?.detail;
       if (errMsg) {
-        throw new LeetCodeHttpError(`submit rejected: ${errMsg}`);
+        this.fail(new LeetCodeHttpError(`submit rejected: ${errMsg}`, status, retryAfterMs));
       }
       throw new LeetCodeHttpError('submit response contained no submission_id');
     }
@@ -341,7 +378,7 @@ export class LeetCodeApi {
    * issues repeatedly after a submit (`/submissions/detail/<id>/v2/check/`).
    * Returns null on any transport/parse problem so the caller can fall back.
    */
-  async checkSubmission(submissionId: string, slug: string): Promise<JudgeCheckResult | null> {
+  async checkSubmission(submissionId: string, slug: string, deadline?: number): Promise<JudgeCheckResult | null> {
     const paths = [
       `${ORIGIN}/submissions/detail/${submissionId}/v2/check/`,
       `${ORIGIN}/submissions/detail/${submissionId}/check/`,
@@ -353,22 +390,29 @@ export class LeetCodeApi {
             Accept: 'application/json',
             Referer: `${ORIGIN}/problems/${slug}/`,
           },
-          timeout: REQUEST_TIMEOUT_MS,
+          ...await this.requestOptions(deadline),
         });
-        if (res.status() !== 200) {
-          logger.debug({ submissionId, url, status: res.status() }, 'judge check non-200');
+        const { status, text, retryAfterMs } = await readResponse(res);
+        if (status !== 200) {
+          if (this.policy && (status === 403 || status === 429)) {
+            this.fail(new LeetCodeHttpError(`judge check HTTP ${status}`, status, retryAfterMs));
+          }
+          logger.debug({ submissionId, url, status }, 'judge check non-200');
           continue;
         }
-        const text = await res.text();
         let json: unknown;
         try {
           json = JSON.parse(text);
         } catch {
+          if (this.policy && looksLikeChallenge(text)) {
+            this.fail(new LeetCodeHttpError('judge check returned non-JSON body', status, retryAfterMs));
+          }
           continue;
         }
         const parsed = parseJudgeCheck(json);
         if (parsed) return parsed;
       } catch (err) {
+        this.checkVerdictFailure(err);
         logger.debug(
           { submissionId, url, err: err instanceof Error ? err.message : String(err) },
           'judge check request failed',
@@ -389,25 +433,28 @@ export class LeetCodeApi {
     let lastStatus = 'PENDING';
     const firstDelay = options.firstPollDelayMs ?? 5_000;
     const interval = options.pollIntervalMs ?? 2_000;
+    const numericId = Number(submissionId);
+    // submissionDetails accepts a GraphQL Int, which cannot represent newer IDs.
+    const canQueryDetails = Number.isInteger(numericId) && numericId > 0 && numericId <= 2_147_483_647;
+    const requestDeadline = this.policy ? deadline : undefined;
+    let nextHistoryCheck = 0;
 
     let firstPoll = true;
     let lastCheckFinal: Extract<JudgeCheckResult, { kind: 'final' }> | null = null;
 
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, firstPoll ? firstDelay : interval));
+      await sleep(Math.min(firstPoll ? firstDelay : interval, deadline - Date.now()), undefined, { signal: this.policy?.signal });
+      if (this.policy && Date.now() >= deadline) break;
       firstPoll = false;
 
       // Primary source: the check endpoint LeetCode's own UI polls.
-      const check = await this.checkSubmission(submissionId, slug);
+      const check = await this.checkSubmission(submissionId, slug, requestDeadline);
       if (check?.kind === 'pending') {
         lastStatus = check.state;
         continue;
       }
       if (check?.kind === 'final') lastCheckFinal = check;
-      if (
-        check?.kind === 'final' &&
-        (check.classification !== 'UNKNOWN' || !/internal error/i.test(check.statusDisplay))
-      ) {
+      if (check?.kind === 'final' && check.classification !== 'UNKNOWN') {
         const outcome: SubmissionOutcome = {
           submissionId,
           classification: check.classification,
@@ -431,62 +478,33 @@ export class LeetCodeApi {
       }
 
       // Fallback: GraphQL submissionDetails (+ history verification).
-      const data = await this.graphql(
+      const data = canQueryDetails ? await this.graphql(
         SUBMISSION_DETAILS_QUERY,
-        { submissionId: Number(submissionId) },
+        { submissionId: numericId },
         submissionDetailsSchema,
-      ).catch(() => null);
+        requestDeadline,
+      ).catch((error) => { this.checkVerdictFailure(error); return null; }) : null;
 
       const d = data?.submissionDetails;
-      if (!d) continue;
-
-      if (JUDGE_PENDING_CODES.has(d.statusCode)) {
+      if (d && JUDGE_PENDING_CODES.has(d.statusCode)) {
         lastStatus = d.statusDisplay ?? lastStatus;
         continue;
       }
 
-      const statusDisplay = d.statusDisplay ?? lastStatus;
-      const classification = classifyStatusCode(d.statusCode);
+      const statusDisplay = d?.statusDisplay ?? lastStatus;
+      const classification = d ? classifyStatusCode(d.statusCode) : 'UNKNOWN';
 
       // LeetCode may temporarily report "Internal Error" from
       // submissionDetails even though the submission has already completed.
       // Verify the exact submission in submission history before declaring
       // the run rejected.
-      if (classification === 'UNKNOWN' || /internal error/i.test(statusDisplay)) {
-        const history = await this.findSubmissionInHistory(submissionId, slug);
-
-        if (history) {
-          const historyClassification = classifyStatusText(history.statusDisplay);
-
-          if (historyClassification !== 'UNKNOWN') {
-            const outcome: SubmissionOutcome = {
-              submissionId,
-              classification: historyClassification,
-              statusDisplay: history.statusDisplay,
-              runtime: history.runtime != null ? `${history.runtime} ms` : null,
-              memory: history.memory != null ? `${history.memory} MB` : null,
-              rawStatusMsg: history.statusDisplay,
-            };
-
-            logger.info(
-              {
-                submissionId,
-                classification: outcome.classification,
-                statusDisplay: outcome.statusDisplay,
-                source: 'submissionList',
-              },
-              'judge result confirmed from submission history',
-            );
-
-            return outcome;
-          }
+      if (!d || classification === 'UNKNOWN' || /internal error/i.test(statusDisplay)) {
+        if (Date.now() >= nextHistoryCheck) {
+          const history = await this.findSubmissionInHistory(submissionId, slug, requestDeadline);
+          if (history) return history;
+          nextHistoryCheck = Date.now() + 15_000;
         }
-
         lastStatus = statusDisplay;
-        logger.warn(
-          { submissionId, statusCode: d.statusCode, statusDisplay },
-          'uncertain judge status - continuing to poll',
-        );
         continue;
       }
 
@@ -516,23 +534,7 @@ export class LeetCodeApi {
     // Last chance before giving up: the submission history is authoritative
     // for a finished submission even if the live polling never saw it.
     const history = await this.findSubmissionInHistory(submissionId, slug);
-    if (history) {
-      const historyClassification = classifyStatusText(history.statusDisplay);
-      if (historyClassification !== 'UNKNOWN') {
-        logger.info(
-          { submissionId, classification: historyClassification, source: 'submissionList' },
-          'judge result recovered from submission history after polling timeout',
-        );
-        return {
-          submissionId,
-          classification: historyClassification,
-          statusDisplay: history.statusDisplay,
-          runtime: history.runtime != null ? `${history.runtime} ms` : null,
-          memory: history.memory != null ? `${history.memory} MB` : null,
-          rawStatusMsg: history.statusDisplay,
-        };
-      }
-    }
+    if (history) return history;
 
     if (lastCheckFinal) {
       return {
@@ -558,11 +560,8 @@ export class LeetCodeApi {
   private async findSubmissionInHistory(
     submissionId: string,
     slug: string,
-  ): Promise<{
-    statusDisplay: string;
-    runtime: string | null;
-    memory: string | null;
-  } | null> {
+    deadline = this.policy ? Date.now() + this.policy.timeoutMs : undefined,
+  ): Promise<SubmissionOutcome | null> {
     try {
       const data = await this.graphql(
         SUBMISSION_LIST_QUERY,
@@ -573,20 +572,28 @@ export class LeetCodeApi {
           questionSlug: slug,
         },
         submissionListSchema,
+        deadline,
       );
 
       const row = data.submissionList?.submissions.find(
         (item) => String(item.id) === String(submissionId),
       );
 
-      if (!row || !row.statusDisplay) return null;
+      if (!row?.statusDisplay || row.isPending === true || row.isPending === 'true') return null;
+      const classification = classifyStatusText(row.statusDisplay);
+      if (classification === 'UNKNOWN') return null;
 
+      logger.info({ submissionId, classification, source: 'submissionList' }, 'judge result confirmed from submission history');
       return {
+        submissionId,
+        classification,
         statusDisplay: row.statusDisplay,
-        runtime: row.runtime ?? null,
-        memory: row.memory ?? null,
+        runtime: row.runtime != null ? `${row.runtime} ms` : null,
+        memory: row.memory != null ? `${row.memory} MB` : null,
+        rawStatusMsg: row.statusDisplay,
       };
     } catch (err) {
+      this.checkVerdictFailure(err);
       logger.warn(
         {
           submissionId,

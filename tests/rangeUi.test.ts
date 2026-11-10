@@ -93,7 +93,7 @@ describe('/questionrangesubmission', () => {
     const { ui } = makeUi(started(['a1']));
     await handleQuestionRangeCommand('200-400', deps, ui);
     expect(sentViews[0]!.text).toContain('🎯 Question range #200–#400 (201');
-    expect(sentViews[0]!.text).toContain('30 s break');
+    expect(sentViews[0]!.text).toContain('30s minimum between submissions across all selected accounts');
     expect(sentViews[0]!.buttons).toEqual([
       [{ text: '▫️ a1', callback_data: 'qr:200-400:a:a1' }],
       [{ text: '▫️ dom4429', callback_data: 'qr:200-400:a:a2' }],

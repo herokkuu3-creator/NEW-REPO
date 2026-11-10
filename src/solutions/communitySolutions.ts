@@ -2,6 +2,7 @@ import { Page } from 'playwright';
 import { logger } from '../logger';
 import { ParsedProblem } from '../leetcode/parser';
 import { signatureMatchesStarter } from './walkccc';
+import { looksLikeChallenge } from '../leetcode/apiClient';
 
 export interface CommunitySolution {
   code: string;
@@ -24,6 +25,7 @@ export interface FetchCommunitySolutionOptions {
   maxArticles?: number;
   page?: Page;
   fetchFn?: typeof fetch;
+  graphql?: <T>(query: string, variables: Record<string, unknown>) => Promise<T>;
   randomize?: boolean;
   targetIndex?: number;
   excludeUuids?: string[] | Set<string>;
@@ -119,6 +121,7 @@ export async function executeLeetCodeGraphQL<T>(
   variables: Record<string, unknown>,
   options?: FetchCommunitySolutionOptions,
 ): Promise<T> {
+  if (options?.graphql) return options.graphql<T>(query, variables);
   if (options?.page) {
     try {
       const evalResult = await options.page.evaluate(
@@ -305,6 +308,7 @@ interface CachedArticleContent {
 const articleContentCache = new Map<string, CachedArticleContent>();
 
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const EMPTY_LIST_CACHE_TTL_MS = 5 * 60 * 1000;
 
 export function clearCommunitySolutionsCache(): void {
   articleListCache.clear();
@@ -325,12 +329,13 @@ export async function fetchCommunityArticleList(
   const cacheKey = `${questionSlug}:${langTag}:${maxArticles}`;
 
   const cached = articleListCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS && cached.edges.length > 0) {
+  if (cached && Date.now() - cached.timestamp < (cached.edges.length ? CACHE_TTL_MS : EMPTY_LIST_CACHE_TTL_MS)) {
     return cached.edges;
   }
 
   // 1. Fetch solution articles tagged with the target language
   let edges: Array<{ node: CommunityArticleNode }> = [];
+  let confirmedEmpty = false;
   try {
     const listData = await executeLeetCodeGraphQL<UgcArticlesResponse>(
       UGC_SOLUTION_ARTICLES_QUERY,
@@ -344,9 +349,12 @@ export async function fetchCommunityArticleList(
       },
       options,
     );
-    edges = listData.ugcArticleSolutionArticles?.edges ?? [];
+    const tagged = listData.ugcArticleSolutionArticles?.edges;
+    edges = tagged ?? [];
+    confirmedEmpty = Array.isArray(tagged) && tagged.length === 0;
     logger.info({ questionSlug, langTag, count: edges.length }, 'community solution articles found with language tag');
   } catch (err) {
+    if (options?.graphql && looksLikeChallenge(err)) throw err;
     logger.warn({ questionSlug, err: String(err) }, 'failed to fetch tagged community solution articles; trying untagged');
   }
 
@@ -364,11 +372,13 @@ export async function fetchCommunityArticleList(
       },
       options,
     );
-    edges = untaggedData.ugcArticleSolutionArticles?.edges ?? [];
+    const untagged = untaggedData.ugcArticleSolutionArticles?.edges;
+    edges = untagged ?? [];
+    confirmedEmpty = confirmedEmpty && Array.isArray(untagged) && untagged.length === 0;
     logger.info({ questionSlug, count: edges.length }, 'community solution articles found without language tag');
   }
 
-  if (edges.length > 0) {
+  if (edges.length > 0 || confirmedEmpty) {
     articleListCache.set(cacheKey, { timestamp: Date.now(), edges });
   }
 
@@ -512,6 +522,7 @@ export async function fetchCommunitySolution(
         );
       }
     } catch (err) {
+      if (options?.graphql && looksLikeChallenge(err)) throw err;
       logger.warn(
         { questionSlug, rank: rank1Based, uuid: node.uuid, err: String(err) },
         'failed to inspect community solution article; checking next candidate',
@@ -593,6 +604,7 @@ export async function resolveLeetCodeSlugByNumber(
     logger.warn({ questionNumber, totalResults: questions.length }, 'no exact frontendQuestionId match found in LeetCode problemset query');
     return null;
   } catch (err) {
+    if (options?.graphql && looksLikeChallenge(err)) throw err;
     logger.error({ questionNumber, err: String(err) }, 'failed to resolve LeetCode slug by question number');
     return null;
   }

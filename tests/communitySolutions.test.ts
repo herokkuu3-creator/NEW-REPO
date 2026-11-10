@@ -270,7 +270,7 @@ public:
     expect(solution.code).toContain('maxAlternatingSum');
   });
 
-  it('throws CommunitySolutionError when no articles exist', async () => {
+  it('caches a confirmed empty article list across lookups', async () => {
     const mockFetch = vi.fn(async () => {
       return new Response(
         JSON.stringify({
@@ -285,11 +285,12 @@ public:
       );
     });
 
-    await expect(
-      fetchCommunitySolution('non-existent-problem', mockProblem3727, {
-        fetchFn: mockFetch as unknown as typeof fetch,
-      }),
-    ).rejects.toThrow(CommunitySolutionError);
+    const lookup = () => fetchCommunitySolution('non-existent-problem', mockProblem3727, {
+      fetchFn: mockFetch as unknown as typeof fetch,
+    });
+    await expect(lookup()).rejects.toThrow(CommunitySolutionError);
+    await expect(lookup()).rejects.toThrow(CommunitySolutionError);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
   it('picks a specific result rank when targetIndex is specified (e.g. 4th result)', async () => {

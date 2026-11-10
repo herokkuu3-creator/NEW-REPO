@@ -149,6 +149,7 @@ import {
   StartRangeOptions,
   StartRangeResult,
 } from '../scheduler/rangeSubmission';
+import { RANGE_SUBMIT_GAP_MS } from '../scheduler/rangeRequestGate';
 import { fetchIncompleteQuestions } from '../leetcode/incompleteQuestions';
 
 /**
@@ -4823,7 +4824,7 @@ export async function handleCallbackQuery(
 // Question-range submission (/questionrangesubmission 200-400)
 // ---------------------------------------------------------------------------
 
-const RANGE_GAP_MS = 30_000;
+const RANGE_PACING_TEXT = `${RANGE_SUBMIT_GAP_MS / 1000}s minimum between submissions across all selected accounts`;
 
 /** Wiring for the range UI — injectable for tests. */
 export interface RangeUiDeps {
@@ -5063,7 +5064,7 @@ export async function handleQuestionRangeTrigger(
     ? (budget.mode === 'parallel' && concurrency > 1 ? ` · ⚡ Parallel (${concurrency}x)` : ' · 🐢 Sequential')
     : '';
   const title = `🎯 <b>LEETCODE QUESTION RANGE (#${range.from}–#${range.to})${modeTag}</b>`;
-  const initialSubtitle = `🔎 Initializing range #${range.from}–#${range.to}…\n<i>⏳ 30s pacing between questions · /rangestatus · /cancelrange</i>`;
+  const initialSubtitle = `🔎 Initializing range #${range.from}–#${range.to}…\n<i>⏳ ${RANGE_PACING_TEXT} · /rangestatus · /cancelrange</i>`;
   const initialBlocks = configuredAccounts.length > 0
     ? renderRangeProgressSections(accountSections, initialTotalAccounts).join('\n\n')
     : initialSubtitle;
@@ -5089,6 +5090,7 @@ export async function handleQuestionRangeTrigger(
   let lastEditTime = 0;
   let pendingEditTimer: NodeJS.Timeout | null = null;
   let pendingFooter: string | undefined = undefined;
+  let editInFlight: Promise<boolean> | null = null;
   const EDIT_THROTTLE_MS = 1000;
 
   const performEdit = async (footer?: string): Promise<boolean> => {
@@ -5145,23 +5147,21 @@ export async function handleQuestionRangeTrigger(
         clearTimeout(pendingEditTimer);
         pendingEditTimer = null;
       }
-      return performEdit(pendingFooter);
-    }
-
-    const elapsed = Date.now() - lastEditTime;
-    if (elapsed >= EDIT_THROTTLE_MS) {
-      if (pendingEditTimer) {
-        clearTimeout(pendingEditTimer);
-        pendingEditTimer = null;
-      }
+      if (editInFlight) await editInFlight;
       return performEdit(pendingFooter);
     }
 
     if (!pendingEditTimer) {
       pendingEditTimer = setTimeout(() => {
-        pendingEditTimer = null;
-        void performEdit(pendingFooter);
-      }, EDIT_THROTTLE_MS - elapsed);
+        void (async () => {
+          if (editInFlight) await editInFlight;
+          // A final update may have superseded this queued edit.
+          if (!pendingEditTimer) return;
+          pendingEditTimer = null;
+          editInFlight = performEdit(pendingFooter).finally(() => { editInFlight = null; });
+          await editInFlight;
+        })();
+      }, Math.max(0, EDIT_THROTTLE_MS - (Date.now() - lastEditTime)));
     }
     return true;
   };
@@ -5199,11 +5199,14 @@ export async function handleQuestionRangeTrigger(
       case 'processing':
         sec.activeLine = `⏳ ${stepPrefix}${qTag} — Processing…`;
         break;
+      case 'waiting-submit':
+        sec.activeLine = `⏳ ${stepPrefix}${qTag} — ${event.waitReason === 'cooldown' ? 'Server cooldown' : 'Waiting for a submission slot'} (~${event.waitSeconds ?? 1}s)…`;
+        break;
       case 'submitting':
         sec.activeLine = `🚀 ${stepPrefix}${qTag} — Submitting…`;
         break;
       case 'verdict':
-        sec.activeLine = `⏳ ${stepPrefix}${qTag} — Waiting for verdict…`;
+        sec.activeLine = `⏳ ${stepPrefix}${qTag} — Waiting for verdict…${event.submissionId ? ` · #${escapeHtml(event.submissionId)}` : ''}`;
         break;
       case 'accepted': {
         const sub = event.submissionId ? ` · #${escapeHtml(event.submissionId)}` : '';
@@ -5457,7 +5460,7 @@ export function buildRangePicker(
     '',
     '👇 Pick the account(s) to run it on:',
     selectionHint,
-    `⏳ Estimated ~${formatDuration(estimateAccountMs(range, RANGE_GAP_MS))} per account (30 s break between questions)`,
+    `⏳ ${RANGE_PACING_TEXT}`,
   ].join('\n');
 
   return { text, buttons };
@@ -5577,7 +5580,7 @@ export function buildIncompletePicker(
     '',
     '👇 Pick the account(s) to run on:',
     selectionHint,
-    `⏳ Pacing: 30s gap between questions (Cloudflare-safe)`,
+    `⏳ ${RANGE_PACING_TEXT}`,
   ].join('\n');
 
   return { text, buttons };
@@ -5645,8 +5648,7 @@ export async function handleIncompleteQuestionsCommand(
         incompleteCount: count,
         resolveQuestions: async (_acc, api) => {
           if (api.graphql) {
-            const items = await fetchIncompleteQuestions({ graphql: api.graphql }, count);
-            return items.map((q) => q.number);
+            return fetchIncompleteQuestions({ graphql: api.graphql }, count);
           }
           return Array.from({ length: count }, (_, i) => i + 1);
         },
@@ -5788,7 +5790,7 @@ export async function handleIncompleteButton(
         `🚀 Starting incomplete question solver: ${count} questions`,
         `👥 ${selected.length === 1 ? `Account: ${accountName(selected[0]!)}` : `Accounts (${selected.length}): ${selected.map((a) => accountName(a)).join(', ')}`}`,
         modeStr ? `⚙️ Mode:${modeStr}` : '',
-        `⏳ 30 s break between questions (Cloudflare-safe)`,
+        `⏳ ${RANGE_PACING_TEXT}`,
       ].filter(Boolean).join('\n'),
     );
 
@@ -5801,8 +5803,7 @@ export async function handleIncompleteButton(
         incompleteCount: count,
         resolveQuestions: async (_acc, api) => {
           if (api.graphql) {
-            const items = await fetchIncompleteQuestions({ graphql: api.graphql }, count);
-            return items.map((q) => q.number);
+            return fetchIncompleteQuestions({ graphql: api.graphql }, count);
           }
           return Array.from({ length: count }, (_, i) => i + 1);
         },
@@ -6092,9 +6093,7 @@ export async function handleRangeButton(
   const modeStr = isParallel
     ? ` · ⚡ Parallel (${budget.concurrency}x concurrent)`
     : (names.length > 1 ? ' · 🐢 Sequential (one by one)' : '');
-  const estMs = isParallel && budget.concurrency > 1
-    ? Math.ceil((estimateAccountMs(range, RANGE_GAP_MS) * names.length) / budget.concurrency)
-    : estimateAccountMs(range, RANGE_GAP_MS) * names.length;
+  const estMs = estimateAccountMs({ from: 1, to: rangeSize(range) * names.length }, RANGE_SUBMIT_GAP_MS);
 
   await deps.answer(callbackId, 'Started 🚀');
   await deps.edit(
@@ -6104,7 +6103,7 @@ export async function handleRangeButton(
       `🚀 Started: questions #${range.from}–#${range.to} (${rangeSize(range)})`,
       `👥 ${names.length === 1 ? `Account: ${names[0]}` : `Accounts: ${names.join(', ')}`}`,
       modeStr ? `⚙️ Mode:${modeStr}` : '',
-      `⏳ ~${formatDuration(estMs)} in total — 30 s break between questions`,
+      `⏳ ~${formatDuration(estMs)} before extra retries or cooldowns · ${RANGE_PACING_TEXT}`,
       '',
       '📬 You get a summary after each account.',
       '📍 /rangestatus shows progress · 🛑 /cancelrange stops it',

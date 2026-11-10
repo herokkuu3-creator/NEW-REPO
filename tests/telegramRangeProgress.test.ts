@@ -110,6 +110,18 @@ describe('handleQuestionRangeTrigger', () => {
             });
 
             await progressCallback?.({
+              phase: 'waiting-submit',
+              label: 'acc-one',
+              accIndex: 0,
+              accTotal: 1,
+              stepIndex: 1,
+              stepTotal: 2,
+              questionNumber: 3800,
+              waitSeconds: 29,
+              waitReason: 'pacing',
+            });
+
+            await progressCallback?.({
               phase: 'submitting',
               label: 'acc-one',
               username: 'user_one',
@@ -165,6 +177,7 @@ describe('handleQuestionRangeTrigger', () => {
     if (res.started) {
       const results = await res.done;
       expect(results).toHaveLength(1);
+      expect(edits.some(edit => edit.includes('Waiting for a submission slot (~29s)'))).toBe(true);
       // Last edit should show Finished summary
       const lastEdit = edits.at(-1);
       expect(lastEdit).not.toContain('Server request paused');
