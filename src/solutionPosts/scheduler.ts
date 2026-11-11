@@ -15,6 +15,7 @@ import { publishDailyPost, processDailyPublicationQueue } from './dailyPublicati
 import { recoverUnverifiedArticleUpvotes } from './upvote';
 import { isSageProvider } from '../config/solutionPostProvider';
 import { SAGE_REPAIR_TIMEOUT_MS } from './router';
+import { IMPLEMENTATION_STAGE_BUDGET } from './implementation';
 
 export const POST_CRON = '0 6 * * *';
 export const POST_TIMEZONE = 'Asia/Kolkata';
@@ -163,8 +164,8 @@ export async function acquireDailyLease(accountId: string, date: string) {
   const key = `solution-post-job:${accountId}:${date}`;
   const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs),
     isSageProvider(config.solutionPosts.baseUrl) ? SAGE_REPAIR_TIMEOUT_MS : 0);
-  const duration = config.solutionPosts.aiProvider === 'firecrawl' ? 6 * FIRECRAWL_STAGE_BUDGET_MS + 15 * 60 * 1000 :
-    2 * Math.max(1, config.solutionPosts.models.length) * (config.solutionPosts.retries + 1) * (maxTimeout + 8000) + 15 * 60 * 1000;
+  const duration = config.solutionPosts.aiProvider === 'firecrawl' ? (6 + IMPLEMENTATION_STAGE_BUDGET) * FIRECRAWL_STAGE_BUDGET_MS + 15 * 60 * 1000 :
+    (2 + IMPLEMENTATION_STAGE_BUDGET) * Math.max(1, config.solutionPosts.models.length) * (config.solutionPosts.retries + 1) * (maxTimeout + 8000) + 15 * 60 * 1000;
   const value = JSON.stringify({ owner: randomUUID(), until: Date.now() + duration });
   try { await prisma.systemState.create({ data: { key, value } }); }
   catch (error) {

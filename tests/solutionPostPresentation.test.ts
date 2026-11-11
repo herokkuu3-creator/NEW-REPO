@@ -53,6 +53,12 @@ it('gives a fifteen-account batch distinct reading structures, not only differen
     time: { bound: 'O(n)', reason: 'One pass visits n input items.' }, space: { bound: 'O(n)', reason: 'The table holds n input items.' } });
   const formats = Array.from({ length: 15 }, (_, index) => renderArticle(draft, { ...context, presentation: presentationVariant(index) }));
   expect(new Set(formats).size).toBe(15);
+  const articleImplementation = { code: 'class Solution { public: int result() { return 1; } };', approach: 'Return the computed result.' };
+  const rewritten = Array.from({ length: 15 }, (_, index) => renderArticle(draft, {
+    ...context, articleImplementation, presentation: presentationVariant(index),
+  }));
+  expect(new Set(rewritten).size).toBe(15);
+  expect(rewritten.every(markdown => markdown.split(articleImplementation.code).length === 2 && !markdown.includes(context.code))).toBe(true);
 });
 it('renders different diagram geometries and animated highlights without adding numeric states', async () => {
   const base = visualPlanSchema.parse({ id: 'visual-1', after: 'intuition', title: 'Watch the lookup', caption: 'Follow the active candidate.',

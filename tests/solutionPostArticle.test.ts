@@ -48,6 +48,18 @@ function stagedResponses(draft: typeof article, review = '{"approved":true,"issu
 }
 
 describe('solution articles', () => {
+  it('drafts and reviews the prose and GIF states against the rewritten implementation', async () => {
+    const api = client(); const responses = stagedResponses(article);
+    api.chat.completions.create.mockImplementation(async () => responses.shift() as never);
+    const articleImplementation = { code: 'class Solution { public: int count() { return 42; } };', approach: 'Compute the result in one pass.' };
+    const result = await generateArticle(new AIModelRouter(options, api as never), { ...context, articleImplementation }, []);
+    for (const [request] of api.chat.completions.create.mock.calls) {
+      const messages = (request as { messages: { content: string }[] }).messages;
+      expect(JSON.parse(messages[1]!.content).source.code).toBe(articleImplementation.code);
+    }
+    expect(result.markdown).toContain(articleImplementation.code);
+    expect(result.markdown).not.toContain(context.code);
+  });
   it('keeps article-title length instructions out of animation metadata stages', () => {
     const prompt = compactArticlePrompt(context, 'visual storytelling', [], { name: 'concept animation first frame', request: 'Return animation metadata.' });
     expect(prompt).toContain('animation titles are 3-48 characters');

@@ -161,6 +161,7 @@ export async function reserveBrowserPublication(id: string, approvedHash: string
   const context = contextSchema.parse(JSON.parse(post.context));
   if (hash(context.code) !== post.codeHash || context.accountId !== post.accountId || context.slug !== post.problemSlug ||
     context.submissionId !== post.submissionId) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  verifyArticleCode(post.markdown, context);
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
   return withAccount(account, async (api, _page, username) => {
     await checkEligibility(api, context, username);
@@ -168,6 +169,12 @@ export async function reserveBrowserPublication(id: string, approvedHash: string
     if (duplicate) return move(post, 'SKIPPED', { lastError: 'EXISTING_ACCOUNT_SOLUTION', publishedUrl: duplicate });
     return move(post, 'PUBLISHING', { lastError: 'LOCAL_BROWSER_PUBLICATION_PENDING' });
   });
+}
+
+function verifyArticleCode(markdown: string, context: SubmissionContext): void {
+  const blocks = [...markdown.matchAll(/^(`{3,})[^\r\n]*\n([\s\S]*?)\n\1[ \t]*$/gm)];
+  const reviewedCode = context.articleImplementation?.code ?? context.code;
+  if (blocks.length !== 1 || blocks[0]?.[2] !== reviewedCode) throw new PostError('SOURCE_INTEGRITY_FAILED');
 }
 
 export async function publishPost(id: string) {
@@ -181,6 +188,7 @@ export async function publishPost(id: string) {
   if (titleIncludesQuestionName(post.title, context)) throw new PostError('QUESTION_NAME_IN_TITLE');
   if (hash(context.code) !== post.codeHash || context.accountId !== post.accountId || context.slug !== post.problemSlug ||
     context.submissionId !== post.submissionId) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  verifyArticleCode(post.markdown, context);
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
   return withAccount(account, async (api, page, username) => {
     preparationStage = 'eligibility';
@@ -190,7 +198,6 @@ export async function publishPost(id: string) {
     if (duplicate) return move(post, 'SKIPPED', { lastError: 'EXISTING_ACCOUNT_SOLUTION', publishedUrl: duplicate });
     if (config.solutionPosts.publishTransport === 'api') {
       preparationStage = 'publication-api';
-      if (post.markdown!.split(context.code).length !== 2) throw new PostError('SOURCE_INTEGRITY_FAILED');
       // Claim BEFORE the sole irreversible request. An error never causes an
       // automatic repeat or a second attempt through the browser transport.
       post = await move(post, 'PUBLISHING');

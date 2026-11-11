@@ -19,6 +19,7 @@ import { ensurePost, move } from './store';
 import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, maskSolutionApiKey, resetSolutionApiKeyPool, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 import { startArticleWorkKeepAlive } from './keepAlive';
+import { generateImplementation, IMPLEMENTATION_STAGE_BUDGET } from './implementation';
 
 export class PostError extends Error {
   constructor(public readonly code: string, public readonly details?: {
@@ -125,6 +126,18 @@ export async function createPostRouter(correlation: { postId?: string; accountId
     });
 }
 
+async function reserveImplementation(post: SolutionPost, context: SubmissionContext, fingerprint: string): Promise<boolean> {
+  const key = `solution-implementation:${context.slug}:${context.language}:${fingerprint}`;
+  try {
+    await prisma.systemState.create({ data: { key, value: post.id } });
+    return true;
+  } catch (error) {
+    if ((error as { code?: string }).code !== 'P2002') throw error;
+    const reservation = await prisma.systemState.findUnique({ where: { key } });
+    return reservation?.value === post.id;
+  }
+}
+
 export async function generatePost(context: SubmissionContext, router?: AIModelRouter, force = false, onStage?: StageCallback): Promise<SolutionPost> {
   context = { ...context, presentation: context.presentation?.visualVersion === 2 ? context.presentation :
     await reserveArticlePresentation(context.accountId, context.slug) };
@@ -137,8 +150,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   if (hash(savedContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
   const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs),
     isSageProvider(config.solutionPosts.baseUrl) ? SAGE_REPAIR_TIMEOUT_MS : 0);
-  const leaseMs = config.solutionPosts.aiProvider === 'firecrawl' ? 6 * FIRECRAWL_STAGE_BUDGET_MS + 120000 :
-    2 * Math.max(1, config.solutionPosts.models.length) * (config.solutionPosts.retries + 1) * (maxTimeout + 8000) + 120000;
+  const leaseMs = config.solutionPosts.aiProvider === 'firecrawl' ? (6 + IMPLEMENTATION_STAGE_BUDGET) * FIRECRAWL_STAGE_BUDGET_MS + 120000 :
+    (2 + IMPLEMENTATION_STAGE_BUDGET) * Math.max(1, config.solutionPosts.models.length) * (config.solutionPosts.retries + 1) * (maxTimeout + 8000) + 120000;
   // Reset an explicitly renewed attempt budget in the same CAS that claims
   // generation. A separate unconditional update can reset another worker's job.
   post = await move(post, 'CHECKING_ELIGIBILITY', { leaseUntil: new Date(Date.now() + leaseMs),
@@ -147,21 +160,40 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   logger.info({ postId: post.id, accountId: post.accountId, retryCount: post.retryCount,
     explicitRetry: force, previousError: post.lastError }, 'solution article generation claimed');
   const stopKeepAlive = startArticleWorkKeepAlive();
+  let implementationAttempts: Awaited<ReturnType<typeof generateImplementation>>['attempts'] = [];
   try {
     // Context comes only from a verified accepted DailyRun; publishing rechecks eligibility and identity.
-    const recent = await prisma.solutionPost.findMany({ where: { OR: [{ accountId: post.accountId }, { problemSlug: post.problemSlug }],
-      id: { not: post.id }, title: { not: null } },
-      orderBy: { createdAt: 'desc' }, take: 8 });
+    const [recent, sameProblem] = await Promise.all([
+      prisma.solutionPost.findMany({ where: { OR: [{ accountId: post.accountId }, { problemSlug: post.problemSlug }],
+        id: { not: post.id }, title: { not: null } }, select: { style: true, title: true }, orderBy: { createdAt: 'desc' }, take: 8 }),
+      prisma.solutionPost.findMany({ where: { problemSlug: post.problemSlug, id: { not: post.id }, title: { not: null } },
+        select: { context: true }, orderBy: { createdAt: 'desc' }, take: 100 }),
+    ]);
+    const previous = sameProblem.flatMap(row => {
+      try {
+        const parsed = contextSchema.safeParse(JSON.parse(row.context));
+        if (parsed.success && parsed.data.language === savedContext.language) {
+          return [parsed.data.articleImplementation ?? { code: parsed.data.code }];
+        }
+      } catch { /* An unreadable historical snapshot has no comparable code. */ }
+      return [];
+    });
     post = await move(post, 'GENERATING', { lastError: null });
     const activeRouter = router ?? await createPostRouter({ postId: post.id, accountId: post.accountId });
+    await onStage?.('generating_article', 'Writing and reviewing a distinct implementation…');
+    const implementation = await generateImplementation(activeRouter, savedContext, previous,
+      fingerprint => reserveImplementation(post, savedContext, fingerprint));
+    implementationAttempts = implementation.attempts;
+    const articleContext = { ...savedContext, articleImplementation: implementation.value };
     let priorFailure: { markdown: string; issues: string[] } | undefined;
     try {
       const feedback = (JSON.parse(post.attempts ?? '[]') as Array<{ reviewIssues?: string[] }>).reverse().find(a => a.reviewIssues?.length);
       if (post.markdown && feedback?.reviewIssues) priorFailure = {
-        markdown: post.markdown.replace(savedContext.code, '[exact accepted source supplied separately]'), issues: feedback.reviewIssues,
+        markdown: post.markdown.replace(/^(`{3,})[^\n]*\n[\s\S]*?\n\1[ \t]*$/gm, '[prior implementation omitted]')
+          .replace(savedContext.code, '[accepted source omitted]'), issues: feedback.reviewIssues,
       };
     } catch { /* an unreadable historical diagnostic must not prevent a clean generation */ }
-    const article = await generateArticle(activeRouter, savedContext,
+    const article = await generateArticle(activeRouter, articleContext,
       recent.map(r => ({ style: r.style ?? '', title: r.title ?? '' })),
       plans => storeVisualAssets(plans, config.api.publicUrl), priorFailure, onStage);
     // Public posts must contain the two independently generated, durable GIFs.
@@ -172,8 +204,9 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
       throw new PostError('TWO_PUBLIC_GIFS_REQUIRED');
     }
     post = await move(post, 'VALIDATING', { title: article.title, markdown: article.markdown,
-      style: article.style, model: article.model, reviewModel: article.reviewModel,
-      attempts: JSON.stringify(article.attempts), contentHash: hash(`${article.title}\n${article.markdown}`), approvedHash: null });
+      style: article.style, model: article.model, reviewModel: article.reviewModel, context: JSON.stringify(articleContext),
+      attempts: JSON.stringify([...implementationAttempts, ...article.attempts]),
+      contentHash: hash(`${article.title}\n${article.markdown}`), approvedHash: null });
     post = await move(post, 'DRAFT_READY', { leaseUntil: null });
     return move(post, 'AWAITING_APPROVAL');
   } catch (error) {
@@ -190,7 +223,9 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
               error instanceof z.ZodError ? `AI_ERROR: SCHEMA:${error.issues.map(i => i.path.join('.')).join(',').slice(0, 200)}` : 'GENERATION_FAILED',
         ...(error instanceof ArticleReviewError ? { ...error.draft,
           contentHash: hash(`${error.draft.title}\n${error.draft.markdown}`), approvedHash: null } : {}),
-        ...(error instanceof RoutingError ? { attempts: JSON.stringify(error.attempts) } : {}) });
+        ...(error instanceof RoutingError || implementationAttempts.length ? {
+          attempts: JSON.stringify([...implementationAttempts, ...(error instanceof RoutingError ? error.attempts : [])]),
+        } : {}) });
       logger.warn({ postId: post.id, accountId: post.accountId, retryCount: post.retryCount,
         error: post.lastError }, 'solution article generation failed');
     }
@@ -205,7 +240,8 @@ export async function generateForRun(accountId: string, runId: string, force = f
     accountId, problemSlug: run.problemSlug, intent: 'community-solution',
   } } });
   if (existing && !['PENDING', 'RETRY_PENDING'].includes(existing.status)) {
-    if (force && existing.status === 'FAILED') {
+    if (force && (existing.status === 'FAILED' || (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(existing.status) &&
+      !contextSchema.parse(JSON.parse(existing.context)).articleImplementation))) {
       return retryPost(existing.id, true, onStage);
     }
     return existing;
@@ -214,16 +250,21 @@ export async function generateForRun(accountId: string, runId: string, force = f
 }
 
 export async function retryPost(id: string, force = false, onStage?: StageCallback): Promise<SolutionPost> {
-  let post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
-  if (!['FAILED', 'RETRY_PENDING'].includes(post.status)) throw new PostError('NOT_RETRYABLE');
-  checkGenerationBudget(post, force);
-  if (post.status === 'FAILED') post = await move(post, 'RETRY_PENDING');
-  if (post.status !== 'RETRY_PENDING') throw new PostError('NOT_RETRYABLE');
+  const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
+  const refreshDraft = force && ['DRAFT_READY', 'AWAITING_APPROVAL'].includes(post.status);
+  if (!refreshDraft && !['FAILED', 'RETRY_PENDING'].includes(post.status)) throw new PostError('NOT_RETRYABLE');
   const context = contextSchema.parse(JSON.parse(post.context));
+  if (refreshDraft && context.articleImplementation) throw new PostError('NOT_RETRYABLE');
+  checkGenerationBudget(post, force);
   const run = await prisma.dailyRun.findFirst({ where: { accountId: post.accountId, submissionId: post.submissionId } });
   if (!run) throw new PostError('SUBMISSION_CONTEXT_MISSING');
   const verified = await loadContext(post.accountId, run.id);
   if (hash(verified.code) !== post.codeHash || verified.slug !== context.slug) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  if (refreshDraft) {
+    await move(post, 'RETRY_PENDING', { approvedHash: null, contentHash: null });
+  } else if (post.status === 'FAILED') {
+    await move(post, 'RETRY_PENDING');
+  }
   return generatePost(context, undefined, force, onStage);
 }
 

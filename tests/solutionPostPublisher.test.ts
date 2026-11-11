@@ -61,6 +61,29 @@ describe('authorized solution publishing', () => {
     await publishPost('post1');
     expect(h.api.graphql.mock.calls.filter((call: any[]) => call[0].includes('mutation '))).toHaveLength(1);
   });
+  it('publishes the reviewed implementation while verifying the original accepted submission', async () => {
+    config.solutionPosts.publishTransport = 'api';
+    const articleImplementation = { code: 'class Solution { public: int size() { return 1; } };', approach: 'Return the fixed size.' };
+    const rewritten = markdown.replace(context.code, articleImplementation.code);
+    const digest = hash(h.row.title + '\n' + rewritten);
+    Object.assign(h.row, { context: JSON.stringify({ ...context, articleImplementation }),
+      markdown: rewritten, contentHash: digest, approvedHash: digest });
+    h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [] } })
+      .mockImplementationOnce(async () => {
+        h.clicked = true;
+        return { ugcArticlePublishSolution: { article: { topicId: 123, slug: 'teach-with-sets' }, error: null } };
+      })
+      .mockResolvedValueOnce({ ugcArticleSolutionArticle: { topicId: 123, title: h.row.title, content: rewritten } });
+    const result = await publishPost('post1');
+    expect(result.status).toBe('PUBLISHED');
+    expect(h.api.awaitSubmission).toHaveBeenCalledWith(context.submissionId, context.slug, expect.any(Number), expect.anything());
+    expect(h.api.graphql.mock.calls[1]![1].data.content).toBe(rewritten);
+  });
+  it('rejects a draft whose code block differs from the reviewed implementation', async () => {
+    h.row.context = JSON.stringify({ ...context, articleImplementation: { code: 'class Different {};', approach: 'A reviewed approach.' } });
+    await expect(publishPost('post1')).rejects.toThrow('SOURCE_INTEGRITY_FAILED');
+    expect(h.api.graphql).not.toHaveBeenCalled();
+  });
   it('never retries an uncertain publication API request or falls back to a Post click', async () => {
     config.solutionPosts.publishTransport = 'api';
     h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [] } })

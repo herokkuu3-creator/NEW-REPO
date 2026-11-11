@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-const h = vi.hoisted(() => ({ row: null as any, rows: [] as any[], generation: vi.fn(), verifyVisuals: vi.fn(),
+const h = vi.hoisted(() => ({ row: null as any, rows: [] as any[], generation: vi.fn(), implementation: vi.fn(), verifyVisuals: vi.fn(),
   pool: vi.fn(), checkSession: vi.fn(), launch: vi.fn(), browser: { newContext: vi.fn(), close: vi.fn() },
   question: vi.fn(), verdict: vi.fn(), daily: vi.fn(), refresh: vi.fn(), run: null as any, account: null as any }));
 vi.mock('../src/database/prisma', () => ({ prisma: {
@@ -23,6 +23,7 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
   systemState: { findUnique: vi.fn(async () => null), upsert: vi.fn(async () => ({})), deleteMany: vi.fn(async () => ({ count: 1 })) },
 } }));
 vi.mock('../src/solutionPosts/article', async orig => ({ ...(await orig() as object), generateArticle: h.generation }));
+vi.mock('../src/solutionPosts/implementation', async orig => ({ ...(await orig() as object), generateImplementation: h.implementation }));
 vi.mock('../src/solutionPosts/presentation', async orig => ({ ...(await orig() as object),
   reserveArticlePresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 2, motions: ['scan', 'slide'] })) }));
 vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn(), verifyHostedVisualAssets: h.verifyVisuals }));
@@ -41,6 +42,7 @@ import { ArticleReviewError, contextSchema, hash } from '../src/solutionPosts/ar
 import { RoutingError } from '../src/solutionPosts/router';
 const context = contextSchema.parse({ accountId: 'a', username: 'alice', problemId: '1', slug: 'example',
   title: 'Example', difficulty: 'Easy', problem: 'An example problem', submissionId: '123', language: 'cpp', code: 'source\r\n', challengeDate: '2026-10-15' });
+const implementation = { code: 'class Solution { public: int count() { return 1; } };', approach: 'Return the only possible count.' };
 const output = { title: 'Example title', markdown: 'verified exact source\r\n', model: 'terra', reviewModel: 'luna', style: 'visual storytelling',
   attempts: [], visuals: [{ id: 'visual-1' }, { id: 'visual-2' }], assets: [{ id: 'visual-1' }, { id: 'visual-2' }], visualFallback: false };
 it('uses the Firecrawl Agent directly without reading the BazaarLink pool', async () => {
@@ -61,6 +63,7 @@ it('fails closed when Firecrawl is selected without a key', async () => {
 });
 beforeEach(() => {
   vi.clearAllMocks(); h.row = null; h.rows = [];
+  h.implementation.mockResolvedValue({ value: implementation, model: 'terra', attempts: [] });
   h.generation.mockResolvedValue(output);
   h.pool.mockResolvedValue({ keys: [], activeIndex: 0, stored: false });
   h.verifyVisuals.mockResolvedValue(true);
@@ -95,6 +98,8 @@ describe('solution workflow and persistence', () => {
     expect(loaded.code).toBe(context.code);
     const first = await generatePost(loaded, {} as never);
     expect(first.status).toBe('AWAITING_APPROVAL'); expect(first.codeHash).toBe(hash(context.code));
+    expect(JSON.parse(first.context)).toMatchObject({ code: context.code, articleImplementation: implementation });
+    expect(h.generation.mock.calls[0]![1]).toMatchObject({ articleImplementation: implementation });
     expect(prisma.solutionPost.findMany).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ id: { not: first.id } }),
     }));
@@ -116,6 +121,16 @@ describe('solution workflow and persistence', () => {
     const saved = JSON.parse(h.row.context);
     expect(saved.presentation).toMatchObject({ visualVersion: 2, diagrams: ['timeline', 'rail'] });
     expect(saved.code).toBe(context.code); expect(h.row.codeHash).toBe(hash(context.code));
+  });
+  it('regenerates an explicitly retried legacy draft and requires approval of the replacement', async () => {
+    await generatePost(context, {} as never);
+    const { articleImplementation: _implementation, ...legacyContext } = JSON.parse(h.row.context);
+    Object.assign(h.row, { status: 'DRAFT_READY', approvedHash: h.row.contentHash, context: JSON.stringify(legacyContext) });
+    h.pool.mockResolvedValue({ keys: ['valid-test-key'], activeIndex: 0, stored: false });
+    const post = await generateForRun('a', 'run1', true);
+    expect(post).toMatchObject({ status: 'AWAITING_APPROVAL', approvedHash: null, codeHash: hash(context.code) });
+    expect(JSON.parse(post.context)).toMatchObject({ code: context.code, articleImplementation: implementation });
+    expect(h.verdict).toHaveBeenCalledTimes(1);
   });
   it('persists all-model failure without changing the accepted run', async () => {
     h.generation.mockRejectedValue(new RoutingError([{ model: 'terra', attempt: 1, outcome: 'TIMEOUT', elapsedMs: 1000 }]));
