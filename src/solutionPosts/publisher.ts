@@ -2,7 +2,7 @@ import { Page } from 'playwright';
 import { z } from 'zod';
 import { prisma } from '../database/prisma';
 import { LeetCodeApi, LeetCodeHttpError } from '../leetcode/apiClient';
-import { contextSchema, hash, SubmissionContext, titleIncludesQuestionName, buildArticleTags } from './article';
+import { articleNeedsRefresh, contextSchema, hash, SubmissionContext, titleIncludesQuestionName, buildArticleTags } from './article';
 import { scheduleSolutionArticleUpvotes } from './upvote';
 import { move } from './store';
 import { PostError, withAccount } from './service';
@@ -162,6 +162,7 @@ export async function reserveBrowserPublication(id: string, approvedHash: string
   const context = contextSchema.parse(JSON.parse(post.context));
   if (hash(context.code) !== post.codeHash || context.accountId !== post.accountId || context.slug !== post.problemSlug ||
     context.submissionId !== post.submissionId) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  if (articleNeedsRefresh(context)) throw new PostError('ARTICLE_LAYOUT_REFRESH_REQUIRED');
   verifyArticleCode(post.markdown, context);
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
   return withAccount(account, async (api, _page, username) => {
@@ -189,6 +190,7 @@ export async function publishPost(id: string) {
   if (titleIncludesQuestionName(post.title, context)) throw new PostError('QUESTION_NAME_IN_TITLE');
   if (hash(context.code) !== post.codeHash || context.accountId !== post.accountId || context.slug !== post.problemSlug ||
     context.submissionId !== post.submissionId) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  if (articleNeedsRefresh(context)) throw new PostError('ARTICLE_LAYOUT_REFRESH_REQUIRED');
   verifyArticleCode(post.markdown, context);
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
   return withAccount(account, async (api, page, username) => {

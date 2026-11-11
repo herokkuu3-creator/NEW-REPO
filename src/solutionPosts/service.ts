@@ -11,16 +11,16 @@ import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallen
 import { AIModelRouter, RoutingError, SAGE_REPAIR_TIMEOUT_MS } from './router';
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { isSageProvider } from '../config/solutionPostProvider';
-import { reserveArticlePresentation } from './presentation';
+import { reservePostPresentation } from './presentation';
 import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
-import { ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext, StageCallback } from './article';
+import { articleNeedsRefresh, ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext, StageCallback } from './article';
 import { OutputValidationError } from './router';
 import { ensurePost, move } from './store';
 import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, maskSolutionApiKey, resetSolutionApiKeyPool, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 import { startArticleWorkKeepAlive } from './keepAlive';
 import { generateImplementation, IMPLEMENTATION_STAGE_BUDGET } from './implementation';
-import { CoarenaRouter, loadCoarenaKey } from './coarena';
+import { CoarenaRouter, loadCoarenaKey, maskCoarenaKey } from './coarena';
 
 export class PostError extends Error {
   constructor(public readonly code: string, public readonly details?: {
@@ -87,19 +87,21 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
 }
 
 export async function createPostRouter(correlation: { postId?: string; accountId?: string } = {},
-  providerOverride?: 'firecrawl' | 'bazaarlink'): Promise<AIModelRouter> {
+  providerOverride?: 'firecrawl' | 'bazaarlink', reportKey?: (label: string) => void): Promise<AIModelRouter> {
   const key = providerOverride ? null : await loadCoarenaKey().catch(() => null);
-  if (key) return new CoarenaRouter(key, () => createDiscoveryRouter(correlation),
-    attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'));
+  if (key) return new CoarenaRouter(key, () => createDiscoveryRouter(correlation, reportKey), attempt => {
+    if (attempt.attempt > 0 && attempt.model !== 'discovery') reportKey?.(`Coarena · ${maskCoarenaKey(key)}`);
+    logger.info({ ...correlation, attempt }, 'solution article AI attempt finished');
+  });
   if ((providerOverride ?? config.solutionPosts.aiProvider) === 'firecrawl') {
     if (!config.solutionPosts.firecrawlApiKey) throw new PostError('FIRECRAWL_KEY_REQUIRED');
     return new FirecrawlAgentRouter(config.solutionPosts.firecrawlApiKey, config.solutionPosts.agentMaxCredits,
       attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'));
   }
-  return createDiscoveryRouter(correlation);
+  return createDiscoveryRouter(correlation, reportKey);
 }
 
-async function createDiscoveryRouter(correlation: { postId?: string; accountId?: string }): Promise<AIModelRouter> {
+async function createDiscoveryRouter(correlation: { postId?: string; accountId?: string }, reportKey?: (label: string) => void): Promise<AIModelRouter> {
   let pool = await loadSolutionKeyPool();
   let activeKeys = activeSolutionApiKeys(pool);
   if (!activeKeys.length && pool.keys.length > 0 &&
@@ -128,6 +130,8 @@ async function createDiscoveryRouter(correlation: { postId?: string; accountId?:
       .sort((a, b) => Number(/^qwen/i.test(b)) - Number(/^qwen/i.test(a))) : undefined;
   return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys, reviewModels }, undefined, undefined,
     attempt => { if (isSageProvider(config.solutionPosts.baseUrl)) attempt.provider = 'discovery';
+      const key = attempt.keySlot && activeKeys[attempt.keySlot - 1];
+      if (attempt.attempt > 0 && attempt.model !== 'discovery' && key) reportKey?.(`Discovery · ${maskSolutionApiKey(key)}`);
       logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'); },
     async (failedKey, reason) => {
       const advanced = await rotateSolutionApiKey(failedKey, reason);
@@ -148,15 +152,14 @@ async function reserveImplementation(post: SolutionPost, context: SubmissionCont
 }
 
 export async function generatePost(context: SubmissionContext, router?: AIModelRouter, force = false, onStage?: StageCallback): Promise<SolutionPost> {
-  context = { ...context, presentation: context.presentation?.visualVersion === 2 ? context.presentation :
-    await reserveArticlePresentation(context.accountId, context.slug) };
   let post = await ensurePost(context);
   if (!['PENDING', 'RETRY_PENDING'].includes(post.status)) return post;
   checkGenerationBudget(post, force);
   // Use the immutable original snapshot when a later submission for the same problem exists.
   const originalContext = contextSchema.parse(JSON.parse(post.context));
-  const savedContext = { ...originalContext, presentation: originalContext.presentation?.visualVersion === 2 ? originalContext.presentation : context.presentation };
-  if (hash(savedContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  if (hash(originalContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  const savedContext = { ...originalContext, presentation: originalContext.presentation?.format ? originalContext.presentation :
+    await reservePostPresentation(post.problemSlug) };
   const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs),
     isSageProvider(config.solutionPosts.baseUrl) ? SAGE_REPAIR_TIMEOUT_MS : 0);
   const leaseMs = config.solutionPosts.aiProvider === 'firecrawl' ? (6 + IMPLEMENTATION_STAGE_BUDGET) * FIRECRAWL_STAGE_BUDGET_MS + 120000 :
@@ -176,7 +179,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
       prisma.solutionPost.findMany({ where: { OR: [{ accountId: post.accountId }, { problemSlug: post.problemSlug }],
         id: { not: post.id }, title: { not: null } }, select: { style: true, title: true }, orderBy: { createdAt: 'desc' }, take: 8 }),
       prisma.solutionPost.findMany({ where: { problemSlug: post.problemSlug, id: { not: post.id }, title: { not: null } },
-        select: { context: true }, orderBy: { createdAt: 'desc' }, take: 100 }),
+        select: { context: true, title: true }, orderBy: { createdAt: 'desc' }, take: 100 }),
     ]);
     const previous = sameProblem.flatMap(row => {
       try {
@@ -188,7 +191,12 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
       return [];
     });
     post = await move(post, 'GENERATING', { lastError: null });
-    const activeRouter = router ?? await createPostRouter({ postId: post.id, accountId: post.accountId });
+    let currentKey: string | undefined;
+    const activeRouter = router ?? await createPostRouter({ postId: post.id, accountId: post.accountId }, undefined, label => {
+      if (label === currentKey) return;
+      currentKey = label;
+      void Promise.resolve(onStage?.('article_provider', label)).catch(() => undefined);
+    });
     await onStage?.('generating_article', 'Writing and reviewing a distinct implementation…');
     const implementation = await generateImplementation(activeRouter, savedContext, previous,
       fingerprint => reserveImplementation(post, savedContext, fingerprint));
@@ -202,8 +210,10 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
           .replace(savedContext.code, '[accepted source omitted]'), issues: feedback.reviewIssues,
       };
     } catch { /* an unreadable historical diagnostic must not prevent a clean generation */ }
+    const recentStyles = new Map(recent.map(item => [item.title ?? '', item.style ?? '']));
+    for (const { title } of sameProblem) if (title && !recentStyles.has(title)) recentStyles.set(title, '');
     const article = await generateArticle(activeRouter, articleContext,
-      recent.map(r => ({ style: r.style ?? '', title: r.title ?? '' })),
+      [...recentStyles].map(([title, style]) => ({ title, style })),
       plans => storeVisualAssets(plans, config.api.publicUrl), priorFailure, onStage);
     // Public posts must contain the two independently generated, durable GIFs.
     // Never degrade a scheduled post to trace tables: that makes a successful
@@ -249,8 +259,8 @@ export async function generateForRun(accountId: string, runId: string, force = f
     accountId, problemSlug: run.problemSlug, intent: 'community-solution',
   } } });
   if (existing && !['PENDING', 'RETRY_PENDING'].includes(existing.status)) {
-    if (force && (existing.status === 'FAILED' || (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(existing.status) &&
-      !contextSchema.parse(JSON.parse(existing.context)).articleImplementation))) {
+    if ((force && existing.status === 'FAILED') || (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(existing.status) &&
+      articleNeedsRefresh(contextSchema.parse(JSON.parse(existing.context))))) {
       return retryPost(existing.id, true, onStage);
     }
     return existing;
@@ -263,7 +273,7 @@ export async function retryPost(id: string, force = false, onStage?: StageCallba
   const refreshDraft = force && ['DRAFT_READY', 'AWAITING_APPROVAL'].includes(post.status);
   if (!refreshDraft && !['FAILED', 'RETRY_PENDING'].includes(post.status)) throw new PostError('NOT_RETRYABLE');
   const context = contextSchema.parse(JSON.parse(post.context));
-  if (refreshDraft && context.articleImplementation) throw new PostError('NOT_RETRYABLE');
+  if (refreshDraft && !articleNeedsRefresh(context)) throw new PostError('NOT_RETRYABLE');
   checkGenerationBudget(post, force);
   const run = await prisma.dailyRun.findFirst({ where: { accountId: post.accountId, submissionId: post.submissionId } });
   if (!run) throw new PostError('SUBMISSION_CONTEXT_MISSING');

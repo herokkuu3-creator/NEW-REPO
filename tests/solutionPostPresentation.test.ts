@@ -6,7 +6,7 @@ vi.mock('../src/database/prisma', () => ({ prisma: { systemState: {
   create: async ({ data }: any) => { if (h.states.has(data.key)) throw Object.assign(Error(), { code: 'P2002' }); h.states.set(data.key, data.value); },
   updateMany: async ({ where, data }: any) => { if (h.states.get(where.key) !== where.value) return { count: 0 }; h.states.set(where.key, data.value); return { count: 1 }; },
 } } }));
-import { reserveArticlePresentation, presentationVariant } from '../src/solutionPosts/presentation';
+import { articleBlockOrder, postPresentationVariant, reserveArticlePresentation, reservePostPresentation, presentationVariant } from '../src/solutionPosts/presentation';
 import { articleSchema, contextSchema, renderArticle, titleIncludesQuestionName } from '../src/solutionPosts/article';
 import { renderVisualGif, renderVisualFrame, visualPlanSchema } from '../src/solutionPosts/visuals';
 import { visualPreviewPlans } from '../src/solutionPosts/visualSamples';
@@ -59,6 +59,36 @@ it('gives a fifteen-account batch distinct reading structures, not only differen
   }));
   expect(new Set(rewritten).size).toBe(15);
   expect(rewritten.every(markdown => markdown.split(articleImplementation.code).length === 2 && !markdown.includes(context.code))).toBe(true);
+});
+it('assigns distinct block orders, GIF slots and geometry to the same problem under concurrent generation', async () => {
+  const assigned = await Promise.all(Array.from({ length: 15 }, () => reservePostPresentation('two-sum')));
+  const orders = assigned.map(item => articleBlockOrder(item.format!.index));
+  expect(new Set(orders.map(order => order.join(' '))).size).toBe(15);
+  expect(new Set(orders.map(order => `${order.indexOf('visual-1')}/${order.indexOf('visual-2')}`)).size).toBe(15);
+  expect(new Set(assigned.map(item => item.diagrams[0])).size).toBe(15);
+  expect(new Set(assigned.map(item => item.diagrams[1])).size).toBe(15);
+  expect(new Set(assigned.flatMap(item => item.diagrams.map((layout, role) =>
+    [layout, item.themes[role], item.motions?.[role]].join('/')))).size).toBe(30);
+  expect(assigned.filter(item => item.format?.optimization)).toHaveLength(1);
+  expect(new Set(Array.from({ length: 10_000 }, (_, index) => articleBlockOrder(index).join(' '))).size).toBe(10_000);
+});
+it('renders the two GIFs and AI code in reserved slots, with only the assigned draft allowed to show optimization', () => {
+  const draft = articleSchema.parse({ title: '✨ One Lookup Can Reveal the Missing Partner',
+    sections: ['intuition', 'approach', 'correctness', 'dryRun', 'takeaways'].map(kind => ({ kind, heading: `section-${kind}`, markdown: 'A short explanation of the decision.' })),
+    time: { bound: 'O(n)', reason: 'One pass visits n input items.' }, space: { bound: 'O(n)', reason: 'The table holds n input items.' },
+    optimization: 'One loop replaces two passes through the data.', visuals: visualPreviewPlans(presentationVariant(0)) });
+  const implementation = { code: 'class Solution { public: int result() { return 1; } };', approach: 'Return the computed result.' };
+  const assets = ['visual-1', 'visual-2'].map(id => ({ id, url: `https://example.test/${id}.gif`, alt: id }));
+  for (let i = 0; i < 15; i++) {
+    const markdown = renderArticle(draft, { ...context, articleImplementation: implementation, presentation: postPresentationVariant(i, i) }, assets);
+    const positions = new Map(Object.entries({ intuition: 'section-intuition', approach: 'section-approach', correctness: 'section-correctness',
+      dryRun: 'section-dryRun', takeaways: 'section-takeaways', costs: 'One pass visits', code: implementation.code,
+      'visual-1': 'https://example.test/visual-1.gif', 'visual-2': 'https://example.test/visual-2.gif' }).map(([key, marker]) => [key, markdown.indexOf(marker)]));
+    expect([...positions.values()].every(position => position >= 0)).toBe(true);
+    expect([...positions.keys()].sort((a, b) => positions.get(a)! - positions.get(b)!)).toEqual(articleBlockOrder(i));
+    expect(markdown.includes('### Optimization')).toBe(i === 0);
+    expect(markdown).not.toContain(context.code);
+  }
 });
 it('renders different diagram geometries and animated highlights without adding numeric states', async () => {
   const base = visualPlanSchema.parse({ id: 'visual-1', after: 'intuition', title: 'Watch the lookup', caption: 'Follow the active candidate.',

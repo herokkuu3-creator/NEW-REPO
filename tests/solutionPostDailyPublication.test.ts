@@ -19,16 +19,28 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
 } }));
 vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: h.publish }));
 import { publishDailyPost, processDailyPublicationQueue, dailyPublicationStatus, DAILY_PUBLICATION_GAP_MS } from '../src/solutionPosts/dailyPublication';
+import { postPresentationVariant } from '../src/solutionPosts/presentationStyles';
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-06T00:00:00Z'));
   h.states.clear(); h.posts.clear(); vi.clearAllMocks();
-  for (const id of ['a', 'b']) h.posts.set(id, { id, status: 'DRAFT_READY', approvedHash: 'approved' });
+  for (const id of ['a', 'b']) h.posts.set(id, { id, status: 'DRAFT_READY', approvedHash: 'approved', context: JSON.stringify({
+    accountId: id, username: id, problemId: '1', slug: 'example', title: 'Example', difficulty: 'Easy', problem: 'Example problem',
+    submissionId: '1', language: 'cpp', code: 'original code', challengeDate: '2026-11-06',
+    articleImplementation: { code: 'rewritten code', approach: 'Use a direct calculation.' }, presentation: postPresentationVariant(0, 0),
+  }) });
   h.publish.mockImplementation(async (id: string) => {
     const post = { ...h.posts.get(id), status: 'PUBLISHED', publishedAt: new Date(), publishedUrl: 'https://leetcode.com/' + id };
     h.posts.set(id, post); return post;
   });
 });
 afterEach(() => vi.useRealTimers());
+it('takes a stale draft out of the queue without using a publication slot', async () => {
+  const post = h.posts.get('a');
+  post.context = JSON.stringify({ ...JSON.parse(post.context), presentation: undefined });
+  expect((await publishDailyPost('a')).lastError).toBe('ARTICLE_LAYOUT_REFRESH_REQUIRED');
+  expect(h.publish).not.toHaveBeenCalled();
+  expect((await publishDailyPost('b')).status).toBe('PUBLISHED');
+});
 it('queues the second account and publishes only after a full 20-minute gap', async () => {
   expect((await publishDailyPost('a')).status).toBe('PUBLISHED');
   expect((await publishDailyPost('b')).lastError).toBe('DAILY_PUBLICATION_COOLDOWN');

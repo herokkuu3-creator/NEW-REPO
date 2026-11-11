@@ -16,10 +16,12 @@ vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error 
   withAccount: vi.fn(async (_account, action) => action(h.api, h.page, 'alice')) }));
 import { hash } from '../src/solutionPosts/article';
 import { config } from '../src/config';
+import { postPresentationVariant } from '../src/solutionPosts/presentationStyles';
 import { prepareEditor, publishPost, reconcilePost, reserveBrowserPublication, validSolutionUrl, inspectPublication } from '../src/solutionPosts/publisher';
 const context = { accountId: 'a', username: 'alice', problemId: '1', slug: 'example', title: 'Example', difficulty: 'Easy',
-  problem: 'Example problem', submissionId: '456', language: 'cpp', code: 'class Solution {};', challengeDate: '2026-10-15' };
-const markdown = '## Teach with sets\n\nAn educational explanation.\n\n```cpp\nclass Solution {};\n```\n';
+  problem: 'Example problem', submissionId: '456', language: 'cpp', code: 'class Solution {};', challengeDate: '2026-10-15',
+  presentation: postPresentationVariant(0, 0), articleImplementation: { code: 'class Solution { public: int count() { return 0; } };', approach: 'Return the only count.' } };
+const markdown = `## Teach with sets\n\nAn educational explanation.\n\n\`\`\`cpp\n${context.articleImplementation.code}\n\`\`\`\n`;
 beforeEach(() => {
   config.solutionPosts.publishTransport = 'browser';
   vi.clearAllMocks(); h.text = h.original; h.title = ''; h.clicked = false; h.duplicate = false; h.verifyFailure = false;
@@ -64,7 +66,7 @@ describe('authorized solution publishing', () => {
   it('publishes the reviewed implementation while verifying the original accepted submission', async () => {
     config.solutionPosts.publishTransport = 'api';
     const articleImplementation = { code: 'class Solution { public: int size() { return 1; } };', approach: 'Return the fixed size.' };
-    const rewritten = markdown.replace(context.code, articleImplementation.code);
+    const rewritten = markdown.replace(context.articleImplementation.code, articleImplementation.code);
     const digest = hash(h.row.title + '\n' + rewritten);
     Object.assign(h.row, { context: JSON.stringify({ ...context, articleImplementation }),
       markdown: rewritten, contentHash: digest, approvedHash: digest });
@@ -82,6 +84,11 @@ describe('authorized solution publishing', () => {
   it('rejects a draft whose code block differs from the reviewed implementation', async () => {
     h.row.context = JSON.stringify({ ...context, articleImplementation: { code: 'class Different {};', approach: 'A reviewed approach.' } });
     await expect(publishPost('post1')).rejects.toThrow('SOURCE_INTEGRITY_FAILED');
+    expect(h.api.graphql).not.toHaveBeenCalled();
+  });
+  it('requires a new layout before a legacy draft can publish', async () => {
+    h.row.context = JSON.stringify({ ...context, presentation: undefined });
+    await expect(publishPost('post1')).rejects.toThrow('ARTICLE_LAYOUT_REFRESH_REQUIRED');
     expect(h.api.graphql).not.toHaveBeenCalled();
   });
   it('never retries an uncertain publication API request or falls back to a Post click', async () => {

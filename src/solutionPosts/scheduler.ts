@@ -55,6 +55,7 @@ export type SolutionWorkflowStage =
   | 'submitting'
   | 'accepted'
   | 'generating_article'
+  | 'article_provider'
   | 'drafting_intuition'
   | 'drafting_approach'
   | 'planning_animations'

@@ -114,6 +114,7 @@ import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver
 import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool, removeSolutionApiKey, solutionKeyPoolStatus, testSolutionApiKey, testAllSolutionApiKeys, maskSolutionApiKey } from '../solutionPosts/keyPool';
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
 import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
+import { COARENA_WRITER, loadCoarenaKey, maskCoarenaKey } from '../solutionPosts/coarena';
 import { boostSolutionArticleViews, extractTopicIdFromUrl, fetchLiveSolutionMetrics } from '../solutionPosts/upvote';
 import { prisma } from '../database/prisma';
 import { firecrawlProbeRequest, probeFirecrawl } from '../solutionPosts/firecrawlProbe';
@@ -2040,6 +2041,7 @@ interface AccountWorkflowState {
   error?: string;
   previousError?: string;
   detail?: string;
+  articleProvider?: string;
   milestones: string[];
 }
 
@@ -2052,6 +2054,7 @@ function renderSolutionWorkflowProgress(
   accounts.forEach((account, index) => {
     const state = states.get(account.id);
     lines.push(`👤 <b>Account ${index + 1}/${accounts.length} · ${escapeHtml(accountName(account))}</b>`);
+    if (state?.articleProvider) lines.push(`├ 🔑 ${escapeHtml(state.articleProvider)}`);
     const milestones = state?.milestones ?? [];
     if (milestones.length > 0) {
       const visibleMilestones = milestones.length > 5 ? milestones.slice(-5) : milestones;
@@ -2125,6 +2128,11 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
 
   const update = async (event: { accountId: string; stage: string; detail?: string; error?: string; previousError?: string }) => {
     const prev = states.get(event.accountId) ?? { stage: 'queued', milestones: [] };
+    if (event.stage === 'article_provider') {
+      states.set(event.accountId, { ...prev, articleProvider: event.detail });
+      scheduleEdit();
+      return;
+    }
     const milestones = [...prev.milestones];
     const addMilestone = (m: string) => {
       if (!milestones.includes(m)) milestones.push(m);
@@ -2160,6 +2168,7 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
       detail: event.detail,
       error: event.error,
       previousError: event.previousError,
+      articleProvider: prev.articleProvider,
       milestones,
     });
 
@@ -3541,10 +3550,13 @@ export async function handleAddCapSolverCommand(commandArg?: string): Promise<vo
 }
 
 export async function formatSolutionKeyStatus(): Promise<string> {
-  const status = await solutionKeyPoolStatus();
+  const [status, primary] = await Promise.all([solutionKeyPoolStatus(), loadCoarenaKey()]);
   const lines = [
-    '✨ <b>Intern-AI Article Key Pool</b>',
+    '✨ <b>Article AI Providers</b>',
     '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
+    primary ? `Primary: <b>Coarena</b> · <code>${escapeHtml(maskCoarenaKey(primary))}</code> · ${escapeHtml(COARENA_WRITER)}` :
+      'Primary: <b>Discovery</b>',
+    primary ? '<b>Discovery fallback keys</b>' : '<b>Discovery keys</b>',
     `Stored keys: <b>${status.total}</b>`,
     `Active key: <b>${status.active ? `#${status.active}` : 'none'}</b>`,
     `Source: <b>${escapeHtml(status.source)}</b>`,
@@ -3552,7 +3564,7 @@ export async function formatSolutionKeyStatus(): Promise<string> {
     '',
   ];
   if (!status.keys.length) {
-    lines.push('No article-generation API keys are configured.');
+    lines.push('No Discovery keys are configured.');
   } else {
     for (const key of status.keys) {
       lines.push(`├ Key #${key.position}: <code>${escapeHtml(key.masked)}</code>${key.active ? ' <b>[ACTIVE]</b>' : ''}`);

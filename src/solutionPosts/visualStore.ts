@@ -36,7 +36,8 @@ export async function storeVisualAssets(plans: VisualPlan[], baseUrl: string): P
 export async function verifyHostedVisualAssets(assets: VisualAsset[], baseUrl: string,
   fetcher: typeof fetch = globalThis.fetch): Promise<boolean> {
   const origin = publicVisualOrigin(baseUrl);
-  if (!origin || assets.length !== 2 || new Set(assets.map(asset => asset.id)).size !== 2) return false;
+  if (!origin || assets.length !== 2 || new Set(assets.map(asset => asset.id)).size !== 2 ||
+      new Set(assets.map(asset => asset.url)).size !== 2) return false;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12_000);
   try {

@@ -25,7 +25,8 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
 vi.mock('../src/solutionPosts/article', async orig => ({ ...(await orig() as object), generateArticle: h.generation }));
 vi.mock('../src/solutionPosts/implementation', async orig => ({ ...(await orig() as object), generateImplementation: h.implementation }));
 vi.mock('../src/solutionPosts/presentation', async orig => ({ ...(await orig() as object),
-  reserveArticlePresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 2, motions: ['scan', 'slide'] })) }));
+  reservePostPresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 2,
+    motions: ['scan', 'slide'], format: { index: 0, optimization: true } })) }));
 vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn(), verifyHostedVisualAssets: h.verifyVisuals }));
 vi.mock('playwright', () => ({ chromium: { launch: h.launch } }));
 vi.mock('../src/browser/sessionCheck', () => ({ checkSession: h.checkSession }));
@@ -122,12 +123,13 @@ describe('solution workflow and persistence', () => {
     expect(saved.presentation).toMatchObject({ visualVersion: 2, diagrams: ['timeline', 'rail'] });
     expect(saved.code).toBe(context.code); expect(h.row.codeHash).toBe(hash(context.code));
   });
-  it('regenerates an explicitly retried legacy draft and requires approval of the replacement', async () => {
+  it('regenerates a legacy draft on the next generation request and requires approval of the replacement', async () => {
     await generatePost(context, {} as never);
-    const { articleImplementation: _implementation, ...legacyContext } = JSON.parse(h.row.context);
+    const legacyContext = JSON.parse(h.row.context);
+    delete legacyContext.presentation.format;
     Object.assign(h.row, { status: 'DRAFT_READY', approvedHash: h.row.contentHash, context: JSON.stringify(legacyContext) });
     h.pool.mockResolvedValue({ keys: ['valid-test-key'], activeIndex: 0, stored: false });
-    const post = await generateForRun('a', 'run1', true);
+    const post = await generateForRun('a', 'run1');
     expect(post).toMatchObject({ status: 'AWAITING_APPROVAL', approvedHash: null, codeHash: hash(context.code) });
     expect(JSON.parse(post.context)).toMatchObject({ code: context.code, articleImplementation: implementation });
     expect(h.verdict).toHaveBeenCalledTimes(1);

@@ -1,6 +1,30 @@
 import { prisma } from '../database/prisma';
-import { ArticlePresentation, presentationSchema, presentationVariant } from './presentationStyles';
+import { createHash } from 'node:crypto';
+import { ArticlePresentation, postPresentationVariant, presentationSchema, presentationVariant } from './presentationStyles';
 export * from './presentationStyles';
+
+async function takePresentationNumber(key: string): Promise<number> {
+  for (let attempt = 0; attempt < 64; attempt++) {
+    const row = await prisma.systemState.findUnique({ where: { key } });
+    const number = Number(row?.value ?? 0);
+    if (!Number.isSafeInteger(number) || number < 0) throw Error('PRESENTATION_ASSIGNMENT_INVALID');
+    const value = String(number + 1);
+    if (row) {
+      if ((await prisma.systemState.updateMany({ where: { key, value: row.value }, data: { value } })).count) return number;
+    } else {
+      try { await prisma.systemState.create({ data: { key, value } }); return number; }
+      catch (error) { if ((error as { code?: string }).code !== 'P2002') throw error; }
+    }
+  }
+  throw Error('PRESENTATION_ASSIGNMENT_BUSY');
+}
+
+export async function reservePostPresentation(slug: string): Promise<ArticlePresentation> {
+  const index = await takePresentationNumber('solution-presentation:posts:v3');
+  const problemIndex = await takePresentationNumber(`solution-presentation:problem:v3:${slug}`);
+  const offset = createHash('sha256').update(slug).digest().readUInt16BE(0);
+  return postPresentationVariant(index, problemIndex, offset);
+}
 
 /** A durable assignment avoids identical neighboring accounts and survives retries. */
 export async function reserveArticlePresentation(accountId: string, _slug: string): Promise<ArticlePresentation> {

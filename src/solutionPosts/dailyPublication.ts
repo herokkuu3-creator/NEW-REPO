@@ -6,6 +6,7 @@ import { logger } from '../logger';
 import { config } from '../config';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { startArticleWorkKeepAlive } from './keepAlive';
+import { articleNeedsRefresh, contextSchema } from './article';
 
 export const DAILY_PUBLICATION_GAP_MS = 20 * 60 * 1000;
 export const DAILY_PUBLICATION_STATE_KEY = 'solution-post-daily-publication:gate';
@@ -52,6 +53,10 @@ export async function publishDailyPost(id: string, now = new Date()): Promise<So
     await prisma.systemState.deleteMany({ where: { key } }); return post;
   }
   if (post.status !== 'DRAFT_READY') throw Error('DAILY_DRAFT_NOT_READY');
+  if (articleNeedsRefresh(contextSchema.parse(JSON.parse(post.context)))) {
+    await prisma.systemState.deleteMany({ where: { key } });
+    return { ...post, lastError: 'ARTICLE_LAYOUT_REFRESH_REQUIRED' };
+  }
   await prisma.systemState.upsert({ where: { key }, create: { key,
     value: JSON.stringify({ postId: id, queuedAt: now.toISOString(), failures: 0 }) }, update: {} });
   const claim = await claimSlot(now.getTime());

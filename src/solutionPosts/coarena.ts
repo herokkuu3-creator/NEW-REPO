@@ -1,11 +1,15 @@
 import { z } from 'zod';
+import { createDecipheriv, createHash } from 'node:crypto';
 import type { LLMMessage } from '../ai/provider';
+import { config } from '../config';
 import { getSystemState, setSystemState } from '../database/models';
 import { decryptText, encryptText } from '../security/credentialStore';
 import { AIModelRouter, ModelAttempt, OutputValidationError, RoutingError } from './router';
 
 const BASE_URL = 'https://coarena.ai/api/v1';
 const KEY_STATE = 'solution-post-coarena-key:v1';
+// Sealed to the service's existing SETUP_TOKEN. The repository contains only ciphertext.
+const BOOTSTRAP_KEY = 'jeYQeXLvzbbbmZpa:XOWp1wC4OfzANW5McLJPTw:wtaRTks1XsSn_04OQkxyJmswqrylZlhDio6BIP2gum0zF03p';
 export const COARENA_WRITER = 'claude-sonnet-5-5';
 export const COARENA_REVIEWER = 'gpt-6-1-sol';
 const DAILY_LIMIT = 5;
@@ -14,9 +18,21 @@ const limitsSchema = z.object({ data: z.object({ free: z.boolean(), usd_per_day:
 }) }) });
 
 export async function loadCoarenaKey(): Promise<string | null> {
-  const encrypted = await getSystemState(KEY_STATE);
-  return encrypted ? decryptText(encrypted) : null;
+  const environment = process.env.COARENA_API_KEY?.trim();
+  if (environment) return environment;
+  const encrypted = await getSystemState(KEY_STATE).catch(() => null);
+  const stored = encrypted && decryptText(encrypted);
+  if (stored) return stored;
+  try {
+    const [iv, tag, ciphertext] = BOOTSTRAP_KEY.split(':').map(part => Buffer.from(part, 'base64url'));
+    const key = createHash('sha256').update(`coarena-render-bootstrap:v1\0${config.api.setupToken}`).digest();
+    const decipher = createDecipheriv('aes-256-gcm', key, iv!);
+    decipher.setAuthTag(tag!);
+    return Buffer.concat([decipher.update(ciphertext!), decipher.final()]).toString('utf8');
+  } catch { return null; }
 }
+
+export function maskCoarenaKey(key: string): string { return `coa_…${key.slice(-4)}`; }
 
 async function readLimits(key: string) {
   const response = await fetch(`${BASE_URL}/limits`, { headers: { Authorization: `Bearer ${key}` },
@@ -29,7 +45,8 @@ export async function coarenaStatus() {
   const key = await loadCoarenaKey();
   if (!key) return { enabled: false };
   const limits = await readLimits(key);
-  return { enabled: true, writer: COARENA_WRITER, reviewer: COARENA_REVIEWER, dailyLimitUsd: limits.usd_per_day, ...limits.today };
+  return { enabled: true, keyMasked: maskCoarenaKey(key), writer: COARENA_WRITER, reviewer: COARENA_REVIEWER,
+    dailyLimitUsd: limits.usd_per_day, ...limits.today };
 }
 
 // Coarena enforces the daily account cap, including costs held by in-flight calls.

@@ -31,6 +31,7 @@ export const visualPlanSchema = z.object({
   theme: z.enum(visualThemes).default('aurora'),
   layout: z.enum(diagramLayouts).optional(),
   motion: z.enum(visualMotions).optional(),
+  pace: z.enum(['quick', 'measured', 'hold-final']).optional(),
   frames: z.array(visualFrameSchema).min(2).max(8),
 }).superRefine((plan, ctx) => {
   for (const [i, frame] of plan.frames.entries()) if (frame.active.some(n => n >= frame.items.length)) {
@@ -159,6 +160,8 @@ export async function renderVisualGif(input: VisualPlan): Promise<Buffer> {
   const [{ default: sharp }, { GIFEncoder, quantize, applyPalette }] = await Promise.all([import('sharp'), import('gifenc')]);
   const gif = GIFEncoder();
   const [width, height] = visualDimensions(plan);
+  const [stepDelay, finalDelay] = plan.pace === 'quick' ? [1050, 1700] : plan.pace === 'measured' ? [1650, 2150] :
+    plan.pace === 'hold-final' ? [1250, 2800] : [1450, 2300];
   // Process sequentially so a worker never retains a full animation of RGBA frames in memory.
   for (let i = 0; i < plan.frames.length; i++) {
     const phases = plan.layout ? [.25, .65, 1] : [1];
@@ -167,7 +170,7 @@ export async function renderVisualGif(input: VisualPlan): Promise<Buffer> {
     const palette = quantize(rgba, 64);
     gif.writeFrame(applyPalette(rgba, palette), width, height, { palette, repeat: 0,
       delay: phase < 1 ? (phase === .25 ? 120 : 160) :
-        (i === plan.frames.length - 1 ? 2300 : 1450) - (plan.layout ? 280 : 0) });
+        (i === plan.frames.length - 1 ? finalDelay : stepDelay) - (plan.layout ? 280 : 0) });
     }
   }
   gif.finish();
