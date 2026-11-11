@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { config } from '../config';
 import { logger } from '../logger';
 import { prisma } from '../database/prisma';
+import { getSystemState, setSystemState } from '../database/models';
 import { parseStoredStorageState } from '../database/accounts';
 import { checkSession } from '../browser/sessionCheck';
 import { LeetCodeApi } from '../leetcode/apiClient';
@@ -20,7 +21,15 @@ import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, maskSolutionApiKey, resetSolutionApiKeyPool, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 import { startArticleWorkKeepAlive } from './keepAlive';
 import { generateImplementation, IMPLEMENTATION_STAGE_BUDGET } from './implementation';
-import { CoarenaRouter, loadCoarenaKey, maskCoarenaKey } from './coarena';
+import { CoarenaRouter, loadCoarenaKey, maskCoarenaKey, type CoarenaReply } from './coarena';
+import { CoarenaPause, isCoarenaPauseCode, isCoarenaPaused } from './coarenaLimits';
+
+type PublicationMode = SubmissionContext['resumePublication'];
+const checkpointPrefix = (postId: string) => 'solution-post-coarena-reply:' + postId + ':';
+
+function awaitingCoarena(post: SolutionPost): boolean {
+  return isCoarenaPaused(post) && (post.leaseUntil?.getTime() ?? 0) > Date.now();
+}
 
 export class PostError extends Error {
   constructor(public readonly code: string, public readonly details?: {
@@ -90,10 +99,16 @@ export async function createPostRouter(correlation: { postId?: string; accountId
   providerOverride?: 'firecrawl' | 'bazaarlink', reportKey?: (label: string) => void): Promise<AIModelRouter> {
   const deadlineAt = providerOverride ? undefined : Date.now() + SOLUTION_ARTICLE_WORK_MS;
   const key = providerOverride ? null : await loadCoarenaKey().catch(() => null);
+  if (key) reportKey?.('Coarena · ' + maskCoarenaKey(key));
   if (key) return new CoarenaRouter(key, () => createDiscoveryRouter(correlation, reportKey, deadlineAt), attempt => {
-    if (attempt.attempt > 0 && attempt.model !== 'discovery') reportKey?.(`Coarena · ${maskCoarenaKey(key)}`);
     logger.info({ ...correlation, attempt }, 'solution article AI attempt finished');
-  }, deadlineAt);
+  }, deadlineAt, correlation.postId ? {
+    async read(id) {
+      const saved = await getSystemState(checkpointPrefix(correlation.postId!) + id);
+      return saved ? JSON.parse(saved) as CoarenaReply : null;
+    },
+    save: (id, reply) => setSystemState(checkpointPrefix(correlation.postId!) + id, JSON.stringify(reply)),
+  } : undefined);
   if ((providerOverride ?? config.solutionPosts.aiProvider) === 'firecrawl') {
     if (!config.solutionPosts.firecrawlApiKey) throw new PostError('FIRECRAWL_KEY_REQUIRED');
     return new FirecrawlAgentRouter(config.solutionPosts.firecrawlApiKey, config.solutionPosts.agentMaxCredits,
@@ -154,14 +169,17 @@ async function reserveImplementation(post: SolutionPost, context: SubmissionCont
   }
 }
 
-export async function generatePost(context: SubmissionContext, router?: AIModelRouter, force = false, onStage?: StageCallback): Promise<SolutionPost> {
+export async function generatePost(context: SubmissionContext, router?: AIModelRouter, force = false, onStage?: StageCallback,
+  publicationMode?: PublicationMode): Promise<SolutionPost> {
   let post = await ensurePost(context);
-  if (!['PENDING', 'RETRY_PENDING'].includes(post.status)) return post;
+  if (!['PENDING', 'RETRY_PENDING'].includes(post.status) || awaitingCoarena(post)) return post;
+  const priorRetryCount = force && post.retryCount >= SOLUTION_POST_RETRY_LIMIT ? 0 : post.retryCount;
   checkGenerationBudget(post, force);
   // Use the immutable original snapshot when a later submission for the same problem exists.
   const originalContext = contextSchema.parse(JSON.parse(post.context));
   if (hash(originalContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
-  const savedContext = { ...originalContext, presentation: originalContext.presentation?.format ? originalContext.presentation :
+  const savedContext = { ...originalContext, resumePublication: publicationMode ?? originalContext.resumePublication,
+    presentation: originalContext.presentation?.format ? originalContext.presentation :
     await reservePostPresentation(post.problemSlug) };
   const workMs = config.solutionPosts.aiProvider === 'firecrawl' ? (6 + IMPLEMENTATION_STAGE_BUDGET) * FIRECRAWL_STAGE_BUDGET_MS : SOLUTION_ARTICLE_WORK_MS;
   const leaseMs = workMs + 120_000;
@@ -174,6 +192,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     explicitRetry: force, previousError: post.lastError }, 'solution article generation claimed');
   const stopKeepAlive = startArticleWorkKeepAlive();
   let implementationAttempts: Awaited<ReturnType<typeof generateImplementation>>['attempts'] = [];
+  let useCoarena = false;
   try {
     // Context comes only from a verified accepted DailyRun; publishing rechecks eligibility and identity.
     const [recent, sameProblem] = await Promise.all([
@@ -191,13 +210,14 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
       } catch { /* An unreadable historical snapshot has no comparable code. */ }
       return [];
     });
-    post = await move(post, 'GENERATING', { lastError: null });
+    post = await move(post, 'GENERATING', { lastError: isCoarenaPauseCode(post.lastError) ? post.lastError : null });
     let currentKey: string | undefined;
     const activeRouter = router ?? await createPostRouter({ postId: post.id, accountId: post.accountId }, undefined, label => {
       if (label === currentKey) return;
       currentKey = label;
       void Promise.resolve(onStage?.('article_provider', label)).catch(() => undefined);
     });
+    useCoarena = activeRouter instanceof CoarenaRouter;
     await onStage?.('generating_article', 'Writing and reviewing a distinct implementation…');
     const implementation = await generateImplementation(activeRouter, savedContext, previous,
       fingerprint => reserveImplementation(post, savedContext, fingerprint));
@@ -227,9 +247,20 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
       style: article.style, model: article.model, reviewModel: article.reviewModel, context: JSON.stringify(articleContext),
       attempts: JSON.stringify([...implementationAttempts, ...article.attempts]),
       contentHash: hash(`${article.title}\n${article.markdown}`), approvedHash: null });
-    post = await move(post, 'DRAFT_READY', { leaseUntil: null });
-    return move(post, 'AWAITING_APPROVAL');
+    post = await move(post, 'DRAFT_READY', { leaseUntil: null, lastError: null });
+    post = await move(post, 'AWAITING_APPROVAL');
+    return post;
   } catch (error) {
+    if (error instanceof CoarenaPause) {
+      const attempts = [...implementationAttempts, ...error.attempts];
+      if (!error.attempts.length) attempts.push({ model: 'limits', provider: 'coarena',
+        attempt: 0, elapsedMs: 0, outcome: error.code, deferred: true });
+      post = await move(post, 'RETRY_PENDING', { leaseUntil: error.retryAt, lastError: error.code,
+        attempts: JSON.stringify(attempts), retryCount: priorRetryCount });
+      logger.info({ postId: post.id, accountId: post.accountId, code: error.code, retryAt: error.retryAt },
+        'solution article waiting for Coarena');
+      return post;
+    }
     // A CAS failure must not overwrite the current owner's result.
     if (['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING'].includes(post.status)) {
       post = await move(post, 'FAILED', { leaseUntil: null,
@@ -250,23 +281,31 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
         error: post.lastError }, 'solution article generation failed');
     }
     return post;
-  } finally { stopKeepAlive(); }
+  } finally {
+    stopKeepAlive();
+    if (useCoarena && ['AWAITING_APPROVAL', 'FAILED'].includes(post.status)) {
+      await prisma.systemState.deleteMany({ where: { key: { startsWith: checkpointPrefix(post.id) } } })
+        .catch(() => undefined);
+    }
+  }
 }
 
-export async function generateForRun(accountId: string, runId: string, force = false, onStage?: StageCallback): Promise<SolutionPost> {
+export async function generateForRun(accountId: string, runId: string, force = false, onStage?: StageCallback,
+  publicationMode?: PublicationMode): Promise<SolutionPost> {
   const run = await prisma.dailyRun.findUniqueOrThrow({ where: { id: runId } });
   if (run.accountId !== accountId) throw new PostError('ACCOUNT_IDENTITY_MISMATCH');
   const existing = await prisma.solutionPost.findUnique({ where: { accountId_problemSlug_intent: {
     accountId, problemSlug: run.problemSlug, intent: 'community-solution',
   } } });
+  if (existing && awaitingCoarena(existing)) return existing;
   if (existing && !['PENDING', 'RETRY_PENDING'].includes(existing.status)) {
     if ((force && existing.status === 'FAILED') || (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(existing.status) &&
       articleNeedsRefresh(contextSchema.parse(JSON.parse(existing.context))))) {
-      return retryPost(existing.id, true, onStage);
+      return retryPost(existing.id, true, onStage, publicationMode);
     }
     return existing;
   }
-  return generatePost(await loadContext(accountId, runId), undefined, force, onStage);
+  return generatePost(await loadContext(accountId, runId), undefined, force, onStage, publicationMode);
 }
 
 export async function requeueInterruptedGeneration(id: string, updatedAt: Date): Promise<SolutionPost> {
@@ -277,18 +316,23 @@ export async function requeueInterruptedGeneration(id: string, updatedAt: Date):
   }
   const key = 'solution-post-job:' + post.accountId + ':' + updatedAt.toISOString().slice(0, 10);
   const lock = await prisma.systemState.findUnique({ where: { key } });
-  const recovered = await move(post, 'RETRY_PENDING', { leaseUntil: null, lastError: 'GENERATION_INTERRUPTED' });
+  const recovered = await move(post, 'RETRY_PENDING', isCoarenaPauseCode(post.lastError)
+    ? { leaseUntil: new Date(), retryCount: { decrement: 1 } }
+    : { leaseUntil: null, lastError: 'GENERATION_INTERRUPTED' });
   // Remove only the account lock observed before this generation made progress.
   if (lock && lock.updatedAt <= updatedAt) await prisma.systemState.deleteMany({ where: { key, value: lock.value } });
   return recovered;
 }
 
-export async function retryPost(id: string, force = false, onStage?: StageCallback): Promise<SolutionPost> {
+export async function retryPost(id: string, force = false, onStage?: StageCallback,
+  publicationMode?: PublicationMode): Promise<SolutionPost> {
   const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
+  if (awaitingCoarena(post)) return post;
   const refreshDraft = force && ['DRAFT_READY', 'AWAITING_APPROVAL'].includes(post.status);
   if (!refreshDraft && !['FAILED', 'RETRY_PENDING'].includes(post.status)) throw new PostError('NOT_RETRYABLE');
   const context = contextSchema.parse(JSON.parse(post.context));
   if (refreshDraft && !articleNeedsRefresh(context)) throw new PostError('NOT_RETRYABLE');
+  if (isCoarenaPaused(post)) return generatePost(context, undefined, force, onStage, publicationMode);
   checkGenerationBudget(post, force);
   const run = await prisma.dailyRun.findFirst({ where: { accountId: post.accountId, submissionId: post.submissionId } });
   if (!run) throw new PostError('SUBMISSION_CONTEXT_MISSING');
@@ -299,7 +343,7 @@ export async function retryPost(id: string, force = false, onStage?: StageCallba
   } else if (post.status === 'FAILED') {
     await move(post, 'RETRY_PENDING');
   }
-  return generatePost(context, undefined, force, onStage);
+  return generatePost(context, undefined, force, onStage, publicationMode);
 }
 
 /** When API keys are renewed or reset, unlock any posts stalled on key errors or retry limits. */

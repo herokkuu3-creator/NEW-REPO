@@ -43,6 +43,8 @@ export interface ModelAttempt {
   stage?: string;
   httpStatus?: number;
   retryAfterMs?: number;
+  providerCode?: string;
+  retryAllowed?: boolean;
   deferred?: boolean;
   agentCreditsUsed?: number;
   providerLimit?: 'requests_per_minute' | 'concurrency' | 'daily' | 'unknown';
@@ -80,6 +82,7 @@ export class AIModelRouter {
     value: T; model: string; attempts: ModelAttempt[];
   }> {
     const attempts: ModelAttempt[] = [];
+    const coarena = new URL(this.options.baseUrl).hostname === 'coarena.ai';
     let lastFailureReason: string | undefined;
     const remainingTime = (timeout: number) => {
       const remaining = (this.options.deadlineAt ?? Infinity) - Date.now();
@@ -197,17 +200,33 @@ export class AIModelRouter {
             const request = { model, messages, max_tokens: attemptMaxTokens,
               ...(jsonMode ? { response_format: { type: 'json_object' as const } } : {}),
               ...(this.options.reasoningEffort ? { reasoning_effort: this.options.reasoningEffort } : {}) };
-            const response = await client.chat.completions.create(
+            const completion = client.chat.completions.create(
               request as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
             { timeout: remainingTime(sageReasoning && stage?.startsWith('technical review') ?
               Math.max(this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs,
                 fullRepair ? SAGE_REPAIR_TIMEOUT_MS : SAGE_REVIEW_TIMEOUT_MS) :
               this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs) });
+            let response: OpenAI.Chat.Completions.ChatCompletion;
+            if (coarena) {
+              const { data, response: http } = await completion.withResponse();
+              // Coarena can return a padded HTTP 200 carrying an upstream error.
+              const embedded = (data as unknown as { error?: { code?: string; message?: string } }).error;
+              if (embedded?.code) {
+                const limited = /^(?:rate_limit_exceeded|concurrency_limit_exceeded|insufficient_quota)$/.test(embedded.code);
+                throw new OpenAI.APIError(limited ? 429 : 502, embedded, embedded.message, {
+                  'retry-after': http.headers.get('retry-after') ?? '',
+                  'x-should-retry': http.headers.get('x-should-retry') ?? '',
+                });
+              }
+              response = data;
+            } else {
+              response = await completion;
+            }
             if (sageReasoning) sageModelHealth.delete(healthKey);
             record.usage = response.usage;
             const cost = (response as unknown as { cost?: unknown }).cost;
             if (typeof cost === 'number' && Number.isFinite(cost)) record.cost = cost;
-            const finishReason = response.choices[0]?.finish_reason;
+            const finishReason = response.choices?.[0]?.finish_reason;
             if (finishReason !== 'stop') {
               throw new Error('INCOMPLETE_OUTPUT');
             }
@@ -321,12 +340,16 @@ export function isKeyExhausted(error: unknown, baseUrl?: string): boolean {
   return /quota|credit|balance|billing|payment|monthly|insufficient_funds/.test(detail);
 }
 
-function httpFailureDetails(error: unknown): Pick<ModelAttempt, 'httpStatus' | 'retryAfterMs'> {
+function httpFailureDetails(error: unknown): Pick<ModelAttempt, 'httpStatus' | 'retryAfterMs' | 'providerCode' | 'retryAllowed'> {
   if (!(error instanceof OpenAI.APIError)) return {};
   const headers = error.headers as Headers | Record<string, string> | undefined;
-  const value = headers instanceof Headers ? headers.get('retry-after') : headers?.['retry-after'];
+  const header = (name: string) => headers instanceof Headers ? headers.get(name) : headers?.[name];
+  const value = header('retry-after');
   const delay = value ? (/^\d+(?:\.\d+)?$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now()) : NaN;
-  return { httpStatus: error.status, ...(Number.isFinite(delay) ? { retryAfterMs: Math.max(0, delay) } : {}) };
+  const code = error.code;
+  return { httpStatus: error.status, ...(Number.isFinite(delay) ? { retryAfterMs: Math.max(0, delay) } : {}),
+    ...(code && /^[a-z0-9_]{1,64}$/.test(code) ? { providerCode: code } : {}),
+    ...(header('x-should-retry') === 'false' ? { retryAllowed: false } : {}) };
 }
 
 function assertBazaarCooldownBudget(record: ModelAttempt): void {

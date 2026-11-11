@@ -1,3 +1,4 @@
+import { CoarenaPause } from './coarenaLimits';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { AIModelRouter, OutputValidationError, RoutingError, ModelAttempt } from './router';
@@ -24,6 +25,7 @@ export const contextSchema = z.object({
   code: z.string().min(1).max(100000), challengeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   presentation: presentationSchema.optional(),
   articleImplementation: implementationSchema.optional(),
+  resumePublication: z.enum(['daily', 'manual']).optional(),
   topicTags: z.array(z.object({ name: z.string(), slug: z.string() })).optional().default([]),
 });
 export type SubmissionContext = z.infer<typeof contextSchema>;
@@ -292,7 +294,7 @@ export async function generateArticle(router: AIModelRouter, context: Submission
     if (router.canUsePrimary) {
       try { return await generateCoarenaArticle(router, context, recent, resolveVisuals, onStage); }
       catch (error) {
-        if (!(error instanceof RoutingError)) throw error;
+        if (error instanceof CoarenaPause || !(error instanceof RoutingError)) throw error;
         primaryAttempts = error.attempts;
         logger.warn({ accountId: context.accountId, outcome: error.lastFailure }, 'Coarena article draft deferred to Discovery');
       }
@@ -552,6 +554,7 @@ async function generateCoarenaArticle(router: CoarenaRouter, context: Submission
         article, visuals: article.visuals, assets, visualFallback: assets.length < article.visuals.length,
         attempts, reviewModel: review.model };
     } catch (error) {
+      if (error instanceof CoarenaPause) throw error.withAttempts(attempts);
       if (!(error instanceof RoutingError)) throw error;
       const records = error.attempts.length ? error.attempts : [{ model: COARENA_WRITER, provider: 'coarena' as const,
         attempt: 0, elapsedMs: 0, outcome: error.lastFailure ?? 'COARENA_UNAVAILABLE' }];

@@ -1996,6 +1996,7 @@ function solutionStageText(stage: string, error?: string, previousError?: string
     case 'publishing_article': return '📮 Posting article to LeetCode with tags…';
     case 'published': return '🚀 Published to LeetCode with tags · Upvotes scheduled';
     case 'article_ready': return '📝 Article generated and awaiting review';
+    case 'provider_paused': return '⏸️ ' + escapeHtml(detail ?? 'Waiting for Coarena. Automatic retry queued.');
     case 'publication_queued': return '⏳ Reviewed article queued; daily posts are spaced at least 20 minutes apart.';
     case 'skipped': return error === 'ACCOUNT_JOB_IN_PROGRESS' ? '⏳ Another run is processing this account; this run skipped it.' :
       `⏭️ Skipped: ${escapeHtml(error ?? 'already in progress')}`;
@@ -2172,7 +2173,7 @@ async function startDailySolutionWorkflow(accountIds: string[], questionNumber?:
       milestones,
     });
 
-    const isTerminal = ['published', 'failed', 'skipped', 'article_ready'].includes(event.stage);
+    const isTerminal = ['published', 'failed', 'skipped', 'article_ready', 'provider_paused'].includes(event.stage);
     scheduleEdit(isTerminal);
   };
   void (async () => {

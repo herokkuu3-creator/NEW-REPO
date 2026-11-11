@@ -20,6 +20,7 @@ import { configureServerTest, readServerTest, startServerTest } from './serverTe
 import { dailyPublicationStatus } from './dailyPublication';
 import { createAccountVisualPreview } from './visualPreview';
 import { coarenaStatus, enableCoarena } from './coarena';
+import { isCoarenaPaused } from './coarenaLimits';
 import { RoutingError } from './router';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
@@ -39,7 +40,7 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
         ...(query.before ? { createdAt: { lt: new Date(query.before) } } : {}) },
         select: { id: true, accountId: true, problemSlug: true, submissionId: true, status: true, title: true,
           style: true, model: true, reviewModel: true, lastError: true, retryCount: true, publishedUrl: true,
-          createdAt: true, updatedAt: true }, orderBy: { createdAt: 'desc' }, take: 100 });
+          createdAt: true, updatedAt: true, leaseUntil: true }, orderBy: { createdAt: 'desc' }, take: 100 });
     });
     scoped.get('/admin/solutions/accounts', async () => prisma.account.findMany({
       where: { status: { not: 'DISABLED' } }, orderBy: { label: 'asc' },
@@ -110,7 +111,8 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     scoped.post('/admin/solutions/generate', async req => {
       const body = z.object({ accountId: z.string().min(1), runId: z.string().min(1) }).strict().parse(req.body);
       const post = await generateForRun(body.accountId, body.runId);
-      return { id: post.id, status: post.status, lastError: post.lastError };
+      return { id: post.id, status: post.status, lastError: post.lastError,
+        ...(isCoarenaPaused(post) ? { retryAt: post.leaseUntil } : {}) };
     });
     // Keys are write-only: callers receive only masked slots and the active position.
     scoped.get('/admin/solutions/api-keys', async () => solutionKeyPoolStatus());

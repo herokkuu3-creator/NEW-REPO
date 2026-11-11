@@ -1,3 +1,4 @@
+import { CoarenaPause } from './coarenaLimits';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { SubmissionContext } from './article';
@@ -38,7 +39,7 @@ export async function generateImplementation(router: AIModelRouter, context: Sub
   previous: Array<{ code: string; approach?: string }>, reserve: (fingerprint: string) => Promise<boolean>) {
   try { return await writeImplementation(router, context, previous, reserve); }
   catch (error) {
-    if (!(error instanceof RoutingError) || !(router instanceof CoarenaRouter) || !router.canUsePrimary) throw error;
+    if (error instanceof CoarenaPause || !(error instanceof RoutingError) || !(router instanceof CoarenaRouter) || !router.canUsePrimary) throw error;
     try {
       const fallback = await writeImplementation(await router.fallback(), context, previous, reserve);
       return { ...fallback, attempts: [...error.attempts, ...fallback.attempts] };
@@ -95,6 +96,7 @@ async function writeImplementation(router: AIModelRouter, context: SubmissionCon
       const attempt = attempts.at(-1);
       if (attempt) attempt.outcome = 'ARTICLE_CODE_TOO_SIMILAR';
     } catch (error) {
+      if (error instanceof CoarenaPause) throw error.withAttempts(attempts);
       if (error instanceof RoutingError) throw new RoutingError([...attempts, ...error.attempts], error.lastFailure);
       throw error;
     }
