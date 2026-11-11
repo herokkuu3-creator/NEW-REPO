@@ -20,6 +20,7 @@ import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, maskSolutionApiKey, resetSolutionApiKeyPool, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 import { startArticleWorkKeepAlive } from './keepAlive';
 import { generateImplementation, IMPLEMENTATION_STAGE_BUDGET } from './implementation';
+import { CoarenaRouter, loadCoarenaKey } from './coarena';
 
 export class PostError extends Error {
   constructor(public readonly code: string, public readonly details?: {
@@ -87,11 +88,18 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
 
 export async function createPostRouter(correlation: { postId?: string; accountId?: string } = {},
   providerOverride?: 'firecrawl' | 'bazaarlink'): Promise<AIModelRouter> {
+  const key = providerOverride ? null : await loadCoarenaKey().catch(() => null);
+  if (key) return new CoarenaRouter(key, () => createDiscoveryRouter(correlation),
+    attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'));
   if ((providerOverride ?? config.solutionPosts.aiProvider) === 'firecrawl') {
     if (!config.solutionPosts.firecrawlApiKey) throw new PostError('FIRECRAWL_KEY_REQUIRED');
     return new FirecrawlAgentRouter(config.solutionPosts.firecrawlApiKey, config.solutionPosts.agentMaxCredits,
       attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'));
   }
+  return createDiscoveryRouter(correlation);
+}
+
+async function createDiscoveryRouter(correlation: { postId?: string; accountId?: string }): Promise<AIModelRouter> {
   let pool = await loadSolutionKeyPool();
   let activeKeys = activeSolutionApiKeys(pool);
   if (!activeKeys.length && pool.keys.length > 0 &&
@@ -119,7 +127,8 @@ export async function createPostRouter(correlation: { postId?: string; accountId
     config.solutionPosts.models.filter(model => /^deepseek-|^qwen/i.test(model))
       .sort((a, b) => Number(/^qwen/i.test(b)) - Number(/^qwen/i.test(a))) : undefined;
   return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys, reviewModels }, undefined, undefined,
-    attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'),
+    attempt => { if (isSageProvider(config.solutionPosts.baseUrl)) attempt.provider = 'discovery';
+      logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'); },
     async (failedKey, reason) => {
       const advanced = await rotateSolutionApiKey(failedKey, reason);
       logger.warn({ ...correlation, reason, activeKey: advanced.activeIndex + 1, totalKeys: advanced.keys.length }, 'solution article API key advanced');

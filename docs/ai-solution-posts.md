@@ -111,6 +111,8 @@ All routes require the existing `Authorization: Bearer <SETUP_TOKEN>` header and
 
 Long generation requests are synchronous. Use a client/proxy timeout that covers the configured model/review budget. A disconnected caller does not roll back a completed draft; inspect history before retrying.
 
+Enable Coarena through `POST /admin/solutions/coarena` with `{"apiKey":"<Coarena key>"}`. The server tests the key before saving it encrypted. `GET /admin/solutions/coarena` reports the active models and the remaining free allowance. The bot uses Claude Sonnet for the implementation and article, and GPT-6.1 Sol for independent review. The article and two GIF storyboards share one request. Coarena calls are serialized and checked against the free $5 daily allowance. Discovery handles the job if Coarena is unavailable, the allowance is exhausted, or the result fails review after repair.
+
 For a live judge comparison, enable one account through `/admin/solutions/test-control` and send `{"runId":"...","verification":"judge"}` to `/admin/solutions/server-tests`. Poll the returned job ID at `/admin/solutions/server-tests/:testId`. The job submits the reviewed draft code once when available. Otherwise it runs the article implementation generator and submits the reviewed result. The job reports which source it used, plus the original and new verdict, runtime, and memory.
 
 ## Scheduling and recovery

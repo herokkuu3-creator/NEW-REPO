@@ -26,8 +26,10 @@ export interface RouterOptions {
   modelTimeoutMs?: Record<string, number>;
   reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   minRequestIntervalMs?: number;
+  oneModelPerStage?: boolean;
 }
 export interface ModelAttempt {
+  provider?: 'coarena' | 'discovery';
   model: string;
   attempt: number;
   outcome: string;
@@ -112,7 +114,7 @@ export class AIModelRouter {
       const sageReasoning = isSageProvider(this.options.baseUrl);
       const modelOrder = stage?.startsWith('technical review') && this.options.reviewModels?.length ?
         this.options.reviewModels.filter(model => this.options.models.includes(model)) : this.options.models;
-      for (const model of [...new Set(modelOrder)]) {
+      for (const model of [...new Set(this.options.oneModelPerStage ? modelOrder.slice(0, 1) : modelOrder)]) {
         if (!available.has(model)) {
           const record = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'UNAVAILABLE' };
           attempts.push(record); this.onAttempt(record); continue;

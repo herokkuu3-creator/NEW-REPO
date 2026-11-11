@@ -19,6 +19,8 @@ import { logger } from '../logger';
 import { configureServerTest, readServerTest, startServerTest } from './serverTest';
 import { dailyPublicationStatus } from './dailyPublication';
 import { createAccountVisualPreview } from './visualPreview';
+import { coarenaStatus, enableCoarena } from './coarena';
+import { RoutingError } from './router';
 
 export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (header: string | undefined) => boolean) {
   app.register(async scoped => {
@@ -54,6 +56,14 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     scoped.post('/admin/solutions/visual-preview', async req => {
       const { accountId } = z.object({ accountId: z.string().min(1) }).strict().parse(req.body);
       return createAccountVisualPreview(accountId);
+    });
+    scoped.get('/admin/solutions/coarena', async () => coarenaStatus());
+    scoped.post('/admin/solutions/coarena', async (req, reply) => {
+      const { apiKey } = z.object({ apiKey: z.string().trim().regex(/^coa_[A-Za-z0-9_-]{16,128}$/) }).strict().parse(req.body);
+      try { return await enableCoarena(apiKey); }
+      catch (error) {
+        return reply.code(409).send({ enabled: false, error: error instanceof RoutingError ? error.lastFailure : 'COARENA_SETUP_FAILED' });
+      }
     });
     scoped.post('/admin/solutions/server-tests', async (req, reply) => {
       const body = z.object({ runId: z.string().min(1), publicationMode: z.enum(['daily', 'manual']).default('manual'),
