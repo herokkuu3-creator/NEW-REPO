@@ -138,7 +138,10 @@ export async function fetchRemoteSyncedProxies(): Promise<string[]> {
   }
 }
 
+export const DEFAULT_DECODO_RESIDENTIAL_PROXY = 'http://spo31gdzsh:G=koPtHx9g1nGs19uz@in.decodo.com:10000';
+
 export const DEFAULT_RESIDENTIAL_PROXIES = [
+  DEFAULT_DECODO_RESIDENTIAL_PROXY,
   'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.244.76:3129',
   'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@151.123.176.240:3129',
   'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@209.50.189.116:3129',
@@ -417,4 +420,27 @@ export async function resolveActiveProxy(
   }
 
   return null;
+}
+
+
+export async function resolveLeetCodeResidentialProxy(
+  options: {
+    envSource?: string;
+    tester?: (proxyUrl: string) => Promise<boolean | ProxyTestResult>;
+    log?: (msg: string) => void;
+    allowInTest?: boolean;
+  } = {},
+): Promise<ActiveProxyResult | null> {
+  const isTest = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
+  if (isTest && !options.allowInTest && !options.envSource && !options.tester) {
+    return null;
+  }
+  const explicitEnv =
+    options.envSource ??
+    (process.env.LEETCODE_RESIDENTIAL_PROXY || process.env.LEETCODE_PROXY || DEFAULT_RESIDENTIAL_PROXIES.join('\n'));
+  return resolveActiveProxy({
+    ...options,
+    envSource: explicitEnv,
+    log: options.log ?? ((msg: string) => logger.info({ msg }, 'leetcode residential proxy resolver')),
+  });
 }

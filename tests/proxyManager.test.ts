@@ -14,6 +14,8 @@ import {
   clearPreferredProxy,
   extractProxyDetails,
   resolveActiveProxy,
+  resolveLeetCodeResidentialProxy,
+  DEFAULT_DECODO_RESIDENTIAL_PROXY,
 } from '../src/codeforces/proxyManager';
 import { selectWorkingProxy, proxyHash, toPlaywrightProxy } from '../src/codeforces/proxyRotator';
 import {
@@ -681,6 +683,17 @@ describe('telegram proxy commands', () => {
       expect(isLikelyProxyPayload('[{"name":"cf_clearance","value":"123"}]')).toBe(false);
       expect(isLikelyProxyPayload('{"key":"value"}')).toBe(false);
       expect(isLikelyProxyPayload('hello how are you')).toBe(false);
+    });
+
+    it('configures Decodo residential proxy as primary default and converts to Playwright format', async () => {
+      expect(toPlaywrightProxy(DEFAULT_DECODO_RESIDENTIAL_PROXY)).toEqual({
+        server: 'http://in.decodo.com:10000',
+        username: 'spo31gdzsh',
+        password: 'G=koPtHx9g1nGs19uz',
+      });
+      const resolved = await resolveLeetCodeResidentialProxy({ allowInTest: true });
+      expect(resolved?.host).toBe('in.decodo.com:10000');
+      expect(resolved?.username).toBe('spo31gdzsh');
     });
   });
 });

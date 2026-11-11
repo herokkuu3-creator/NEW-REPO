@@ -27,6 +27,7 @@ import {
 import { findCredentialsForAccount, saveEncryptedCredentials } from '../security/credentialStore';
 import { loginToLeetCode } from '../leetcode/auth';
 import {
+  clearLeetCodeLoginCooldown,
   clearLeetCodeLoginCooldownsForTests,
   findStoredLeetCodeAccount,
   formatRemainingTtl,
@@ -93,6 +94,7 @@ import {
   setPreferredProxyByIndex,
   clearPreferredProxy,
   extractProxyDetails,
+  resolveLeetCodeResidentialProxy,
   type ProxyCheckStatus,
 } from '../codeforces/proxyManager';
 import { testProxyDetailed, type ProxyTestResult } from '../codeforces/proxyRotator';
@@ -6791,6 +6793,7 @@ export async function handleExecuteLogin(
   const controller = site === 'leetcode' ? new AbortController() : null;
   if (controller) activeLeetCodeLogin = controller;
   const siteName = site === 'leetcode' ? 'LeetCode' : 'Codeforces';
+  let lcProxy: Awaited<ReturnType<typeof resolveLeetCodeResidentialProxy>> = null;
   try {
     if (site === 'leetcode') {
       // 1. Autonomous Session Reuse First:
@@ -6826,9 +6829,10 @@ export async function handleExecuteLogin(
         }
       }
 
-      // 2. Check Server Login Cooldown to avoid hammering Cloudflare /accounts/login/
+      // 2. Check Server Login Cooldown to avoid hammering Cloudflare /accounts/login/ on direct datacenter IP
+      lcProxy = await resolveLeetCodeResidentialProxy().catch(() => null);
       const cooldown = await getLeetCodeLoginCooldown(label);
-      if (cooldown.coolingDown) {
+      if (cooldown.coolingDown && !lcProxy) {
         const mins = Math.max(1, Math.ceil(cooldown.remainingSeconds / 60));
         await replyFunc(
           `⏳ <b>LeetCode Login Cooldown Active (${mins}m remaining)</b>\n` +
@@ -6843,21 +6847,39 @@ export async function handleExecuteLogin(
     await replyFunc(
       `🔄 <b>Logging in to ${siteName}...</b>\n` +
       `• Account label: <code>${escapeHtml(label)}</code>\n` +
-      `• Identifier: <code>${escapeHtml(identifier)}</code>\n\n` +
+      `• Identifier: <code>${escapeHtml(identifier)}</code>\n` +
+      (lcProxy ? `• Route: 🏠 Residential Proxy (<code>${escapeHtml(lcProxy.host)}</code>)\n` : '') +
+      `\n` +
       (site === 'leetcode'
         ? '<i>Executing autonomous server-side authentication…</i>'
         : '<i>Starting account authentication…</i>'),
     );
 
     if (site === 'leetcode') {
-      const res = await withSingleFlightLogin(label, () =>
-        loginToLeetCode(identifier, password, {
+      const res = await withSingleFlightLogin(label, async () => {
+        const firstAttempt = await loginToLeetCode(identifier, password, {
+          ...(lcProxy?.url ? { proxyUrl: lcProxy.url } : {}),
           signal: controller!.signal,
           onProgress: async (msg) => {
             await replyFunc(escapeHtml(msg)).catch(() => undefined);
           },
-        }),
-      );
+        });
+        if (
+          !firstAttempt.ok &&
+          lcProxy?.url &&
+          !controller!.signal.aborted &&
+          (firstAttempt.code === 'LOGIN_BROWSER_ERROR' || firstAttempt.code === 'LOGIN_TIMEOUT')
+        ) {
+          logger.warn({ label, code: firstAttempt.code, proxy: lcProxy.host }, 'Proxied LeetCode login failed with browser/timeout error; retrying direct');
+          return loginToLeetCode(identifier, password, {
+            signal: controller!.signal,
+            onProgress: async (msg) => {
+              await replyFunc(escapeHtml(msg)).catch(() => undefined);
+            },
+          });
+        }
+        return firstAttempt;
+      });
 
       if (!res.ok || !res.storageState) {
         if (res.code === 'VERIFICATION_REQUIRED') {
@@ -6945,6 +6967,7 @@ export async function handleExecuteLogin(
       cancelAllLeetCodePairingSessions();
       pendingLeetCodeVerificationHandoff = null;
       pendingRenewalLabel = undefined;
+      await clearLeetCodeLoginCooldown(label);
       const username = res.username || identifier;
       await saveEncryptedCredentials('leetcode', label, {
         username,

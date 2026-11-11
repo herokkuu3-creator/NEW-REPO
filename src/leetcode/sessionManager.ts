@@ -430,6 +430,18 @@ export async function recordLeetCodeLoginCooldown(
   }
 }
 
+export async function clearLeetCodeLoginCooldown(label: string): Promise<void> {
+  const norm = label.trim().toLowerCase();
+  memoryCooldowns.delete(norm);
+  if (!isTestEnv()) {
+    try {
+      await setSystemState(cooldownStateKey(norm), JSON.stringify({ until: 0 }));
+    } catch {
+      // best-effort DB clear
+    }
+  }
+}
+
 export function clearLeetCodeLoginCooldownsForTests(): void {
   memoryCooldowns.clear();
   inFlightLogins.clear();

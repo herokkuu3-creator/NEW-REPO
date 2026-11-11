@@ -15,6 +15,7 @@ import {
   withSingleFlightLogin,
 } from '../leetcode/sessionManager';
 import { loginToCodeforces } from '../codeforces/auth';
+import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { config } from '../config';
 import { logger } from '../logger';
@@ -115,9 +116,10 @@ export async function refreshLeetCodeAccount(account: AccountRecord): Promise<Ac
     };
   }
 
-  logger.info({ label: account.label, username: creds.username }, 'Attempting automated LeetCode re-login with stored credentials');
+  const lcProxy = await resolveLeetCodeResidentialProxy().catch(() => null);
+  logger.info({ label: account.label, username: creds.username, proxy: lcProxy ? lcProxy.host : 'direct' }, 'Attempting automated LeetCode re-login with stored credentials');
   const loginRes = await withSingleFlightLogin(account.label, () =>
-    loginToLeetCode(creds.username, creds.password),
+    lcProxy?.url ? loginToLeetCode(creds.username, creds.password, { proxyUrl: lcProxy.url }) : loginToLeetCode(creds.username, creds.password),
   );
 
   if (loginRes.ok && loginRes.storageState) {

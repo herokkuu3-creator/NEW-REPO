@@ -56,7 +56,7 @@ export async function signedInUser(page: Page, timeoutMs: number): Promise<strin
       const user = body?.data?.userStatus;
       return user?.isSignedIn === true && typeof user.username === 'string' && user.username.trim() ? user.username : null;
     } catch { return null; }
-  }, Math.max(1, Math.min(timeoutMs, 3000))).catch(() => null);
+  }, Math.max(1, Math.min(timeoutMs, 8000))).catch(() => null);
 }
 
 /** Exposed for local browser fixtures; all navigation remains in the caller's context. */
@@ -93,7 +93,7 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
     if (await verificationState(page) === 'required') throw new LoginFailure('VERIFICATION_REQUIRED', VERIFICATION_MESSAGE);
     if (status && status >= 400) throw new LoginFailure('LOGIN_PAGE_HTTP_ERROR', `LeetCode login page returned HTTP ${status}.`);
     const usernameInput = page.locator(USERNAME).first();
-    try { await usernameInput.waitFor({ state: 'visible', timeout: Math.min(5000, remaining()) }); }
+    try { await usernameInput.waitFor({ state: 'visible', timeout: Math.min(options.proxyUrl ? 25_000 : 5000, remaining()) }); }
     catch {
       const verified = await signedInUser(page, remaining());
       if (verified) return { ok: true, username: verified, storageState: await page.context().storageState() as StorageStateShape };
@@ -154,7 +154,7 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
 export async function loginToLeetCode(loginInput: string, password: string,
   options: LeetCodeLoginOptions = {}): Promise<LeetCodeLoginResult> {
   if (!loginInput.trim() || !password) return { ok: false, code: 'CREDENTIALS_REQUIRED', error: 'Username/email and password are required.' };
-  const timeoutMs = options.timeoutMs ?? 60_000;
+  const timeoutMs = options.timeoutMs ?? (options.proxyUrl ? 90_000 : 60_000);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return { ok: false, code: 'INVALID_TIMEOUT', error: 'Login timeout must be a positive number.' };
   if (options.signal?.aborted) return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.' };
   const deadline = Date.now() + timeoutMs;
@@ -163,13 +163,23 @@ export async function loginToLeetCode(loginInput: string, password: string,
   const close = () => { void browser?.close().catch(() => undefined); };
   options.signal?.addEventListener('abort', close, { once: true });
   try {
+    const proxy = options.proxyUrl ? toPlaywrightProxy(options.proxyUrl) : undefined;
     browser = await chromium.launch({ headless: config.browser.headless, timeout: timeoutMs,
       args: ['--disable-dev-shm-usage', '--no-sandbox'],
-      proxy: options.proxyUrl ? toPlaywrightProxy(options.proxyUrl) : undefined });
+      proxy });
     if (options.signal?.aborted) return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.' };
     if (Date.now() >= deadline) return { ok: false, code: 'LOGIN_TIMEOUT', error: 'Login timed out while launching the browser.' };
     timer = setTimeout(close, Math.max(1, deadline - Date.now()));
     const context = await browser.newContext();
+    if (proxy) {
+      await context.route('**/*', async route => {
+        const type = route.request().resourceType();
+        if (type === 'image' || type === 'media' || type === 'font') {
+          return route.abort().catch(() => undefined);
+        }
+        return route.continue().catch(() => undefined);
+      });
+    }
     const page = await context.newPage();
     return await loginOnLeetCodePage(page, loginInput.trim(), password, { ...options, timeoutMs: Math.max(1, deadline - Date.now()) });
   } catch {

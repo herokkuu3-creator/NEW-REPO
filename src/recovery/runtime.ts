@@ -8,6 +8,7 @@ import { sendTelegramMessage } from '../notifications/telegram';
 import { checkSession } from '../browser/sessionCheck';
 import { resolvePublicBaseUrl } from '../leetcode/loginHandoff';
 import { openLightweightLeetCodeSession, verifyStoredLeetCodeAccount } from '../leetcode/sessionManager';
+import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { PrismaRecoveryStore } from './prismaStore';
 import { openRemoteBrowser } from './remoteBrowser';
 import { loadRecoveryLimits, RecoveryService, type RecoveryAccount } from './service';
@@ -62,7 +63,10 @@ export function createProductionRecoveryService(hooks: RecoveryRuntimeHooks = {}
       const creds = await findCredentialsForAccount('leetcode', full);
       return creds ? { username: creds.username, password: creds.password } : null;
     },
-    openBrowser: () => openRemoteBrowser({ headless: true }),
+    openBrowser: async () => {
+      const lcProxy = await resolveLeetCodeResidentialProxy().catch(() => null);
+      return openRemoteBrowser({ headless: true, proxyUrl: lcProxy?.url });
+    },
     sendTelegram: (text, markup) =>
       sendTelegramMessage(text, { parseMode: 'HTML', disableWebPagePreview: true, replyMarkup: markup }),
     onRecovered: async () => {

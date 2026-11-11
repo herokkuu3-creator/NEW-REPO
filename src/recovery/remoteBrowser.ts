@@ -7,6 +7,7 @@ import {
   type Route,
 } from 'playwright';
 import type { StorageStateShape } from '../browser/cookiePayload';
+import { toPlaywrightProxy } from '../codeforces/proxyRotator';
 import { logger } from '../logger';
 
 /**
@@ -79,7 +80,7 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
       // Container-required flags + a memory cap only. Nothing that alters how
       // the browser presents itself to the site.
       args: ['--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu', '--js-flags=--max-old-space-size=256'],
-      proxy: opts.proxyUrl ? { server: opts.proxyUrl } : undefined,
+      proxy: opts.proxyUrl ? (toPlaywrightProxy(opts.proxyUrl) ?? { server: opts.proxyUrl }) : undefined,
     });
     const context = await browser.newContext({
       viewport,
