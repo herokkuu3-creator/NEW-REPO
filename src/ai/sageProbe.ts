@@ -1,5 +1,11 @@
-import { config } from '../config';
-import { logger } from '../logger';
+// This module is also loaded by the standalone submitter, which has no DATABASE_URL
+// and must not trigger the main app's config validation (process.exit) at import time.
+const logger = {
+  warn: (obj: unknown, msg: string): void => {
+    const err = (obj as { err?: unknown })?.err ?? obj;
+    try { process.stderr.write(`${JSON.stringify({ level: 40, msg, err: err instanceof Error ? err.message : String(err) })}\n`); } catch { /* ignore */ }
+  },
+};
 
 export const DEFAULT_SAGE_BASE_URL = 'https://discovery-api.intern-ai.org.cn/v1';
 export const DEFAULT_SAGE_API_KEY = 'sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056';
@@ -74,9 +80,9 @@ export async function probeSageApi(
   modelOverride?: string,
 ): Promise<SageProbeDiagnostic> {
   const started = Date.now();
-  const apiKey = (apiKeyOverride || config.sage?.apiKey || process.env.SAGE_API_KEY || DEFAULT_SAGE_API_KEY).trim();
-  const baseUrl = (config.sage?.baseUrl || process.env.SAGE_BASE_URL || DEFAULT_SAGE_BASE_URL).trim().replace(/\/+$/, '');
-  const model = (modelOverride || config.sage?.model || process.env.SAGE_MODEL || DEFAULT_SAGE_MODEL).trim();
+  const apiKey = (apiKeyOverride || process.env.SAGE_API_KEY || DEFAULT_SAGE_API_KEY).trim();
+  const baseUrl = (process.env.SAGE_BASE_URL || DEFAULT_SAGE_BASE_URL).trim().replace(/\/+$/, '');
+  const model = (modelOverride || process.env.SAGE_MODEL || DEFAULT_SAGE_MODEL).trim();
 
   const metadata = {
     executionHost: (process.env.RENDER_INSTANCE_ID ? 'render' : 'local') as 'render' | 'local',
@@ -242,9 +248,9 @@ export async function askSage(
     };
   }
 
-  const apiKey = (options?.apiKey || config.sage?.apiKey || process.env.SAGE_API_KEY || DEFAULT_SAGE_API_KEY).trim();
-  const baseUrl = (config.sage?.baseUrl || process.env.SAGE_BASE_URL || DEFAULT_SAGE_BASE_URL).trim().replace(/\/+$/, '');
-  const model = (options?.model || config.sage?.model || process.env.SAGE_MODEL || DEFAULT_SAGE_MODEL).trim();
+  const apiKey = (options?.apiKey || process.env.SAGE_API_KEY || DEFAULT_SAGE_API_KEY).trim();
+  const baseUrl = (process.env.SAGE_BASE_URL || DEFAULT_SAGE_BASE_URL).trim().replace(/\/+$/, '');
+  const model = (options?.model || process.env.SAGE_MODEL || DEFAULT_SAGE_MODEL).trim();
   const maxTokens = options?.maxTokens ?? 1500;
 
   try {

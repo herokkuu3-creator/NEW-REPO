@@ -412,12 +412,10 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
           await setOwner(instanceId).catch(() => null);
           return true;
         }
-      } else {
-        // Legacy owner string without timestamp (e.g. from an imported DB backup)
-        logger.info({ legacyOwner: raw }, 'legacy telegram poller owner key detected — reclaiming ownership');
-        await setOwner(instanceId).catch(() => null);
-        return true;
       }
+      // Another instance claimed the slot after this one did (every instance claims it at
+      // startup), so it is the newer one. Never reclaim from it here: two instances that
+      // each "reclaim" would fight forever instead of handing over.
       return false;
     } catch {
       return true; // DB hiccup: keep polling rather than going silent
