@@ -54,7 +54,7 @@ export function articleBlockOrder(index: number): string[] {
 
 export function postPresentationVariant(index: number, problemIndex: number, layoutOffset = 0): ArticlePresentation {
   const layout = articleLayouts[index % articleLayouts.length]!;
-  const first = (problemIndex + layoutOffset) % accountDiagramLayouts.length;
+  const first = (2 * problemIndex + layoutOffset) % accountDiagramLayouts.length;
   const second = (first + 1 + Math.floor(problemIndex / accountDiagramLayouts.length) % 14) % accountDiagramLayouts.length;
   const themeOffset = layoutOffset + Math.floor(problemIndex / accountDiagramLayouts.length);
   const firstTheme = (first + themeOffset) % accountVisualThemes.length;

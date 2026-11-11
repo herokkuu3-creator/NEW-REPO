@@ -67,6 +67,8 @@ it('assigns distinct block orders, GIF slots and geometry to the same problem un
   expect(new Set(orders.map(order => `${order.indexOf('visual-1')}/${order.indexOf('visual-2')}`)).size).toBe(15);
   expect(new Set(assigned.map(item => item.diagrams[0])).size).toBe(15);
   expect(new Set(assigned.map(item => item.diagrams[1])).size).toBe(15);
+  const firstSeven = Array.from({ length: 7 }, (_, i) => postPresentationVariant(i, i));
+  expect(new Set(firstSeven.flatMap(item => item.diagrams)).size).toBe(14);
   expect(new Set(assigned.flatMap(item => item.diagrams.map((layout, role) =>
     [layout, item.themes[role], item.motions?.[role]].join('/')))).size).toBe(30);
   expect(assigned.filter(item => item.format?.optimization)).toHaveLength(1);
