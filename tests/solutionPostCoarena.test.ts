@@ -31,7 +31,8 @@ it('uses the primary when within the free allowance without initializing Discove
   const infer = vi.spyOn(AIModelRouter.prototype, 'generate').mockResolvedValue({ value: 'primary', model: COARENA_WRITER, attempts: [] });
   const fallback = vi.fn(async () => { throw new Error('unexpected fallback'); });
   const router = new CoarenaRouter('coa_test', fallback);
-  expect((await router.generate(request, validate)).value).toBe('primary');
-  expect(infer).toHaveBeenCalledOnce();
+  expect((await router.generate(request, validate, 1024, true, 'technical review implementation')).value).toBe('primary');
+  expect(infer).toHaveBeenCalledWith([...request, { role: 'user', content: 'Return the result as a JSON object.' }],
+    validate, 2400, true, 'technical review implementation');
   expect(fallback).not.toHaveBeenCalled();
 });

@@ -64,7 +64,10 @@ export class CoarenaRouter extends AIModelRouter {
       const delay = nextStart - Date.now();
       if (delay > 0) await new Promise<void>(resolve => setTimeout(resolve, delay));
       nextStart = Date.now() + 2100;
-      return super.generate(messages, validate, maxTokens, jsonMode, stage);
+      // Coarena's GPT bridge checks user messages for the word JSON when JSON mode is set.
+      const input: LLMMessage[] = jsonMode ? [...messages, { role: 'user', content: 'Return the result as a JSON object.' }] : messages;
+      const tokens = stage === 'technical review implementation' ? Math.max(maxTokens ?? 0, 2400) : maxTokens;
+      return super.generate(input, validate, tokens, jsonMode, stage);
     });
     lane = request.catch(() => undefined);
     try { return await request; }
@@ -98,11 +101,15 @@ export class CoarenaRouter extends AIModelRouter {
 /** Verify from this host before replacing the live key. */
 export async function enableCoarena(key: string) {
   const router = new CoarenaRouter(key, async () => { throw new Error('Discovery unavailable in a Coarena probe'); });
-  const probe = await router.generatePrimary([{ role: 'user', content: 'Return only the JSON object {"ready":true}.' }], text => {
+  const messages: LLMMessage[] = [{ role: 'system', content: 'Return only {"ready":true}.' }, { role: 'user', content: 'Confirm readiness.' }];
+  const validate = (text: string) => {
     if (JSON.parse(text).ready !== true) throw new OutputValidationError('COARENA_PROBE_INVALID');
     return true;
-  }, 64, true, 'coarena probe');
+  };
+  const writer = await router.generatePrimary(messages, validate, 128, true, 'coarena probe');
+  const reviewer = await router.generatePrimary(messages, validate, 128, true, 'technical review probe');
   await setSystemState(KEY_STATE, encryptText(key));
-  return { enabled: true, model: probe.model, usage: probe.attempts.at(-1)?.usage,
+  return { enabled: true, model: writer.model, reviewModel: reviewer.model,
+    usage: [...writer.attempts, ...reviewer.attempts].map(attempt => ({ model: attempt.model, tokens: attempt.usage?.total_tokens })),
     executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local', revision: process.env.RENDER_GIT_COMMIT ?? null };
 }
