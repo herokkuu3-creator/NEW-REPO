@@ -111,6 +111,8 @@ All routes require the existing `Authorization: Bearer <SETUP_TOKEN>` header and
 
 Long generation requests are synchronous. Use a client/proxy timeout that covers the configured model/review budget. A disconnected caller does not roll back a completed draft; inspect history before retrying.
 
+For a live judge comparison, enable one account through `/admin/solutions/test-control` and send `{"runId":"...","verification":"judge"}` to `/admin/solutions/server-tests`. Poll the returned job ID at `/admin/solutions/server-tests/:testId`. The job submits the reviewed draft code once when available. Otherwise it runs the article implementation generator and submits the reviewed result. The job reports which source it used, plus the original and new verdict, runtime, and memory.
+
 ## Scheduling and recovery
 
 The new article cron is `0 6 * * *`, explicitly interpreted in `Asia/Kolkata`. Recovery checks every ten minutes after 06:00 IST and on startup. They process only explicitly selected accounts whose current UTC challenge day has no completed article. With the default `SOLUTION_POST_AUTO_PUBLISH=true`, a successfully generated and independently reviewed article is automatically approved and posted through the configured publication adapter (authenticated API by default). Set the flag to `false` to retain drafts for manual approval.

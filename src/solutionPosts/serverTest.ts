@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import type { SolutionPost } from '@prisma/client';
 import { prisma } from '../database/prisma';
 import { config } from '../config';
-import { generateForRun, PostError } from './service';
+import { createPostRouter, generateForRun, loadContext, PostError, withAccount } from './service';
+import { contextSchema, hash, type SubmissionContext } from './article';
+import { generateImplementation } from './implementation';
+import { RoutingError } from './router';
 import { approvePost } from './store';
-import { publishPost } from './publisher';
+import { checkEligibility, publishPost, verifyArticleCode } from './publisher';
 import { acquireDailyLease } from './scheduler';
 import { logger } from '../logger';
 import { publishDailyPost, dailyPublicationStatus } from './dailyPublication';
@@ -47,22 +51,50 @@ export async function readServerTest(id: string) {
   return job;
 }
 
-/** Return 202 immediately; every operation, including the Post click, runs on Render. */
-export async function startServerTest(runId: string, publicationMode: 'daily' | 'manual' = 'manual') {
+function reviewedDraftContext(post: SolutionPost, originalSubmissionId: string): SubmissionContext | null {
+  if (!['AWAITING_APPROVAL', 'DRAFT_READY'].includes(post.status) || post.submissionId !== originalSubmissionId) return null;
+  if (!post.title || !post.markdown || hash(`${post.title}\n${post.markdown}`) !== post.contentHash) throw new PostError('REVIEW_REQUIRED');
+  const context = contextSchema.parse(JSON.parse(post.context));
+  if (context.accountId !== post.accountId || context.slug !== post.problemSlug || context.submissionId !== originalSubmissionId ||
+      hash(context.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  if (!context.articleImplementation) return null;
+  verifyArticleCode(post.markdown, context);
+  return context;
+}
+
+async function judgeImplementation(context: SubmissionContext, code: string, save: (update: object) => Promise<void>) {
+  const account = await prisma.account.findUniqueOrThrow({ where: { id: context.accountId } });
+  await withAccount(account, async (api, _page, username) => {
+    const baseline = await checkEligibility(api, context, username);
+    await save({ stage: 'submitting_implementation', baseline, implementationHash: hash(code) });
+    const submissionId = await api.submitSolution({ slug: context.slug, questionId: context.problemId,
+      lang: context.language, code });
+    await save({ stage: 'awaiting_verdict', submissionId });
+    const verdict = await api.awaitSubmission(submissionId, context.slug, 90_000);
+    await save({ status: verdict.classification === 'ACCEPTED' ? 'ACCEPTED' : 'FAILED', stage: 'finished',
+      verdict, lastError: verdict.classification === 'ACCEPTED' ? null : verdict.classification,
+      finishedAt: new Date().toISOString() });
+  });
+}
+
+/** Return 202 immediately and run the selected test on Render. */
+export async function startServerTest(runId: string, publicationMode: 'daily' | 'manual' = 'manual',
+  verification: 'publication' | 'judge' = 'publication') {
   if (!process.env.RENDER_INSTANCE_ID) throw new PostError('RENDER_SERVER_REQUIRED');
   const old = await prisma.systemState.findUnique({ where: { key: TEST_CONTROL_KEY } });
   const control: Control | null = old ? JSON.parse(old.value) : null;
   if (!control || control.until <= Date.now()) throw new PostError('SERVER_TEST_DISABLED');
   if (control.active) throw new PostError('SERVER_TEST_IN_PROGRESS');
   const run = await prisma.dailyRun.findUniqueOrThrow({ where: { id: runId } });
-  if (run.accountId !== control.accountId || run.state !== 'SUCCESS' || run.submissionStatus !== 'Accepted' || !run.submissionId) {
+  const originalSubmissionId = run.submissionId;
+  if (run.accountId !== control.accountId || run.state !== 'SUCCESS' || run.submissionStatus !== 'Accepted' || !originalSubmissionId) {
     throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
   }
   const id = randomUUID();
   const claimed = JSON.stringify({ ...control, active: id });
   const claim = await prisma.systemState.updateMany({ where: { key: TEST_CONTROL_KEY, value: old!.value }, data: { value: claimed } });
   if (!claim.count) throw new PostError('SERVER_TEST_IN_PROGRESS');
-  const job = { id, accountId: control.accountId, runId, publicationMode, executionHost: 'render',
+  const job = { id, accountId: control.accountId, runId, publicationMode, verification, executionHost: 'render',
     revision: process.env.RENDER_GIT_COMMIT ?? null, startedAt: new Date().toISOString(), status: 'RUNNING', stage: 'generation' };
   const save = async (update: object) => {
     Object.assign(job, update);
@@ -75,6 +107,22 @@ export async function startServerTest(runId: string, publicationMode: 'daily' | 
     try {
       release = await acquireDailyLease(control.accountId, new Date().toISOString().slice(0, 10));
       if (!release) throw new PostError('ACCOUNT_JOB_IN_PROGRESS');
+      if (verification === 'judge') {
+        const draft = await prisma.solutionPost.findUnique({ where: { accountId_problemSlug_intent: {
+          accountId: run.accountId, problemSlug: run.problemSlug, intent: 'community-solution',
+        } } });
+        const draftContext = draft ? reviewedDraftContext(draft, originalSubmissionId) : null;
+        if (draft && draftContext?.articleImplementation) {
+          await save({ implementationSource: 'reviewed_draft', postId: draft.id, postStatus: draft.status });
+          return await judgeImplementation(draftContext, draftContext.articleImplementation.code, save);
+        }
+        await save({ stage: 'generating_implementation', implementationSource: 'server_generator' });
+        const context = await loadContext(run.accountId, runId);
+        if (context.submissionId !== originalSubmissionId) throw new PostError('SOURCE_INTEGRITY_FAILED');
+        const router = await createPostRouter({ accountId: run.accountId });
+        const implementation = await generateImplementation(router, context, [], async () => true);
+        return await judgeImplementation(context, implementation.value.code, save);
+      }
       let post = await generateForRun(control.accountId, runId, true);
       await save({ postId: post.id, postStatus: post.status, lastError: post.lastError });
       if (post.status === 'AWAITING_APPROVAL') {
@@ -92,7 +140,7 @@ export async function startServerTest(runId: string, publicationMode: 'daily' | 
         finishedAt: new Date().toISOString() });
     } catch (error) {
       await save({ status: 'FAILED', stage: 'finished', finishedAt: new Date().toISOString(),
-        lastError: error instanceof PostError ? error.code : 'SERVER_TEST_FAILED' });
+        lastError: error instanceof PostError ? error.code : error instanceof RoutingError ? error.lastFailure ?? 'SERVER_TEST_FAILED' : 'SERVER_TEST_FAILED' });
     } finally {
       if (release) await release().catch(() => undefined);
       await prisma.systemState.updateMany({ where: { key: TEST_CONTROL_KEY, value: claimed }, data: { value: old!.value } });

@@ -58,10 +58,11 @@ export function validSolutionUrl(url: string, slug: string): boolean {
   catch { return false; }
 }
 
-async function checkEligibility(api: LeetCodeApi, context: SubmissionContext, username: string) {
+export async function checkEligibility(api: LeetCodeApi, context: SubmissionContext, username: string) {
   if (username.toLowerCase() !== context.username.toLowerCase()) throw new PostError('ACCOUNT_IDENTITY_MISMATCH');
   const result = await api.awaitSubmission(context.submissionId, context.slug, 30000, { firstPollDelayMs: 0 });
   if (result.classification !== 'ACCEPTED') throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
+  return result;
 }
 
 /** Uses only the visible post-solution UI, with exact source comparison before replacing the template. */
@@ -171,7 +172,7 @@ export async function reserveBrowserPublication(id: string, approvedHash: string
   });
 }
 
-function verifyArticleCode(markdown: string, context: SubmissionContext): void {
+export function verifyArticleCode(markdown: string, context: SubmissionContext): void {
   const blocks = [...markdown.matchAll(/^(`{3,})[^\r\n]*\n([\s\S]*?)\n\1[ \t]*$/gm)];
   const reviewedCode = context.articleImplementation?.code ?? context.code;
   if (blocks.length !== 1 || blocks[0]?.[2] !== reviewedCode) throw new PostError('SOURCE_INTEGRITY_FAILED');

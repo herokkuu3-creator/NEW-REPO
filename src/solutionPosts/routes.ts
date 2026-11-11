@@ -56,8 +56,9 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       return createAccountVisualPreview(accountId);
     });
     scoped.post('/admin/solutions/server-tests', async (req, reply) => {
-      const body = z.object({ runId: z.string().min(1), publicationMode: z.enum(['daily', 'manual']).default('manual') }).strict().parse(req.body);
-      return reply.code(202).send(await startServerTest(body.runId, body.publicationMode));
+      const body = z.object({ runId: z.string().min(1), publicationMode: z.enum(['daily', 'manual']).default('manual'),
+        verification: z.enum(['publication', 'judge']).default('publication') }).strict().parse(req.body);
+      return reply.code(202).send(await startServerTest(body.runId, body.publicationMode, body.verification));
     });
     scoped.get('/admin/solutions/server-tests/:testId', async req => {
       const { testId } = z.object({ testId: z.string().uuid() }).parse(req.params);
