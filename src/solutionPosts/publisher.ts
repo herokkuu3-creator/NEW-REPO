@@ -179,6 +179,10 @@ export function verifyArticleCode(markdown: string, context: SubmissionContext):
   if (blocks.length !== 1 || blocks[0]?.[2] !== reviewedCode) throw new PostError('SOURCE_INTEGRITY_FAILED');
 }
 
+function isContestPostingRestriction(reason: unknown): boolean {
+  return typeof reason === 'string' && /banned from posting[^.]*contest rules/i.test(reason);
+}
+
 export async function publishPost(id: string) {
   let preparationStage = 'load';
   let post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
@@ -212,6 +216,9 @@ export async function publishPost(id: string) {
           summary: post.title!, thumbnail: '', tags,
         } }, publishSchema);
         const response = result.ugcArticlePublishSolution;
+        if (!response.article && isContestPostingRestriction(response.error)) {
+          return move(post, 'SKIPPED', { lastError: 'LEETCODE_POSTING_RESTRICTED' });
+        }
         if (response.error || !response.article) {
           logger.warn({ postId: id, reason: String(response.error ?? 'NO_ARTICLE_RETURNED')
             .replace(/(?:fc-|sk-|cc_)[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 500) }, 'solution article publication API rejected');
@@ -227,6 +234,9 @@ export async function publishPost(id: string) {
         void scheduleSolutionArticleUpvotes(post).catch((upErr) => logger.warn({ postId: id, err: upErr }, 'failed to schedule article upvotes'));
         return post;
       } catch (error) {
+        if (!post.publishedUrl && error instanceof LeetCodeHttpError && isContestPostingRestriction(error.message)) {
+          return move(post, 'SKIPPED', { lastError: 'LEETCODE_POSTING_RESTRICTED' });
+        }
         logger.warn({ postId: id, errorName: error instanceof Error ? error.name : 'Unknown',
           httpStatus: error instanceof LeetCodeHttpError ? error.status : undefined,
           reason: error instanceof LeetCodeHttpError ? error.message.replace(/(?:fc-|sk-|cc_)[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 500) : undefined,
@@ -277,8 +287,8 @@ export async function publishPost(id: string) {
   });
 }
 
-/** Operator supplies the candidate URL after an uncertain result. Only positive verification completes it. */
-export async function reconcilePost(id: string, url?: string) {
+/** Verify a candidate or close a confirmed posting refusal after a complete account scan. */
+export async function reconcilePost(id: string, url?: string, postingRestricted = false) {
   const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
   if (post.status !== 'PUBLISHING' || !post.title) throw new PostError('NOT_A_PENDING_PUBLICATION');
   const context = contextSchema.parse(JSON.parse(post.context));
@@ -290,7 +300,12 @@ export async function reconcilePost(id: string, url?: string) {
     // browser is blocked. Exact content, topic and authenticated author must
     // still be independently verified through LeetCode's API.
     const candidate = url ?? await existingPost(api, context, post.title!);
-    if (!candidate) throw new PostError('PUBLICATION_NOT_FOUND_RECONCILE_LATER');
+    if (!candidate) {
+      if (postingRestricted && !post.publishedUrl && post.lastError === 'PUBLICATION_UNCERTAIN_RECONCILE_FIRST') {
+        return move(post, 'SKIPPED', { lastError: 'LEETCODE_POSTING_RESTRICTED' });
+      }
+      throw new PostError('PUBLICATION_NOT_FOUND_RECONCILE_LATER');
+    }
     await verifyPublishedContent(api, candidate, context, post.title!, post.markdown!);
     logger.info({ postId: id, url: candidate, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
       revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication reconciled');

@@ -16,6 +16,7 @@ vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error 
   withAccount: vi.fn(async (_account, action) => action(h.api, h.page, 'alice')) }));
 import { hash } from '../src/solutionPosts/article';
 import { config } from '../src/config';
+import { LeetCodeHttpError } from '../src/leetcode/apiClient';
 import { postPresentationVariant } from '../src/solutionPosts/presentationStyles';
 import { prepareEditor, publishPost, reconcilePost, reserveBrowserPublication, validSolutionUrl, inspectPublication } from '../src/solutionPosts/publisher';
 const context = { accountId: 'a', username: 'alice', problemId: '1', slug: 'example', title: 'Example', difficulty: 'Easy',
@@ -90,6 +91,18 @@ describe('authorized solution publishing', () => {
     h.row.context = JSON.stringify({ ...context, presentation: undefined });
     await expect(publishPost('post1')).rejects.toThrow('ARTICLE_LAYOUT_REFRESH_REQUIRED');
     expect(h.api.graphql).not.toHaveBeenCalled();
+  });
+  it('closes a definitive contest-rules posting refusal without retrying the mutation', async () => {
+    config.solutionPosts.publishTransport = 'api';
+    h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [] } })
+      .mockRejectedValueOnce(new LeetCodeHttpError('GraphQL error: You have been banned from posting due to violating our contest rules.', 200));
+    expect(await publishPost('post1')).toMatchObject({ status: 'SKIPPED', lastError: 'LEETCODE_POSTING_RESTRICTED', markdown });
+    expect(h.api.graphql.mock.calls.filter((call: any[]) => call[0].includes('mutation '))).toHaveLength(1);
+  });
+  it('closes an earlier confirmed refusal after checking that no matching article exists', async () => {
+    Object.assign(h.row, { status: 'PUBLISHING', lastError: 'PUBLICATION_UNCERTAIN_RECONCILE_FIRST', publishedUrl: null });
+    expect(await reconcilePost('post1', undefined, true)).toMatchObject({ status: 'SKIPPED', lastError: 'LEETCODE_POSTING_RESTRICTED', markdown });
+    expect(h.api.graphql.mock.calls.every((call: any[]) => !call[0].includes('mutation '))).toBe(true);
   });
   it('never retries an uncertain publication API request or falls back to a Post click', async () => {
     config.solutionPosts.publishTransport = 'api';

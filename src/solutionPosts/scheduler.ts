@@ -148,8 +148,9 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
         post = await publishGeneratedPost(post);
       }
       results.push({ accountId: account.id, postId: post.id, status: post.status });
-      await reportProgress(onProgress, { accountId: account.id, stage: post.status === 'PUBLISHED' ? 'published' : 'article_ready', questionNumber,
-        submissionId, postId: post.id, status: post.status });
+      await reportProgress(onProgress, { accountId: account.id,
+        stage: post.status === 'PUBLISHED' ? 'published' : post.status === 'SKIPPED' ? 'skipped' : 'article_ready',
+        questionNumber, submissionId, postId: post.id, status: post.status, error: post.lastError ?? undefined });
     } catch (error) {
       const code = errorCode(error, 'MANUAL_WORKFLOW_FAILED');
       results.push({ accountId: account.id, status: 'FAILED', error: code });
@@ -304,8 +305,8 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
       }
       results.push({ accountId, postId: post.id, status: post.status, ...(post.lastError ? { error: post.lastError } : {}) });
       await reportProgress(onProgress, { accountId, stage: post.status === 'PUBLISHED' ? 'published' :
-        post.lastError === 'DAILY_PUBLICATION_COOLDOWN' ? 'publication_queued' : 'article_ready',
-        submissionId: run.submissionId, postId: post.id, status: post.status });
+        post.status === 'SKIPPED' ? 'skipped' : post.lastError === 'DAILY_PUBLICATION_COOLDOWN' ? 'publication_queued' : 'article_ready',
+        submissionId: run.submissionId, postId: post.id, status: post.status, error: post.lastError ?? undefined });
     } catch (error) {
       const code = errorCode(error, 'COMBINED_WORKFLOW_FAILED');
       const details = error instanceof PostError ? error.details : undefined;

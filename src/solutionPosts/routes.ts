@@ -235,8 +235,10 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     });
     scoped.post('/admin/solutions/:id/reconcile', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);
-      const { url } = z.object({ url: z.string().url().optional() }).strict().parse(req.body ?? {});
-      const post = await reconcilePost(id, url); return { id, status: post.status, url: post.publishedUrl };
+      const { url, postingRestricted } = z.object({ url: z.string().url().optional(), postingRestricted: z.literal(true).optional() })
+        .strict().parse(req.body ?? {});
+      const post = postingRestricted ? await reconcilePost(id, url, true) : await reconcilePost(id, url);
+      return { id, status: post.status, url: post.publishedUrl, lastError: post.lastError };
     });
     scoped.get('/admin/solutions/:id/publication-check', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);
