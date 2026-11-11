@@ -101,6 +101,7 @@ export async function createPostRouter(correlation: { postId?: string; accountId
   const key = providerOverride ? null : await loadCoarenaKey().catch(() => null);
   if (key) reportKey?.('Coarena · ' + maskCoarenaKey(key));
   if (key) return new CoarenaRouter(key, () => createDiscoveryRouter(correlation, reportKey, deadlineAt), attempt => {
+    if (attempt.attempt > 0 && attempt.model !== 'discovery') reportKey?.('Coarena · ' + maskCoarenaKey(key));
     logger.info({ ...correlation, attempt }, 'solution article AI attempt finished');
   }, deadlineAt, correlation.postId ? {
     async read(id) {

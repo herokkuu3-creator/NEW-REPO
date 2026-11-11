@@ -94,7 +94,6 @@ export class CoarenaRouter extends AIModelRouter {
   get canUsePrimary(): boolean { return !this.primaryUnavailable; }
 
   fallback(): Promise<AIModelRouter> {
-    this.primaryUnavailable = true;
     this.fallbackRouter ??= this.createFallback();
     return this.fallbackRouter;
   }

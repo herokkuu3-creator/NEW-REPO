@@ -1,6 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import { contextSchema } from '../src/solutionPosts/article';
 import { generateImplementation, implementationFingerprint } from '../src/solutionPosts/implementation';
+import { CoarenaRouter } from '../src/solutionPosts/coarena';
 import { AIModelRouter } from '../src/solutionPosts/router';
 
 const context = contextSchema.parse({ accountId: 'a', username: 'alice', problemId: '1', slug: 'count-ones', title: 'Count Ones',
@@ -54,4 +55,15 @@ it('handles Python comments without treating floor division as a comment', () =>
   const renamed = 'def count(self, nums):\n    return nums[0] // 2  # divide';
   expect(implementationFingerprint(original, 'python3')).toBe(implementationFingerprint(renamed, 'python3'));
   expect(implementationFingerprint(original, 'python3')).not.toBe(implementationFingerprint(original.replace('//', '/'), 'python3'));
+});
+
+it('keeps Coarena available for the article when Discovery rewrites an implementation rejected for quality', async () => {
+  const fallback = mockRouter(distinct, { issues: [] }).router;
+  const router = new CoarenaRouter('coa_test', async () => fallback);
+  vi.spyOn(router, 'generatePrimary').mockImplementation(async (_messages, parse) => ({
+    value: parse(JSON.stringify({ ...distinct, code: renamed })), model: 'coarena', attempts: [],
+  }));
+  const result = await generateImplementation(router, context, [], async () => true);
+  expect(result.value).toEqual(distinct);
+  expect(router.canUsePrimary).toBe(true);
 });

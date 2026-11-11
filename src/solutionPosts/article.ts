@@ -498,12 +498,12 @@ async function generateCoarenaArticle(router: CoarenaRouter, context: Submission
   const comparison = context.presentation?.format?.optimization ? { acceptedSource: context.code } : undefined;
   let feedback: { draft: unknown; issues: string[] } | undefined;
   let rejection = 'TECHNICAL_REVIEW_REJECTED';
-  for (let round = 0; round < 2; round++) {
+  for (let round = 0; round < 3; round++) {
     try {
       await onStage?.('drafting_intuition', round ? 'Repairing the article with Coarena…' : 'Drafting the article and both GIF storyboards…');
       const draft = await router.generatePrimary([
         { role: 'system', content: compactArticlePrompt(context, style, titles.slice(0, 3)) +
-          '\nWrite for a reader seeing the technique for the first time. Use a precise title centered on the technique, short headings, and clean Markdown. Aim for 110–140 words total across title, headings, sections, and complexity reasons. Keep every paragraph under 30 words. Make the intuition concrete and explain why the algorithm follows from it. Start the dryRun section with a line labeled **Input:** containing the full small input in inline code. Trace it briefly, then end with **Output:** and the exact result in inline code. Separate these lines and the trace with blank lines. Give each GIF 3 to 5 distinct, readable frames, including the initial state and a meaningful result. The concept GIF isolates the key operation. The dry-run GIF follows the input printed in the prose through its final answer. Use short labels, one visible change per frame, and a caption explaining what to watch. If feedback is provided, fix every issue in a full replacement.' },
+          '\nWrite for a reader seeing the technique for the first time. Use a precise title centered on the technique, short headings, and clean Markdown. Aim for 110–140 words total across title, headings, sections, and complexity reasons. Keep every paragraph under 30 words. Make the intuition concrete and explain why the algorithm follows from it. Start the dryRun section with a line labeled **Input:** containing the full small input in inline code. Trace it briefly, then end with **Output:** and the exact result in inline code. Separate these lines and the trace with blank lines. Give each GIF 3 to 5 distinct, readable frames, including the initial state and a meaningful result. The concept GIF isolates the key operation. The dry-run GIF follows the input printed in the prose through its final answer. Use short labels, one visible change per frame, and a caption explaining what to watch. Keep the problem’s positions and code’s array indices distinct throughout both GIFs. If feedback is provided, fix each issue and copy unaffected fields unchanged into the complete JSON.' },
         { role: 'user', content: JSON.stringify({ source, comparison, feedback }) },
       ], text => text, 4200, true, 'article and GIF storyboards');
       attempts.push(...draft.attempts);
