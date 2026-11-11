@@ -11,6 +11,7 @@ let nextSageRequestAt = 0;
 let sageBlockedUntil = 0;
 const sageModelHealth = new Map<string, { failures: number; until: number; lastFailureAt: number }>();
 const SAGE_MODEL_COOLDOWN_MS = 30 * 60 * 1000;
+export const SOLUTION_ARTICLE_WORK_MS = 5 * 60_000;
 export const SAGE_REPAIR_TIMEOUT_MS = 300000;
 export const SAGE_REVIEW_TIMEOUT_MS = 300000;
 
@@ -27,6 +28,8 @@ export interface RouterOptions {
   reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   minRequestIntervalMs?: number;
   oneModelPerStage?: boolean;
+  deferOnRateLimit?: boolean;
+  deadlineAt?: number;
 }
 export interface ModelAttempt {
   provider?: 'coarena' | 'discovery';
@@ -78,16 +81,30 @@ export class AIModelRouter {
   }> {
     const attempts: ModelAttempt[] = [];
     let lastFailureReason: string | undefined;
+    const remainingTime = (timeout: number) => {
+      const remaining = (this.options.deadlineAt ?? Infinity) - Date.now();
+      if (remaining <= 0) throw new RoutingError(attempts, 'ARTICLE_TIME_BUDGET_EXCEEDED');
+      return Math.min(timeout, remaining);
+    };
+    const deferRateLimit = this.options.deferOnRateLimit && stage !== 'telegram-chat';
     for (let keyIndex = 0; keyIndex < this.apiKeys.length; keyIndex++) {
       const key = this.apiKeys[keyIndex]!;
       if (this.exhaustedKeys.has(key)) continue;
       const client = keyIndex === 0 && this.firstClient ? this.firstClient : this.createClient(key);
       let available: Set<string>;
+      const discoveryTimeout = remainingTime(this.options.timeoutMs);
+      if (deferRateLimit && isSageProvider(this.options.baseUrl) && sageBlockedUntil > Date.now()) {
+        const record: ModelAttempt = { model: 'discovery', attempt: 0, elapsedMs: 0, stage, outcome: 'HTTP_429',
+          retryAfterMs: sageBlockedUntil - Date.now(), deferred: true };
+        attempts.push(record);
+        this.onAttempt(record);
+        throw new RoutingError(attempts, 'HTTP_429');
+      }
       try {
         const cached = this.catalogs.get(key);
         if (cached) available = cached;
         else {
-          const list = await client.models.list({ timeout: this.options.timeoutMs });
+          const list = await client.models.list({ timeout: discoveryTimeout });
           available = new Set(list.data.map(m => m.id));
           this.catalogs.set(key, available);
         }
@@ -182,10 +199,10 @@ export class AIModelRouter {
               ...(this.options.reasoningEffort ? { reasoning_effort: this.options.reasoningEffort } : {}) };
             const response = await client.chat.completions.create(
               request as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
-            { timeout: sageReasoning && stage?.startsWith('technical review') ?
+            { timeout: remainingTime(sageReasoning && stage?.startsWith('technical review') ?
               Math.max(this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs,
                 fullRepair ? SAGE_REPAIR_TIMEOUT_MS : SAGE_REVIEW_TIMEOUT_MS) :
-              this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs });
+              this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs) });
             if (sageReasoning) sageModelHealth.delete(healthKey);
             record.usage = response.usage;
             const cost = (response as unknown as { cost?: unknown }).cost;
@@ -201,6 +218,7 @@ export class AIModelRouter {
             attempts.push(record); this.onAttempt(record);
             return { value, model, attempts };
           } catch (error) {
+            if (error instanceof RoutingError) throw error;
             Object.assign(record, httpFailureDetails(error));
             if (sageReasoning && (error instanceof OpenAI.APIConnectionError || (record.httpStatus ?? 0) >= 500)) {
               const old = sageModelHealth.get(healthKey);
@@ -208,9 +226,11 @@ export class AIModelRouter {
               sageModelHealth.set(healthKey, { failures, until: failures >= 2 ? Date.now() + SAGE_MODEL_COOLDOWN_MS : 0,
                 lastFailureAt: Date.now() });
             }
-            if (sageReasoning && record.httpStatus === 429 && record.retryAfterMs == null) {
-              record.retryAfterMs = 60000;
-              sageBlockedUntil = Math.max(sageBlockedUntil, Date.now() + record.retryAfterMs);
+            if (sageReasoning && record.httpStatus === 429) {
+              if (record.retryAfterMs == null || deferRateLimit) {
+                record.retryAfterMs ??= 60000;
+                sageBlockedUntil = Math.max(sageBlockedUntil, Date.now() + record.retryAfterMs);
+              }
             }
             if (!record.deferred && record.httpStatus === 429 && isBazaarLinkProvider(this.options.baseUrl)) {
               bazaarFreeBlockedUntil = Math.max(bazaarFreeBlockedUntil, Date.now() + (record.retryAfterMs ?? 1000));
@@ -230,6 +250,10 @@ export class AIModelRouter {
             record.elapsedMs = Date.now() - started;
             attempts.push(record); this.onAttempt(record);
           }
+          if (deferRateLimit && record.httpStatus === 429) {
+            if (this.apiKeys.length > 1) await this.markRotated(key, 'HTTP_429');
+            throw new RoutingError(attempts, 'HTTP_429');
+          }
           if (record.outcome === 'PROVIDER_ACCESS_BLOCKED') throw new RoutingError(attempts, record.outcome);
           if (sageReasoning && (sageModelHealth.get(healthKey)?.until ?? 0) > Date.now()) break;
           // Some reasoning/free-tier models occasionally stop at their token
@@ -242,7 +266,7 @@ export class AIModelRouter {
           if (exhausted || !transient || n === this.options.retries) break;
           // Defer instead of retrying before a long provider-specified reset.
           if ((record.retryAfterMs ?? 0) > 60000) break;
-          await this.sleep(Math.max(Math.min(1000 * 2 ** n, 8000), record.retryAfterMs ?? 0));
+          await this.sleep(remainingTime(Math.max(Math.min(1000 * 2 ** n, 8000), record.retryAfterMs ?? 0)));
         }
         if (exhausted) break;
       }

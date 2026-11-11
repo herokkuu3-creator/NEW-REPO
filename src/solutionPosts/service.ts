@@ -8,7 +8,7 @@ import { parseStoredStorageState } from '../database/accounts';
 import { checkSession } from '../browser/sessionCheck';
 import { LeetCodeApi } from '../leetcode/apiClient';
 import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallenge';
-import { AIModelRouter, RoutingError, SAGE_REPAIR_TIMEOUT_MS } from './router';
+import { AIModelRouter, RoutingError, SOLUTION_ARTICLE_WORK_MS } from './router';
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { isSageProvider } from '../config/solutionPostProvider';
 import { reservePostPresentation } from './presentation';
@@ -88,20 +88,22 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
 
 export async function createPostRouter(correlation: { postId?: string; accountId?: string } = {},
   providerOverride?: 'firecrawl' | 'bazaarlink', reportKey?: (label: string) => void): Promise<AIModelRouter> {
+  const deadlineAt = providerOverride ? undefined : Date.now() + SOLUTION_ARTICLE_WORK_MS;
   const key = providerOverride ? null : await loadCoarenaKey().catch(() => null);
-  if (key) return new CoarenaRouter(key, () => createDiscoveryRouter(correlation, reportKey), attempt => {
+  if (key) return new CoarenaRouter(key, () => createDiscoveryRouter(correlation, reportKey, deadlineAt), attempt => {
     if (attempt.attempt > 0 && attempt.model !== 'discovery') reportKey?.(`Coarena · ${maskCoarenaKey(key)}`);
     logger.info({ ...correlation, attempt }, 'solution article AI attempt finished');
-  });
+  }, deadlineAt);
   if ((providerOverride ?? config.solutionPosts.aiProvider) === 'firecrawl') {
     if (!config.solutionPosts.firecrawlApiKey) throw new PostError('FIRECRAWL_KEY_REQUIRED');
     return new FirecrawlAgentRouter(config.solutionPosts.firecrawlApiKey, config.solutionPosts.agentMaxCredits,
       attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'));
   }
-  return createDiscoveryRouter(correlation, reportKey);
+  return createDiscoveryRouter(correlation, reportKey, deadlineAt);
 }
 
-async function createDiscoveryRouter(correlation: { postId?: string; accountId?: string }, reportKey?: (label: string) => void): Promise<AIModelRouter> {
+async function createDiscoveryRouter(correlation: { postId?: string; accountId?: string }, reportKey?: (label: string) => void,
+  deadlineAt?: number): Promise<AIModelRouter> {
   let pool = await loadSolutionKeyPool();
   let activeKeys = activeSolutionApiKeys(pool);
   if (!activeKeys.length && pool.keys.length > 0 &&
@@ -128,7 +130,8 @@ async function createDiscoveryRouter(correlation: { postId?: string; accountId?:
   const reviewModels = isSageProvider(config.solutionPosts.baseUrl) ?
     config.solutionPosts.models.filter(model => /^deepseek-|^qwen/i.test(model))
       .sort((a, b) => Number(/^qwen/i.test(b)) - Number(/^qwen/i.test(a))) : undefined;
-  return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys, reviewModels }, undefined, undefined,
+  return new AIModelRouter({ ...config.solutionPosts, apiKeys: activeKeys, reviewModels, deadlineAt,
+    deferOnRateLimit: deadlineAt !== undefined }, undefined, undefined,
     attempt => { if (isSageProvider(config.solutionPosts.baseUrl)) attempt.provider = 'discovery';
       const key = attempt.keySlot && activeKeys[attempt.keySlot - 1];
       if (attempt.attempt > 0 && attempt.model !== 'discovery' && key) reportKey?.(`Discovery · ${maskSolutionApiKey(key)}`);
@@ -160,10 +163,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   if (hash(originalContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
   const savedContext = { ...originalContext, presentation: originalContext.presentation?.format ? originalContext.presentation :
     await reservePostPresentation(post.problemSlug) };
-  const maxTimeout = Math.max(config.solutionPosts.timeoutMs, ...Object.values(config.solutionPosts.modelTimeoutMs),
-    isSageProvider(config.solutionPosts.baseUrl) ? SAGE_REPAIR_TIMEOUT_MS : 0);
-  const leaseMs = config.solutionPosts.aiProvider === 'firecrawl' ? (6 + IMPLEMENTATION_STAGE_BUDGET) * FIRECRAWL_STAGE_BUDGET_MS + 120000 :
-    (2 + IMPLEMENTATION_STAGE_BUDGET) * Math.max(1, config.solutionPosts.models.length) * (config.solutionPosts.retries + 1) * (maxTimeout + 8000) + 120000;
+  const workMs = config.solutionPosts.aiProvider === 'firecrawl' ? (6 + IMPLEMENTATION_STAGE_BUDGET) * FIRECRAWL_STAGE_BUDGET_MS : SOLUTION_ARTICLE_WORK_MS;
+  const leaseMs = workMs + 120_000;
   // Reset an explicitly renewed attempt budget in the same CAS that claims
   // generation. A separate unconditional update can reset another worker's job.
   post = await move(post, 'CHECKING_ELIGIBILITY', { leaseUntil: new Date(Date.now() + leaseMs),
@@ -266,6 +267,20 @@ export async function generateForRun(accountId: string, runId: string, force = f
     return existing;
   }
   return generatePost(await loadContext(accountId, runId), undefined, force, onStage);
+}
+
+export async function requeueInterruptedGeneration(id: string, updatedAt: Date): Promise<SolutionPost> {
+  const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
+  if (!['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING'].includes(post.status) ||
+      post.updatedAt.getTime() !== updatedAt.getTime() || Date.now() - updatedAt.getTime() < SOLUTION_ARTICLE_WORK_MS) {
+    throw new PostError('GENERATION_RECOVERY_CONFLICT');
+  }
+  const key = 'solution-post-job:' + post.accountId + ':' + updatedAt.toISOString().slice(0, 10);
+  const lock = await prisma.systemState.findUnique({ where: { key } });
+  const recovered = await move(post, 'RETRY_PENDING', { leaseUntil: null, lastError: 'GENERATION_INTERRUPTED' });
+  // Remove only the account lock observed before this generation made progress.
+  if (lock && lock.updatedAt <= updatedAt) await prisma.systemState.deleteMany({ where: { key, value: lock.value } });
+  return recovered;
 }
 
 export async function retryPost(id: string, force = false, onStage?: StageCallback): Promise<SolutionPost> {

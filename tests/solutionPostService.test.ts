@@ -34,7 +34,7 @@ vi.mock('../src/leetcode/apiClient', () => ({ LeetCodeApi: class { awaitSubmissi
 vi.mock('../src/leetcode/dailyChallenge', () => ({ fetchQuestionData: h.question, fetchDailyChallenge: h.daily }));
 vi.mock('../src/security/sessionAutoRefresh', () => ({ refreshLeetCodeAccount: h.refresh }));
 vi.mock('../src/solutionPosts/keyPool', async orig => ({ ...(await orig() as object), loadSolutionKeyPool: h.pool }));
-import { activeSolutionApiKeys, createPostRouter, generateForRun, generatePost, loadContext, resolveCurrentDaily, resetFailedSolutionPostRetries, retryPost, withAccount } from '../src/solutionPosts/service';
+import { activeSolutionApiKeys, createPostRouter, generateForRun, generatePost, loadContext, resolveCurrentDaily, resetFailedSolutionPostRetries, requeueInterruptedGeneration, retryPost, withAccount } from '../src/solutionPosts/service';
 import { config } from '../src/config';
 import { FirecrawlAgentRouter } from '../src/solutionPosts/firecrawlAgent';
 import { prisma } from '../src/database/prisma';
@@ -112,6 +112,17 @@ describe('solution workflow and persistence', () => {
     h.run.date = 'manual:3820:2026-10-15';
     const loaded = await loadContext('a', 'run1');
     expect(loaded.challengeDate).toBe('2026-10-15');
+  });
+  it('requeues only the exact observed stale generation and preserves the accepted source', async () => {
+    await generatePost(context, {} as never);
+    const stale = new Date(Date.now() - 10 * 60_000);
+    h.row.status = 'GENERATING';
+    h.row.updatedAt = stale;
+    await expect(requeueInterruptedGeneration('post1', new Date(stale.getTime() - 1000)))
+      .rejects.toMatchObject({ code: 'GENERATION_RECOVERY_CONFLICT' });
+    const recovered = await requeueInterruptedGeneration('post1', stale);
+    expect(recovered).toMatchObject({ status: 'RETRY_PENDING', leaseUntil: null, lastError: 'GENERATION_INTERRUPTED', codeHash: hash(context.code) });
+    expect(h.run.submissionId).toBe('123');
   });
   it('upgrades a retry from legacy visual styling without altering its original accepted source', async () => {
     await generatePost(context, {} as never);

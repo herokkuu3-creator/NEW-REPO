@@ -2,7 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config';
 import { prisma } from '../database/prisma';
-import { generateForRun, retryPost, PostError, resetFailedSolutionPostRetries } from './service';
+import { generateForRun, retryPost, requeueInterruptedGeneration, PostError, resetFailedSolutionPostRetries } from './service';
 import { approvePost } from './store';
 import { publishPost, reconcilePost, reserveBrowserPublication, inspectPublication } from './publisher';
 import { runCombined, setSelectedAccounts, POST_CRON, POST_TIMEZONE, runScheduledSolutionPosts,
@@ -213,6 +213,12 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       const { context: _context, leaseUntil: _lease, ...preview } = post;
       const stored = JSON.parse(post.context);
       return { ...preview, presentation: stored.presentation ?? null };
+    });
+    scoped.post('/admin/solutions/:id/recover-generation', async req => {
+      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+      const { updatedAt } = z.object({ updatedAt: z.string().datetime() }).strict().parse(req.body);
+      const post = await requeueInterruptedGeneration(id, new Date(updatedAt));
+      return { id, status: post.status, lastError: post.lastError };
     });
     scoped.post('/admin/solutions/:id/retry', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);

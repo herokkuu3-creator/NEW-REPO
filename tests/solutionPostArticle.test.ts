@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import OpenAI from 'openai';
+import { CoarenaRouter } from '../src/solutionPosts/coarena';
 import { AIModelRouter, RoutingError } from '../src/solutionPosts/router';
 import { articleSchema, compactArticlePrompt, contextSchema, generateArticle, renderArticle, selectStyle, validateArticle } from '../src/solutionPosts/article';
 
@@ -48,6 +49,39 @@ function stagedResponses(draft: typeof article, review = '{"approved":true,"issu
 }
 
 describe('solution articles', () => {
+  it('repairs an over-budget article on Coarena before contacting Discovery', async () => {
+    const draft = structuredClone(article);
+    draft.sections.find(section => section.kind === 'dryRun')!.markdown =
+      '**Input:** `[1,2]`\n\nThe three intervals contribute one, four, and one.\n\n**Output:** `6`';
+    for (const plan of draft.visuals) plan.frames.push({ ...plan.frames.at(-1)!, label: 'Finish', state: 'answer = 6', metric: '6' });
+    const invalid = structuredClone(draft);
+    invalid.sections[0]!.markdown = 'word '.repeat(60).trim();
+    const fallback = vi.fn(async () => { throw new Error('unexpected fallback'); });
+    const router = new CoarenaRouter('coa_test', fallback);
+    const responses = [invalid, draft, { issues: [] }];
+    const primary = vi.spyOn(router, 'generatePrimary').mockImplementation(async (_messages, validate, _max, _json, stage) => ({
+      value: validate(JSON.stringify(responses.shift())), model: 'coarena-test',
+      attempts: [{ model: 'coarena-test', attempt: 1, elapsedMs: 0, outcome: 'SUCCESS', stage }],
+    }));
+    const result = await generateArticle(router, context, []);
+    expect(result.attempts.map(attempt => attempt.outcome)).toEqual(['READING_BUDGET_EXCEEDED', 'SUCCESS', 'SUCCESS']);
+    expect(primary.mock.calls[1]?.[0][1]?.content).toContain('Shorten the prose');
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
+  it('ends the fallback request immediately on HTTP 429 instead of waiting or trying every model and key', async () => {
+    const api = client();
+    const sleep = vi.fn(async () => {});
+    const rotate = vi.fn(async () => {});
+    api.chat.completions.create.mockRejectedValue(new OpenAI.RateLimitError(429, {}, 'rate limited', { 'retry-after': '60' }));
+    const router = new AIModelRouter({ ...options, apiKeys: ['one', 'two'], retries: 3, deferOnRateLimit: true },
+      api as never, sleep, undefined, rotate, () => api as never);
+    await expect(router.generate([], text => text)).rejects.toMatchObject({ lastFailure: 'HTTP_429' });
+    expect(api.chat.completions.create).toHaveBeenCalledOnce();
+    expect(sleep).not.toHaveBeenCalled();
+    expect(rotate).toHaveBeenCalledWith('one', 'HTTP_429');
+  });
+
   it('drafts and reviews the prose and GIF states against the rewritten implementation', async () => {
     const api = client(); const responses = stagedResponses(article);
     api.chat.completions.create.mockImplementation(async () => responses.shift() as never);

@@ -59,9 +59,9 @@ export class CoarenaRouter extends AIModelRouter {
   private primaryUnavailable = false;
 
   constructor(private readonly key: string, private readonly createFallback: () => Promise<AIModelRouter>,
-    onAttempt?: (attempt: ModelAttempt) => void) {
+    onAttempt?: (attempt: ModelAttempt) => void, private readonly deadlineAt?: number) {
     super({ apiKey: key, baseUrl: BASE_URL, models: [COARENA_WRITER, COARENA_REVIEWER], reviewModels: [COARENA_REVIEWER],
-      timeoutMs: 55_000, retries: 0, maxTokens: 4096, oneModelPerStage: true }, undefined, undefined,
+      timeoutMs: 55_000, retries: 0, maxTokens: 4096, oneModelPerStage: true, deadlineAt }, undefined, undefined,
       attempt => { attempt.provider = 'coarena'; onAttempt?.(attempt); });
   }
 
@@ -75,6 +75,7 @@ export class CoarenaRouter extends AIModelRouter {
 
   async generatePrimary<T>(messages: LLMMessage[], validate: (text: string) => T, maxTokens?: number, jsonMode?: boolean, stage?: string) {
     const request = lane.then(async () => {
+      if (Date.now() >= (this.deadlineAt ?? Infinity)) throw new RoutingError([], 'ARTICLE_TIME_BUDGET_EXCEEDED');
       const limits = await readLimits(this.key);
       if (!limits.free || limits.usd_per_day > DAILY_LIMIT) throw new RoutingError([], 'COARENA_FREE_LIMIT_REQUIRED');
       if (limits.today.left_usd <= 0 || limits.today.requests_left === 0) throw new RoutingError([], 'COARENA_DAILY_LIMIT');
@@ -87,11 +88,19 @@ export class CoarenaRouter extends AIModelRouter {
       return super.generate(input, validate, tokens, jsonMode, stage);
     });
     lane = request.catch(() => undefined);
-    try { return await request; }
-    catch (error) {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = this.deadlineAt;
+    try {
+      if (deadline === undefined) return await request;
+      return await Promise.race([request, new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new RoutingError([], 'ARTICLE_TIME_BUDGET_EXCEEDED')), Math.max(0, deadline - Date.now()));
+      })]);
+    } catch (error) {
       this.primaryUnavailable = true;
       if (error instanceof RoutingError) throw error;
       throw new RoutingError([], 'COARENA_UNAVAILABLE');
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
   }
 
