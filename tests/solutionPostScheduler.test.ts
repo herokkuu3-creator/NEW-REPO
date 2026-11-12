@@ -12,7 +12,8 @@ vi.mock('../src/database/prisma', () => {
     dailyRun: { findUnique: vi.fn(async ({ where }: any) => h.runs.get(where.accountId_date.accountId) ?? null),
       findMany: vi.fn(async ({ where }: any) => [...h.runs.values()].filter(r => where.accountId.in.includes(r.accountId))),
       upsert: vi.fn(async ({ create }: any) => ({ id: `manual-${create.accountId}`, ...create })) },
-    solutionPost: { findUnique: vi.fn(async ({ where }: any) => h.posts.find(p => p.accountId === where.accountId_problemSlug_intent.accountId) ?? null), findMany: vi.fn(async () => h.posts) },
+    solutionPost: { findUnique: vi.fn(async ({ where }: any) => h.posts.find(p => p.accountId === where.accountId_problemSlug_intent.accountId) ?? null), findMany: vi.fn(async ({ where }: any) => where.status === 'RETRY_PENDING' ?
+      h.posts.filter(p => p.status === where.status && where.lastError.in.includes(p.lastError) && p.leaseUntil) : h.posts) },
     solutionPostPreference: {
       updateMany: vi.fn(async () => { h.preferences = []; }),
       upsert: vi.fn(async ({ create }: any) => { h.preferences.push(create); }),
@@ -43,7 +44,7 @@ vi.mock('../src/solutionPosts/dailyPublication', () => ({ publishDailyPost: h.pu
 vi.mock('../src/scheduler/dailyWorker', () => ({ runSubmissionNow: h.submit }));
 vi.mock('../src/scheduler/rangeSubmission', () => ({ submitSingleQuestionDirectly: h.submitSingle }));
 import { afterPostSchedule, POST_CRON, POST_TIMEZONE, runCombined, runManualQuestion, runScheduledSolutionPosts,
-  SCHEDULE_STATE_KEY, setSelectedAccounts, startSolutionPostScheduler } from '../src/solutionPosts/scheduler';
+  resumePausedCoarenaArticles, SCHEDULE_STATE_KEY, setSelectedAccounts, startSolutionPostScheduler } from '../src/solutionPosts/scheduler';
 import { PostError } from '../src/solutionPosts/service';
 beforeEach(() => {
   vi.clearAllMocks(); h.locks.clear(); h.preferences = []; h.runs.clear(); h.calls = []; h.timers = []; h.posts = [];
@@ -161,7 +162,7 @@ describe('daily AI drafts', () => {
     const results = await runManualQuestion(3820, ['a'], new Date('2026-10-15T00:30:00Z'));
     expect(h.submitSingle).toHaveBeenCalledWith(expect.objectContaining({ id: 'a' }), 3820);
     expect(results).toEqual([{ accountId: 'a', postId: 'post-a', status: 'PUBLISHED' }]);
-    expect(h.generate).toHaveBeenCalledWith('a', 'manual-a', true);
+    expect(h.generate).toHaveBeenCalledWith('a', 'manual-a', true, undefined, 'manual');
   });
   it('retries all four exhausted accounts on an explicit daily run without resubmitting accepted code', async () => {
     h.accounts = h.accounts.slice(0, 4);
@@ -173,7 +174,7 @@ describe('daily AI drafts', () => {
     const results = await runCombined(h.accounts.map(a => a.id), new Date('2026-10-15T00:30:00Z'), undefined,
       { retryFailedGeneration: true });
     expect(results.filter(r => r.status === 'PUBLISHED')).toHaveLength(4);
-    for (const post of h.posts) expect(h.retry).toHaveBeenCalledWith(post.id, true);
+    for (const post of h.posts) expect(h.retry).toHaveBeenCalledWith(post.id, true, undefined, 'daily');
     expect(h.submit).not.toHaveBeenCalled();
     expect(h.generate).not.toHaveBeenCalled();
   });
@@ -185,10 +186,32 @@ describe('daily AI drafts', () => {
     }));
     const events: any[] = [];
     const results = await runCombined(['a'], new Date('2026-10-15T00:30:00Z'), event => { events.push(event); });
-    expect(h.retry).toHaveBeenCalledWith('post-a', false, expect.any(Function));
+    expect(h.retry).toHaveBeenCalledWith('post-a', false, expect.any(Function), 'daily');
     expect(results[0]).toMatchObject({ postId: 'post-a', error: 'GENERATION_RETRY_LIMIT', previousError: 'AI_PROVIDER_ACCESS_BLOCKED' });
     expect(events.at(-1)).toMatchObject({ stage: 'failed', previousError: 'AI_PROVIDER_ACCESS_BLOCKED' });
     expect(h.publish).not.toHaveBeenCalled();
+  });
+  it('reports a Coarena pause and resumes it after the reset without resubmitting', async () => {
+    const retryAt = new Date('2026-10-16T00:00:00Z');
+    const paused = { id: 'post-a', accountId: 'a', problemSlug: 'today', status: 'RETRY_PENDING',
+      lastError: 'COARENA_DAILY_LIMIT', leaseUntil: retryAt };
+    h.generate.mockResolvedValueOnce(paused);
+    const events: any[] = [];
+    const result = await runCombined(['a'], new Date('2026-10-15T01:00:00Z'), event => { events.push(event); });
+    expect(result[0]).toMatchObject({ status: 'RETRY_PENDING', error: 'COARENA_DAILY_LIMIT' });
+    expect(events.at(-1)).toMatchObject({ stage: 'provider_paused', detail: expect.stringContaining('IST') });
+    expect(h.publish).not.toHaveBeenCalled();
+    h.posts = [paused];
+    await resumePausedCoarenaArticles(new Date(retryAt.getTime() - 1));
+    expect(h.retry).not.toHaveBeenCalled();
+    h.retry.mockResolvedValueOnce({ id: 'post-a', status: 'AWAITING_APPROVAL', contentHash: 'a'.repeat(64),
+      context: JSON.stringify({ accountId: 'a', username: 'user', problemId: '1', slug: 'today', title: 'Today',
+        difficulty: 'Easy', problem: 'Problem', language: 'cpp', code: 'class Solution {};', submissionId: '123',
+        challengeDate: '2026-10-15', resumePublication: 'daily' }) });
+    await resumePausedCoarenaArticles(retryAt);
+    expect(h.retry).toHaveBeenCalledWith('post-a');
+    expect(h.submit).not.toHaveBeenCalled();
+    expect(h.publish).toHaveBeenCalledWith('post-a');
   });
   it('keeps cron from force-resetting exhausted article records', async () => {
     h.accounts = [h.accounts[0]]; h.preferences = [{ accountId: 'a', enabled: true }];

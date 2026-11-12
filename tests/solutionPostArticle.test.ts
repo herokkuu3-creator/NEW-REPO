@@ -49,7 +49,7 @@ function stagedResponses(draft: typeof article, review = '{"approved":true,"issu
 }
 
 describe('solution articles', () => {
-  it('repairs an over-budget article on Coarena before contacting Discovery', async () => {
+  it('repairs validation and technical review issues on Coarena before contacting Discovery', async () => {
     const draft = structuredClone(article);
     draft.sections.find(section => section.kind === 'dryRun')!.markdown =
       '**Input:** `[1,2]`\n\nThe three intervals contribute one, four, and one.\n\n**Output:** `6`';
@@ -58,14 +58,15 @@ describe('solution articles', () => {
     invalid.sections[0]!.markdown = 'word '.repeat(60).trim();
     const fallback = vi.fn(async () => { throw new Error('unexpected fallback'); });
     const router = new CoarenaRouter('coa_test', fallback);
-    const responses = [invalid, draft, { issues: [] }];
+    const responses = [invalid, draft, { issues: ['Correct the final frame index.'] }, draft, { issues: [] }];
     const primary = vi.spyOn(router, 'generatePrimary').mockImplementation(async (_messages, validate, _max, _json, stage) => ({
       value: validate(JSON.stringify(responses.shift())), model: 'coarena-test',
       attempts: [{ model: 'coarena-test', attempt: 1, elapsedMs: 0, outcome: 'SUCCESS', stage }],
     }));
     const result = await generateArticle(router, context, []);
-    expect(result.attempts.map(attempt => attempt.outcome)).toEqual(['READING_BUDGET_EXCEEDED', 'SUCCESS', 'SUCCESS']);
+    expect(result.attempts.map(attempt => attempt.outcome)).toEqual(['READING_BUDGET_EXCEEDED', 'SUCCESS', 'TECHNICAL_REVIEW_REJECTED', 'SUCCESS', 'SUCCESS']);
     expect(primary.mock.calls[1]?.[0][1]?.content).toContain('Shorten the prose');
+    expect(primary.mock.calls[3]?.[0][1]?.content).toContain('Correct the final frame index.');
     expect(fallback).not.toHaveBeenCalled();
   });
 

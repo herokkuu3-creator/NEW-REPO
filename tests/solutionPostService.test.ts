@@ -25,8 +25,8 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
 vi.mock('../src/solutionPosts/article', async orig => ({ ...(await orig() as object), generateArticle: h.generation }));
 vi.mock('../src/solutionPosts/implementation', async orig => ({ ...(await orig() as object), generateImplementation: h.implementation }));
 vi.mock('../src/solutionPosts/presentation', async orig => ({ ...(await orig() as object),
-  reservePostPresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 2,
-    motions: ['scan', 'slide'], format: { index: 0, optimization: true } })) }));
+  reservePostPresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 7,
+    scenes: ['orbit', 'film'], directions: ['forward', 'forward'], motions: ['scan', 'slide'], format: { index: 0, optimization: true } })) }));
 vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn(), verifyHostedVisualAssets: h.verifyVisuals }));
 vi.mock('playwright', () => ({ chromium: { launch: h.launch } }));
 vi.mock('../src/browser/sessionCheck', () => ({ checkSession: h.checkSession }));
@@ -40,6 +40,7 @@ import { FirecrawlAgentRouter } from '../src/solutionPosts/firecrawlAgent';
 import { prisma } from '../src/database/prisma';
 import { assertTransition, approvePost, move } from '../src/solutionPosts/store';
 import { ArticleReviewError, contextSchema, hash } from '../src/solutionPosts/article';
+import { CoarenaPause } from '../src/solutionPosts/coarenaLimits';
 import { RoutingError } from '../src/solutionPosts/router';
 const context = contextSchema.parse({ accountId: 'a', username: 'alice', problemId: '1', slug: 'example',
   title: 'Example', difficulty: 'Easy', problem: 'An example problem', submissionId: '123', language: 'cpp', code: 'source\r\n', challengeDate: '2026-10-15' });
@@ -131,18 +132,21 @@ describe('solution workflow and persistence', () => {
     h.generation.mockClear();
     expect((await generatePost(context, {} as never)).status).toBe('AWAITING_APPROVAL');
     const saved = JSON.parse(h.row.context);
-    expect(saved.presentation).toMatchObject({ visualVersion: 2, diagrams: ['timeline', 'rail'] });
+    expect(saved.presentation).toMatchObject({ visualVersion: 7, diagrams: ['timeline', 'rail'] });
     expect(saved.code).toBe(context.code); expect(h.row.codeHash).toBe(hash(context.code));
   });
-  it('regenerates a legacy draft on the next generation request and requires approval of the replacement', async () => {
+  it('regenerates a legacy draft on explicit retry and requires approval of the replacement', async () => {
     await generatePost(context, {} as never);
     const legacyContext = JSON.parse(h.row.context);
-    delete legacyContext.presentation.format;
+    legacyContext.presentation.visualVersion = 4;
+    legacyContext.presentation.scenes = ['switchboard', 'terminal'];
     Object.assign(h.row, { status: 'DRAFT_READY', approvedHash: h.row.contentHash, context: JSON.stringify(legacyContext) });
     h.pool.mockResolvedValue({ keys: ['valid-test-key'], activeIndex: 0, stored: false });
-    const post = await generateForRun('a', 'run1');
+    const post = await retryPost('post1', true);
     expect(post).toMatchObject({ status: 'AWAITING_APPROVAL', approvedHash: null, codeHash: hash(context.code) });
-    expect(JSON.parse(post.context)).toMatchObject({ code: context.code, articleImplementation: implementation });
+    expect(JSON.parse(post.context)).toMatchObject({ code: context.code, articleImplementation: implementation,
+      presentation: { visualVersion: 7, scenes: ['switchboard', 'terminal'] } });
+    expect(h.implementation).toHaveBeenCalledOnce();
     expect(h.verdict).toHaveBeenCalledTimes(1);
   });
   it('persists all-model failure without changing the accepted run', async () => {
@@ -158,6 +162,22 @@ describe('solution workflow and persistence', () => {
     h.pool.mockResolvedValue({ keys: ['invalid_key_0001'], activeIndex: 1, stored: true, lastFailure: 'HTTP_401' });
     expect(await generatePost(context)).toMatchObject({ status: 'FAILED', lastError: 'AI_AUTHENTICATION_FAILED' });
     expect(h.run).toMatchObject({ state: 'SUCCESS', submissionId: '123' });
+  });
+  it('persists a Coarena pause without using a retry or reopening LeetCode during the cooldown', async () => {
+    const retryAt = new Date(Date.now() + 60_000);
+    h.generation.mockRejectedValueOnce(new CoarenaPause('COARENA_RATE_LIMIT', retryAt));
+    const paused = await generatePost(context, {} as never, false, undefined, 'manual');
+    expect(paused).toMatchObject({ status: 'RETRY_PENDING', lastError: 'COARENA_RATE_LIMIT', leaseUntil: retryAt,
+      retryCount: 0, submissionId: '123', codeHash: hash(context.code) });
+    expect(JSON.parse(paused.context).resumePublication).toBe('manual');
+    expect(await retryPost(paused.id, true)).toEqual(paused);
+    expect(h.verdict).not.toHaveBeenCalled();
+    expect(h.generation).toHaveBeenCalledOnce();
+    h.row.leaseUntil = new Date(Date.now() - 1);
+    h.pool.mockResolvedValue({ keys: ['valid-test-key'], activeIndex: 0, stored: false });
+    expect(await retryPost(paused.id)).toMatchObject({ status: 'AWAITING_APPROVAL', lastError: null, retryCount: 1 });
+    expect(h.verdict).not.toHaveBeenCalled();
+    expect(h.generation).toHaveBeenCalledTimes(2);
   });
   it('reports provider throttling as a retryable rate limit, including during technical review', async () => {
     h.generation.mockRejectedValue(new ArticleReviewError([{ model: 'qwen', attempt: 1,

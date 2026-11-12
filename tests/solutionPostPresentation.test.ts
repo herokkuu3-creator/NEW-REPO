@@ -11,7 +11,7 @@ import { articleSchema, contextSchema, renderArticle, titleIncludesQuestionName 
 import { renderVisualGif, renderVisualFrame, visualPlanSchema } from '../src/solutionPosts/visuals';
 import { visualPreviewPlans } from '../src/solutionPosts/visualSamples';
 import { visualDimensions } from '../src/solutionPosts/visualRenderer';
-import { accountDiagramLayouts } from '../src/solutionPosts/visualStyles';
+import { animatedScenes, accountDiagramLayouts } from '../src/solutionPosts/visualStyles';
 import { createHash } from 'node:crypto';
 const context = contextSchema.parse({ accountId: 'a', username: 'a', problemId: '1', slug: 'two-sum', title: 'Two Sum',
   difficulty: 'Easy', problem: 'An example', submissionId: '1', code: 'class Solution {};', language: 'cpp', challengeDate: '2026-11-06' });
@@ -71,6 +71,8 @@ it('assigns distinct block orders, GIF slots and geometry to the same problem un
   expect(new Set(firstSeven.flatMap(item => item.diagrams)).size).toBe(14);
   expect(new Set(assigned.flatMap(item => item.diagrams.map((layout, role) =>
     [layout, item.themes[role], item.motions?.[role]].join('/')))).size).toBe(30);
+  expect(new Set(assigned.map(item => item.scenes!.join('/'))).size).toBe(15);
+  expect(assigned.every(item => item.visualVersion === 7)).toBe(true);
   expect(assigned.filter(item => item.format?.optimization)).toHaveLength(1);
   expect(new Set(Array.from({ length: 10_000 }, (_, index) => articleBlockOrder(index).join(' '))).size).toBe(10_000);
 });
@@ -141,3 +143,53 @@ it('keeps eight-state, eight-value traces inside the media budget in every famil
     expect(bytes.length).toBeLessThan(500000);
   }
 }, 90000);
+
+it('encodes real in-between motion in each new scene on a shared palette', async () => {
+  const base = visualPreviewPlans(postPresentationVariant(0, 0))[1]!;
+  const dimensions = new Set<string>();
+  for (const scene of animatedScenes) {
+    const gif = await renderVisualGif({ ...base, terrain: undefined, scene, theme: 'midnight' });
+    const meta = await sharp(gif, { animated: true }).metadata();
+    dimensions.add([meta.width, meta.pageHeight].join('x'));
+    expect(meta.pages).toBe(19);
+    expect(meta.delay?.slice(1, 6)).toEqual([70, 70, 70, 70, 70]);
+    const decoded = await sharp(gif, { page: 7, pages: 6 }).removeAlpha().raw().toBuffer();
+    const frameSize = meta.width! * meta.pageHeight! * 3;
+    const entry = decoded.subarray(0, frameSize);
+    const settled = decoded.subarray(5 * frameSize, 6 * frameSize);
+    const difference = entry.reduce((sum, pixel, i) => sum + Math.abs(pixel - settled[i]!), 0) / frameSize;
+    expect(difference, scene).toBeGreaterThan(0.65);
+    expect(gif.length).toBeLessThan(500000);
+  }
+  expect(dimensions.size).toBe(animatedScenes.length);
+}, 90000);
+
+it('keeps the reviewed states and timing when a dense animated scene needs compression', async () => {
+  const plan = visualPreviewPlans(postPresentationVariant(1, 1))[0]!;
+  plan.terrain = undefined;
+  plan.frames = Array.from({ length: 8 }, (_, i) => ({
+    label: 'Inspect the candidate at index ' + i,
+    items: Array.from({ length: 8 }, (_, j) => 'array[' + j + '] = 123456789012'),
+    active: [i], state: 'step=' + i + '; the current state shows all reviewed values',
+    metric: 'comparisons = 123456; remaining = 123', note: 'Read the current values before advancing to the next state.',
+  }));
+  const gif = await renderVisualGif(plan);
+  const meta = await sharp(gif, { animated: true }).metadata();
+  expect(meta.pages).toBe(29);
+  expect(meta.delay?.slice(0, 5)).toEqual([1450, 90, 90, 90, 1180]);
+  expect(gif.length).toBeLessThan(500000);
+});
+
+it('renders a stair trace as illustrated blocks with the actual indices and values', () => {
+  const plan = visualPreviewPlans(postPresentationVariant(1, 1))[1]!;
+  plan.scene = 'terminal';
+  plan.terrain = 'steps';
+  plan.frames[0] = { label: 'Start at the ground', items: ['b0=0', 'best[1]=INF'],
+    active: [0], state: 'Only the ground is reachable.', metric: 'Cost = 0', note: 'Read the starting value.' };
+  const svg = renderVisualFrame(plan, 0);
+  expect(svg).toContain('<polygon');
+  expect(svg).toContain('>Step 0</text>');
+  expect(svg).toContain('>Step 1</text>');
+  expect(svg).toContain('>∞</text>');
+  expect(svg).not.toContain('&gt; Start at the ground');
+});

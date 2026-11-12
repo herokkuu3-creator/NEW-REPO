@@ -5,6 +5,13 @@ export const diagramLayouts = [...legacyDiagramLayouts, ...accountDiagramLayouts
 export const accountVisualThemes = ['paper', 'cobalt', 'mint', 'berry', 'phosphor', 'amber', 'lavender',
   'coral', 'ice', 'sand', 'forest', 'cyanotype', 'plum', 'slate', 'midnight'] as const;
 export const visualThemes = ['aurora', 'sunset', 'ocean', 'violet', ...accountVisualThemes] as const;
+export const conceptScenes = ['orbit', 'switchboard', 'grid', 'stage'] as const;
+export const traceScenes = ['film', 'terminal', 'waterfall', 'split'] as const;
+export const animatedScenes = [...conceptScenes, ...traceScenes] as const;
+export type AnimatedScene = typeof animatedScenes[number];
+export const illustrationKinds = ['steps', 'grid', 'tree', 'graph', 'stack', 'queue', 'window', 'search', 'sequence', 'decision'] as const;
+export type IllustrationKind = typeof illustrationKinds[number];
+export const sceneDirections = ['forward', 'reverse'] as const;
 export const visualMotions = ['scan', 'pulse', 'slide', 'wipe', 'stamp'] as const;
 export type AccountDiagramLayout = typeof accountDiagramLayouts[number];
 export type VisualMotion = typeof visualMotions[number];

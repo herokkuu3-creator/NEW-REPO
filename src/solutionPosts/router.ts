@@ -20,20 +20,23 @@ export interface RouterOptions {
   apiKeys?: string[];
   baseUrl: string;
   models: string[];
-  reviewModels?: string[];
+  reviewModels?: readonly string[];
+  writingModels?: readonly string[];
   timeoutMs: number;
   retries: number;
   maxTokens: number;
   modelTimeoutMs?: Record<string, number>;
   reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   minRequestIntervalMs?: number;
-  oneModelPerStage?: boolean;
+  beforeInference?: (attempts: ModelAttempt[]) => Promise<void>;
+  stopAfterAttempt?: (attempt: ModelAttempt) => boolean;
   deferOnRateLimit?: boolean;
   deadlineAt?: number;
 }
 export interface ModelAttempt {
   provider?: 'coarena' | 'discovery';
   model: string;
+  requestedModel?: string;
   attempt: number;
   outcome: string;
   elapsedMs: number;
@@ -43,6 +46,8 @@ export interface ModelAttempt {
   stage?: string;
   httpStatus?: number;
   retryAfterMs?: number;
+  providerCode?: string;
+  retryAllowed?: boolean;
   deferred?: boolean;
   agentCreditsUsed?: number;
   providerLimit?: 'requests_per_minute' | 'concurrency' | 'daily' | 'unknown';
@@ -62,6 +67,7 @@ export class OutputValidationError extends Error {
 export class AIModelRouter {
   private readonly apiKeys: string[];
   private readonly exhaustedKeys = new Set<string>();
+  private readonly failedCoarenaModels = new Set<string>();
   private readonly catalogs = new Map<string, Set<string>>();
   private readonly firstClient?: OpenAI;
   constructor(private readonly options: RouterOptions, client?: OpenAI,
@@ -80,6 +86,7 @@ export class AIModelRouter {
     value: T; model: string; attempts: ModelAttempt[];
   }> {
     const attempts: ModelAttempt[] = [];
+    const coarena = new URL(this.options.baseUrl).hostname === 'coarena.ai';
     let lastFailureReason: string | undefined;
     const remainingTime = (timeout: number) => {
       const remaining = (this.options.deadlineAt ?? Infinity) - Date.now();
@@ -129,12 +136,15 @@ export class AIModelRouter {
       }
       let exhausted = false;
       const sageReasoning = isSageProvider(this.options.baseUrl);
-      const modelOrder = stage?.startsWith('technical review') && this.options.reviewModels?.length ?
-        this.options.reviewModels.filter(model => this.options.models.includes(model)) : this.options.models;
-      for (const model of [...new Set(this.options.oneModelPerStage ? modelOrder.slice(0, 1) : modelOrder)]) {
-        if (!available.has(model)) {
-          const record = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'UNAVAILABLE' };
-          attempts.push(record); this.onAttempt(record); continue;
+      const roleModels = stage?.startsWith('technical review') ? this.options.reviewModels : this.options.writingModels;
+      const modelOrder = roleModels?.length ? roleModels.filter(model => this.options.models.includes(model)) : this.options.models;
+      for (const model of new Set(modelOrder)) {
+        if (!available.has(model) || this.failedCoarenaModels.has(model)) {
+          const record = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, stage,
+            outcome: available.has(model) ? 'MODEL_TEMPORARILY_UNAVAILABLE' : 'UNAVAILABLE' };
+          attempts.push(record); this.onAttempt(record);
+          lastFailureReason ??= record.outcome;
+          continue;
         }
         const healthKey = `${new URL(this.options.baseUrl).origin}:${model}`;
         const blockedUntil = sageReasoning ? sageModelHealth.get(healthKey)?.until ?? 0 : 0;
@@ -157,6 +167,7 @@ export class AIModelRouter {
         let attemptMaxTokens = sageReasoning ? Math.min(Math.max(maxTokens * (fullRepair ? 4 : 2),
           fullReview ? 16384 : fullRepair ? 8192 : 4096), tokenCeiling) : maxTokens;
         for (let n = 0; n <= this.options.retries; n++) {
+          await this.options.beforeInference?.(attempts);
           const started = Date.now();
           const record: ModelAttempt = { model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0,
             outcome: 'INVALID_OUTPUT', stage, requestedMaxTokens: attemptMaxTokens };
@@ -197,17 +208,37 @@ export class AIModelRouter {
             const request = { model, messages, max_tokens: attemptMaxTokens,
               ...(jsonMode ? { response_format: { type: 'json_object' as const } } : {}),
               ...(this.options.reasoningEffort ? { reasoning_effort: this.options.reasoningEffort } : {}) };
-            const response = await client.chat.completions.create(
+            const completion = client.chat.completions.create(
               request as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
             { timeout: remainingTime(sageReasoning && stage?.startsWith('technical review') ?
               Math.max(this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs,
                 fullRepair ? SAGE_REPAIR_TIMEOUT_MS : SAGE_REVIEW_TIMEOUT_MS) :
               this.options.modelTimeoutMs?.[model] ?? this.options.timeoutMs) });
+            let response: OpenAI.Chat.Completions.ChatCompletion;
+            if (coarena) {
+              const { data, response: http } = await completion.withResponse();
+              // Coarena can return a padded HTTP 200 carrying an upstream error.
+              const embedded = (data as unknown as { error?: { code?: string; message?: string } }).error;
+              if (embedded?.code) {
+                throw new OpenAI.APIError(coarenaErrorStatus(embedded.code), embedded, embedded.message, {
+                  'retry-after': http.headers.get('retry-after') ?? '',
+                  'x-should-retry': http.headers.get('x-should-retry') ?? '',
+                });
+              }
+              const served = http.headers.get('x-coarena-model') || data.model;
+              if (typeof served === 'string' && /^[a-zA-Z0-9_.:/-]{1,128}$/.test(served) && served !== model) {
+                record.requestedModel = model;
+                record.model = served;
+              }
+              response = data;
+            } else {
+              response = await completion;
+            }
             if (sageReasoning) sageModelHealth.delete(healthKey);
             record.usage = response.usage;
             const cost = (response as unknown as { cost?: unknown }).cost;
             if (typeof cost === 'number' && Number.isFinite(cost)) record.cost = cost;
-            const finishReason = response.choices[0]?.finish_reason;
+            const finishReason = response.choices?.[0]?.finish_reason;
             if (finishReason !== 'stop') {
               throw new Error('INCOMPLETE_OUTPUT');
             }
@@ -216,7 +247,7 @@ export class AIModelRouter {
             const value = validate(text);
             record.outcome = 'SUCCESS'; record.elapsedMs = Date.now() - started;
             attempts.push(record); this.onAttempt(record);
-            return { value, model, attempts };
+            return { value, model: record.model, attempts };
           } catch (error) {
             if (error instanceof RoutingError) throw error;
             Object.assign(record, httpFailureDetails(error));
@@ -249,6 +280,11 @@ export class AIModelRouter {
             }
             record.elapsedMs = Date.now() - started;
             attempts.push(record); this.onAttempt(record);
+          }
+          if (this.options.stopAfterAttempt?.(record)) throw new RoutingError(attempts, record.outcome);
+          if (coarena && !exhausted && (record.httpStatus === 404 || record.httpStatus === 408 ||
+            (record.httpStatus ?? 0) >= 500 || ['TIMEOUT', 'CONNECTION_ERROR', 'model_off'].includes(record.providerCode ?? record.outcome))) {
+            this.failedCoarenaModels.add(model);
           }
           if (deferRateLimit && record.httpStatus === 429) {
             if (this.apiKeys.length > 1) await this.markRotated(key, 'HTTP_429');
@@ -292,6 +328,16 @@ export class AIModelRouter {
   }
 }
 
+function coarenaErrorStatus(code: string): number {
+  if (['rate_limit_exceeded', 'concurrency_limit_exceeded', 'insufficient_quota'].includes(code)) return 429;
+  if (['invalid_api_key', 'api_key_revoked', 'api_key_expired', 'api_keys_disabled'].includes(code)) return 401;
+  if (['insufficient_scope', 'model_api_terms_required', 'account_blocked', 'account_withdrawn'].includes(code)) return 403;
+  if (['model_not_found', 'not_found'].includes(code)) return 404;
+  if (['content_filtered', 'model_off', 'provider_restricted', 'invalid_request', 'context_length_exceeded'].includes(code)) return 400;
+  if (['server_busy', 'server_draining', 'quota_unavailable', 'upstream_capacity', 'model_unavailable', 'model_api_disabled'].includes(code)) return 503;
+  return 502;
+}
+
 function safeOutcome(error: unknown): string {
   if (error instanceof OpenAI.APIConnectionTimeoutError) return 'TIMEOUT';
   if (error instanceof OpenAI.APIConnectionError) return 'CONNECTION_ERROR';
@@ -315,18 +361,22 @@ export function isKeyExhausted(error: unknown, baseUrl?: string): boolean {
   // BazaarLink and Sage Inkstone (discovery-api.intern-ai.org.cn) use 429 for
   // RPM/TPM/concurrency and daily free allowances; monthly balance/allowance
   // failures use 402. Do not retire a valid key for a month on 429.
-  if (baseUrl && (isBazaarLinkProvider(baseUrl) || isSageProvider(baseUrl))) return false;
+  if (baseUrl && (isBazaarLinkProvider(baseUrl) || isSageProvider(baseUrl) || new URL(baseUrl).hostname === 'coarena.ai')) return false;
   const candidate = error as { code?: unknown; type?: unknown; message?: unknown };
   const detail = [candidate.code, candidate.type, candidate.message].filter(v => typeof v === 'string').join(' ').toLowerCase();
   return /quota|credit|balance|billing|payment|monthly|insufficient_funds/.test(detail);
 }
 
-function httpFailureDetails(error: unknown): Pick<ModelAttempt, 'httpStatus' | 'retryAfterMs'> {
+function httpFailureDetails(error: unknown): Pick<ModelAttempt, 'httpStatus' | 'retryAfterMs' | 'providerCode' | 'retryAllowed'> {
   if (!(error instanceof OpenAI.APIError)) return {};
   const headers = error.headers as Headers | Record<string, string> | undefined;
-  const value = headers instanceof Headers ? headers.get('retry-after') : headers?.['retry-after'];
+  const header = (name: string) => headers instanceof Headers ? headers.get(name) : headers?.[name];
+  const value = header('retry-after');
   const delay = value ? (/^\d+(?:\.\d+)?$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now()) : NaN;
-  return { httpStatus: error.status, ...(Number.isFinite(delay) ? { retryAfterMs: Math.max(0, delay) } : {}) };
+  const code = error.code;
+  return { httpStatus: error.status, ...(Number.isFinite(delay) ? { retryAfterMs: Math.max(0, delay) } : {}),
+    ...(code && /^[a-z0-9_]{1,64}$/.test(code) ? { providerCode: code } : {}),
+    ...(header('x-should-retry') === 'false' ? { retryAllowed: false } : {}) };
 }
 
 function assertBazaarCooldownBudget(record: ModelAttempt): void {

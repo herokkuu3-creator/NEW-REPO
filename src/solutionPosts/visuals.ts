@@ -1,5 +1,7 @@
 import { z } from 'zod';
-import { diagramLayouts, visualThemes, visualMotions, accountDiagramLayouts } from './visualStyles';
+import { diagramLayouts, visualThemes, visualMotions, accountDiagramLayouts, animatedScenes, sceneDirections, illustrationKinds } from './visualStyles';
+import { animatedSceneDimensions, renderAnimatedScene } from './animatedScenes';
+import { illustratedDimensions, renderQuestionIllustration } from './questionIllustration';
 import { renderAccountVisualFrame, visualDimensions } from './visualRenderer';
 
 export const sectionKinds = ['intuition', 'approach', 'correctness', 'dryRun', 'takeaways'] as const;
@@ -19,10 +21,15 @@ export const visualTitleSchema = z.string().trim().min(3).max(160).transform(tit
   if (boundary >= 24) prefix = prefix.slice(0, boundary);
   return prefix.trimEnd() + '…';
 }).pipe(z.string().min(3).max(48));
+const itemIndex = z.number().int().min(0).max(7);
+const coordinate = z.number().int().min(-100).max(100);
 export const visualFrameSchema = z.object({
   label: z.string().min(2).max(48), items: z.array(z.string().max(24)).min(1).max(8),
   active: z.preprocess(value => typeof value === 'number' ? [value] : value,
     z.array(z.number().int().min(0).max(7)).max(8)),
+  cells: z.array(z.tuple([coordinate, coordinate])).min(1).max(8).optional(),
+  edges: z.array(z.tuple([itemIndex, itemIndex])).max(16).optional(),
+  range: z.tuple([itemIndex, itemIndex]).optional(),
   state: z.string().min(1).max(64), metric: z.string().min(1).max(40), note: z.string().max(76),
 }).strict();
 export const visualPlanSchema = z.object({
@@ -31,17 +38,33 @@ export const visualPlanSchema = z.object({
   theme: z.enum(visualThemes).default('aurora'),
   layout: z.enum(diagramLayouts).optional(),
   motion: z.enum(visualMotions).optional(),
+  scene: z.enum(animatedScenes).optional(),
+  direction: z.enum(sceneDirections).optional(),
+  terrain: z.enum(illustrationKinds).optional(),
   pace: z.enum(['quick', 'measured', 'hold-final']).optional(),
   frames: z.array(visualFrameSchema).min(2).max(8),
 }).superRefine((plan, ctx) => {
-  for (const [i, frame] of plan.frames.entries()) if (frame.active.some(n => n >= frame.items.length)) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['frames', i, 'active'], message: 'Active index is outside the diagram' });
+  for (const [i, frame] of plan.frames.entries()) {
+    const count = frame.items.length;
+    const issue = (field: string, message: string) =>
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['frames', i, field], message });
+    if (frame.active.some(n => n >= count)) issue('active', 'Active index is outside the diagram');
+    if (frame.cells && (frame.cells.length !== count || new Set(frame.cells.map(cell => cell.join(','))).size !== count)) {
+      issue('cells', 'Provide a different row and column pair for each item');
+    }
+    if (frame.edges?.some(([a, b]) => a >= count || b >= count || a === b)) {
+      issue('edges', 'Connect two distinct visible item indices');
+    }
+    if (frame.range && (frame.range[0] > frame.range[1] || frame.range[1] >= count)) {
+      issue('range', 'Range endpoints must be ordered visible item indices');
+    }
   }
   // A multi-frame GIF must teach a changing state, rather than looping the same
   // screenshot. State and metric are rendered on the card, so they count as a
   // visible change along with the highlighted values.
   const snapshots = new Set(plan.frames.map(frame => JSON.stringify({
     items: frame.items, active: frame.active, state: frame.state, metric: frame.metric,
+    cells: frame.cells, edges: frame.edges, range: frame.range,
   })));
   if (snapshots.size < 2) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['frames'], message: 'Animation frames must show a state change' });
@@ -66,6 +89,9 @@ const palettes = {
 
 /** Original code-drawn diagrams: no fetched media, AI-generated URLs, or executable SVG markup. */
 export function renderVisualFrame(plan: VisualPlan, frameIndex: number, phase = 1): string {
+  if (plan.terrain === 'steps') return renderAnimatedScene({ ...plan, scene: 'terminal' }, frameIndex, phase);
+  if (plan.terrain) return renderQuestionIllustration(plan, plan.terrain, frameIndex, phase);
+  if (plan.scene) return renderAnimatedScene({ ...plan, scene: plan.scene }, frameIndex, phase);
   if ((accountDiagramLayouts as readonly string[]).includes(plan.layout ?? '')) return renderAccountVisualFrame(plan, frameIndex, phase);
   const frame = plan.frames[frameIndex]!;
   const colors = palettes[plan.theme as keyof typeof palettes] ?? palettes.aurora;
@@ -159,27 +185,42 @@ export async function renderVisualGif(input: VisualPlan): Promise<Buffer> {
   const plan = visualPlanSchema.parse(input);
   const [{ default: sharp }, { GIFEncoder, quantize, applyPalette }] = await Promise.all([import('sharp'), import('gifenc')]);
   const gif = GIFEncoder();
-  const [width, height] = visualDimensions(plan);
+  const dimensions = plan.terrain === 'steps' ? animatedSceneDimensions.terminal :
+    plan.terrain ? illustratedDimensions(plan) : plan.scene ? animatedSceneDimensions[plan.scene] : visualDimensions(plan);
+  const [sourceWidth, sourceHeight] = dimensions;
+  const animated = !!(plan.scene || plan.terrain);
+  const dense = animated && plan.frames.length > 5;
+  const width = dense ? Math.floor(sourceWidth * .78) : sourceWidth;
+  const height = dense ? Math.round(sourceHeight * width / sourceWidth) : sourceHeight;
   const [stepDelay, finalDelay] = plan.pace === 'quick' ? [1050, 1700] : plan.pace === 'measured' ? [1650, 2150] :
     plan.pace === 'hold-final' ? [1250, 2800] : [1450, 2300];
+  const transition: [number, number][] = plan.frames.length > 5 ? [[.18, 90], [.5, 90], [.82, 90]] :
+    [[.12, 70], [.3, 70], [.5, 70], [.7, 70], [.87, 70]];
+  const transitionDelay = transition.reduce((sum, [, delay]) => sum + delay, 0);
   // Process sequentially so a worker never retains a full animation of RGBA frames in memory.
   for (let i = 0; i < plan.frames.length; i++) {
-    const phases = plan.layout ? [.25, .65, 1] : [1];
-    for (const phase of phases) {
-    const rgba = await sharp(Buffer.from(renderVisualFrame(plan, i, phase))).ensureAlpha().raw().toBuffer();
-    const palette = quantize(rgba, 64);
-    gif.writeFrame(applyPalette(rgba, palette), width, height, { palette, repeat: 0,
-      delay: phase < 1 ? (phase === .25 ? 120 : 160) :
-        (i === plan.frames.length - 1 ? finalDelay : stepDelay) - (plan.layout ? 280 : 0) });
+    const hold = i === plan.frames.length - 1 ? finalDelay : stepDelay;
+    const samples: [number, number][] = animated
+      ? i === 0 ? [[1, hold]] : [...transition, [1, hold - transitionDelay]]
+      : plan.layout ? [[.25, 120], [.65, 160], [1, hold - 280]] : [[1, hold]];
+    for (const [phase, delay] of samples) {
+      const raster = sharp(Buffer.from(renderVisualFrame(plan, i, phase)));
+      if (dense) raster.resize(width, height, { fit: 'fill' });
+      const rgba = await raster.ensureAlpha().raw().toBuffer();
+      const palette = quantize(rgba, dense ? 48 : 64);
+      gif.writeFrame(applyPalette(rgba, palette), width, height, { palette, repeat: 0, delay });
     }
   }
   gif.finish();
   let result: Buffer = Buffer.from(gif.bytes());
-  // Long traces use larger canvases. Lossless inter-frame optimisation retains
-  // every reviewed state and playback delay instead of dropping trace steps.
-  if (result.length > 500000) result = await sharp(result, { animated: true }).gif({
-    effort: 7, colours: 64, dither: 0, interFrameMaxError: 0, interPaletteMaxError: 0,
-  }).toBuffer();
+  // Preserve every reviewed state and dwell time. Reduce resolution only if
+  // a dense animation still exceeds the hosting budget after encoding.
+  if (result.length > 500000) {
+    const animation = sharp(result, { animated: true });
+    if (animated) animation.resize({ width: Math.floor(width * .82) });
+    result = await animation.gif({ effort: 7, colours: animated ? 48 : 64, dither: 0,
+      interFrameMaxError: 0, interPaletteMaxError: 0, keepDuplicateFrames: true }).toBuffer();
+  }
   if (result.length > 500000) throw new Error('Visual exceeds the media budget');
   return result;
 }

@@ -16,6 +16,10 @@ import { publishDailyPost, processDailyPublicationQueue } from './dailyPublicati
 import { recoverUnverifiedArticleUpvotes } from './upvote';
 import { IMPLEMENTATION_STAGE_BUDGET } from './implementation';
 
+import { startArticleWorkKeepAlive } from './keepAlive';
+import { contextSchema } from './article';
+import { COARENA_PAUSE_CODES, isCoarenaPauseCode, isCoarenaPaused } from './coarenaLimits';
+
 export const POST_CRON = '0 6 * * *';
 export const POST_TIMEZONE = 'Asia/Kolkata';
 export const SCHEDULE_STATE_KEY = 'solution-post-scheduler:last-tick';
@@ -65,6 +69,7 @@ export type SolutionWorkflowStage =
   | 'published'
   | 'article_ready'
   | 'publication_queued'
+  | 'provider_paused'
   | 'failed'
   | 'skipped';
 
@@ -87,6 +92,16 @@ async function reportProgress(reporter: ProgressReporter | undefined, event: Sol
   if (!reporter) return;
   try { await reporter(event); }
   catch (error) { logger.warn({ accountId: event.accountId, stage: event.stage, err: error }, 'solution workflow progress reporter failed'); }
+}
+
+function coarenaPauseProgress(post: SolutionPost) {
+  const retryAt = post.leaseUntil && new Intl.DateTimeFormat('en-IN', {
+    timeZone: POST_TIMEZONE, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  }).format(post.leaseUntil);
+  const reason = post.lastError === 'COARENA_DAILY_LIMIT' ? 'daily allowance exhausted' :
+    post.lastError === 'COARENA_RATE_LIMIT' ? 'request limit reached' : 'capacity temporarily unavailable';
+  return { stage: 'provider_paused' as const, status: post.status, error: post.lastError ?? undefined,
+    detail: 'Coarena ' + reason + '. Automatic retry ' + (retryAt ? 'from ' + retryAt + ' IST.' : 'queued.') };
 }
 
 function errorCode(error: unknown, fallback: string): string {
@@ -134,9 +149,16 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
       const onStage = onProgress ? (stage: string, detail?: string) => {
         void reportProgress(onProgress, { accountId: account.id, stage: stage as any, questionNumber, submissionId, detail });
       } : undefined;
+      const mode = config.solutionPosts.autoPublish ? 'manual' : undefined;
       let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status)
-        ? (onStage ? await retryPost(existing.id, true, onStage) : await retryPost(existing.id, true))
-        : (onStage ? await generateForRun(account.id, run.id, true, onStage) : await generateForRun(account.id, run.id, true));
+        ? await retryPost(existing.id, true, onStage, mode)
+        : await generateForRun(account.id, run.id, true, onStage, mode);
+      if (isCoarenaPaused(post)) {
+        const pause = coarenaPauseProgress(post);
+        results.push({ accountId: account.id, postId: post.id, status: post.status, error: pause.error });
+        await reportProgress(onProgress, { accountId: account.id, postId: post.id, questionNumber, submissionId, ...pause });
+        continue;
+      }
       if (post.status === 'FAILED') {
         const error = post.lastError || 'GENERATION_FAILED';
         results.push({ accountId: account.id, postId: post.id, status: 'FAILED', error });
@@ -285,9 +307,16 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
         void reportProgress(onProgress, { accountId, stage: stage as any, submissionId: run.submissionId, detail });
       } : undefined;
       const forceRetry = options.retryFailedGeneration === true || existing?.lastError === 'AI_KEYS_EXHAUSTED';
-      let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status) ?
-        (onStage ? await retryPost(existing.id, forceRetry, onStage) : await retryPost(existing.id, forceRetry)) :
-        (onStage ? await generateForRun(accountId, run.runId, forceRetry, onStage) : await generateForRun(accountId, run.runId, forceRetry));
+      const mode = config.solutionPosts.autoPublish ? options.publicationMode ?? 'daily' : undefined;
+      let post = existing && ['FAILED', 'RETRY_PENDING'].includes(existing.status)
+        ? await retryPost(existing.id, forceRetry, onStage, mode)
+        : await generateForRun(accountId, run.runId, forceRetry, onStage, mode);
+      if (isCoarenaPaused(post)) {
+        const pause = coarenaPauseProgress(post);
+        results.push({ accountId, postId: post.id, status: post.status, error: pause.error });
+        await reportProgress(onProgress, { accountId, postId: post.id, submissionId: run.submissionId, ...pause });
+        continue;
+      }
       if (['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING', 'PUBLISHING'].includes(post.status)) {
         results.push({ accountId, postId: post.id, status: 'SKIPPED', error: 'ACCOUNT_JOB_IN_PROGRESS' });
         await reportProgress(onProgress, { accountId, stage: 'skipped', postId: post.id, error: 'ACCOUNT_JOB_IN_PROGRESS' });
@@ -363,6 +392,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
       if (!run || !acceptedDailyRun(run, run.problemSlug)) return true;
       const post = posts.find(p => p.accountId === id && p.problemSlug === run.problemSlug);
       if (!post) return true;
+      if (isCoarenaPaused(post)) return false;
       if (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(post.status)) return config.solutionPosts.autoPublish;
       if (!['PENDING', 'RETRY_PENDING', 'FAILED'].includes(post.status)) return false;
       if (post.status === 'FAILED' && post.lastError === 'AI_KEYS_EXHAUSTED') {
@@ -389,7 +419,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
     const results = await runCombined(pendingIds, now);
     for (const result of results) {
       // Contention is not an execution failure and must not use up the day's retries.
-      if (['SUBMISSION_WORKER_BUSY', 'ACCOUNT_JOB_IN_PROGRESS', 'DAILY_PUBLICATION_COOLDOWN', 'AI_KEYS_EXHAUSTED'].includes(result.error ?? '')) {
+      if (isCoarenaPauseCode(result.error) || ['SUBMISSION_WORKER_BUSY', 'ACCOUNT_JOB_IN_PROGRESS', 'DAILY_PUBLICATION_COOLDOWN', 'AI_KEYS_EXHAUSTED'].includes(result.error ?? '')) {
         const key = `solution-post-schedule-budget:${result.accountId}:${today}`;
         const old = await prisma.systemState.findUnique({ where: { key } });
         if (old) await prisma.systemState.updateMany({ where: { key, value: old.value },
@@ -415,6 +445,42 @@ export async function runScheduledSolutionPosts(now = new Date()) {
   } finally { scheduledRunInProgress = false; }
 }
 
+let coarenaResumeInProgress = false;
+let stopCoarenaQueueKeepAlive: (() => void) | undefined;
+
+/** Handles both manual and daily posts, even after their original schedule date. */
+export async function resumePausedCoarenaArticles(now = new Date()): Promise<void> {
+  if (coarenaResumeInProgress) return;
+  coarenaResumeInProgress = true;
+  try {
+    const posts = await prisma.solutionPost.findMany({
+      where: { status: 'RETRY_PENDING', lastError: { in: [...COARENA_PAUSE_CODES] },
+        leaseUntil: { not: null }, account: { status: { not: 'DISABLED' } } },
+      orderBy: [{ leaseUntil: 'asc' }, { createdAt: 'asc' }], take: 2,
+    });
+    if (posts.length) {
+      stopCoarenaQueueKeepAlive ??= startArticleWorkKeepAlive();
+    } else {
+      stopCoarenaQueueKeepAlive?.();
+      stopCoarenaQueueKeepAlive = undefined;
+    }
+    for (const paused of posts) {
+      if (!paused.leaseUntil || paused.leaseUntil > now) break;
+      try {
+        // generatePost claims ownership with a database compare-and-set.
+        const ready = await retryPost(paused.id);
+        if (isCoarenaPaused(ready)) continue;
+        const mode = contextSchema.parse(JSON.parse(ready.context)).resumePublication;
+        const result = mode && config.solutionPosts.autoPublish ? await publishGeneratedPost(ready, mode) : ready;
+        logger.info({ postId: result.id, status: result.status, outcome: result.lastError }, 'Coarena article resume finished');
+      } catch (error) {
+        logger.warn({ postId: paused.id, errorName: error instanceof Error ? error.name : undefined },
+          'Coarena article resume did not complete');
+      }
+    }
+  } finally { coarenaResumeInProgress = false; }
+}
+
 export function startSolutionPostScheduler(): () => void {
   const tick = () => {
     void runScheduledSolutionPosts();
@@ -423,9 +489,18 @@ export function startSolutionPostScheduler(): () => void {
   // The recovery timer also catches up after a restart; uniqueness and leases arbitrate multiple processes.
   const daily = cron.schedule(POST_CRON, tick, { timezone: POST_TIMEZONE });
   const recovery = cron.schedule('*/10 * * * *', tick, { timezone: POST_TIMEZONE });
-  const queueTick = () => void processDailyPublicationQueue().catch(error => logger.warn({ errorName: error?.name }, 'daily publication queue unavailable'));
+  const queueTick = () => {
+    void processDailyPublicationQueue().catch(error => logger.warn({ errorName: error?.name }, 'daily publication queue unavailable'));
+    void resumePausedCoarenaArticles().catch(error => logger.warn({ errorName: error?.name }, 'Coarena resume queue unavailable'));
+  };
   const queue = cron.schedule('* * * * *', queueTick, { timezone: POST_TIMEZONE });
   queueTick();
   tick();
-  return () => { daily.stop(); recovery.stop(); queue.stop(); };
+  return () => {
+    daily.stop();
+    recovery.stop();
+    queue.stop();
+    stopCoarenaQueueKeepAlive?.();
+    stopCoarenaQueueKeepAlive = undefined;
+  };
 }
