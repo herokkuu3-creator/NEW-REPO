@@ -12,7 +12,7 @@ import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallen
 import { AIModelRouter, RoutingError, SOLUTION_ARTICLE_WORK_MS } from './router';
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { isSageProvider } from '../config/solutionPostProvider';
-import { reservePostPresentation, usesAnimatedPresentation } from './presentation';
+import { CURRENT_VISUAL_VERSION, reservePostPresentation, usesAnimatedPresentation, type ArticlePresentation } from './presentation';
 import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
 import { articleNeedsRefresh, ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext, StageCallback } from './article';
 import { OutputValidationError } from './router';
@@ -21,7 +21,7 @@ import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, maskSolutionApiKey, resetSolutionApiKeyPool, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 import { startArticleWorkKeepAlive } from './keepAlive';
 import { generateImplementation, IMPLEMENTATION_STAGE_BUDGET } from './implementation';
-import { CoarenaRouter, loadCoarenaKey, maskCoarenaKey, type CoarenaReply } from './coarena';
+import { CoarenaRouter, loadCoarenaKey, loadCoarenaModelOrder, maskCoarenaKey, type CoarenaReply } from './coarena';
 import { CoarenaPause, isCoarenaPauseCode, isCoarenaPaused } from './coarenaLimits';
 
 type PublicationMode = SubmissionContext['resumePublication'];
@@ -101,7 +101,7 @@ export async function createPostRouter(correlation: { postId?: string; accountId
   const key = providerOverride ? null : await loadCoarenaKey().catch(() => null);
   if (key) reportKey?.('Coarena · ' + maskCoarenaKey(key));
   if (key) return new CoarenaRouter(key, () => createDiscoveryRouter(correlation, reportKey, deadlineAt), attempt => {
-    if (attempt.attempt > 0 && attempt.model !== 'discovery') reportKey?.('Coarena · ' + maskCoarenaKey(key));
+    if (attempt.outcome === 'SUCCESS') reportKey?.('Coarena · ' + maskCoarenaKey(key) + ' · ' + attempt.model);
     logger.info({ ...correlation, attempt }, 'solution article AI attempt finished');
   }, deadlineAt, correlation.postId ? {
     async read(id) {
@@ -109,7 +109,7 @@ export async function createPostRouter(correlation: { postId?: string; accountId
       return saved ? JSON.parse(saved) as CoarenaReply : null;
     },
     save: (id, reply) => setSystemState(checkpointPrefix(correlation.postId!) + id, JSON.stringify(reply)),
-  } : undefined);
+  } : undefined, await loadCoarenaModelOrder());
   if ((providerOverride ?? config.solutionPosts.aiProvider) === 'firecrawl') {
     if (!config.solutionPosts.firecrawlApiKey) throw new PostError('FIRECRAWL_KEY_REQUIRED');
     return new FirecrawlAgentRouter(config.solutionPosts.firecrawlApiKey, config.solutionPosts.agentMaxCredits,
@@ -180,7 +180,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   const originalContext = contextSchema.parse(JSON.parse(post.context));
   if (hash(originalContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
   const oldFormat = originalContext.presentation?.format;
-  const presentation = oldFormat && usesAnimatedPresentation(originalContext.presentation) ? originalContext.presentation! :
+  const presentation: ArticlePresentation = oldFormat && usesAnimatedPresentation(originalContext.presentation) ?
+    { ...originalContext.presentation!, visualVersion: CURRENT_VISUAL_VERSION } :
     await reservePostPresentation(post.problemSlug);
   if (oldFormat?.optimization && presentation.format) presentation.format.optimization = true;
   const savedContext = { ...originalContext, resumePublication: publicationMode ?? originalContext.resumePublication, presentation };
@@ -255,6 +256,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
       contentHash: hash(`${article.title}\n${article.markdown}`), approvedHash: null });
     post = await move(post, 'DRAFT_READY', { leaseUntil: null, lastError: null });
     post = await move(post, 'AWAITING_APPROVAL');
+    await onStage?.('draft_ready', 'Article ready with both GIFs verified');
     return post;
   } catch (error) {
     if (error instanceof CoarenaPause) {
@@ -297,7 +299,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
 }
 
 function draftNeedsRefresh(context: SubmissionContext): boolean {
-  return articleNeedsRefresh(context) || !usesAnimatedPresentation(context.presentation);
+  return articleNeedsRefresh(context) || context.presentation?.visualVersion !== CURRENT_VISUAL_VERSION || !usesAnimatedPresentation(context.presentation);
 }
 
 export async function generateForRun(accountId: string, runId: string, force = false, onStage?: StageCallback,
@@ -309,7 +311,7 @@ export async function generateForRun(accountId: string, runId: string, force = f
   } } });
   if (existing && awaitingCoarena(existing)) return existing;
   if (existing && !['PENDING', 'RETRY_PENDING'].includes(existing.status)) {
-    if ((force && existing.status === 'FAILED') || (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(existing.status) &&
+    if ((force && existing.status === 'FAILED') || (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(existing.status) && !existing.approvedHash &&
       draftNeedsRefresh(contextSchema.parse(JSON.parse(existing.context))))) {
       return retryPost(existing.id, true, onStage, publicationMode);
     }

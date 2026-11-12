@@ -1,7 +1,8 @@
 import OpenAI from 'openai';
 import { afterEach, expect, it, vi } from 'vitest';
 import { AIModelRouter, RoutingError } from '../src/solutionPosts/router';
-import { CoarenaRouter, COARENA_WRITER, type CoarenaReply } from '../src/solutionPosts/coarena';
+import * as state from '../src/database/models';
+import { CoarenaRouter, COARENA_WRITER, loadCoarenaModelOrder, setCoarenaModelPreference, type CoarenaReply } from '../src/solutionPosts/coarena';
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -107,8 +108,78 @@ it('selects an available review model when the preferred catalog entry disappear
   });
   const client = new OpenAI({ apiKey: 'coa_catalog', baseURL: baseUrl, fetch: fetcher as never, maxRetries: 0 });
   const router = new AIModelRouter({ apiKey: 'coa_catalog', baseUrl, models: ['writer', 'review-gone', 'review-available'],
-    reviewModels: ['review-gone', 'review-available'], oneModelPerStage: true, timeoutMs: 1000, retries: 0, maxTokens: 32 }, client);
+    reviewModels: ['review-gone', 'review-available'], timeoutMs: 1000, retries: 0, maxTokens: 32 }, client);
   expect(await router.generate(request, validate, 32, true, 'technical review article')).toMatchObject({
     value: 'review-available', model: 'review-available',
   });
+});
+
+function mockCoarena(infer: (model: string) => Response, left = () => 5) {
+  const models = { writers: ['writer-a', 'writer-b', 'writer-c'], reviewers: ['review-a', 'review-b', 'review-c'] };
+  const fetchLimits = vi.fn(async () => Response.json({ data: { free: true, usd_per_day: 5, today: {
+    used_usd: 5 - left(), left_usd: left(), resets_at: Date.now() + 60_000, requests_left: null,
+  } } }));
+  vi.stubGlobal('fetch', fetchLimits);
+  const completion = vi.fn(infer);
+  const client = new OpenAI({ apiKey: 'test', baseURL: 'https://coarena.ai/api/v1', maxRetries: 0,
+    fetch: (async (url: URL, options?: { body?: string }) => {
+      if (url.toString().endsWith('/models')) return Response.json({ data: [...models.writers, ...models.reviewers].map(id => ({ id })) });
+      return completion(JSON.parse(options!.body!).model);
+    }) as never });
+  const fallback = vi.fn(async () => { throw new Error('unexpected Discovery fallback'); });
+  const router = new CoarenaRouter('coa_route_' + Math.random(), fallback, undefined, undefined, undefined, models, client);
+  return { router, completion, fallback, fetchLimits };
+}
+
+it('uses the third writer after model capacity and invalid JSON, and reports the model that served the reply', async () => {
+  const { router, completion, fallback, fetchLimits } = mockCoarena(model => {
+    if (model === 'writer-a') return Response.json({ error: { code: 'upstream_capacity' } }, { status: 503 });
+    return Response.json({ model: model === 'writer-c' ? 'served-model' : model, choices: [
+      { finish_reason: 'stop', message: { content: model === 'writer-b' ? 'broken JSON' : '{"ok":true}' } },
+    ] });
+  });
+  const result = await router.generate(request, JSON.parse, 128, true, 'article implementation');
+  expect(result).toMatchObject({ model: 'served-model', value: { ok: true },
+    attempts: [{ model: 'writer-a', outcome: 'HTTP_503' }, { model: 'writer-b', outcome: 'INVALID_OUTPUT' },
+      { model: 'served-model', requestedModel: 'writer-c', outcome: 'SUCCESS' }] });
+  expect(completion.mock.calls.flat()).toEqual(['writer-a', 'writer-b', 'writer-c']);
+  expect(fetchLimits).toHaveBeenCalledTimes(3);
+  expect(fallback).not.toHaveBeenCalled();
+}, 15000);
+
+it('stops the review chain on an account limit and retains the preceding model failure', async () => {
+  const { router, completion, fallback } = mockCoarena(model => model === 'review-a'
+    ? Response.json({ error: { code: 'model_not_found' } }, { status: 404 })
+    : Response.json({ error: { code: 'rate_limit_exceeded' } }, { status: 429, headers: { 'retry-after': '8' } }));
+  await expect(router.generate(request, validate, 128, true, 'technical review article')).rejects.toMatchObject({
+    code: 'COARENA_RATE_LIMIT', attempts: [{ model: 'review-a', httpStatus: 404 }, { model: 'review-b', httpStatus: 429 }],
+  });
+  expect(completion.mock.calls.flat()).toEqual(['review-a', 'review-b']);
+  expect(fallback).not.toHaveBeenCalled();
+}, 15000);
+
+it('pauses before a fallback inference if the allowance was spent by the first attempt', async () => {
+  let left = 5;
+  const { router, completion, fallback } = mockCoarena(() => {
+    left = 0;
+    return Response.json({ error: { code: 'upstream_error' } }, { status: 502 });
+  }, () => left);
+  await expect(router.generate(request, validate)).rejects.toMatchObject({
+    code: 'COARENA_DAILY_LIMIT', attempts: [{ model: 'writer-a', httpStatus: 502 }],
+  });
+  expect(completion.mock.calls.flat()).toEqual(['writer-a']);
+  expect(fallback).not.toHaveBeenCalled();
+}, 15000);
+
+it('saves a preferred pair, keeps the alternate models, and restores automatic order', async () => {
+  let stored: string | null = null;
+  vi.spyOn(state, 'getSystemState').mockImplementation(async () => stored);
+  vi.spyOn(state, 'setSystemState').mockImplementation(async (_key, value) => { stored = value; });
+  await expect(setCoarenaModelPreference({ writer: 'gemini-3-8-flash', reviewer: 'claude-opus-5-5' })).resolves.toMatchObject({
+    mode: 'preferred', writers: ['gemini-3-8-flash', 'claude-sonnet-5-5', 'kimi-k3-1-pro'],
+    reviewers: ['claude-opus-5-5', 'gemini-4-argon', 'qwen3-8-2-4t-a95b'],
+  });
+  await expect(setCoarenaModelPreference({ writer: 'unknown', reviewer: 'claude-opus-5-5' })).rejects.toThrow();
+  await expect(setCoarenaModelPreference('auto')).resolves.toMatchObject({ mode: 'auto' });
+  expect((await loadCoarenaModelOrder()).writers[0]).toBe(COARENA_WRITER);
 });

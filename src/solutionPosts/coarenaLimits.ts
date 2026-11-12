@@ -27,6 +27,11 @@ export class CoarenaPause extends RoutingError {
 
 const capacityCodes = new Set(['quota_unavailable', 'upstream_capacity', 'server_busy', 'server_draining']);
 
+export function isCoarenaSharedLimit(attempt: ModelAttempt): boolean {
+  return attempt.httpStatus === 429 ||
+    !!attempt.providerCode && attempt.providerCode !== 'upstream_capacity' && capacityCodes.has(attempt.providerCode);
+}
+
 export function coarenaPauseForAttempt(attempt: ModelAttempt, resetAt?: number, now = Date.now()): CoarenaPause | undefined {
   const code = attempt.providerCode;
   const rateLimited = attempt.httpStatus === 429;

@@ -25,7 +25,7 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
 vi.mock('../src/solutionPosts/article', async orig => ({ ...(await orig() as object), generateArticle: h.generation }));
 vi.mock('../src/solutionPosts/implementation', async orig => ({ ...(await orig() as object), generateImplementation: h.implementation }));
 vi.mock('../src/solutionPosts/presentation', async orig => ({ ...(await orig() as object),
-  reservePostPresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 3,
+  reservePostPresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 4,
     scenes: ['orbit', 'film'], directions: ['forward', 'forward'], motions: ['scan', 'slide'], format: { index: 0, optimization: true } })) }));
 vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn(), verifyHostedVisualAssets: h.verifyVisuals }));
 vi.mock('playwright', () => ({ chromium: { launch: h.launch } }));
@@ -132,21 +132,20 @@ describe('solution workflow and persistence', () => {
     h.generation.mockClear();
     expect((await generatePost(context, {} as never)).status).toBe('AWAITING_APPROVAL');
     const saved = JSON.parse(h.row.context);
-    expect(saved.presentation).toMatchObject({ visualVersion: 3, diagrams: ['timeline', 'rail'] });
+    expect(saved.presentation).toMatchObject({ visualVersion: 4, diagrams: ['timeline', 'rail'] });
     expect(saved.code).toBe(context.code); expect(h.row.codeHash).toBe(hash(context.code));
   });
-  it('regenerates a legacy draft on the next generation request and requires approval of the replacement', async () => {
+  it('regenerates a legacy draft on explicit retry and requires approval of the replacement', async () => {
     await generatePost(context, {} as never);
     const legacyContext = JSON.parse(h.row.context);
-    legacyContext.presentation.visualVersion = 2;
-    delete legacyContext.presentation.scenes;
-    delete legacyContext.presentation.directions;
+    legacyContext.presentation.visualVersion = 3;
+    legacyContext.presentation.scenes = ['switchboard', 'terminal'];
     Object.assign(h.row, { status: 'DRAFT_READY', approvedHash: h.row.contentHash, context: JSON.stringify(legacyContext) });
     h.pool.mockResolvedValue({ keys: ['valid-test-key'], activeIndex: 0, stored: false });
-    const post = await generateForRun('a', 'run1');
+    const post = await retryPost('post1', true);
     expect(post).toMatchObject({ status: 'AWAITING_APPROVAL', approvedHash: null, codeHash: hash(context.code) });
     expect(JSON.parse(post.context)).toMatchObject({ code: context.code, articleImplementation: implementation,
-      presentation: { visualVersion: 3, scenes: ['orbit', 'film'] } });
+      presentation: { visualVersion: 4, scenes: ['switchboard', 'terminal'] } });
     expect(h.implementation).toHaveBeenCalledOnce();
     expect(h.verdict).toHaveBeenCalledTimes(1);
   });

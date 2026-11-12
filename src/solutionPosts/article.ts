@@ -528,7 +528,6 @@ async function generateStagedArticle(router: AIModelRouter, context: SubmissionC
     await onStage?.('rendering_gifs', 'Rendering verified animation frames to GIFs…');
     try { assets = await resolveVisuals(article.visuals); } catch { visualFallback = true; }
   }
-  await onStage?.('draft_ready', 'Animation GIFs rendered & hosted; article draft ready');
   return { title: article.title, markdown: renderArticle(article, context, assets), style, model,
     article, visuals: article.visuals, assets, visualFallback: visualFallback || assets.length < article.visuals.length,
     attempts, reviewModel };
@@ -551,7 +550,10 @@ async function generateCoarenaArticle(router: CoarenaRouter, context: Submission
         { role: 'system', content: compactArticlePrompt(context, style, titles.slice(0, 3)) +
           '\nWrite for a reader seeing the technique for the first time. Use a precise title centered on the technique, short headings, and clean Markdown. Aim for 110–140 words total across title, headings, sections, and complexity reasons. Keep every paragraph under 30 words. Make the intuition concrete and explain why the algorithm follows from it. Start the dryRun section with a line labeled **Input:** containing the full small input in inline code. Trace it briefly, then end with **Output:** and the exact result in inline code. Separate these lines and the trace with blank lines. Give each GIF 3 to 5 distinct, readable frames, including the initial state and a meaningful result. The concept GIF isolates the key operation. The dry-run GIF follows the input printed in the prose through its final answer. Use short labels, one visible change per frame, and a caption explaining what to watch. Keep the problem’s positions and code’s array indices distinct throughout both GIFs. If feedback is provided, fix each issue and copy unaffected fields unchanged into the complete JSON.' },
         { role: 'user', content: JSON.stringify({ source, comparison, feedback }) },
-      ], text => text, 4200, true, 'article and GIF storyboards');
+      ], text => {
+        if (!z.record(z.unknown()).safeParse(parseJSON(text)).success) throw new OutputValidationError('INVALID_ARTICLE_JSON');
+        return text;
+      }, 4200, true, 'article and GIF storyboards');
       attempts.push(...draft.attempts);
       let article: Article;
       try {
@@ -597,7 +599,6 @@ async function generateCoarenaArticle(router: CoarenaRouter, context: Submission
       }
       await onStage?.('rendering_gifs', 'Rendering the two reviewed GIFs…');
       const assets = resolveVisuals ? await resolveVisuals(article.visuals).catch(() => []) : [];
-      await onStage?.('draft_ready', 'Article draft ready');
       return { title: article.title, markdown: renderArticle(article, context, assets), style, model: draft.model,
         article, visuals: article.visuals, assets, visualFallback: assets.length < article.visuals.length,
         attempts, reviewModel: review.model };

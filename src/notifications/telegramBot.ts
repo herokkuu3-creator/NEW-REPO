@@ -1,3 +1,4 @@
+import { ZodError } from 'zod';
 import { AccountStatus, CodeforcesAccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
@@ -114,7 +115,7 @@ import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver
 import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool, removeSolutionApiKey, solutionKeyPoolStatus, testSolutionApiKey, testAllSolutionApiKeys, maskSolutionApiKey } from '../solutionPosts/keyPool';
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
 import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
-import { COARENA_WRITER, loadCoarenaKey, maskCoarenaKey } from '../solutionPosts/coarena';
+import { loadCoarenaKey, loadCoarenaModelOrder, maskCoarenaKey, setCoarenaModelPreference } from '../solutionPosts/coarena';
 import { boostSolutionArticleViews, extractTopicIdFromUrl, fetchLiveSolutionMetrics } from '../solutionPosts/upvote';
 import { prisma } from '../database/prisma';
 import { firecrawlProbeRequest, probeFirecrawl } from '../solutionPosts/firecrawlProbe';
@@ -312,6 +313,7 @@ export const HELP_TEXT = [
   '├ /delsolkey &lt;# or key&gt; — Remove an API key from pool (e.g. /delsolkey 2)',
   '├ /solkeys — Show all API keys &amp; active rotation status',
   '├ /resetsolkeys — Reset active key to #1 &amp; clear retry limits',
+  '├ /solmodels — View or change Coarena model priority',
   '├ /testsolkey [key/#] — Test all or specific Intern-AI key(s)',
   '├ /asksage &lt;question&gt; — Ask Sage Inkstone / Intern-AI directly',
   '├ /ask &lt;question&gt; — Ask the configured AI',
@@ -753,6 +755,9 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       case '/checksolkey':
         await deleteSensitiveTelegramMessage(msg);
         void handleTestSolutionApiKey(commandArg).catch(() => logger.warn('solution provider diagnostic failed'));
+        return;
+      case '/solmodels':
+        await handleCoarenaModels(commandArg);
         return;
       case '/solutionkeystatus':
       case '/solutionkey_status':
@@ -3550,12 +3555,43 @@ export async function handleAddCapSolverCommand(commandArg?: string): Promise<vo
   await replyHtml(promptMsg);
 }
 
+async function handleCoarenaModels(argument?: string): Promise<void> {
+  if (!await loadCoarenaKey()) {
+    await reply('Coarena is unavailable. Discovery is configured for article generation.');
+    return;
+  }
+  const raw = argument?.trim() ?? '';
+  const [writer, reviewer, extra] = raw.split(/\s+/);
+  let status = await loadCoarenaModelOrder();
+  let message = '';
+  if (raw && raw !== 'auto' && (!writer || !reviewer || extra)) {
+    message = 'Choose one model from each list.\n';
+  } else if (raw) {
+    try {
+      status = await setCoarenaModelPreference(raw === 'auto' ? 'auto' : { writer, reviewer });
+      message = 'Model order saved.\n';
+    } catch (error) {
+      message = error instanceof ZodError
+        ? 'Choose one model from each list.\n' : 'Could not save the model order.\n';
+    }
+  }
+  await replyHtml([
+    '<b>Coarena article models</b>',
+    message + 'Mode: ' + (status.mode === 'auto' ? 'automatic' : 'preferred models first'),
+    'Writers: ' + status.writers.map(model => '<code>' + escapeHtml(model) + '</code>').join(' → '),
+    'Reviewers: ' + status.reviewers.map(model => '<code>' + escapeHtml(model) + '</code>').join(' → '),
+    'The bot tries the next model after a model error. Account limits pause generation.',
+    '<code>/solmodels &lt;writer&gt; &lt;reviewer&gt;</code> sets the preferred pair.',
+    '<code>/solmodels auto</code> restores the default order.',
+  ].join('\n'));
+}
+
 export async function formatSolutionKeyStatus(): Promise<string> {
-  const [status, primary] = await Promise.all([solutionKeyPoolStatus(), loadCoarenaKey()]);
+  const [status, primary, models] = await Promise.all([solutionKeyPoolStatus(), loadCoarenaKey(), loadCoarenaModelOrder()]);
   const lines = [
     '✨ <b>Article AI Providers</b>',
     '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
-    primary ? `Primary: <b>Coarena</b> · <code>${escapeHtml(maskCoarenaKey(primary))}</code> · ${escapeHtml(COARENA_WRITER)}` :
+    primary ? `Primary: <b>Coarena</b> · <code>${escapeHtml(maskCoarenaKey(primary))}</code> · ${escapeHtml(models.writers[0]!)}` :
       'Primary: <b>Discovery</b>',
     primary ? '<b>Discovery fallback keys</b>' : '<b>Discovery keys</b>',
     `Stored keys: <b>${status.total}</b>`,
@@ -3572,9 +3608,11 @@ export async function formatSolutionKeyStatus(): Promise<string> {
     }
   }
   lines.push('');
-  lines.push('💡 <i>Automatic key rotation is active. If any key receives HTTP 429, the workflow automatically fails over to the next key.</i>');
+  if (primary) lines.push('<i>Coarena switches models on model errors and pauses on account limits.</i>');
+  else lines.push('<i>Discovery key rotation is active.</i>');
   lines.push('');
   lines.push('<b>Commands:</b>');
+  if (primary) lines.push('├ <code>/solmodels</code> — View or change Coarena model priority');
   lines.push('├ <code>/addsolkey &lt;key&gt;</code> — Add key to pool');
   lines.push('├ <code>/delsolkey &lt;# or key&gt;</code> — Delete key from pool (e.g. /delsolkey 2)');
   lines.push('├ <code>/testsolkey [#]</code> — Test all keys or key #');

@@ -1,13 +1,14 @@
 import { z } from 'zod';
 import { accountDiagramLayouts, accountVisualThemes, diagramLayouts, visualMotions, visualThemes, conceptScenes, traceScenes, sceneDirections } from './visualStyles';
 
+export const CURRENT_VISUAL_VERSION = 4;
 export const articleLayouts = ['notebook', 'questions', 'example-first', 'recipe', 'interview', 'field-guide'] as const;
 export { diagramLayouts } from './visualStyles';
 export const presentationSchema = z.object({
   layout: z.enum(articleLayouts), diagrams: z.tuple([z.enum(diagramLayouts), z.enum(diagramLayouts)]),
   themes: z.tuple([z.enum(visualThemes), z.enum(visualThemes)]),
   motions: z.tuple([z.enum(visualMotions), z.enum(visualMotions)]).optional(),
-  visualVersion: z.union([z.literal(2), z.literal(3)]).optional(),
+  visualVersion: z.union([z.literal(2), z.literal(3), z.literal(CURRENT_VISUAL_VERSION)]).optional(),
   scenes: z.tuple([z.enum(conceptScenes), z.enum(traceScenes)]).optional(),
   directions: z.tuple([z.enum(sceneDirections), z.enum(sceneDirections)]).optional(),
   codePlacement: z.enum(['end', 'after-approach']).default('end'),
@@ -71,13 +72,13 @@ export function postPresentationVariant(index: number, problemIndex: number, lay
 export function withAnimatedScenes(presentation: ArticlePresentation, position: number, offset = 0): ArticlePresentation {
   const concept = (position + offset) % conceptScenes.length;
   const trace = (position + Math.floor(position / conceptScenes.length) + Math.floor(offset / conceptScenes.length)) % traceScenes.length;
-  return { ...presentation, visualVersion: 3, scenes: [conceptScenes[concept]!, traceScenes[trace]!],
+  return { ...presentation, visualVersion: CURRENT_VISUAL_VERSION, scenes: [conceptScenes[concept]!, traceScenes[trace]!],
     directions: [sceneDirections[Math.floor(position / conceptScenes.length) % 2]!,
       sceneDirections[(position + Math.floor(position / (conceptScenes.length * traceScenes.length))) % 2]!] };
 }
 
 export function usesAnimatedPresentation(presentation: ArticlePresentation | undefined): boolean {
-  return presentation?.visualVersion === 3 && !!presentation.scenes && !!presentation.directions;
+  return (presentation?.visualVersion ?? 0) >= 3 && !!presentation?.scenes && !!presentation.directions;
 }
 
 
