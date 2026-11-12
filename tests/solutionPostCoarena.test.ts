@@ -99,16 +99,17 @@ it('reads Retry-After from a padded Coarena response using the actual OpenAI tra
   });
 });
 
-it('selects an available review model when the preferred catalog entry disappears', async () => {
+it.each([{ models: ['review-gone', 'review-available'] }, { models: [] }])(
+  'uses an available reviewer with the configured priority $models', async ({ models }) => {
   const baseUrl = 'https://coarena.ai/api/v1';
   const fetcher = vi.fn(async (url: URL, options?: { body?: string }) => {
-    if (url.toString().endsWith('/models')) return Response.json({ data: [{ id: 'writer' }, { id: 'review-available' }] });
+    if (url.toString().endsWith('/models')) return Response.json({ data: [{ id: 'review-available' }] });
     const model = JSON.parse(options!.body!).model;
     return Response.json({ choices: [{ finish_reason: 'stop', message: { content: model } }] });
   });
   const client = new OpenAI({ apiKey: 'coa_catalog', baseURL: baseUrl, fetch: fetcher as never, maxRetries: 0 });
   const router = new AIModelRouter({ apiKey: 'coa_catalog', baseUrl, models: ['writer', 'review-gone', 'review-available'],
-    reviewModels: ['review-gone', 'review-available'], timeoutMs: 1000, retries: 0, maxTokens: 32 }, client);
+    reviewModels: models, timeoutMs: 1000, retries: 0, maxTokens: 32 }, client);
   expect(await router.generate(request, validate, 32, true, 'technical review article')).toMatchObject({
     value: 'review-available', model: 'review-available',
   });

@@ -136,8 +136,8 @@ export class AIModelRouter {
       }
       let exhausted = false;
       const sageReasoning = isSageProvider(this.options.baseUrl);
-      const modelOrder = stage?.startsWith('technical review')
-        ? this.options.reviewModels ?? this.options.models : this.options.writingModels ?? this.options.models;
+      const roleModels = stage?.startsWith('technical review') ? this.options.reviewModels : this.options.writingModels;
+      const modelOrder = roleModels?.length ? roleModels.filter(model => this.options.models.includes(model)) : this.options.models;
       for (const model of new Set(modelOrder)) {
         if (!available.has(model) || this.failedCoarenaModels.has(model)) {
           const record = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, stage,
