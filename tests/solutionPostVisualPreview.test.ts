@@ -13,11 +13,14 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs());
 it('uses the real account assignment and normal asset store on Render', async () => {
   const result = await createAccountVisualPreview('a');
-  expect(result).toMatchObject({ executionHost: 'render', revision: 'preview-revision', username: 'alice', presentation: { visualVersion: 2 } });
+  expect(result).toMatchObject({ executionHost: 'render', revision: 'preview-revision', username: 'alice', presentation: { visualVersion: 3, scenes: ['stage', 'split'] } });
   expect(h.reserve).toHaveBeenCalledWith('a', 'visual-preview');
   const plans = h.store.mock.calls[0]![0];
   expect(plans.map((plan: any) => plan.layout)).toEqual(presentationVariant(3).diagrams);
-  expect(plans[0].frames).toEqual(plans[1].frames);
+  expect(plans.map((plan: any) => plan.scene)).toEqual(['stage', 'split']);
+  expect(plans[0].frames).toHaveLength(3);
+  expect(plans[1].frames).toHaveLength(4);
+  expect(plans[0].frames).not.toEqual(plans[1].frames);
   expect(h.verify).toHaveBeenCalledWith(result.assets, expect.any(String));
 });
 it('rejects local execution and disabled accounts before creating assets', async () => {

@@ -12,7 +12,7 @@ import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallen
 import { AIModelRouter, RoutingError, SOLUTION_ARTICLE_WORK_MS } from './router';
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { isSageProvider } from '../config/solutionPostProvider';
-import { reservePostPresentation } from './presentation';
+import { reservePostPresentation, usesAnimatedPresentation } from './presentation';
 import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
 import { articleNeedsRefresh, ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext, StageCallback } from './article';
 import { OutputValidationError } from './router';
@@ -179,9 +179,11 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   // Use the immutable original snapshot when a later submission for the same problem exists.
   const originalContext = contextSchema.parse(JSON.parse(post.context));
   if (hash(originalContext.code) !== post.codeHash) throw new PostError('SOURCE_INTEGRITY_FAILED');
-  const savedContext = { ...originalContext, resumePublication: publicationMode ?? originalContext.resumePublication,
-    presentation: originalContext.presentation?.format ? originalContext.presentation :
-    await reservePostPresentation(post.problemSlug) };
+  const oldFormat = originalContext.presentation?.format;
+  const presentation = oldFormat && usesAnimatedPresentation(originalContext.presentation) ? originalContext.presentation! :
+    await reservePostPresentation(post.problemSlug);
+  if (oldFormat?.optimization && presentation.format) presentation.format.optimization = true;
+  const savedContext = { ...originalContext, resumePublication: publicationMode ?? originalContext.resumePublication, presentation };
   const workMs = config.solutionPosts.aiProvider === 'firecrawl' ? (6 + IMPLEMENTATION_STAGE_BUDGET) * FIRECRAWL_STAGE_BUDGET_MS : SOLUTION_ARTICLE_WORK_MS;
   const leaseMs = workMs + 120_000;
   // Reset an explicitly renewed attempt budget in the same CAS that claims
@@ -219,9 +221,12 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
       void Promise.resolve(onStage?.('article_provider', label)).catch(() => undefined);
     });
     useCoarena = activeRouter instanceof CoarenaRouter;
-    await onStage?.('generating_article', 'Writing and reviewing a distinct implementation…');
-    const implementation = await generateImplementation(activeRouter, savedContext, previous,
-      fingerprint => reserveImplementation(post, savedContext, fingerprint));
+    let implementation = { value: savedContext.articleImplementation, attempts: implementationAttempts };
+    if (!implementation.value) {
+      await onStage?.('generating_article', 'Writing and reviewing a distinct implementation…');
+      implementation = await generateImplementation(activeRouter, savedContext, previous,
+        fingerprint => reserveImplementation(post, savedContext, fingerprint));
+    }
     implementationAttempts = implementation.attempts;
     const articleContext = { ...savedContext, articleImplementation: implementation.value };
     let priorFailure: { markdown: string; issues: string[] } | undefined;
@@ -291,6 +296,10 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
   }
 }
 
+function draftNeedsRefresh(context: SubmissionContext): boolean {
+  return articleNeedsRefresh(context) || !usesAnimatedPresentation(context.presentation);
+}
+
 export async function generateForRun(accountId: string, runId: string, force = false, onStage?: StageCallback,
   publicationMode?: PublicationMode): Promise<SolutionPost> {
   const run = await prisma.dailyRun.findUniqueOrThrow({ where: { id: runId } });
@@ -301,7 +310,7 @@ export async function generateForRun(accountId: string, runId: string, force = f
   if (existing && awaitingCoarena(existing)) return existing;
   if (existing && !['PENDING', 'RETRY_PENDING'].includes(existing.status)) {
     if ((force && existing.status === 'FAILED') || (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(existing.status) &&
-      articleNeedsRefresh(contextSchema.parse(JSON.parse(existing.context))))) {
+      draftNeedsRefresh(contextSchema.parse(JSON.parse(existing.context))))) {
       return retryPost(existing.id, true, onStage, publicationMode);
     }
     return existing;
@@ -332,7 +341,7 @@ export async function retryPost(id: string, force = false, onStage?: StageCallba
   const refreshDraft = force && ['DRAFT_READY', 'AWAITING_APPROVAL'].includes(post.status);
   if (!refreshDraft && !['FAILED', 'RETRY_PENDING'].includes(post.status)) throw new PostError('NOT_RETRYABLE');
   const context = contextSchema.parse(JSON.parse(post.context));
-  if (refreshDraft && !articleNeedsRefresh(context)) throw new PostError('NOT_RETRYABLE');
+  if (refreshDraft && !draftNeedsRefresh(context)) throw new PostError('NOT_RETRYABLE');
   if (isCoarenaPaused(post)) return generatePost(context, undefined, force, onStage, publicationMode);
   checkGenerationBudget(post, force);
   const run = await prisma.dailyRun.findFirst({ where: { accountId: post.accountId, submissionId: post.submissionId } });

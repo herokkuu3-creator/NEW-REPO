@@ -5,7 +5,7 @@ import { AIModelRouter, OutputValidationError, RoutingError, ModelAttempt } from
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { sectionKinds, visualFrameSchema, visualPlanSchema, visualTitleSchema, VisualAsset, VisualResolver, renderVisualFallback, plainMarkdown } from './visuals';
 import { logger } from '../logger';
-import { articleBlockOrder, articleVisualGuidance, presentationSchema, layoutGuidance } from './presentation';
+import { articleBlockOrder, articleVisualGuidance, presentationSchema, layoutGuidance, usesAnimatedPresentation } from './presentation';
 import { LLMMessage } from '../ai/provider';
 import { implementationSchema } from './implementation';
 import { CoarenaRouter, COARENA_WRITER } from './coarena';
@@ -76,6 +76,8 @@ export function validateArticle(text: string, context: SubmissionContext, recent
     visual.layout = context.presentation!.diagrams[index];
     visual.theme = context.presentation!.themes[index];
     visual.motion = context.presentation!.motions?.[index];
+    visual.scene = context.presentation!.scenes?.[index];
+    visual.direction = context.presentation!.directions?.[index];
     if (context.presentation!.format) {
       visual.pace = (['quick', 'measured', 'hold-final'] as const)[(context.presentation!.format.index + index) % 3];
     }
@@ -95,6 +97,11 @@ export function validateArticle(text: string, context: SubmissionContext, recent
   const secondVisual = article.visuals.find(v => v.id === 'visual-2');
   if (!firstVisual || !secondVisual || !['intuition', 'approach'].includes(firstVisual.after) || secondVisual.after !== 'dryRun') {
     throw new OutputValidationError('GIF_PLACEMENT_REQUIRED');
+  }
+  if (usesAnimatedPresentation(context.presentation)) {
+    const signature = (visual: Article['visuals'][number]) => JSON.stringify(visual.frames.map(frame =>
+      [frame.items, [...frame.active].sort((a, b) => a - b), frame.state, frame.metric]));
+    if (signature(firstVisual) === signature(secondVisual)) throw new OutputValidationError('DUPLICATE_GIF_STORY');
   }
   // C++ template names are code, not HTML. Inline code and exact source template types are safe;
   // the renderer wraps any unfenced template type in inline code before Markdown rendering.
@@ -166,19 +173,24 @@ export function renderArticle(article: Article, context: SubmissionContext, asse
     'field-guide': ['Spot the pattern', 'Put it into practice', 'The rule that stays true', 'Follow the trace', 'Recognize it next time'],
   };
   const ordered = layout ? orders[layout]!.map(kind => article.sections.find(s => s.kind === kind)!).filter(Boolean) : article.sections;
+  const animated = usesAnimatedPresentation(context.presentation);
   const renderVisual = (plan: Article['visuals'][number]) => {
     const asset = assets.find(a => a.id === plan.id);
     if (!asset) return renderVisualFallback(plan);
     const url = new URL(asset.url);
     if (url.protocol !== 'https:' || url.username || url.password || /[\s()<>]/.test(asset.url)) throw new Error('Unusable visual URL');
     const alt = plainMarkdown(asset.alt);
-    return `![${alt}](${url.href})\n\n*${alt}*`;
+    const image = `![${alt}](${url.href})`;
+    if (animated && (plan.scene === 'film' || plan.scene === 'stage')) return `**${plainMarkdown(plan.title)}**\n\n${image}\n\n${alt}`;
+    if (animated && (plan.scene === 'switchboard' || plan.scene === 'split')) return `> ${alt}\n\n${image}`;
+    return `${image}\n\n*${alt}*`;
   };
   const format = context.presentation?.format;
   const sections = ordered.map(s => {
-    const prose = formatProse(s.markdown, templates);
+    const sourceProse = formatProse(s.markdown, templates);
+    const prose = animated && format && s.kind === 'dryRun' ? renderWorkedExample(sourceProse, format.index) : sourceProse;
     const heading = layout && !context.articleImplementation ? headings[layout]![sectionKinds.indexOf(s.kind)]! : s.heading;
-    const block = format ? renderPostSection(s.kind, heading, prose, format.index) :
+    const block = format ? renderPostSection(s.kind, heading, prose, format.index, animated) :
       layout === 'questions' ? `### ${heading}\n\n${prose}` :
       layout === 'recipe' && s.kind === 'intuition' ? `> **${heading}.** ${prose}` :
       layout === 'notebook' && s.kind === 'intuition' ? `**${heading}**\n\n${prose}` :
@@ -209,7 +221,10 @@ export function renderArticle(article: Article, context: SubmissionContext, asse
       blocks.set('optimization', `### Optimization\n\n${formatProse(article.optimization, templates)}`);
       order.splice(order.indexOf('costs') + 1, 0, 'optimization');
     }
-    return order.map(key => blocks.get(key)).filter(Boolean).join(format.index % 3 === 2 ? '\n\n---\n\n' : '\n\n') + '\n';
+    const chunks = order.map(key => blocks.get(key)).filter(Boolean);
+    if (animated && format.index % 4 === 1) chunks.splice(2, 0, '---');
+    if (animated && format.index % 4 === 3) chunks.splice(-2, 0, '---');
+    return chunks.join(format.index % 3 === 2 && !animated ? '\n\n---\n\n' : '\n\n') + '\n';
   }
   if (context.articleImplementation) {
     const codeBlock = `## Implementation\n\n${fence}${language}\n${code}\n${fence}`;
@@ -229,7 +244,38 @@ export function renderArticle(article: Article, context: SubmissionContext, asse
   return sections.join(separator) + costs + codeBlock;
 }
 
-function renderPostSection(kind: string, heading: string, prose: string, index: number): string {
+function renderWorkedExample(prose: string, index: number): string {
+  const example = /^\*\*Input:\*\*[ \t]+([^\n]+)\n+([\s\S]+?)\n+\*\*Output:\*\*[ \t]+([^\n]+)$/.exec(prose.trim());
+  if (!example) return prose;
+  const [, input, trace, output] = example;
+  if (index % 4 === 1) return `**Result ${output}**\n\nWith ${input}\n\n${trace}`;
+  if (index % 4 === 2) {
+    const cell = (value: string) => value.replace(/\|/g, '\\|');
+    return `| Input | Output |\n|---|---|\n| ${cell(input!)} | ${cell(output!)} |\n\n${trace}`;
+  }
+  if (index % 4 === 3) return `- **Input** ${input}\n- **Returned** ${output}\n\n${trace}`;
+  return prose;
+}
+
+const editorialForms = [
+  ['aside', 'heading', 'inline', 'heading', 'inline'],
+  ['lead', 'inline', 'heading', 'aside', 'heading'],
+  ['heading', 'lead', 'aside', 'inline', 'inline'],
+  ['inline', 'heading', 'lead', 'heading', 'aside'],
+  ['lead', 'aside', 'inline', 'heading', 'lead'],
+  ['heading', 'inline', 'heading', 'lead', 'aside'],
+  ['aside', 'lead', 'inline', 'heading', 'heading'],
+  ['inline', 'heading', 'aside', 'lead', 'inline'],
+] as const;
+
+function renderPostSection(kind: typeof sectionKinds[number], heading: string, prose: string, index: number, animated: boolean): string {
+  if (animated) {
+    const form = editorialForms[index % editorialForms.length]![sectionKinds.indexOf(kind)];
+    if (form === 'aside') return `> **${heading}**\n>\n${prose.split('\n').map(line => `> ${line}`).join('\n')}`;
+    if (form === 'lead') return `**${heading}**\n\n${prose}`;
+    if (form === 'inline' && !/^(?:[|>]|(?:[-*+]|\d+[.)])\s)/.test(prose)) return `**${heading}** — ${prose}`;
+    return `${form === 'heading' && index % 2 === 0 ? '##' : '###'} ${heading}\n\n${prose}`;
+  }
   if (index % 5 === 0 && kind === 'intuition') return `> **${heading}**\n>\n${prose.split('\n').map(line => `> ${line}`).join('\n')}`;
   if (index % 5 === 1 && kind === 'dryRun') return `## ${heading}\n\n${prose}`;
   if (index % 5 === 2 && kind === 'takeaways') return `**${heading}.** ${prose}`;
@@ -524,7 +570,9 @@ async function generateCoarenaArticle(router: CoarenaRouter, context: Submission
           ? error.issues.map(issue => issue.path.join('.') + ': ' + issue.message)
           : [rejection === 'READING_BUDGET_EXCEEDED'
             ? 'Shorten the prose to 110–140 words total. Use paragraphs of at most 30 words, including each list or worked-example step.'
-            : rejection];
+            : rejection === 'DUPLICATE_GIF_STORY'
+              ? 'Give the concept GIF its own small valid case and decision. Keep the walkthrough tied to the printed input.'
+              : rejection];
         let previous: unknown = draft.value.slice(0, 16_000);
         try { previous = parseJSON(draft.value); } catch { /* use the raw draft to repair malformed JSON */ }
         feedback = { draft: previous, issues };
@@ -668,6 +716,9 @@ export function compactArticlePrompt(context: SubmissionContext, style: string, 
   if (format) {
     style += `. Reading order: ${articleBlockOrder(format.index).join(', ')}. Write standalone sections that work in this order.`;
     if (!stage || /animation/.test(stage.name)) style += ` Concept GIF: ${articleVisualGuidance(format.index * 2)} Walkthrough GIF: ${articleVisualGuidance(format.index * 2 + 1)}`;
+  }
+  if (usesAnimatedPresentation(context.presentation) && (!stage || /animation/.test(stage.name))) {
+    style += ' Storyboard the two GIFs as different stories. Use a small separate valid case for the concept GIF to spotlight a decision or invariant. For the walkthrough, use the article’s printed example and show the trace from input to returned output. Choose distinct titles and frame labels. Keep input fixed inside each GIF.';
   }
   if (context.articleImplementation) style += '. Write headings specific to this implementation and example. Avoid generic labels such as Approach or Dry Run.';
   style += '. ARTICLE TITLE RULE: Never include the question name, its slug, or a long verbatim fragment in the article title. Use an original metaphor, invariant, insight, or technique hook.';

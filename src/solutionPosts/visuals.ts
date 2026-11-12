@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { diagramLayouts, visualThemes, visualMotions, accountDiagramLayouts } from './visualStyles';
+import { diagramLayouts, visualThemes, visualMotions, accountDiagramLayouts, animatedScenes, sceneDirections } from './visualStyles';
+import { animatedSceneDimensions, renderAnimatedScene } from './animatedScenes';
 import { renderAccountVisualFrame, visualDimensions } from './visualRenderer';
 
 export const sectionKinds = ['intuition', 'approach', 'correctness', 'dryRun', 'takeaways'] as const;
@@ -31,6 +32,8 @@ export const visualPlanSchema = z.object({
   theme: z.enum(visualThemes).default('aurora'),
   layout: z.enum(diagramLayouts).optional(),
   motion: z.enum(visualMotions).optional(),
+  scene: z.enum(animatedScenes).optional(),
+  direction: z.enum(sceneDirections).optional(),
   pace: z.enum(['quick', 'measured', 'hold-final']).optional(),
   frames: z.array(visualFrameSchema).min(2).max(8),
 }).superRefine((plan, ctx) => {
@@ -66,6 +69,7 @@ const palettes = {
 
 /** Original code-drawn diagrams: no fetched media, AI-generated URLs, or executable SVG markup. */
 export function renderVisualFrame(plan: VisualPlan, frameIndex: number, phase = 1): string {
+  if (plan.scene) return renderAnimatedScene({ ...plan, scene: plan.scene }, frameIndex, phase);
   if ((accountDiagramLayouts as readonly string[]).includes(plan.layout ?? '')) return renderAccountVisualFrame(plan, frameIndex, phase);
   const frame = plan.frames[frameIndex]!;
   const colors = palettes[plan.theme as keyof typeof palettes] ?? palettes.aurora;
@@ -159,18 +163,19 @@ export async function renderVisualGif(input: VisualPlan): Promise<Buffer> {
   const plan = visualPlanSchema.parse(input);
   const [{ default: sharp }, { GIFEncoder, quantize, applyPalette }] = await Promise.all([import('sharp'), import('gifenc')]);
   const gif = GIFEncoder();
-  const [width, height] = visualDimensions(plan);
+  const [width, height] = plan.scene ? animatedSceneDimensions[plan.scene] : visualDimensions(plan);
   const [stepDelay, finalDelay] = plan.pace === 'quick' ? [1050, 1700] : plan.pace === 'measured' ? [1650, 2150] :
     plan.pace === 'hold-final' ? [1250, 2800] : [1450, 2300];
   // Process sequentially so a worker never retains a full animation of RGBA frames in memory.
   for (let i = 0; i < plan.frames.length; i++) {
-    const phases = plan.layout ? [.25, .65, 1] : [1];
-    for (const phase of phases) {
-    const rgba = await sharp(Buffer.from(renderVisualFrame(plan, i, phase))).ensureAlpha().raw().toBuffer();
-    const palette = quantize(rgba, 64);
-    gif.writeFrame(applyPalette(rgba, palette), width, height, { palette, repeat: 0,
-      delay: phase < 1 ? (phase === .25 ? 120 : 160) :
-        (i === plan.frames.length - 1 ? finalDelay : stepDelay) - (plan.layout ? 280 : 0) });
+    const hold = i === plan.frames.length - 1 ? finalDelay : stepDelay;
+    const samples: [number, number][] = plan.scene
+      ? i === 0 ? [[1, hold]] : [[.12, 70], [.3, 70], [.5, 70], [.7, 70], [.87, 70], [1, hold - 350]]
+      : plan.layout ? [[.25, 120], [.65, 160], [1, hold - 280]] : [[1, hold]];
+    for (const [phase, delay] of samples) {
+      const rgba = await sharp(Buffer.from(renderVisualFrame(plan, i, phase))).ensureAlpha().raw().toBuffer();
+      const palette = quantize(rgba, 64);
+      gif.writeFrame(applyPalette(rgba, palette), width, height, { palette, repeat: 0, delay });
     }
   }
   gif.finish();

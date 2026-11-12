@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { accountDiagramLayouts, accountVisualThemes, diagramLayouts, visualMotions, visualThemes } from './visualStyles';
+import { accountDiagramLayouts, accountVisualThemes, diagramLayouts, visualMotions, visualThemes, conceptScenes, traceScenes, sceneDirections } from './visualStyles';
 
 export const articleLayouts = ['notebook', 'questions', 'example-first', 'recipe', 'interview', 'field-guide'] as const;
 export { diagramLayouts } from './visualStyles';
@@ -7,7 +7,9 @@ export const presentationSchema = z.object({
   layout: z.enum(articleLayouts), diagrams: z.tuple([z.enum(diagramLayouts), z.enum(diagramLayouts)]),
   themes: z.tuple([z.enum(visualThemes), z.enum(visualThemes)]),
   motions: z.tuple([z.enum(visualMotions), z.enum(visualMotions)]).optional(),
-  visualVersion: z.literal(2).optional(),
+  visualVersion: z.union([z.literal(2), z.literal(3)]).optional(),
+  scenes: z.tuple([z.enum(conceptScenes), z.enum(traceScenes)]).optional(),
+  directions: z.tuple([z.enum(sceneDirections), z.enum(sceneDirections)]).optional(),
   codePlacement: z.enum(['end', 'after-approach']).default('end'),
   costStyle: z.enum(['standard', 'bullets', 'compact']).default('standard'),
   format: z.object({ index: z.number().int().nonnegative(), optimization: z.boolean() }).optional(),
@@ -59,12 +61,25 @@ export function postPresentationVariant(index: number, problemIndex: number, lay
   const themeOffset = layoutOffset + Math.floor(problemIndex / accountDiagramLayouts.length);
   const firstTheme = (first + themeOffset) % accountVisualThemes.length;
   const traceTheme = (second + themeOffset + 7) % accountVisualThemes.length;
-  return { layout, diagrams: [accountDiagramLayouts[first]!, accountDiagramLayouts[second]!],
+  return withAnimatedScenes({ layout, diagrams: [accountDiagramLayouts[first]!, accountDiagramLayouts[second]!],
     themes: [accountVisualThemes[firstTheme]!, accountVisualThemes[traceTheme === firstTheme ? (traceTheme + 1) % accountVisualThemes.length : traceTheme]!],
     motions: [visualMotions[index % visualMotions.length]!, visualMotions[(index + 2) % visualMotions.length]!],
     visualVersion: 2, codePlacement: 'end', costStyle: (['standard', 'bullets', 'compact'] as const)[index % 3]!,
-    format: { index, optimization: problemIndex === 0 } };
+    format: { index, optimization: problemIndex === 0 } }, problemIndex, layoutOffset);
 }
+
+export function withAnimatedScenes(presentation: ArticlePresentation, position: number, offset = 0): ArticlePresentation {
+  const concept = (position + offset) % conceptScenes.length;
+  const trace = (position + Math.floor(position / conceptScenes.length) + Math.floor(offset / conceptScenes.length)) % traceScenes.length;
+  return { ...presentation, visualVersion: 3, scenes: [conceptScenes[concept]!, traceScenes[trace]!],
+    directions: [sceneDirections[Math.floor(position / conceptScenes.length) % 2]!,
+      sceneDirections[(position + Math.floor(position / (conceptScenes.length * traceScenes.length))) % 2]!] };
+}
+
+export function usesAnimatedPresentation(presentation: ArticlePresentation | undefined): boolean {
+  return presentation?.visualVersion === 3 && !!presentation.scenes && !!presentation.directions;
+}
+
 
 const visualStories = [
   'Contrast the state just before and just after the key decision.',
