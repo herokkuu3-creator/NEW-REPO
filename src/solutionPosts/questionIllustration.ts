@@ -108,9 +108,13 @@ export function renderQuestionIllustration(plan: VisualPlan, kind: IllustrationK
       const h = Math.min(73, (area.height - 24) / rowCount);
       const w = Math.min(110, (area.width - 22) / columnCount);
       const left = area.left + (area.width - columnCount * w) / 2;
-      const top = area.top + (area.height - rowCount * h) / 2;
+      const top = area.top + (area.height - rowCount * h) / 2 + (compact ? 7 : 0);
       body += rect(left - 11, top - 11, columnCount * w + 22, rowCount * h + 22, c.fog, 20, c.stroke);
       if (compact && frame.cells) {
+        body += columns.map(col =>
+          text(String(col), left + (col - columns[0]! + .5) * w, top - 17, w, 14, c.muted, 700, 'middle', 1)).join('');
+        body += rows.map(r =>
+          text(String(r), left - 22, top + (r - rows[0]! + .5) * h + 4, 28, 14, c.muted, 700, 'middle', 1)).join('');
         body += frame.cells.map(([r, col], i) =>
           tile(i, { x: left + (col - columns[0]! + .5) * w, y: top + (r - rows[0]! + .5) * h }, w - 9, h - 9)).join('');
       } else {

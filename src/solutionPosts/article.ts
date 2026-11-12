@@ -5,7 +5,7 @@ import { AIModelRouter, OutputValidationError, RoutingError, ModelAttempt } from
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { sectionKinds, visualFrameSchema, visualPlanSchema, visualTitleSchema, VisualAsset, VisualResolver, renderVisualFallback, plainMarkdown } from './visuals';
 import { logger } from '../logger';
-import { questionIllustration, questionStoryboard } from './questionVisuals';
+import { gridFrame, questionIllustration, questionStoryboard } from './questionVisuals';
 import { CURRENT_VISUAL_VERSION, articleBlockOrder, articleVisualGuidance, presentationSchema, layoutGuidance, usesAnimatedPresentation } from './presentation';
 import { LLMMessage } from '../ai/provider';
 import { implementationSchema } from './implementation';
@@ -82,6 +82,7 @@ export function validateArticle(text: string, context: SubmissionContext, recent
     if (context.presentation!.visualVersion === CURRENT_VISUAL_VERSION) {
       const family = questionIllustration(context);
       visual.terrain = family === 'steps' && index === 0 ? 'decision' : family;
+      if (visual.terrain === 'grid') visual.frames = visual.frames.map(gridFrame);
     } else {
       visual.terrain = visual.scene === 'terminal' && /^climbing-stairs(?:-|$)/.test(context.slug) ? 'steps' : undefined;
     }
@@ -581,7 +582,7 @@ async function generateCoarenaArticle(router: CoarenaRouter, context: Submission
             ? 'Shorten the prose to 110–140 words total. Use paragraphs of at most 30 words, including each list or worked-example step.'
             : rejection === 'DUPLICATE_GIF_STORY'
               ? 'Give the concept GIF its own small valid case and decision. Keep the walkthrough tied to the printed input.'
-              : rejection];
+              : rejection === 'GRID_CELLS_REQUIRED' ? questionStoryboard(context) : rejection];
         let previous: unknown = draft.value.slice(0, 16_000);
         try { previous = parseJSON(draft.value); } catch { /* use the raw draft to repair malformed JSON */ }
         feedback = { draft: previous, issues };

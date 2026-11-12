@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest';
 import sharp from 'sharp';
 import { contextSchema } from '../src/solutionPosts/article';
-import { questionIllustration } from '../src/solutionPosts/questionVisuals';
+import { gridFrame, questionIllustration } from '../src/solutionPosts/questionVisuals';
 import { renderVisualFrame, renderVisualGif, visualPlanSchema } from '../src/solutionPosts/visuals';
 
 const context = (slug: string, tags: string[], code = 'class Solution {}') => contextSchema.parse({
@@ -62,4 +62,11 @@ it('encodes distinct grid and tree GIFs while keeping the traced state count', a
     expect(meta.pages).toBe(13);
     expect(gif.length).toBeLessThan(500000);
   }
+});
+
+it('requires actual board cells and accepts explicit cell labels when coordinate metadata is missing', () => {
+  expect(() => gridFrame({ ...fixture.frames[0]!, items: ['row count = 2', 'result = 3'], active: [0] }))
+    .toThrow('GRID_CELLS_REQUIRED');
+  expect(gridFrame({ ...fixture.frames[0]!, items: ['(0,0)=1', '[1,1]:0'], active: [1] }))
+    .toMatchObject({ cells: [[0, 0], [1, 1]], items: ['1', '0'] });
 });

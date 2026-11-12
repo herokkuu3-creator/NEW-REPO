@@ -25,7 +25,7 @@ vi.mock('../src/database/prisma', () => ({ prisma: {
 vi.mock('../src/solutionPosts/article', async orig => ({ ...(await orig() as object), generateArticle: h.generation }));
 vi.mock('../src/solutionPosts/implementation', async orig => ({ ...(await orig() as object), generateImplementation: h.implementation }));
 vi.mock('../src/solutionPosts/presentation', async orig => ({ ...(await orig() as object),
-  reservePostPresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 6,
+  reservePostPresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 7,
     scenes: ['orbit', 'film'], directions: ['forward', 'forward'], motions: ['scan', 'slide'], format: { index: 0, optimization: true } })) }));
 vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn(), verifyHostedVisualAssets: h.verifyVisuals }));
 vi.mock('playwright', () => ({ chromium: { launch: h.launch } }));
@@ -132,7 +132,7 @@ describe('solution workflow and persistence', () => {
     h.generation.mockClear();
     expect((await generatePost(context, {} as never)).status).toBe('AWAITING_APPROVAL');
     const saved = JSON.parse(h.row.context);
-    expect(saved.presentation).toMatchObject({ visualVersion: 6, diagrams: ['timeline', 'rail'] });
+    expect(saved.presentation).toMatchObject({ visualVersion: 7, diagrams: ['timeline', 'rail'] });
     expect(saved.code).toBe(context.code); expect(h.row.codeHash).toBe(hash(context.code));
   });
   it('regenerates a legacy draft on explicit retry and requires approval of the replacement', async () => {
@@ -145,7 +145,7 @@ describe('solution workflow and persistence', () => {
     const post = await retryPost('post1', true);
     expect(post).toMatchObject({ status: 'AWAITING_APPROVAL', approvedHash: null, codeHash: hash(context.code) });
     expect(JSON.parse(post.context)).toMatchObject({ code: context.code, articleImplementation: implementation,
-      presentation: { visualVersion: 6, scenes: ['switchboard', 'terminal'] } });
+      presentation: { visualVersion: 7, scenes: ['switchboard', 'terminal'] } });
     expect(h.implementation).toHaveBeenCalledOnce();
     expect(h.verdict).toHaveBeenCalledTimes(1);
   });

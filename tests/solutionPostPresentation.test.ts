@@ -72,7 +72,7 @@ it('assigns distinct block orders, GIF slots and geometry to the same problem un
   expect(new Set(assigned.flatMap(item => item.diagrams.map((layout, role) =>
     [layout, item.themes[role], item.motions?.[role]].join('/')))).size).toBe(30);
   expect(new Set(assigned.map(item => item.scenes!.join('/'))).size).toBe(15);
-  expect(assigned.every(item => item.visualVersion === 6)).toBe(true);
+  expect(assigned.every(item => item.visualVersion === 7)).toBe(true);
   expect(assigned.filter(item => item.format?.optimization)).toHaveLength(1);
   expect(new Set(Array.from({ length: 10_000 }, (_, index) => articleBlockOrder(index).join(' '))).size).toBe(10_000);
 });

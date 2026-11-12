@@ -12,6 +12,7 @@ import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallen
 import { AIModelRouter, RoutingError, SOLUTION_ARTICLE_WORK_MS } from './router';
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { isSageProvider } from '../config/solutionPostProvider';
+import { questionIllustration } from './questionVisuals';
 import { CURRENT_VISUAL_VERSION, reservePostPresentation, usesAnimatedPresentation, type ArticlePresentation } from './presentation';
 import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
 import { articleNeedsRefresh, ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext, StageCallback } from './article';
@@ -302,7 +303,8 @@ function draftNeedsRefresh(context: SubmissionContext): boolean {
   const presentation = context.presentation;
   if (articleNeedsRefresh(context) || !usesAnimatedPresentation(presentation)) return true;
   return (presentation?.visualVersion ?? 0) < 4 ||
-    (presentation?.visualVersion === 4 && presentation.scenes?.[1] === 'terminal');
+    (presentation?.visualVersion === 4 && presentation.scenes?.[1] === 'terminal') ||
+    (presentation?.visualVersion === 6 && questionIllustration(context) === 'grid');
 }
 
 export async function generateForRun(accountId: string, runId: string, force = false, onStage?: StageCallback,
