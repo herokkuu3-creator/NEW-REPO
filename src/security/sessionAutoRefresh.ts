@@ -116,7 +116,7 @@ export async function refreshLeetCodeAccount(account: AccountRecord): Promise<Ac
     };
   }
 
-  const lcProxy = await resolveLeetCodeResidentialProxy().catch(() => null);
+  const lcProxy = await resolveLeetCodeResidentialProxy();
   logger.info({ label: account.label, username: creds.username, proxy: lcProxy ? lcProxy.host : 'direct' }, 'Attempting automated LeetCode re-login with stored credentials');
   const loginRes = await withSingleFlightLogin(account.label, () =>
     lcProxy?.url ? loginToLeetCode(creds.username, creds.password, { proxyUrl: lcProxy.url }) : loginToLeetCode(creds.username, creds.password),

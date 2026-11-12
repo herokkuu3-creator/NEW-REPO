@@ -1,10 +1,13 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { AccountStatus } from '@prisma/client';
 import { ingestCookiePayload, type IngestResult, type Validator } from '../accounts/ingest';
+import { checkSession } from '../browser/sessionCheck';
 import { listAccounts } from '../database/accounts';
 import { logger } from '../logger';
 import { sendTelegramMessage } from '../notifications/telegram';
+import { hasRecoveryService, getRecoveryService } from '../recovery/runtime';
 import { saveEncryptedCredentials } from '../security/credentialStore';
+import { clearLeetCodeLoginCooldown, openLightweightLeetCodeSession } from './sessionManager';
 
 export const DEFAULT_PAIRING_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const MAX_ACTIVE_PAIRING_SESSIONS = 32;
@@ -358,12 +361,36 @@ export async function completeLeetCodePairingSession(
   // Lock token against concurrent replay while server-side GraphQL verification runs.
   session.status = 'completing';
 
+  const defaultLightweightValidator: Validator = async (state) => {
+    const s = await openLightweightLeetCodeSession(state);
+    try {
+      const check = await checkSession(s.api);
+      if (check.authenticated && check.username) {
+        return { ok: true, username: check.username };
+      }
+      if (check.cause === 'query-failed') {
+        return {
+          ok: false,
+          reason: 'blocked',
+          error: 'the LeetCode check request failed (network or bot protection)',
+        };
+      }
+      return {
+        ok: false,
+        reason: 'signed-out',
+        error: 'LeetCode reported userStatus.isSignedIn = false',
+      };
+    } finally {
+      await s.close().catch(() => undefined);
+    }
+  };
+
   let ingestResult: IngestResult;
   try {
     ingestResult = await ingestCookiePayload(rawCookiePayload, {
       label: session.label,
       validate: true,
-      validator: deps.validator,
+      validator: deps.validator ?? defaultLightweightValidator,
     });
   } catch (err) {
     session.status = 'pending';
@@ -407,6 +434,10 @@ export async function completeLeetCodePairingSession(
 
   if (ingestResult.status === AccountStatus.ACTIVE) {
     const verifiedUsername = ingestResult.username || localVerifiedUsername || pendingIdentifier || ingestResult.label;
+    await clearLeetCodeLoginCooldown(ingestResult.label).catch(() => undefined);
+    if (hasRecoveryService()) {
+      await getRecoveryService().cancelByLabel(ingestResult.label).catch(() => undefined);
+    }
     let savedCreds = false;
     if (pendingPassword) {
       await saveEncryptedCredentials('leetcode', ingestResult.label, {

@@ -57,8 +57,8 @@ describe('Capzy / CapSolver API Key Manager & Rotation', () => {
 
   describe('maskApiKey', () => {
     it('masks long API keys correctly for secure Telegram display', () => {
-      expect(maskApiKey('capzy_b1680657df2e72f365f078303446b985a2aa59c49adf5abe')).toBe('capzy_b1...5abe');
-      expect(maskApiKey('capzy_696cff0b8e4ba932cf5af125cc3367489ee969291f61709f')).toBe('capzy_69...709f');
+      expect(maskApiKey('capzy_b10000000000000000000000000000000000000000005abe')).toBe('capzy_b1...5abe');
+      expect(maskApiKey('capzy_69000000000000000000000000000000000000000000709f')).toBe('capzy_69...709f');
     });
 
     it('handles short keys and empty values safely', () => {
@@ -69,8 +69,8 @@ describe('Capzy / CapSolver API Key Manager & Rotation', () => {
 
   describe('isLikelyCapzyKey', () => {
     it('identifies valid Capzy key strings', () => {
-      expect(isLikelyCapzyKey('capzy_b1680657df2e72f365f078303446b985a2aa59c49adf5abe')).toBe(true);
-      expect(isLikelyCapzyKey('capzy_b1680657df2e72f365f078303446b985a2aa59c49adf5abe, capzy_696cff0b8e4ba932cf5af125cc3367489ee969291f61709f')).toBe(true);
+      expect(isLikelyCapzyKey('capzy_b10000000000000000000000000000000000000000005abe')).toBe(true);
+      expect(isLikelyCapzyKey('capzy_b10000000000000000000000000000000000000000005abe, capzy_69000000000000000000000000000000000000000000709f')).toBe(true);
     });
 
     it('rejects bot commands, json, and regular text', () => {

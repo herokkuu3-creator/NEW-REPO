@@ -1,4 +1,3 @@
-import { Browser, chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import { AccountStatus } from '@prisma/client';
@@ -6,10 +5,11 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { saveStorageStateToDb, setSystemState, SystemKeys } from '../database/models';
 import { listAccounts, saveAccount } from '../database/accounts';
-import { LeetCodeApi, looksLikeChallenge } from '../leetcode/apiClient';
-import { buildLaunchArgs } from './playwright';
+import { looksLikeChallenge } from '../leetcode/apiClient';
 import { checkSession } from './sessionCheck';
 import { parseCookiePayload, StorageStateShape } from './cookiePayload';
+import * as sessionManager from '../leetcode/sessionManager';
+import type { LightweightLeetCodeSession } from '../leetcode/sessionManager';
 
 /**
  * Session renewal — the apply half of the /renew flow.
@@ -53,24 +53,10 @@ const NOT_SIGNED_IN_ERROR =
 export async function validateCookiesAgainstLeetcode(
   storageState: StorageStateShape,
 ): Promise<ValidationOutcome> {
-  let browser: Browser | undefined;
+  let session: LightweightLeetCodeSession | undefined;
   try {
-    const isHeadless = config.browser.headless;
-    browser = await chromium.launch({
-      headless: isHeadless,
-      args: buildLaunchArgs(isHeadless),
-    });
-    const context = await browser.newContext({
-      storageState: {
-        cookies: storageState.cookies,
-        origins: storageState.origins,
-      },
-      viewport: { width: 1366, height: 900 },
-      locale: 'en-US',
-    });
-
-    const check = await checkSession(new LeetCodeApi(context));
-    await context.close().catch(() => undefined);
+    session = await sessionManager.openLightweightLeetCodeSession(storageState);
+    const check = await checkSession(session.api);
 
     if (!check.authenticated || !check.username) {
       if (check.cause === 'query-failed') {
@@ -95,7 +81,7 @@ export async function validateCookiesAgainstLeetcode(
     logger.warn({ err: msg }, 'cookie validation failed');
     return { ok: false, reason: 'error', error: `validation failed: ${msg}` };
   } finally {
-    if (browser) await browser.close().catch(() => undefined);
+    if (session) await session.close().catch(() => undefined);
   }
 }
 

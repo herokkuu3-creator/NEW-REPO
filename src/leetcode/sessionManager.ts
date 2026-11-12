@@ -15,6 +15,8 @@ import { extractSessionIdentity, type SessionIdentity } from '../browser/session
 import { type StorageStateShape } from '../browser/cookiePayload';
 import { LeetCodeApi } from './apiClient';
 import { logger } from '../logger';
+import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
+import { toPlaywrightProxy } from '../codeforces/proxyRotator';
 
 const ORIGIN = 'https://leetcode.com';
 const DEFAULT_USER_AGENT =
@@ -58,6 +60,7 @@ export async function persistRotatedCookiesFromContext(
       return false;
     }
     const updatedState: StorageStateShape = {
+      transport: initialState.transport,
       cookies: latest.cookies as StorageStateShape['cookies'],
       origins: Array.isArray(initialState.origins) ? initialState.origins : [],
     };
@@ -105,9 +108,13 @@ export async function openLightweightLeetCodeSession(
 ): Promise<LightweightLeetCodeSession> {
   const initialFingerprint = cookieFingerprint(state);
   const preservedOrigins = Array.isArray(state.origins) ? state.origins : [];
+  const proxyUrl = state.transport?.proxyUrl ?? (await resolveLeetCodeResidentialProxy())?.url;
+  const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
+  if (proxyUrl && !proxy) throw new Error('LEETCODE_PROXY_INVALID');
 
   const ctx = await playwrightRequest.newContext({
-    userAgent: DEFAULT_USER_AGENT,
+    userAgent: state.transport?.userAgent ?? DEFAULT_USER_AGENT,
+    proxy,
     storageState: {
       cookies: state.cookies as never,
       origins: [],
@@ -134,6 +141,7 @@ export async function openLightweightLeetCodeSession(
   const getStorageState = async (): Promise<StorageStateShape> => {
     const latest = await ctx.storageState();
     return {
+      transport: state.transport ?? (proxyUrl ? { proxyUrl } : undefined),
       cookies: latest.cookies as unknown as StorageStateShape['cookies'],
       origins: preservedOrigins,
     };

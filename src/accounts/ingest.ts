@@ -75,6 +75,106 @@ export async function ingestStorageState(
     labelFromFileName(opts.fileName),
   );
 
+  const previous = existing.find((a) => a.label === label);
+
+  // If validating live (or replacing an existing account during a validated renewal), verify
+  // before overwriting any stored session so a bad upload never clobbers an existing session.
+  if (opts.validate === true) {
+    if (identity.expired) {
+      if (!isNew) {
+        return { ok: false, error: 'Session token is expired; stored session retained.' };
+      }
+      const account = await saveAccount(label, JSON.stringify(state), {
+        username: identity.username,
+        status: AccountStatus.UNKNOWN,
+      });
+      const detail = 'the session token is past its expiry date — capture fresh cookies';
+      await patchAccount(account.id, { status: AccountStatus.EXPIRED, lastError: detail, checked: true });
+      return {
+        ok: true,
+        label,
+        created: isNew,
+        username: identity.username ?? null,
+        status: AccountStatus.EXPIRED,
+        cookieCount: state.cookies.length,
+        format,
+        detail,
+      };
+    }
+    const validator = opts.validator ?? (await import('../browser/sessionRenewal')).validateCookiesAgainstLeetcode;
+    let validation: Awaited<ReturnType<Validator>>;
+    try {
+      validation = await validator(state);
+    } catch {
+      return { ok: false, error: 'Session validation unavailable; stored session retained. Retry later.' };
+    }
+    if (!validation.ok) {
+      if (!isNew) {
+        return { ok: false, error: `${validation.error}; stored session retained.` };
+      }
+      const account = await saveAccount(label, JSON.stringify(state), {
+        username: identity.username,
+        status: AccountStatus.UNKNOWN,
+      });
+      if (validation.reason === 'signed-out') {
+        const detail =
+          'LeetCode rejected this transferred session from the agent server — this does not by itself prove that the token has expired';
+        await patchAccount(account.id, { status: AccountStatus.REJECTED, lastError: detail, checked: true });
+        return {
+          ok: true,
+          label,
+          created: isNew,
+          username: identity.username ?? null,
+          status: AccountStatus.REJECTED,
+          cookieCount: state.cookies.length,
+          format,
+          detail,
+        };
+      }
+      const detail = `could not verify right now (${validation.error}) — stored; the next daily run re-checks it`;
+      await patchAccount(account.id, { lastError: detail, checked: true });
+      return {
+        ok: true,
+        label,
+        created: isNew,
+        username: identity.username ?? null,
+        status: AccountStatus.UNKNOWN,
+        cookieCount: state.cookies.length,
+        format,
+        detail,
+      };
+    }
+    if (
+      previous?.username &&
+      !previous.username.includes('@') &&
+      previous.username.toLowerCase() !== validation.username.toLowerCase()
+    ) {
+      return { ok: false, error: 'Authenticated username does not match the target account; stored session retained.' };
+    }
+    const account = await saveAccount(label, JSON.stringify(state), {
+      username: validation.username,
+      status: AccountStatus.ACTIVE,
+    });
+    if (account?.id) {
+      await patchAccount(account.id, {
+        username: validation.username,
+        status: AccountStatus.ACTIVE,
+        lastError: null,
+        checked: true,
+      });
+    }
+    return {
+      ok: true,
+      label,
+      created: isNew,
+      username: validation.username,
+      status: AccountStatus.ACTIVE,
+      cookieCount: state.cookies.length,
+      format,
+      detail: 'LeetCode confirmed the session is signed in',
+    };
+  }
+
   // 1) STORE first — new label = add, existing label = override the cookies.
   // Normal capture uploads do NOT perform a Render-side live check. This keeps
   // a cross-network session rejection from being misreported as token expiry.
@@ -102,36 +202,12 @@ export async function ingestStorageState(
     return { ...base, username: identity.username ?? null, status: AccountStatus.EXPIRED, detail };
   }
 
-  if (opts.validate !== true) {
-    return {
-      ...base,
-      username: identity.username ?? null,
-      status: AccountStatus.UNKNOWN,
-      detail: 'stored without a live check — the next daily run verifies it',
-    };
-  }
-
-  // 3) Live check against LeetCode.
-  const validator = opts.validator ?? (await import('../browser/sessionRenewal')).validateCookiesAgainstLeetcode;
-  const v = await validator(state);
-  if (v.ok) {
-    await patchAccount(account.id, {
-      username: v.username,
-      status: AccountStatus.ACTIVE,
-      lastError: null,
-      checked: true,
-    });
-    return { ...base, username: v.username, status: AccountStatus.ACTIVE, detail: 'LeetCode confirmed the session is signed in' };
-  }
-  if (v.reason === 'signed-out') {
-    const detail =
-      'LeetCode rejected this transferred session from the agent server — this does not by itself prove that the token has expired';
-    await patchAccount(account.id, { status: AccountStatus.REJECTED, lastError: detail, checked: true });
-    return { ...base, username: identity.username ?? null, status: AccountStatus.REJECTED, detail };
-  }
-  const detail = `could not verify right now (${v.error}) — stored; the next daily run re-checks it`;
-  await patchAccount(account.id, { lastError: detail, checked: true });
-  return { ...base, username: identity.username ?? null, status: AccountStatus.UNKNOWN, detail };
+  return {
+    ...base,
+    username: identity.username ?? null,
+    status: AccountStatus.UNKNOWN,
+    detail: 'stored without a live check — the next daily run verifies it',
+  };
 }
 
 /** One Telegram-friendly line for an ingest result. */

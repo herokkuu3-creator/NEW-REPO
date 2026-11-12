@@ -104,6 +104,8 @@ export interface RecoveryStore {
   ): Promise<RecoveryRecord | null>;
   cancel(id: string, category: string): Promise<RecoveryRecord | null>;
   rescheduleReminder(id: string, at: Date): Promise<void>;
+  /** Clears any prior error category/message and schedules an immediate reminder when an operator explicitly requests recovery. */
+  resetForOperatorRequest?(id: string, now: Date): Promise<void>;
   /**
    * ATOMIC: replaces the account's session AND marks the recovery RECOVERED in
    * one transaction, only while the recovery is still VERIFYING. Throws

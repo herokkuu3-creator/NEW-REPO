@@ -15,7 +15,6 @@ import {
   extractProxyDetails,
   resolveActiveProxy,
   resolveLeetCodeResidentialProxy,
-  DEFAULT_DECODO_RESIDENTIAL_PROXY,
 } from '../src/codeforces/proxyManager';
 import { selectWorkingProxy, proxyHash, toPlaywrightProxy } from '../src/codeforces/proxyRotator';
 import {
@@ -685,15 +684,31 @@ describe('telegram proxy commands', () => {
       expect(isLikelyProxyPayload('hello how are you')).toBe(false);
     });
 
-    it('configures Decodo residential proxy as primary default and converts to Playwright format', async () => {
-      expect(toPlaywrightProxy(DEFAULT_DECODO_RESIDENTIAL_PROXY)).toEqual({
-        server: 'http://in.decodo.com:10000',
-        username: 'spo31gdzsh',
-        password: 'G=koPtHx9g1nGs19uz',
-      });
-      const resolved = await resolveLeetCodeResidentialProxy({ allowInTest: true });
-      expect(resolved?.host).toBe('in.decodo.com:10000');
-      expect(resolved?.username).toBe('spo31gdzsh');
+    it('loads LeetCode residential proxy strictly from environment variables and converts to Playwright format', async () => {
+      const prevLeetCodeResProxy = process.env.LEETCODE_RESIDENTIAL_PROXY;
+      const prevLeetCodeProxy = process.env.LEETCODE_PROXY;
+      try {
+        delete process.env.LEETCODE_RESIDENTIAL_PROXY;
+        delete process.env.LEETCODE_PROXY;
+        expect(await resolveLeetCodeResidentialProxy({ allowInTest: true })).toBeNull();
+
+        const fixtureProxy = 'http://fixtureuser:fixturepass@proxy.example.test:10000';
+        expect(toPlaywrightProxy(fixtureProxy)).toEqual({
+          server: 'http://proxy.example.test:10000',
+          username: 'fixtureuser',
+          password: 'fixturepass',
+        });
+
+        process.env.LEETCODE_RESIDENTIAL_PROXY = fixtureProxy;
+        const resolved = await resolveLeetCodeResidentialProxy({ allowInTest: true });
+        expect(resolved?.host).toBe('proxy.example.test:10000');
+        expect(resolved?.username).toBe('fixtureuser');
+      } finally {
+        if (prevLeetCodeResProxy === undefined) delete process.env.LEETCODE_RESIDENTIAL_PROXY;
+        else process.env.LEETCODE_RESIDENTIAL_PROXY = prevLeetCodeResProxy;
+        if (prevLeetCodeProxy === undefined) delete process.env.LEETCODE_PROXY;
+        else process.env.LEETCODE_PROXY = prevLeetCodeProxy;
+      }
     });
   });
 });

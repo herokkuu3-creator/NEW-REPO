@@ -153,6 +153,16 @@ export class MemoryRecoveryStore implements RecoveryStore {
     if (r && REMINDABLE_STATUSES.includes(r.status)) r.nextReminderAt = at;
   }
 
+  async resetForOperatorRequest(id: string, now: Date) {
+    const r = this.rows.get(id);
+    if (r && REMINDABLE_STATUSES.includes(r.status)) {
+      r.status = RecoveryStatus.RECOVERY_PENDING;
+      r.lastErrorCategory = null;
+      r.lastError = null;
+      r.nextReminderAt = now;
+    }
+  }
+
   async commitRecovered(input: CommitRecoveredInput): Promise<RecoveryRecord> {
     if (this.failNextCommit) {
       const err = this.failNextCommit;

@@ -139,7 +139,7 @@ export async function loginToCodeforces(
       const currentCookies = await context.cookies('https://codeforces.com').catch(() => []);
       const solved = await solveCloudflareOrchestrated({
         websiteURL: page.url(),
-        sitekey,
+        ...(sitekey ? { sitekey } : {}),
         proxyUrl,
         userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
         cookies: currentCookies,
@@ -344,13 +344,12 @@ async function detectCodeforcesHandle(page: Page): Promise<string | null> {
   }).catch(() => null);
 }
 
-async function extractTurnstileSitekey(page: Page): Promise<string> {
-  const fallbackKey = '0x4AAAAAAADnPIDROrmt1Wwj';
-  if (!page || page.isClosed()) return fallbackKey;
+async function extractTurnstileSitekey(page: Page): Promise<string | undefined> {
+  if (!page || page.isClosed()) return undefined;
   try {
     const extracted = await page.evaluate(() => {
       const win = window as any;
-      const el = document.querySelector('.cf-turnstile, [data-sitekey], [data-key]');
+      const el = document.querySelector('[data-sitekey], [data-key], .cf-turnstile');
       let key = win.__turnstileSitekey || el?.getAttribute('data-sitekey') || el?.getAttribute('data-key') || (el as HTMLElement | null)?.dataset?.sitekey || null;
       if (!key) {
         const iframes = Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="cloudflare.com"]')) as HTMLIFrameElement[];
@@ -373,9 +372,9 @@ async function extractTurnstileSitekey(page: Page): Promise<string> {
       }
       return key;
     }).catch(() => null);
-    return extracted || fallbackKey;
+    return extracted || undefined;
   } catch {
-    return fallbackKey;
+    return undefined;
   }
 }
 

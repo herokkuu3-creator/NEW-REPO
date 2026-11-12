@@ -39,6 +39,7 @@ export interface KeyBalanceResult {
 }
 
 let inMemoryKeys: string[] = [];
+let inMemoryKeysExplicitlySet = false;
 let inMemoryActiveIndex = 0;
 
 export const MIN_USABLE_CAPZY_BALANCE = 0.0012;
@@ -203,7 +204,7 @@ export async function checkCapzyKeyBalance(clientKey: string): Promise<KeyBalanc
 }
 
 export async function getCapzyApiKeys(): Promise<string[]> {
-  if (inMemoryKeys.length > 0) return inMemoryKeys;
+  if (inMemoryKeysExplicitlySet || inMemoryKeys.length > 0) return inMemoryKeys;
 
   if (!process.env.VITEST && process.env.NODE_ENV !== 'test') {
     try {
@@ -235,12 +236,8 @@ export async function getCapzyApiKeys(): Promise<string[]> {
     process.env.CAPSOLVER_API_KEY ||
     '';
 
-  const defaultFundedKey = 'capzy_696cff0b8e4ba932cf5af125cc3367489ee969291f61709f';
   const envKeys = parseCapzyApiKeys(envRaw);
   if (envKeys.length > 0) {
-    if (!envKeys.includes(defaultFundedKey)) {
-      envKeys.push(defaultFundedKey);
-    }
     inMemoryKeys = envKeys;
     return inMemoryKeys;
   }
@@ -249,16 +246,14 @@ export async function getCapzyApiKeys(): Promise<string[]> {
     return ['test-capzy-key'];
   }
 
-  inMemoryKeys = [defaultFundedKey];
-  return inMemoryKeys;
+  return [];
 }
 
 export function initCapzyKeys(keys: string[], activeIndex = 0): void {
   const parsed = parseCapzyApiKeys(keys);
-  if (parsed.length > 0) {
-    inMemoryKeys = parsed;
-    inMemoryActiveIndex = Math.max(0, Math.min(activeIndex, parsed.length - 1));
-  }
+  inMemoryKeys = parsed;
+  inMemoryKeysExplicitlySet = true;
+  inMemoryActiveIndex = parsed.length > 0 ? Math.max(0, Math.min(activeIndex, parsed.length - 1)) : 0;
 }
 
 export async function setActiveCapzyKeyIndex(index: number): Promise<void> {
@@ -300,7 +295,7 @@ export async function saveCapzyApiKeys(
   }
 
   // Set the first funded key as the active index, or 0 if none funded
-  const firstFundedIdx = balances.findIndex((b) => b.ok && b.balance > 0);
+  const firstFundedIdx = balances.findIndex((b) => b.ok && b.balance >= MIN_USABLE_CAPZY_BALANCE);
   const activeIdx = firstFundedIdx >= 0 ? firstFundedIdx : 0;
 
   inMemoryKeys = keys;
@@ -467,10 +462,19 @@ export async function rotateToNextCapzyKey(
 }
 
 export async function getCandidateCapzyKeys(overrideKeys?: string[]): Promise<string[]> {
-  const keys = overrideKeys && overrideKeys.length > 0 ? overrideKeys : await getCapzyApiKeys();
+  const keys = overrideKeys && overrideKeys.length > 0 ? parseCapzyApiKeys(overrideKeys) : await getCapzyApiKeys();
   if (keys.length === 0) return [];
+
+  // If overrideKeys were passed and do not match explicitly set in-memory pool,
+  // treat as a fresh ad-hoc key list rather than applying old rotation state
+  if (overrideKeys && overrideKeys.length > 0) {
+    if (!inMemoryKeysExplicitlySet || inMemoryKeys.join(',') !== keys.join(',')) {
+      return keys;
+    }
+  }
+
   const activeIdx = await getActiveCapzyKeyIndex();
-  // Return keys starting from activeIdx, followed by preceding keys as fallback if needed
-  const primary = keys.slice(activeIdx);
-  return primary.length > 0 ? primary : keys;
+  const safeIdx = Math.max(0, activeIdx);
+  if (safeIdx >= keys.length) return [];
+  return keys.slice(safeIdx);
 }

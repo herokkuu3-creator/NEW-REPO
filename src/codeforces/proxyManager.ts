@@ -138,30 +138,15 @@ export async function fetchRemoteSyncedProxies(): Promise<string[]> {
   }
 }
 
-export const DEFAULT_DECODO_RESIDENTIAL_PROXY = 'http://spo31gdzsh:G=koPtHx9g1nGs19uz@in.decodo.com:10000';
-
-export const DEFAULT_RESIDENTIAL_PROXIES = [
-  DEFAULT_DECODO_RESIDENTIAL_PROXY,
-  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.244.76:3129',
-  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@151.123.176.240:3129',
-  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@209.50.189.116:3129',
-  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@209.50.186.187:3129',
-  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.253.46:3129',
-  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.246.199:3129',
-  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@104.207.56.101:3129',
-  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.249.242:3129',
-  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@104.207.56.199:3129',
-  'http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@65.111.22.35:3129',
-];
-
-export const DEFAULT_JOY_PROXY = DEFAULT_RESIDENTIAL_PROXIES[0]!;
+/** Default proxy lists must come strictly from environment configuration or Postgres state. */
+export const DEFAULT_RESIDENTIAL_PROXIES: string[] = [];
 
 export async function getAllConfiguredProxies(envSource?: string): Promise<ManagedProxy[]> {
   const rawEnv = envSource ?? (
     process.env.FALLBACK_CODEFORCES_PROXY ||
     process.env.CODEFORCES_RESIDENTIAL_PROXY ||
     process.env.CODEFORCES_PROXY ||
-    DEFAULT_RESIDENTIAL_PROXIES.join('\n')
+    ''
   );
 
   const envProxies = parseProxyList(rawEnv);
@@ -435,12 +420,70 @@ export async function resolveLeetCodeResidentialProxy(
   if (isTest && !options.allowInTest && !options.envSource && !options.tester) {
     return null;
   }
+  const log = options.log ?? ((msg: string) => logger.info({ msg }, 'leetcode residential proxy resolver'));
   const explicitEnv =
     options.envSource ??
-    (process.env.LEETCODE_RESIDENTIAL_PROXY || process.env.LEETCODE_PROXY || DEFAULT_RESIDENTIAL_PROXIES.join('\n'));
-  return resolveActiveProxy({
-    ...options,
-    envSource: explicitEnv,
-    log: options.log ?? ((msg: string) => logger.info({ msg }, 'leetcode residential proxy resolver')),
-  });
+    (process.env.LEETCODE_RESIDENTIAL_PROXY || process.env.LEETCODE_PROXY || '');
+  const candidates = parseProxyList(explicitEnv);
+  if (candidates.length === 0) {
+    log('No LeetCode residential proxies configured.');
+    return null;
+  }
+
+  const runTest = async (url: string): Promise<ProxyTestResult> => {
+    if (options.tester) {
+      try {
+        const res = await options.tester(url);
+        if (typeof res === 'boolean') return { ok: res, latencyMs: 0, error: res ? undefined : 'tester returned false' };
+        return res;
+      } catch (err) {
+        return { ok: false, latencyMs: 0, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+    return testProxyDetailed(url, 10).catch((err) => ({
+      ok: false,
+      latencyMs: 0,
+      error: err instanceof Error ? err.message : String(err),
+    }));
+  };
+
+  let fallbackOccurred = false;
+  for (let i = 0; i < candidates.length; i++) {
+    const url = candidates[i]!;
+    const masked = maskProxyUrl(url);
+    const hash = proxyHash(url);
+    const managed: ManagedProxy = {
+      index: i + 1,
+      url,
+      masked,
+      hash,
+      isRemoved: false,
+      isCustom: false,
+      isPreferred: i === 0,
+    };
+    log(`Testing LeetCode residential proxy [${i + 1}/${candidates.length}] ${masked}...`);
+    const testRes = await runTest(url);
+    if (testRes.ok) {
+      log(`LeetCode residential proxy [${i + 1}/${candidates.length}] ${masked} is live! Selected.`);
+      const details = extractProxyDetails(url);
+      return {
+        proxy: managed,
+        url,
+        host: details.host,
+        username: details.username,
+        fromPreferred: i === 0,
+        fallbackOccurred,
+      };
+    }
+    fallbackOccurred = true;
+    logger.warn(
+      { proxy: masked, index: i + 1, error: testRes.error },
+      'LeetCode residential proxy failed health check, testing next.',
+    );
+  }
+
+  if (explicitEnv.trim()) {
+    throw new Error('LEETCODE_PROXY_UNAVAILABLE: configured proxies failed health checks; direct fallback disabled');
+  }
+  return null;
 }

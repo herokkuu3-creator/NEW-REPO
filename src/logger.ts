@@ -2,15 +2,20 @@ import pino from 'pino';
 import { config } from './config';
 import { isoLocal } from './time';
 import { Writable } from 'node:stream';
+import { redactSecrets } from './security/redact';
 
 /**
  * Patterns whose values must never appear in logs. The redaction is
- * path-based (pino `redact`) plus a runtime serializer guard for cookies.
+ * path-based (pino `redact`) plus a runtime regex scrubber for embedded secrets.
  */
 const REDACT_PATHS = [
   'password',
   'cookie',
   'cookies',
+  'proxyUrl',
+  'proxyPassword',
+  'clientKey',
+  'capzyApiKeys',
   'headers.cookie',
   'headers.authorization',
   'headers["x-csrftoken"]',
@@ -29,6 +34,10 @@ const REDACT_PATHS = [
   '*.token',
   '*.password',
   '*.secret',
+  '*.proxyUrl',
+  '*.proxyPassword',
+  '*.clientKey',
+  '*.capzyApiKeys',
 ];
 
 export interface LogEntry {
@@ -43,9 +52,9 @@ const RING_BUFFER_MAX = 1000;
 
 const ringStream = new Writable({
   write(chunk: Buffer, encoding, callback) {
-    process.stdout.write(chunk);
+    const line = redactSecrets(chunk.toString('utf8'));
+    process.stdout.write(line);
     try {
-      const line = chunk.toString('utf8');
       const obj = JSON.parse(line);
       logRingBuffer.push(obj);
       if (logRingBuffer.length > RING_BUFFER_MAX) {

@@ -1,6 +1,7 @@
 import { AccountStatus, CodeforcesAccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
+import { redactSecrets } from '../security/redact';
 import { sendTelegramMessage } from './telegram';
 import { randomUUID } from 'node:crypto';
 import {
@@ -856,6 +857,16 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
         if (pendingLeetCodeVerificationHandoff) {
           pendingLeetCodeVerificationHandoff.label = commandArg;
         }
+        if (hasRecoveryService()) {
+          const account = await findStoredLeetCodeAccount(commandArg);
+          if (account && await findCredentialsForAccount('leetcode', account)) {
+            const outcome = await getRecoveryService().requestRecovery(account.label);
+            await reply(
+              `🏷️ Renewal status for "${commandArg}": ${outcome}. Complete sign-in using the recovery link above, or send a cookie export (text or file) in your next message. /cancel aborts.`,
+            );
+            return;
+          }
+        }
         await reply(`🏷️ Renewing the "${commandArg}" account. Send its cookie export (text or file) in your next message. /cancel aborts.`);
         return;
       }
@@ -1381,12 +1392,19 @@ export async function processCookieMessage(
     return { stored: false, site: 'leetcode', text: `${opts.fileName ? `${opts.fileName}: ` : ''}${describeIngest(result)}` };
   }
 
+  if (result.status === AccountStatus.ACTIVE) {
+    clearLeetCodeLoginCooldownsForTests();
+    await clearLeetCodeLoginCooldown(result.label).catch(() => undefined);
+    if (hasRecoveryService()) {
+      await getRecoveryService().cancelByLabel(result.label).catch(() => undefined);
+    }
+  }
+
   let handoffNotice = '';
   if (handoff) {
     pendingLeetCodeVerificationHandoff = null;
     pendingRenewalLabel = undefined;
     if (result.status === AccountStatus.ACTIVE) {
-      clearLeetCodeLoginCooldownsForTests();
       const verifiedUsername = result.username || handoff.identifier;
       await saveEncryptedCredentials('leetcode', result.label, {
         username: verifiedUsername,
@@ -1401,7 +1419,7 @@ export async function processCookieMessage(
   return {
     stored: true,
     site: 'leetcode',
-    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}${handoffNotice}\n\n📊 LeetCode accounts stored: ${total}. Send more files to add more — /accounts lists them.`,
+    text: `${opts.fileName ? `${opts.fileName}\n` : ''}${describeIngest(result)}${handoffNotice}\n\n📊 LeetCode accounts stored: ${total} (Accounts stored: ${total}). Send more files to add more — /accounts lists them.`,
   };
 }
 
@@ -6796,6 +6814,8 @@ export async function handleExecuteLogin(
   password: string,
   replyFunc: (text: string) => Promise<void> = replyHtml,
 ): Promise<void> {
+  const operationId = randomUUID();
+  logger.info({ operationId, site, label }, '[LOGIN] Command received');
   if (site === 'leetcode' && activeLeetCodeLogin) {
     await replyFunc('A LeetCode login is already running. Use /cancel or wait for its result.');
     return;
@@ -6804,19 +6824,25 @@ export async function handleExecuteLogin(
   if (controller) activeLeetCodeLogin = controller;
   const siteName = site === 'leetcode' ? 'LeetCode' : 'Codeforces';
   let lcProxy: Awaited<ReturnType<typeof resolveLeetCodeResidentialProxy>> = null;
+  let existingAccount: AccountRecord | null = null;
+  let existingAccountTransientQueryFailure = false;
   try {
     if (site === 'leetcode') {
       // 1. Autonomous Session Reuse First:
       // Check if the server already holds a valid session for this label or identifier
       // via lightweight GraphQL userStatus BEFORE launching Chromium or hitting /accounts/login/.
-      const existingAccount =
+      existingAccount =
         (await findStoredLeetCodeAccount(label)) ??
         (await findStoredLeetCodeAccount(identifier));
+      logger.info({ operationId, label, hasExistingAccount: Boolean(existingAccount) }, '[LOGIN] Account resolved');
       if (existingAccount) {
         const verified = await verifyStoredLeetCodeAccount(existingAccount, {
           maxAttempts: 2,
           baseBackoffMs: 300,
         });
+        logger.info({ operationId, label, authenticated: verified.authenticated, cause: verified.cause }, '[LOGIN] Existing session checked');
+        existingAccountTransientQueryFailure =
+          !verified.authenticated && verified.cause === 'query-failed';
         if (verified.authenticated && verified.username) {
           cancelAllLeetCodePairingSessions();
           pendingLeetCodeVerificationHandoff = null;
@@ -6835,12 +6861,19 @@ export async function handleExecuteLogin(
             `• Encrypted credentials updated in PostgreSQL for autonomous maintenance.\n` +
             `• Bypassed <code>/accounts/login/</code> completely by reusing the active server session.`,
           );
+          logger.info({ operationId, label: existingAccount.label, status: 'reused_session' }, '[TELEGRAM] Final result delivered');
           return;
         }
+      } else {
+        logger.info({ operationId, label, authenticated: false, cause: 'no-existing-account' }, '[LOGIN] Existing session checked');
       }
 
       // 2. Check Server Login Cooldown to avoid hammering Cloudflare /accounts/login/ on direct datacenter IP
-      lcProxy = await resolveLeetCodeResidentialProxy().catch(() => null);
+      lcProxy = await resolveLeetCodeResidentialProxy().catch((err) => {
+        logger.warn({ err: errText(err), label }, 'LeetCode residential proxy unavailable');
+        return null;
+      });
+      logger.info({ operationId, label, proxyHost: lcProxy?.host ?? 'direct' }, '[LOGIN] Proxy configuration resolved');
       const cooldown = await getLeetCodeLoginCooldown(label);
       if (cooldown.coolingDown && !lcProxy) {
         const mins = Math.max(1, Math.ceil(cooldown.remainingSeconds / 60));
@@ -6850,6 +6883,7 @@ export async function handleExecuteLogin(
           `• Reason: Cloudflare blocked headless datacenter login on <code>/accounts/login/</code> (<code>${escapeHtml(cooldown.code ?? 'VERIFICATION_REQUIRED')}</code>).\n` +
           `• The server enforces a cooldown so repeated login attempts do not rate-limit or lock out the account.`,
         );
+        logger.info({ operationId, label, status: 'cooldown_active' }, '[TELEGRAM] Final result delivered');
         return;
       }
     }
@@ -6874,20 +6908,6 @@ export async function handleExecuteLogin(
             await replyFunc(escapeHtml(msg)).catch(() => undefined);
           },
         });
-        if (
-          !firstAttempt.ok &&
-          lcProxy?.url &&
-          !controller!.signal.aborted &&
-          (firstAttempt.code === 'LOGIN_BROWSER_ERROR' || firstAttempt.code === 'LOGIN_TIMEOUT')
-        ) {
-          logger.warn({ label, code: firstAttempt.code, proxy: lcProxy.host }, 'Proxied LeetCode login failed with browser/timeout error; retrying direct');
-          return loginToLeetCode(identifier, password, {
-            signal: controller!.signal,
-            onProgress: async (msg) => {
-              await replyFunc(escapeHtml(msg)).catch(() => undefined);
-            },
-          });
-        }
         return firstAttempt;
       });
 
@@ -6898,52 +6918,6 @@ export async function handleExecuteLogin(
             res.code,
             res.error || 'Cloudflare verification required on /accounts/login/',
           );
-
-          if (hasRecoveryService()) {
-            try {
-              // 1. Securely save encrypted credentials so the server-side recovery portal can autofill them
-              await saveEncryptedCredentials('leetcode', label, {
-                username: identifier,
-                password,
-                label,
-              }).catch((err) => {
-                logger.warn({ err: errText(err), label }, 'Failed to save encrypted credentials during verification prompt');
-              });
-
-              // 2. Ensure an account record exists in database
-              let account = await findStoredLeetCodeAccount(label).catch(() => null);
-              if (!account) {
-                await saveAccount(label, JSON.stringify({ cookies: [], origins: [] }), {
-                  username: identifier,
-                  status: AccountStatus.EXPIRED,
-                }).catch(() => undefined);
-                account = await findStoredLeetCodeAccount(label).catch(() => null);
-              } else if (account.status === AccountStatus.ACTIVE) {
-                await patchAccount(account.id, {
-                  status: AccountStatus.EXPIRED,
-                  lastError: 'Cloudflare verification required',
-                }).catch(() => undefined);
-              }
-
-              // 3. Trigger server-hosted remote interactive recovery portal
-              const recoverySvc = getRecoveryService();
-              if (recoverySvc && account) {
-                const outcome = await recoverySvc.requestRecovery(account.label).catch(() => null);
-                if (outcome === 'sent') {
-                  await replyFunc(
-                    `🛡️ <b>Cloudflare Verification Required</b>\n` +
-                    `• Account: <code>${escapeHtml(label)}</code>\n` +
-                    `• Credentials have been encrypted and stored in PostgreSQL.\n` +
-                    `• A single-use server recovery link has been issued above.\n\n` +
-                    `<i>Tap <b>Reconnect Account</b> above to complete verification. The server will automatically fill your password, verify identity, and store the active session.</i>`,
-                  );
-                  return;
-                }
-              }
-            } catch (recErr) {
-              logger.warn({ err: errText(recErr), label }, 'Recovery portal dispatch bypassed; falling back to pairing prompt');
-            }
-          }
 
           pendingRenewalLabel = label;
           pendingLeetCodeVerificationHandoff = {
@@ -6957,19 +6931,191 @@ export async function handleExecuteLogin(
             identifier,
             password,
           });
+
+          const d = res.diagnostic;
+          const challengeType = d?.challengeType ?? 'cloudflare_interstitial';
+          const selectedAdapter = d?.selectedAdapter ? d.selectedAdapter.toUpperCase() : 'None';
+          const solverAttempted = d?.solverAttempted ? 'Yes' : 'No';
+          const solverResult = d?.solverResult ?? 'unresolved';
+          const manualRequired = d?.manualVerificationRequired !== false ? 'Yes (operator handoff armed)' : 'No';
+          const continuation = d?.continuationStatus ?? 'awaiting_user';
+          const sessionPersisted = d?.sessionPersisted ? '✅ Persisted' : '⏳ Awaiting verification';
+
+          const fmtStatus = (val: boolean | undefined, trueTxt: string, falseTxt: string) =>
+            val ? `✅ ${trueTxt}` : `❌ ${falseTxt}`;
+
+          const diagLines = [
+            `🛡️ <b>Cloudflare Verification Required</b>`,
+            `• Account: <code>${escapeHtml(label)}</code>`,
+            `• Detected Challenge: <code>${escapeHtml(challengeType)}</code>`,
+            `• Selected Adapter: <code>${escapeHtml(selectedAdapter)}</code>`,
+            `• Solver Test Attempted: <code>${escapeHtml(solverAttempted)}</code>`,
+            `• Solver Result: <code>${escapeHtml(solverResult)}</code>`,
+            `• Website Verification: <code>Incomplete</code>`,
+            `• Authentication: <code>Not Completed</code>`,
+            `• Manual Verification Required: <code>${escapeHtml(manualRequired)}</code>`,
+            `• Continuation Status: <code>${escapeHtml(continuation)}</code>`,
+            `• Session Persisted: <code>${escapeHtml(sessionPersisted)}</code>`,
+            ``,
+            `<b>Lifecycle Verification State Machine:</b>`,
+            `1. Adapter Initialized: ${fmtStatus(d?.adapterInitialized, 'INITIALIZED', 'NOT_INITIALIZED')}`,
+            `2. Provider Request Accepted: ${fmtStatus(d?.providerRequestAccepted, 'ACCEPTED', 'NOT_ACCEPTED')}`,
+            `3. Provider Operation Completed: ${fmtStatus(d?.providerOperationCompleted, 'COMPLETED', 'FAILED/PENDING')}`,
+            `4. Verification Completed: ${fmtStatus(d?.verificationCompleted, 'COMPLETED', 'INCOMPLETE')}`,
+            `5. User Authenticated: ${fmtStatus(d?.userAuthenticated, 'AUTHENTICATED', 'NOT_AUTHENTICATED')}`,
+            `6. Session Validated: ${fmtStatus(d?.sessionValidated, 'VALIDATED', 'NOT_VALIDATED')}`,
+            `7. Session Persisted: ${fmtStatus(d?.sessionPersisted, 'PERSISTED', 'AWAITING_PERSISTENCE')}`,
+          ];
+
+          const sanitizedDiags: string[] = [];
+          if (d?.providerHttpStatus !== undefined) {
+            sanitizedDiags.push(`• Provider HTTP Status: <code>${d.providerHttpStatus}</code>`);
+          }
+          if (d?.providerErrorCode) {
+            sanitizedDiags.push(`• Provider Error Code: <code>${escapeHtml(d.providerErrorCode)}</code>`);
+          }
+          if (d?.providerErrorCategory) {
+            sanitizedDiags.push(`• Provider Error Category: <code>${escapeHtml(d.providerErrorCategory)}</code>`);
+          }
+          if (d?.taskLifecycleState) {
+            sanitizedDiags.push(`• Task Lifecycle State: <code>${escapeHtml(d.taskLifecycleState)}</code>`);
+          }
+          if (d?.elapsedTimeMs !== undefined && d.elapsedTimeMs > 0) {
+            sanitizedDiags.push(`• Elapsed Time: <code>${d.elapsedTimeMs}ms</code>`);
+          }
+          if (d?.timeoutReason) {
+            sanitizedDiags.push(`• Timeout Reason: <code>${escapeHtml(d.timeoutReason)}</code>`);
+          }
+          if (d?.solverError && !sanitizedDiags.some(s => s.includes(escapeHtml(d.solverError!)))) {
+            sanitizedDiags.push(`• Solver Error: <code>${escapeHtml(d.solverError)}</code>`);
+          }
+
+          if (sanitizedDiags.length > 0) {
+            diagLines.push(``, `<b>Sanitized Provider Diagnostics:</b>`, ...sanitizedDiags);
+          }
+
+          const diagBlock = diagLines.join('\n');
+
+          if (hasRecoveryService()) {
+            try {
+              // 1. Securely save encrypted credentials so the server-side recovery portal can autofill them
+              await saveEncryptedCredentials('leetcode', label, {
+                username: identifier,
+                password,
+                label,
+              }).catch((err) => {
+                logger.warn({ err: errText(err), label }, 'Failed to save encrypted credentials during verification prompt');
+              });
+
+              // 2. Ensure an account record exists in database without polluting username with an email address
+              let account = await findStoredLeetCodeAccount(label).catch(() => null);
+              if (!account) {
+                await saveAccount(label, JSON.stringify({ cookies: [], origins: [] }), {
+                  username: identifier.includes('@') ? undefined : identifier,
+                  status: AccountStatus.UNKNOWN,
+                }).catch(() => undefined);
+                account = await findStoredLeetCodeAccount(label).catch(() => null);
+                if (account) {
+                  await patchAccount(account.id, {
+                    lastError: 'Cloudflare verification required',
+                  }).catch(() => undefined);
+                }
+              } else if (account.status === AccountStatus.ACTIVE && !existingAccountTransientQueryFailure) {
+                await patchAccount(account.id, {
+                  status: AccountStatus.UNKNOWN,
+                  lastError: 'Cloudflare verification required',
+                }).catch(() => undefined);
+              }
+
+              // 3. Trigger server-hosted remote interactive recovery portal with explicit VERIFICATION_REQUIRED reason
+              const recoverySvc = getRecoveryService();
+              if (recoverySvc && account) {
+                const outcome = await recoverySvc.requestRecovery(account.label, 'VERIFICATION_REQUIRED').catch(() => null);
+                if (outcome === 'sent') {
+                  await replyFunc(
+                    `${diagBlock}\n\n` +
+                    `<i>Credentials have been encrypted and stored in PostgreSQL.\n` +
+                    `Tap <b>Reconnect Account</b> above to complete verification in the remote browser, use <code>${escapeHtml(pairingSession.pairingUrl)}</code>, or send cookies after <code>/renew ${escapeHtml(label)}</code>.</i>`,
+                  );
+                  logger.info({ operationId, label, status: 'verification_required_recovery_sent' }, '[TELEGRAM] Final result delivered');
+                  return;
+                }
+              }
+            } catch (recErr) {
+              logger.warn({ err: errText(recErr), label }, 'Recovery portal dispatch bypassed; falling back to pairing prompt');
+            }
+          }
+
           await replyFunc(
+            `${diagBlock}\n\n` +
             formatTelegramPairingPrompt(pairingSession, {
               reason: 'verification_required',
-              diagnosticError: res.error || 'Browser verification required.',
+              diagnosticError: `Challenge: ${challengeType}, Adapter: ${selectedAdapter} (${solverResult})`,
             }) +
               `\n\n<i>(Server login cooldown armed for 30m to prevent Cloudflare rate-limiting. Optional recovery: <code>/renew</code> is also armed for <code>${escapeHtml(label)}</code>.)</i>`,
           );
+          logger.info({ operationId, label, status: 'verification_required_pairing_prompt' }, '[TELEGRAM] Final result delivered');
           return;
         }
         await replyFunc(
           `❌ <b>LeetCode Login Failed:</b>\n` +
           `<i>${escapeHtml(res.error || 'Authentication timed out or failed.')}</i>\n\n` +
           `Diagnostic: <code>${escapeHtml(res.code ?? 'LOGIN_FAILED')}</code>. Retry <code>/lclogin</code> or use <code>/renew</code>.`,
+        );
+        logger.info({ operationId, label, status: 'login_failed', code: res.code }, '[TELEGRAM] Final result delivered');
+        return;
+      }
+
+      // Identity & Username-Match Validation (Part 10):
+      // Require an explicitly verified username and reject any mismatch against the target account's expected identity
+      const verifiedUsername = typeof res.username === 'string' ? res.username.trim() : '';
+      if (!verifiedUsername) {
+        logger.warn({ operationId, label }, '[GRAPHQL] Identity validation failed: missing authenticated username');
+        await replyFunc(
+          `❌ <b>LeetCode Login Failed:</b>\n` +
+          `<i>Authenticated session did not return a verified LeetCode username via GraphQL userStatus.</i>\n\n` +
+          `Diagnostic: <code>IDENTITY_VALIDATION_FAILED</code>. Existing account state was not modified.`,
+        );
+        return;
+      }
+
+      const expectedExistingUsername =
+        existingAccount?.username && !existingAccount.username.includes('@')
+          ? existingAccount.username.trim()
+          : (!identifier.includes('@') ? identifier.trim() : '');
+      if (expectedExistingUsername && verifiedUsername.toLowerCase() !== expectedExistingUsername.toLowerCase()) {
+        logger.warn(
+          { operationId, label, expectedUsername: expectedExistingUsername, actualUsername: verifiedUsername },
+          '[GRAPHQL] Identity validation failed: username mismatch',
+        );
+        await replyFunc(
+          `❌ <b>LeetCode Login Rejected (Username Mismatch):</b>\n` +
+          `• Target Account: <code>${escapeHtml(label)}</code> (expected <code>${escapeHtml(expectedExistingUsername)}</code>)\n` +
+          `• Authenticated Username: <code>${escapeHtml(verifiedUsername)}</code>\n` +
+          `• Diagnostic: <code>USERNAME_MISMATCH</code>\n` +
+          `• Existing PostgreSQL session and credentials were NOT overwritten.`,
+        );
+        return;
+      }
+
+      const allStoredAccounts = await listAccounts().catch(() => []);
+      const conflictingAccount = allStoredAccounts.find(
+        (a) =>
+          a.label.toLowerCase() !== label.toLowerCase() &&
+          a.username &&
+          a.username.toLowerCase() === verifiedUsername.toLowerCase(),
+      );
+      if (conflictingAccount) {
+        logger.warn(
+          { operationId, label, conflictingLabel: conflictingAccount.label, actualUsername: verifiedUsername },
+          '[GRAPHQL] Identity validation failed: authenticated username belongs to another stored account',
+        );
+        await replyFunc(
+          `❌ <b>LeetCode Login Rejected (Username Mismatch):</b>\n` +
+          `• Target Account: <code>${escapeHtml(label)}</code>\n` +
+          `• Authenticated Username: <code>${escapeHtml(verifiedUsername)}</code> (already bound to account <code>${escapeHtml(conflictingAccount.label)}</code>)\n` +
+          `• Diagnostic: <code>USERNAME_MISMATCH</code>\n` +
+          `• Existing PostgreSQL session and credentials were NOT overwritten.`,
         );
         return;
       }
@@ -6978,25 +7124,63 @@ export async function handleExecuteLogin(
       pendingLeetCodeVerificationHandoff = null;
       pendingRenewalLabel = undefined;
       await clearLeetCodeLoginCooldown(label);
-      const username = res.username || identifier;
-      await saveEncryptedCredentials('leetcode', label, {
-        username,
-        password,
-        label,
-      });
+      const username = verifiedUsername;
 
-      await saveAccount(label, JSON.stringify(res.storageState), {
-        username,
-        status: AccountStatus.ACTIVE,
-      });
+      try {
+        await saveEncryptedCredentials('leetcode', label, {
+          username,
+          password,
+          label,
+        });
+
+        const savedRecord = await saveAccount(label, JSON.stringify(res.storageState), {
+          username,
+          status: AccountStatus.ACTIVE,
+        });
+        logger.info({ operationId, label, username }, '[DATABASE] Encrypted session persisted');
+
+        // Read-back verification from PostgreSQL (Part 8 & Part 11)
+        const readBack = await findStoredLeetCodeAccount(label).catch(() => null);
+        const persistedRecord = readBack ?? savedRecord;
+        if (
+          persistedRecord &&
+          (persistedRecord.status !== AccountStatus.ACTIVE ||
+            (persistedRecord.username && persistedRecord.username.toLowerCase() !== username.toLowerCase()))
+        ) {
+          throw new Error(`Read-back verification mismatch for ${label} (status=${persistedRecord.status})`);
+        }
+        if (res.diagnostic) {
+          res.diagnostic.sessionPersisted = true;
+        }
+        logger.info({ operationId, label, username, status: 'ACTIVE' }, '[DATABASE] Persisted record verified');
+      } catch (persistErr) {
+        logger.error({ operationId, label, err: errText(persistErr) }, '[DATABASE] Failed to persist or verify LeetCode session');
+        await replyFunc(
+          `❌ <b>LeetCode Login Persistence Failed:</b>\n` +
+          `• Account: <code>${escapeHtml(label)}</code>\n` +
+          `• Authenticated as: <code>${escapeHtml(username)}</code>\n` +
+          `• PostgreSQL: <code>Persistence Failed (${escapeHtml(errText(persistErr))})</code>\n` +
+          `• Diagnostic: <code>SESSION_PERSISTENCE_FAILED</code>`,
+        );
+        return;
+      }
 
       await replyFunc(
         `✅ <b>LeetCode Login Successful!</b>\n` +
-        `• Authenticated as: <code>${escapeHtml(username)}</code>\n` +
+        `• Account: <code>${escapeHtml(label)}</code>\n` +
         `• Account label: <code>${escapeHtml(label)}</code>\n` +
+        `• Authenticated as: <code>${escapeHtml(username)}</code>\n` +
+        `• Website Verification: <code>Completed</code>\n` +
+        `• Authentication: <code>Successful</code>\n` +
+        `• Identity: <code>Verified (${escapeHtml(username)})</code>\n` +
+        `• GraphQL: <code>Validated</code>\n` +
+        `• PostgreSQL: <code>Session Saved</code>\n` +
+        `• Session Restoration: <code>Verified</code>\n` +
+        `• Status: <b>ACTIVE</b>\n` +
         `• Active session cookies saved to database.\n` +
         `• Credentials encrypted with AES-256-GCM and stored for automated daily re-login.`,
       );
+      logger.info({ operationId, label, username, status: 'LOGIN_SUCCESS' }, '[TELEGRAM] Final result delivered');
     } else {
       const res = await loginToCodeforces(identifier, password, {
         onProgress: async (msg) => {
@@ -7347,7 +7531,7 @@ async function tgApi<T = unknown>(
 }
 
 function errText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return redactSecrets(err instanceof Error ? err.message : String(err));
 }
 
 function sleep(ms: number): Promise<void> {

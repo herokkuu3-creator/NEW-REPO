@@ -3,17 +3,10 @@ import sodium from 'libsodium-wrappers';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const REPO = 'herokkuu41/NEW-REPO';
 const SECRET_NAME = 'CODEFORCES_RESIDENTIAL_PROXY';
-
-const SECRET_VALUE = `http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.244.76:3129
-http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@151.123.176.240:3129
-http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@209.50.189.116:3129
-http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@209.50.186.187:3129
-http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.253.46:3129
-http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.246.199:3129
-http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@104.207.56.101:3129
-http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@216.26.249.242:3129
-http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@104.207.56.199:3129
-http://lxwhp9qwnfzu:lu0xh7yyx30fzwl@65.111.22.35:3129`;
+const SECRET_VALUE = (process.env.CODEFORCES_RESIDENTIAL_PROXY || process.env.PROXY_LIST || '').trim();
+if (!SECRET_VALUE) {
+  throw new Error('Missing CODEFORCES_RESIDENTIAL_PROXY or PROXY_LIST environment variable');
+}
 
 async function main() {
   await sodium.ready;

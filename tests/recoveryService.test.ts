@@ -517,5 +517,61 @@ describe('RecoveryService', () => {
       unblockDriver();
       await svc.shutdown();
     });
+
+    it('recovers an account registered with an email identifier (e.g. sks7501) and adopts the verified LeetCode handle', async () => {
+      accountsMap.set('acc-email', {
+        id: 'acc-email',
+        label: 'sks7501',
+        username: 'sks7501@example.com',
+        status: AccountStatus.EXPIRED,
+        storageState: '',
+      });
+      credentialsMap.set('acc-email', { username: 'sks7501@example.com', password: 'secret_password' });
+      mockDriverResult = { ok: true, username: 'sks7501_real_handle' };
+
+      const svc = createService({
+        verifyCapturedSession: async () => ({ authenticated: true, username: 'sks7501_real_handle' }),
+      });
+
+      const reqOutcome = await svc.requestRecovery('sks7501');
+      expect(reqOutcome).toBe('sent');
+
+      const lastMsg = telegramMessages[telegramMessages.length - 1];
+      const token = lastMsg.markup.inline_keyboard[0][0].url.split('/auth/recover/')[1];
+
+      const startResult = await svc.openPortalSession(token);
+      expect(startResult.ok).toBe(true);
+      await svc.drain();
+
+      const updated = accountsMap.get('acc-email');
+      expect(updated?.status).toBe(AccountStatus.ACTIVE);
+      expect(updated?.username).toBe('sks7501_real_handle');
+    });
+
+    it('clears stale non-retryable lastErrorCategory and live-checks stale ACTIVE status on operator requestRecovery', async () => {
+      // Simulate an account marked ACTIVE in DB whose session is actually signed out live,
+      // and which previously had a non-retryable error category.
+      accountsMap.get('acc-1')!.status = AccountStatus.ACTIVE;
+      const { recovery: existingRec } = await store.create({
+        accountId: 'acc-1',
+        reason: 'MANUAL',
+        telegramChatId: '123456789',
+        now: currentTime,
+        nextReminderAt: currentTime,
+      });
+      await store.markFailed(existingRec.id, 'INVALID_CREDENTIALS', 'old error', currentTime);
+
+      const svc = createService({
+        verifyStoredSession: async () => ({ authenticated: false, cause: 'signed-out' }),
+      });
+
+      const outcome = await svc.requestRecovery('account_one');
+      expect(outcome).toBe('sent');
+      expect(accountsMap.get('acc-1')?.status).toBe(AccountStatus.EXPIRED);
+
+      const open = await store.findOpenByAccount('acc-1');
+      expect(open?.lastErrorCategory).toBeNull();
+      expect(open?.tokenHash).not.toBeNull();
+    });
   });
 });

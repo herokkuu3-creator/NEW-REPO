@@ -171,6 +171,18 @@ export class PrismaRecoveryStore implements RecoveryStore {
     });
   }
 
+  async resetForOperatorRequest(id: string, now: Date): Promise<void> {
+    await prisma.accountRecovery.updateMany({
+      where: { id, status: { in: remindable } },
+      data: {
+        status: RecoveryStatus.RECOVERY_PENDING,
+        lastErrorCategory: null,
+        lastError: null,
+        nextReminderAt: now,
+      },
+    });
+  }
+
   commitRecovered(input: CommitRecoveredInput): Promise<RecoveryRecord> {
     return prisma.$transaction(async (tx) => {
       const recovery = await tx.accountRecovery.findUnique({ where: { id: input.recoveryId } });

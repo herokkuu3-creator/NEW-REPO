@@ -26,12 +26,22 @@ import { getLogs } from '../CPSolver/src/config';
 
 describe('HTTP request completion versus client disconnect', () => {
   it('keeps connected requests queued after their JSON bodies finish', async () => {
+    const prevToken = process.env.CPSOLVER_API_TOKEN;
+    const prevLoopback = process.env.CPSOLVER_ALLOW_LOOPBACK_TEST;
+    process.env.CPSOLVER_API_TOKEN = 'http-lifecycle-test-token';
+    process.env.CPSOLVER_ALLOW_LOOPBACK_TEST = 'true';
+
     const server = app.listen(0, '127.0.0.1');
     await new Promise<void>(resolve => server.once('listening', resolve));
     try {
       const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/solve`;
       const post = (id: string) => fetch(url, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-request-id': id },
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer http-lifecycle-test-token',
+          'x-request-id': id,
+        },
         body: JSON.stringify({ siteurl: 'http://localhost/fixture', mode: 'navigate' }),
       });
       const first = post('http-first');
@@ -48,6 +58,10 @@ describe('HTTP request completion versus client disconnect', () => {
         expect((await response.json() as any).error).toBe('Controlled fixture result');
       }
     } finally {
+      if (prevToken === undefined) delete process.env.CPSOLVER_API_TOKEN;
+      else process.env.CPSOLVER_API_TOKEN = prevToken;
+      if (prevLoopback === undefined) delete process.env.CPSOLVER_ALLOW_LOOPBACK_TEST;
+      else process.env.CPSOLVER_ALLOW_LOOPBACK_TEST = prevLoopback;
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
   });

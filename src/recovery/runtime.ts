@@ -7,7 +7,7 @@ import { findCredentialsForAccount } from '../security/credentialStore';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { checkSession } from '../browser/sessionCheck';
 import { resolvePublicBaseUrl } from '../leetcode/loginHandoff';
-import { openLightweightLeetCodeSession, verifyStoredLeetCodeAccount } from '../leetcode/sessionManager';
+import { clearLeetCodeLoginCooldown, openLightweightLeetCodeSession, verifyStoredLeetCodeAccount } from '../leetcode/sessionManager';
 import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { PrismaRecoveryStore } from './prismaStore';
 import { openRemoteBrowser } from './remoteBrowser';
@@ -64,12 +64,13 @@ export function createProductionRecoveryService(hooks: RecoveryRuntimeHooks = {}
       return creds ? { username: creds.username, password: creds.password } : null;
     },
     openBrowser: async () => {
-      const lcProxy = await resolveLeetCodeResidentialProxy().catch(() => null);
+      const lcProxy = await resolveLeetCodeResidentialProxy();
       return openRemoteBrowser({ headless: true, proxyUrl: lcProxy?.url });
     },
     sendTelegram: (text, markup) =>
       sendTelegramMessage(text, { parseMode: 'HTML', disableWebPagePreview: true, replyMarkup: markup }),
-    onRecovered: async () => {
+    onRecovered: async (account) => {
+      await clearLeetCodeLoginCooldown(account.label).catch(() => undefined);
       await hooks.onRecovered?.();
     },
     limits: loadRecoveryLimits(),

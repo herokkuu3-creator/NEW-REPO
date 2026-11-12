@@ -75,12 +75,14 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
   const viewport = opts.viewport ?? { width: 1024, height: 720 };
   let browser: Browser | null = null;
   try {
+    const proxy = opts.proxyUrl ? toPlaywrightProxy(opts.proxyUrl) : undefined;
+    if (opts.proxyUrl && !proxy) throw new Error('LEETCODE_PROXY_INVALID');
     browser = await chromium.launch({
       headless: opts.headless ?? true,
       // Container-required flags + a memory cap only. Nothing that alters how
       // the browser presents itself to the site.
       args: ['--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu', '--js-flags=--max-old-space-size=256'],
-      proxy: opts.proxyUrl ? (toPlaywrightProxy(opts.proxyUrl) ?? { server: opts.proxyUrl }) : undefined,
+      proxy,
     });
     const context = await browser.newContext({
       viewport,
@@ -164,6 +166,7 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
       async captureStorageState() {
         const state = await context.storageState();
         return {
+          transport: { proxyUrl: opts.proxyUrl, userAgent: await page.evaluate(() => navigator.userAgent) },
           cookies: state.cookies as unknown as StorageStateShape['cookies'],
           origins: (state.origins ?? []) as unknown as StorageStateShape['origins'],
         };

@@ -193,9 +193,16 @@ const secretHash = (s: string): string => createHash('sha256').update(`portal:${
 const lower = (s: string | null | undefined): string => (s ?? '').trim().toLowerCase();
 
 export function expectedUsername(account: RecoveryAccount, creds: RecoveryCredentials): string | null {
-  if (account.username) return account.username;
+  if (account.username && !account.username.includes('@')) return account.username;
   if (creds.username && !creds.username.includes('@')) return creds.username;
+  if (account.label && !account.label.includes('@')) return account.label;
   return null;
+}
+
+export function isFirstTimeEmailAccount(account: RecoveryAccount, creds: RecoveryCredentials): boolean {
+  const hasRealUsername = Boolean(account.username && !account.username.includes('@'));
+  const hasEmailCred = Boolean(creds.username && creds.username.includes('@'));
+  return !hasRealUsername && hasEmailCred;
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +226,7 @@ export class RecoveryService {
   /** Opens (or returns) the single recovery for an account. The next tick sends the notice. */
   async openRecovery(
     account: RecoveryAccount,
-    reason: 'EXPIRED' | 'REJECTED',
+    reason: 'EXPIRED' | 'REJECTED' | 'VERIFICATION_REQUIRED',
   ): Promise<{ recovery: RecoveryRecord; created: boolean }> {
     const now = this.deps.now();
     return this.deps.store.create({
@@ -348,7 +355,9 @@ export class RecoveryService {
     const buttons: { text: string; url: string }[][] = [];
     if (entries.length === 1) {
       const { account, recovery, link } = entries[0]!;
-      lines.push('🔴 <b>LeetCode Session Expired</b>', '', `Account: <code>${esc(account.label)}</code>`, 'Status: Verification required');
+      const isVerification = recovery.reason === 'VERIFICATION_REQUIRED';
+      const header = isVerification ? '🛡️ <b>LeetCode Verification Required</b>' : '🔴 <b>LeetCode Session Expired</b>';
+      lines.push(header, '', `Account: <code>${esc(account.label)}</code>`, `Status: ${isVerification ? 'Verification required' : 'Session expired'}`);
       if (recovery.lastErrorCategory) lines.push(`Last attempt: ${esc(describeCategory(recovery.lastErrorCategory))}`);
       lines.push('');
       if (link) {
@@ -358,9 +367,17 @@ export class RecoveryService {
         lines.push(`Action needed: ${esc(describeCategory(recovery.lastErrorCategory ?? ''))}. Re-save the account with <code>/lclogin ${esc(account.label)}</code>.`);
       }
     } else {
-      lines.push(`🔴 <b>${entries.length} LeetCode Sessions Expired</b>`, '');
+      const allVerification = entries.every((e) => e.recovery.reason === 'VERIFICATION_REQUIRED');
+      const allExpired = entries.every((e) => e.recovery.reason === 'EXPIRED');
+      const headerTitle = allVerification
+        ? `🛡️ <b>${entries.length} LeetCode Accounts Need Verification</b>`
+        : allExpired
+        ? `🔴 <b>${entries.length} LeetCode Sessions Expired</b>`
+        : `🔴 <b>${entries.length} LeetCode Accounts Need Attention</b>`;
+      lines.push(headerTitle, '');
       for (const { account, recovery, link } of entries) {
-        lines.push(`• <code>${esc(account.label)}</code> — ${link ? 'verification required' : esc(describeCategory(recovery.lastErrorCategory ?? 'attention needed'))}`);
+        const isVer = recovery.reason === 'VERIFICATION_REQUIRED';
+        lines.push(`• <code>${esc(account.label)}</code> — ${link ? (isVer ? 'verification required' : 'session expired') : esc(describeCategory(recovery.lastErrorCategory ?? 'attention needed'))}`);
         if (link) buttons.push([{ text: `🔗 Reconnect ${account.label}`.slice(0, 60), url: link }]);
       }
       lines.push('', 'Credentials are already securely saved. Open each link to complete verification for that account only.');
@@ -489,7 +506,7 @@ export class RecoveryService {
           pollMs: limits.pollMs,
           onPhase: async (p: DriverPhase) => {
             this.setPhase(s, p);
-            if (p === 'submitting') {
+            if (p === 'submitting' || p === 'verifying') {
               await this.deps.store.setStatus(recovery.id, [RecoveryStatus.AWAITING_VERIFICATION], RecoveryStatus.VERIFYING);
             }
           },
@@ -504,7 +521,8 @@ export class RecoveryService {
 
       // ---- identity checks BEFORE anything is written --------------------------------
       const expected = expectedUsername(account, creds)!;
-      if (lower(result.username) !== lower(expected)) {
+      const allowAnyUnclaimedHandle = isFirstTimeEmailAccount(account, creds);
+      if (!allowAnyUnclaimedHandle && lower(result.username) !== lower(expected)) {
         return void (await this.failRecovery(recovery, s, 'USERNAME_MISMATCH', describeCategory('USERNAME_MISMATCH'), { notify: true }));
       }
       const others = (await this.deps.listAccounts()).filter((a) => a.id !== account.id);
@@ -519,7 +537,8 @@ export class RecoveryService {
         return void (await this.failRecovery(recovery, s, 'BROWSER_CRASHED', describeCategory('BROWSER_CRASHED'), { notify: true }));
       }
       const check = await this.deps.verifyCapturedSession(state).catch(() => ({ authenticated: false as const, username: null }));
-      if (!check.authenticated || lower(check.username) !== lower(expected)) {
+      const expectedAfterLogin = allowAnyUnclaimedHandle ? result.username : expected;
+      if (!check.authenticated || lower(check.username) !== lower(expectedAfterLogin)) {
         return void (await this.failRecovery(recovery, s, 'SERVER_VERIFICATION_FAILED', describeCategory('SERVER_VERIFICATION_FAILED'), { notify: true }));
       }
 
@@ -689,13 +708,29 @@ export class RecoveryService {
   }
 
   /** Operator-forced recovery for one account: opens it and sends the link right away. */
-  async requestRecovery(label: string): Promise<'sent' | 'unknown_account' | 'active' | 'in_progress'> {
+  async requestRecovery(
+    label: string,
+    reason: 'EXPIRED' | 'REJECTED' | 'VERIFICATION_REQUIRED' = 'EXPIRED',
+  ): Promise<'sent' | 'unknown_account' | 'active' | 'in_progress'> {
     const accounts = await this.deps.listAccounts();
     const account = accounts.find((a) => lower(a.label) === lower(label) || lower(a.username) === lower(label));
     if (!account) return 'unknown_account';
-    const { recovery } = await this.openRecovery(account, 'EXPIRED');
+    // A manual renewal may target an account whose ACTIVE status is stale.
+    // Check it instead of silently cancelling its reminder in notify().
+    if (account.status === AccountStatus.ACTIVE) {
+      const live = await this.deps.verifyStoredSession(account);
+      if (live.authenticated) return 'active';
+      if (live.cause === 'query-failed') throw new Error('Session verification unavailable; existing session retained');
+      await this.deps.markAccount(account.id, AccountStatus.EXPIRED, 'Manual renewal: session signed out');
+    }
+    const { recovery } = await this.openRecovery(account, reason);
     if (IN_SESSION_STATUSES.includes(recovery.status)) return 'in_progress';
-    await this.deps.store.rescheduleReminder(recovery.id, this.deps.now());
+    const now = this.deps.now();
+    if (this.deps.store.resetForOperatorRequest) {
+      await this.deps.store.resetForOperatorRequest(recovery.id, now);
+    } else {
+      await this.deps.store.rescheduleReminder(recovery.id, now);
+    }
     await this.tick();
     return 'sent';
   }

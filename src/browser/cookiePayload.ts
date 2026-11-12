@@ -32,6 +32,8 @@ export interface StorageOrigin {
 export interface StorageStateShape {
   cookies: StorageCookie[];
   origins: StorageOrigin[];
+  /** Internal capture metadata; never accepted from an uploaded cookie export. */
+  transport?: { proxyUrl?: string; userAgent?: string };
 }
 
 export type ParseResult =

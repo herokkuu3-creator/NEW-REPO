@@ -136,6 +136,8 @@ services:
         sync: false
       - key: CPSOLVER_URL
         value: https://pk-coder.onrender.com
+      - key: CPSOLVER_API_TOKEN
+        sync: false
       - key: CODEFORCES_RESIDENTIAL_PROXY
         sync: false
 

@@ -196,6 +196,7 @@ describe('Telegram-Initiated LeetCode Interactive Pairing & Companion Flow', () 
   });
 
   it('detects when a session is valid locally in the companion browser but rejected on Render, without marking ACTIVE', async () => {
+    vi.mocked(listAccounts).mockResolvedValue([]);
     vi.mocked(saveAccount).mockResolvedValue({
       id: 'acc-mismatch',
       label: 'black_sheep_7',

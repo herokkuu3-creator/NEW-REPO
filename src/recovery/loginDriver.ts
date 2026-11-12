@@ -98,6 +98,10 @@ export async function driveLeetCodeLogin(
       const state = await verificationState(page).catch(() => 'required' as const);
       const visible = await usernameInput.isVisible().catch(() => false);
       if (visible && state === 'none') break;
+      if (state === 'none' && !opts.dryRun) {
+        const username = await signedInUser(page, Math.min(3000, remaining()));
+        if (username) { await phase('verifying'); return { ok: true, username }; }
+      }
       await sleep(poll);
     }
 
@@ -132,6 +136,7 @@ export async function driveLeetCodeLogin(
       const state = await verificationState(page).catch(() => 'required' as const);
       const ready = (await submit.isVisible().catch(() => false)) && (await submit.isEnabled().catch(() => false));
       if (state === 'none' && ready) break;
+      await phase('awaiting_verification');
       await sleep(poll);
     }
 
@@ -149,13 +154,17 @@ export async function driveLeetCodeLogin(
       if (loginStatus === 400 || loginStatus === 401) {
         throw new Stop('LOGIN_REJECTED', 'LeetCode rejected the stored credentials.');
       }
-      if (loginStatus === 403) {
-        throw new Stop('VERIFICATION_REJECTED', 'LeetCode asked for verification again after sign-in.');
-      }
       if (loginStatus === 429) throw new Stop('RATE_LIMITED', 'LeetCode rate limited the sign-in.');
       if (loginStatus && loginStatus >= 500) throw new Stop('SERVICE_ERROR', `LeetCode sign-in returned HTTP ${loginStatus}.`);
       const username = await signedInUser(page, Math.min(3000, remaining()));
       if (username) return { ok: true, username };
+      if (loginStatus === 403 || await verificationState(page).catch(() => 'required') === 'required') {
+        await phase('awaiting_verification');
+        // Preserve this page, cookie jar and proxy. Only the human may retry
+        // submission after a challenged POST; never automatically replay it.
+        await sleep(poll);
+        continue;
+      }
       const errorVisible = await page
         .locator('.error-message, .errorlist, [role="alert"], p.text-red-500, div.text-red-500')
         .first()
