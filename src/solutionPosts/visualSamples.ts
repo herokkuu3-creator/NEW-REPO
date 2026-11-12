@@ -1,4 +1,4 @@
-import type { ArticlePresentation } from './presentationStyles';
+import { CURRENT_VISUAL_VERSION, type ArticlePresentation } from './presentationStyles';
 import { visualPlanSchema, VisualPlan } from './visuals';
 
 /** Identical demonstration data makes style comparisons independent of AI content. */
@@ -8,6 +8,7 @@ export function visualPreviewPlans(presentation: ArticlePresentation): VisualPla
     title: presentation.scenes ? index ? 'Find the matching pair' : 'Look up the missing value' : 'Follow one update',
     caption: presentation.scenes ? index ? 'Follow the complete search for target 10.' : 'A lookup finds the number that makes the target.' :
       'Style preview: apply the same update once.',
+    terrain: presentation.visualVersion === CURRENT_VISUAL_VERSION ? 'sequence' : undefined,
     scene: presentation.scenes?.[index], direction: presentation.directions?.[index],
     layout: presentation.diagrams[index], theme: presentation.themes[index], motion: presentation.motions?.[index],
     frames: presentation.scenes ? (index ? [

@@ -13,7 +13,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs());
 it('uses the real account assignment and normal asset store on Render', async () => {
   const result = await createAccountVisualPreview('a');
-  expect(result).toMatchObject({ executionHost: 'render', revision: 'preview-revision', username: 'alice', presentation: { visualVersion: 5, scenes: ['stage', 'split'] } });
+  expect(result).toMatchObject({ executionHost: 'render', revision: 'preview-revision', username: 'alice', presentation: { visualVersion: 6, scenes: ['stage', 'split'] } });
   expect(h.reserve).toHaveBeenCalledWith('a', 'visual-preview');
   const plans = h.store.mock.calls[0]![0];
   expect(plans.map((plan: any) => plan.layout)).toEqual(presentationVariant(3).diagrams);

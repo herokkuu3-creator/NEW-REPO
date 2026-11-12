@@ -72,7 +72,7 @@ it('assigns distinct block orders, GIF slots and geometry to the same problem un
   expect(new Set(assigned.flatMap(item => item.diagrams.map((layout, role) =>
     [layout, item.themes[role], item.motions?.[role]].join('/')))).size).toBe(30);
   expect(new Set(assigned.map(item => item.scenes!.join('/'))).size).toBe(15);
-  expect(assigned.every(item => item.visualVersion === 5)).toBe(true);
+  expect(assigned.every(item => item.visualVersion === 6)).toBe(true);
   expect(assigned.filter(item => item.format?.optimization)).toHaveLength(1);
   expect(new Set(Array.from({ length: 10_000 }, (_, index) => articleBlockOrder(index).join(' '))).size).toBe(10_000);
 });
@@ -148,7 +148,7 @@ it('encodes real in-between motion in each new scene on a shared palette', async
   const base = visualPreviewPlans(postPresentationVariant(0, 0))[1]!;
   const dimensions = new Set<string>();
   for (const scene of animatedScenes) {
-    const gif = await renderVisualGif({ ...base, scene, theme: 'midnight' });
+    const gif = await renderVisualGif({ ...base, terrain: undefined, scene, theme: 'midnight' });
     const meta = await sharp(gif, { animated: true }).metadata();
     dimensions.add([meta.width, meta.pageHeight].join('x'));
     expect(meta.pages).toBe(19);
@@ -166,6 +166,7 @@ it('encodes real in-between motion in each new scene on a shared palette', async
 
 it('keeps the reviewed states and timing when a dense animated scene needs compression', async () => {
   const plan = visualPreviewPlans(postPresentationVariant(1, 1))[0]!;
+  plan.terrain = undefined;
   plan.frames = Array.from({ length: 8 }, (_, i) => ({
     label: 'Inspect the candidate at index ' + i,
     items: Array.from({ length: 8 }, (_, j) => 'array[' + j + '] = 123456789012'),

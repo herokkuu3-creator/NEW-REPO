@@ -1,14 +1,14 @@
 import { z } from 'zod';
 import { accountDiagramLayouts, accountVisualThemes, diagramLayouts, visualMotions, visualThemes, conceptScenes, traceScenes, sceneDirections } from './visualStyles';
 
-export const CURRENT_VISUAL_VERSION = 5;
+export const CURRENT_VISUAL_VERSION = 6;
 export const articleLayouts = ['notebook', 'questions', 'example-first', 'recipe', 'interview', 'field-guide'] as const;
 export { diagramLayouts } from './visualStyles';
 export const presentationSchema = z.object({
   layout: z.enum(articleLayouts), diagrams: z.tuple([z.enum(diagramLayouts), z.enum(diagramLayouts)]),
   themes: z.tuple([z.enum(visualThemes), z.enum(visualThemes)]),
   motions: z.tuple([z.enum(visualMotions), z.enum(visualMotions)]).optional(),
-  visualVersion: z.union([z.literal(2), z.literal(3), z.literal(4), z.literal(CURRENT_VISUAL_VERSION)]).optional(),
+  visualVersion: z.union([z.literal(2), z.literal(3), z.literal(4), z.literal(5), z.literal(CURRENT_VISUAL_VERSION)]).optional(),
   scenes: z.tuple([z.enum(conceptScenes), z.enum(traceScenes)]).optional(),
   directions: z.tuple([z.enum(sceneDirections), z.enum(sceneDirections)]).optional(),
   codePlacement: z.enum(['end', 'after-approach']).default('end'),
