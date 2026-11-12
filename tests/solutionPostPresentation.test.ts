@@ -163,3 +163,18 @@ it('encodes real in-between motion in each new scene on a shared palette', async
   }
   expect(dimensions.size).toBe(animatedScenes.length);
 }, 90000);
+
+it('keeps the reviewed states and timing when a dense animated scene needs compression', async () => {
+  const plan = visualPreviewPlans(postPresentationVariant(1, 1))[0]!;
+  plan.frames = Array.from({ length: 8 }, (_, i) => ({
+    label: 'Inspect the candidate at index ' + i,
+    items: Array.from({ length: 8 }, (_, j) => 'array[' + j + '] = 123456789012'),
+    active: [i], state: 'step=' + i + '; the current state shows all reviewed values',
+    metric: 'comparisons = 123456; remaining = 123', note: 'Read the current values before advancing to the next state.',
+  }));
+  const gif = await renderVisualGif(plan);
+  const meta = await sharp(gif, { animated: true }).metadata();
+  expect(meta.pages).toBe(29);
+  expect(meta.delay?.slice(0, 5)).toEqual([1450, 90, 90, 90, 1180]);
+  expect(gif.length).toBeLessThan(500000);
+});
