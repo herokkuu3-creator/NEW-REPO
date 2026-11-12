@@ -299,7 +299,10 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
 }
 
 function draftNeedsRefresh(context: SubmissionContext): boolean {
-  return articleNeedsRefresh(context) || context.presentation?.visualVersion !== CURRENT_VISUAL_VERSION || !usesAnimatedPresentation(context.presentation);
+  const presentation = context.presentation;
+  if (articleNeedsRefresh(context) || !usesAnimatedPresentation(presentation)) return true;
+  return (presentation?.visualVersion ?? 0) < 4 ||
+    (presentation?.visualVersion === 4 && presentation.scenes?.[1] === 'terminal');
 }
 
 export async function generateForRun(accountId: string, runId: string, force = false, onStage?: StageCallback,

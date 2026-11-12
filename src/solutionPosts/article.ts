@@ -78,6 +78,7 @@ export function validateArticle(text: string, context: SubmissionContext, recent
     visual.motion = context.presentation!.motions?.[index];
     visual.scene = context.presentation!.scenes?.[index];
     visual.direction = context.presentation!.directions?.[index];
+    visual.terrain = visual.scene === 'terminal' && /^climbing-stairs(?:-|$)/.test(context.slug) ? 'steps' : undefined;
     if (context.presentation!.format) {
       visual.pace = (['quick', 'measured', 'hold-final'] as const)[(context.presentation!.format.index + index) % 3];
     }

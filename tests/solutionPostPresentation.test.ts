@@ -72,7 +72,7 @@ it('assigns distinct block orders, GIF slots and geometry to the same problem un
   expect(new Set(assigned.flatMap(item => item.diagrams.map((layout, role) =>
     [layout, item.themes[role], item.motions?.[role]].join('/')))).size).toBe(30);
   expect(new Set(assigned.map(item => item.scenes!.join('/'))).size).toBe(15);
-  expect(assigned.every(item => item.visualVersion === 4)).toBe(true);
+  expect(assigned.every(item => item.visualVersion === 5)).toBe(true);
   expect(assigned.filter(item => item.format?.optimization)).toHaveLength(1);
   expect(new Set(Array.from({ length: 10_000 }, (_, index) => articleBlockOrder(index).join(' '))).size).toBe(10_000);
 });
@@ -177,4 +177,18 @@ it('keeps the reviewed states and timing when a dense animated scene needs compr
   expect(meta.pages).toBe(29);
   expect(meta.delay?.slice(0, 5)).toEqual([1450, 90, 90, 90, 1180]);
   expect(gif.length).toBeLessThan(500000);
+});
+
+it('renders a stair trace as illustrated blocks with the actual indices and values', () => {
+  const plan = visualPreviewPlans(postPresentationVariant(1, 1))[1]!;
+  plan.scene = 'terminal';
+  plan.terrain = 'steps';
+  plan.frames[0] = { label: 'Start at the ground', items: ['b0=0', 'best[1]=INF'],
+    active: [0], state: 'Only the ground is reachable.', metric: 'Cost = 0', note: 'Read the starting value.' };
+  const svg = renderVisualFrame(plan, 0);
+  expect(svg).toContain('<polygon');
+  expect(svg).toContain('>Step 0</text>');
+  expect(svg).toContain('>Step 1</text>');
+  expect(svg).toContain('>∞</text>');
+  expect(svg).not.toContain('&gt; Start at the ground');
 });

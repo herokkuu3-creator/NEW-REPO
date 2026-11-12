@@ -3,13 +3,31 @@ import { paletteForAccount, type AnimatedScene } from './visualStyles';
 
 export const animatedSceneDimensions: Record<AnimatedScene, [number, number]> = {
   orbit: [720, 490], switchboard: [780, 410], grid: [680, 505], stage: [690, 450],
-  film: [780, 400], terminal: [710, 430], waterfall: [650, 540], split: [760, 440],
+  film: [780, 400], terminal: [800, 510], waterfall: [650, 540], split: [760, 440],
 };
 
 const escape = (value: string) => value.replace(/[&<>"']/g, char =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[char]!);
 const ease = (value: number) => value * value * (3 - 2 * value);
 const mix = (from: number, to: number, progress: number) => from + (to - from) * progress;
+
+const routeColors = {
+  background: '#fbf7f1', ink: '#241c40', muted: '#625674', cloud: '#f4eafc', blush: '#fbe6d6',
+  baseline: '#cbbce1', front: '#e9dcfa', top: '#f7eeff', side: '#c8b6e9',
+  violet: '#6141c5', violetTop: '#9477eb', violetSide: '#462a9b', soft: '#eee5ff',
+  green: '#c9f0dc', greenTop: '#e2f8ee', greenSide: '#9bceb2', forest: '#194d3b',
+};
+
+function blendColor(from: string, to: string, progress: number): string {
+  const channel = (start: number) => Math.round(mix(parseInt(from.slice(start, start + 2), 16),
+    parseInt(to.slice(start, start + 2), 16), progress)).toString(16).padStart(2, '0');
+  return '#' + channel(1) + channel(3) + channel(5);
+}
+
+function routeItem(item: string): { index: string; value: string } | undefined {
+  const match = /^(?:b\[?|best\[)(\d+)\]?\s*[:=]\s*(.+)$/i.exec(item);
+  return match ? { index: match[1]!, value: match[2]!.replace(/^(?:inf(?:inity)?|∞)$/i, '∞') } : undefined;
+}
 
 function wrap(value: string, width: number): string[] {
   const lines: string[] = [];
@@ -194,24 +212,84 @@ export function renderAnimatedScene(plan: VisualPlan & { scene: AnimatedScene },
       break;
     }
     case 'terminal': {
-      art += rect(15, 15, width - 30, height - 30, colors.surface, 19) + keyline(15, 15, width - 30, height - 30, 19);
-      art += rect(27, 74, width - 54, 249, colors.background, 10);
-      art += [0, 1, 2].map((dot) => circle(36 + dot * 16, 43, 4.5, dot === 0 ? colors.accent : colors.line)).join('');
-      art += text(plan.title, 90, 49, 584, 21, colors.ink, 700, 'start', mono, 1);
-      const commands = plan.frames.slice(Math.max(0, index - 2), index + 1);
-      art += commands.map((frame, offset) => {
-        const isCurrent = offset === commands.length - 1;
-        const y = 111 + offset * 34;
-        const command = `> ${frame.label}`;
-        const visible = isCurrent ? Array.from(command).slice(0, Math.ceil(Array.from(command).length * progress)).join('') : command;
-        return text(visible + (isCurrent && phase < 1 ? ' ▋' : ''), 42, y, 624, 16, isCurrent ? colors.accent : colors.muted, 600, 'start', mono);
+      // The saved scene identifier also covers articles created before the illustration.
+      const c = routeColors;
+      const items = current.items.map(routeItem);
+      const stairs = plan.terrain === 'steps' || items.every(Boolean) && /steps?|stairs?|climb|jump/i.test(
+        [plan.title, plan.caption, ...plan.frames.map(frame => frame.note)].join(' '));
+      const base = 345;
+      const span = 644;
+      const stride = span / Math.max(current.items.length, 3);
+      const size = Math.min(111, stride - 15);
+      const position = (i: number, count: number) => {
+        const spacing = span / Math.max(count, 3);
+        const column = stairs || flip > 0 ? i : count - i - 1;
+        return { x: width / 2 + (column - (count - 1) / 2) * spacing,
+          y: stairs ? 277 - 96 * i / Math.max(count - 1, 1) : 237 };
+      };
+      const points = current.items.map((_, i) => position(i, current.items.length));
+      const poly = (points: string, fill: string) => `<polygon points="${points}" fill="${fill}"/>`;
+      const final = index === plan.frames.length - 1;
+      const highlight = final ? c.forest : c.violet;
+      const label = (value: string, x: number, y: number, w: number, size: number, ink = c.ink,
+        weight = 700, align: 'start' | 'middle' = 'start', maxLines = 2) =>
+        text(value, x, y, w, size, ink, weight, align, 'Arial, DejaVu Sans, sans-serif', maxLines);
+
+      art = rect(0, 0, width, height, c.background);
+      art += `<path d="M0 189C124 114 227 119 344 169S614 211 800 100V332C656 356 524 371 382 334S128 283 0 341Z" fill="${c.cloud}"/>`;
+      art += ellipse(681, 207, 90, 65, c.blush);
+      art += label(plan.title, 38, 68, 572, 35, c.ink, 700, 'start', 1);
+      art += label(current.label, 39, 110, 680, 19, c.muted, 500);
+      // This is trace progress, independent of the values or algorithm indices.
+      const markerX = 762 - plan.frames.length * 16;
+      art += plan.frames.map((_, i) => rect(markerX + i * 16, 61, 11, 5, i <= index ? c.violet : c.baseline, 2.5)).join('');
+      art += path('M54 347 H746', c.baseline, 1.5);
+
+      const route = points.map(({ x, y }, i) => (i ? 'L' : 'M') + (x + 5) + ' ' + (y - 28)).join(' ');
+      if (points.length > 1) art += path(route, c.baseline, 2, '4 7');
+      art += current.items.map((value, i) => {
+        const point = points[i]!;
+        const active = current.active.includes(i);
+        const entering = index > 0 && active && (!previous.active.includes(i) || previous.items[i] !== value);
+        const light = active ? entering ? progress : 1 : 0;
+        const x = point.x;
+        const y = point.y + (entering ? (1 - progress) * 13 : 0);
+        const top = blendColor(c.top, final ? c.greenTop : c.violetTop, light);
+        const front = blendColor(c.front, final ? c.green : c.violet, light);
+        const side = blendColor(c.side, final ? c.greenSide : c.violetSide, light);
+        const ink = active && light > .63 ? (final ? c.forest : '#ffffff') : c.ink;
+        const left = x - size / 2;
+        const right = x + size / 2;
+        const floor = stairs ? base : point.y + 75;
+        const depth = Math.min(16, stride * .12);
+        const item = items[i];
+        const displayed = stairs && item ? item.value : value;
+        const valueSize = displayed.length <= 5 ? 30 : 18;
+        const shadow = ellipse(x + 8, floor + 2, size * .55, 9, c.baseline);
+        const body = rect(left, y, size, floor - y, front) +
+          poly(`${right},${y} ${right + depth},${y - 11} ${right + depth},${floor - 11} ${right},${floor}`, side) +
+          poly(`${left},${y} ${left + depth},${y - 11} ${right + depth},${y - 11} ${right},${y}`, top);
+        const caption = stairs && item ? label('Step ' + item.index, x, 368, size + 6, 13, c.muted, 600, 'middle', 1) : '';
+        return shadow + body + label(displayed, x, y + (valueSize === 30 ? 38 : 32), size - 9, valueSize,
+          ink, 700, 'middle', 3) + caption;
       }).join('');
-      art += path('M42 206 H667', colors.line, 2, '4 5');
-      art += change(text(current.state, 42, 233, 622, 19, colors.ink, 700, 'start', mono, 2) +
-        itemText(current, 42, 274, 622, 15, 3));
-      art += rect(27, 333, width - 54, 41, colors.selected, 9);
-      art += text(current.metric, 42, 360, 624, 21, colors.selectedInk, 700, 'start', mono, 1) +
-        text(current.note, 28, 396, 654, 15, colors.muted, 500, 'start', sans, 2);
+
+      if (current.active.length) {
+        const destination = points[focus]!;
+        const origin = previous.active.length ? position(oldFocus, previous.items.length) : destination;
+        const x = mix(origin.x, destination.x, progress) + 5;
+        const y = mix(origin.y, destination.y, progress) - 28 - 28 * Math.sin(Math.PI * progress);
+        art += circle(x, y, 14 + (1 - progress) * 5, final ? c.greenTop : c.soft) +
+          circle(x, y, 7, highlight) + circle(x - 2, y - 2, 2, '#fff8f7');
+      }
+
+      art += rect(30, 388, 740, 97, '#fffdf9', 20);
+      art += label(current.state, 49, 421, 478, 18, c.ink, 700);
+      art += label(current.note, 49, 463, 478, 14, c.muted, 500);
+      const result = rect(551, 403, 203, 67, final ? c.green : c.soft, 16) +
+        label(current.metric, 652, 434 - (current.metric.length > 15 ? 7 : 0),
+          178, 26, highlight, 700, 'middle');
+      art += slide(result, 0, (1 - progress) * 9, .45 + progress * .55);
       break;
     }
     case 'waterfall': {

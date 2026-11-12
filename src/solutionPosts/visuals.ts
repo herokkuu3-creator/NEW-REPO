@@ -34,6 +34,7 @@ export const visualPlanSchema = z.object({
   motion: z.enum(visualMotions).optional(),
   scene: z.enum(animatedScenes).optional(),
   direction: z.enum(sceneDirections).optional(),
+  terrain: z.literal('steps').optional(),
   pace: z.enum(['quick', 'measured', 'hold-final']).optional(),
   frames: z.array(visualFrameSchema).min(2).max(8),
 }).superRefine((plan, ctx) => {
