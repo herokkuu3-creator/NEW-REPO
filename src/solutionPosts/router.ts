@@ -134,9 +134,11 @@ export class AIModelRouter {
       const sageReasoning = isSageProvider(this.options.baseUrl);
       const modelOrder = stage?.startsWith('technical review') && this.options.reviewModels?.length ?
         this.options.reviewModels.filter(model => this.options.models.includes(model)) : this.options.models;
-      for (const model of [...new Set(this.options.oneModelPerStage ? modelOrder.slice(0, 1) : modelOrder)]) {
+      const firstAvailable = modelOrder.find(model => available.has(model));
+      const candidates = this.options.oneModelPerStage ? [firstAvailable ?? modelOrder[0]!].filter(Boolean) : modelOrder;
+      for (const model of new Set(candidates)) {
         if (!available.has(model)) {
-          const record = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, outcome: 'UNAVAILABLE' };
+          const record = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, stage, outcome: 'UNAVAILABLE' };
           attempts.push(record); this.onAttempt(record); continue;
         }
         const healthKey = `${new URL(this.options.baseUrl).origin}:${model}`;

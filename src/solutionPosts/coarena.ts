@@ -12,7 +12,8 @@ const KEY_STATE = 'solution-post-coarena-key:v1';
 // Sealed to the service's existing SETUP_TOKEN. The repository contains only ciphertext.
 const BOOTSTRAP_KEY = 'jeYQeXLvzbbbmZpa:XOWp1wC4OfzANW5McLJPTw:wtaRTks1XsSn_04OQkxyJmswqrylZlhDio6BIP2gum0zF03p';
 export const COARENA_WRITER = 'claude-sonnet-5-5';
-export const COARENA_REVIEWER = 'gpt-6-1-sol';
+export const COARENA_REVIEWER = 'gemini-4-argon';
+const REVIEW_MODELS = [COARENA_REVIEWER, 'claude-opus-5-5'];
 const DAILY_LIMIT = 5;
 const limitsSchema = z.object({ data: z.object({ free: z.boolean(), usd_per_day: z.number(), today: z.object({
   used_usd: z.number(), left_usd: z.number(), held_usd: z.number().optional(), resets_at: z.number(), requests_left: z.number().nullable(),
@@ -85,7 +86,7 @@ export class CoarenaRouter extends AIModelRouter {
   constructor(private readonly key: string, private readonly createFallback: () => Promise<AIModelRouter>,
     onAttempt?: (attempt: ModelAttempt) => void, private readonly deadlineAt?: number,
     private readonly checkpoint?: CoarenaCheckpoint) {
-    super({ apiKey: key, baseUrl: BASE_URL, models: [COARENA_WRITER, COARENA_REVIEWER], reviewModels: [COARENA_REVIEWER],
+    super({ apiKey: key, baseUrl: BASE_URL, models: [COARENA_WRITER, ...REVIEW_MODELS], reviewModels: REVIEW_MODELS,
       timeoutMs: 55_000, retries: 0, maxTokens: 4096, oneModelPerStage: true, deadlineAt }, undefined, undefined,
       attempt => { attempt.provider = 'coarena'; onAttempt?.(attempt); });
     this.quotaKey = createHash('sha256').update(key).digest('hex');
@@ -101,7 +102,7 @@ export class CoarenaRouter extends AIModelRouter {
   async generatePrimary<T>(messages: LLMMessage[], validate: (text: string) => T, maxTokens?: number, jsonMode?: boolean, stage?: string) {
     const input: LLMMessage[] = jsonMode ? [...messages, { role: 'user', content: 'Return the result as a JSON object.' }] : messages;
     const tokens = stage === 'technical review implementation' ? Math.max(maxTokens ?? 0, 2400) : maxTokens;
-    const checkpointId = createHash('sha256').update(JSON.stringify([COARENA_WRITER, COARENA_REVIEWER,
+    const checkpointId = createHash('sha256').update(JSON.stringify([COARENA_WRITER, REVIEW_MODELS,
       stage, input, tokens, jsonMode])).digest('hex');
     const saved = await this.checkpoint?.read(checkpointId);
     if (saved) return { value: validate(saved.raw), model: saved.model, attempts: saved.attempts };
