@@ -30,6 +30,26 @@ export interface GhostSubmitParams {
   onStorageState?: (state: StorageStateShape) => Promise<void> | void;
 }
 
+export interface GhostBrowserSubmitParams {
+  slug: string;
+  questionId: string;
+  lang: string;
+  code: string;
+  signal?: AbortSignal;
+  forceNavigate?: boolean;
+}
+
+export interface GhostBrowserSessionOptions {
+  userAgent?: string;
+  proxyUrl?: string;
+  onStorageState?: (state: StorageStateShape) => Promise<void> | void;
+}
+
+export interface GhostBrowserSession {
+  submit(params: GhostBrowserSubmitParams): Promise<GhostSubmitResult>;
+  close(): Promise<void>;
+}
+
 export interface GhostSubmitResult {
   submissionId: string;
   storageState: StorageStateShape;
@@ -48,11 +68,17 @@ function withGhostBrowserLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Drops decorative heavy assets (images, media, fonts, beacons) inside the
- * ghost Chromium session while keeping LeetCode app scripts and Cloudflare
- * verification scripts intact.
+ * Drops decorative heavy assets (images, media, fonts, stylesheets, heavy
+ * Monaco/React bundles from `assets.leetcode.com`, and analytics) inside the
+ * ghost Chromium session while keeping `blob:`/`data:` challenge workers and
+ * Cloudflare verification scripts intact.
  */
 export function blockNonEssentialProblemAssets(url: string, type: string): boolean {
+  const lowerUrl = url.toLowerCase();
+  if (lowerUrl.startsWith('blob:') || lowerUrl.startsWith('data:') || lowerUrl.startsWith('about:')) {
+    return false;
+  }
+
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -72,7 +98,15 @@ export function blockNonEssentialProblemAssets(url: string, type: string): boole
     return false;
   }
 
-  if (['image', 'media', 'font', 'websocket', 'eventsource', 'manifest', 'ping'].includes(type)) {
+  if (
+    ['image', 'media', 'font', 'stylesheet', 'websocket', 'eventsource', 'manifest', 'ping'].includes(
+      type,
+    )
+  ) {
+    return true;
+  }
+
+  if (host === 'assets.leetcode.com') {
     return true;
   }
 
@@ -109,7 +143,14 @@ export async function submitViaPageFetch(
 
   const sendInPage = async (csrfToken: string) =>
     page.evaluate(
-      async ({ submitUrl, body, csrf }) => {
+      async ({ origin, problemPath, submitUrl, body, csrf }) => {
+        try {
+          if (window.location.origin === origin && window.location.pathname !== problemPath) {
+            window.history.replaceState(null, '', problemPath);
+          }
+        } catch {
+          // Ignore history replace errors if origin differs.
+        }
         const res = await fetch(submitUrl, {
           method: 'POST',
           credentials: 'include',
@@ -128,6 +169,8 @@ export async function submitViaPageFetch(
         };
       },
       {
+        origin: ORIGIN,
+        problemPath: `/problems/${params.slug}/`,
         submitUrl: `${ORIGIN}/problems/${params.slug}/submit/`,
         body: {
           lang: params.lang,
@@ -189,12 +232,29 @@ export async function submitViaPageFetch(
   return String(parsed.submission_id);
 }
 
-async function waitForPassiveChallengeSettle(page: Page, signal?: AbortSignal): Promise<string | null> {
-  const deadline = Date.now() + 8_000;
-  let kind = await detectVerificationPage(page);
+async function waitForPassiveChallengeSettle(
+  page: Page,
+  signal?: AbortSignal,
+  maxWaitMs = 25_000,
+): Promise<string | null> {
+  const safeDetect = async (): Promise<string | null> => {
+    try {
+      return await detectVerificationPage(page);
+    } catch {
+      // Execution context can be destroyed mid-redirect while Cloudflare settles.
+      return 'challenge-page';
+    }
+  };
+
+  const deadline = Date.now() + maxWaitMs;
+  let kind = await safeDetect();
   while (kind && Date.now() < deadline && !signal?.aborted) {
     await page.waitForTimeout(600).catch(() => undefined);
-    kind = await detectVerificationPage(page);
+    kind = await safeDetect();
+  }
+  if (!kind && !signal?.aborted) {
+    await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => undefined);
+    kind = await safeDetect();
   }
   return kind;
 }
@@ -202,6 +262,208 @@ async function waitForPassiveChallengeSettle(page: Page, signal?: AbortSignal): 
 export interface GhostBrowserDeps {
   resolveProxy?: typeof resolveLeetCodeResidentialProxy;
   submitPageFetch?: typeof submitViaPageFetch;
+}
+
+/**
+ * Reusable ghost-mode stealth Chromium session. Keeps one Browser, Context,
+ * and Page warm across multiple submissions so Cloudflare `cf_clearance` and
+ * Chromium's TLS session survive between questions without cold-relaunching or
+ * re-navigating problem pages unnecessarily.
+ */
+export async function openGhostBrowserSession(
+  initialState: StorageStateShape,
+  sessionOptions: GhostBrowserSessionOptions = {},
+  deps: GhostBrowserDeps = {},
+): Promise<GhostBrowserSession> {
+  const resolveProxy = deps.resolveProxy ?? resolveLeetCodeResidentialProxy;
+  const pageFetch = deps.submitPageFetch ?? submitViaPageFetch;
+
+  let currentState: StorageStateShape = {
+    ...initialState,
+    cookies: pruneExpiredCookies(initialState.cookies ?? []),
+  };
+  let resolvedProxyUrl = sessionOptions.proxyUrl ?? initialState.transport?.proxyUrl;
+  let proxyResolved = resolvedProxyUrl !== undefined;
+  let browser: Browser | null = null;
+  let context: BrowserContext | null = null;
+  let page: Page | null = null;
+  let hasSettledProblemPage = false;
+  let closed = false;
+
+  const closeResources = async () => {
+    hasSettledProblemPage = false;
+    const activeCtx = context;
+    const activeBrowser = browser;
+    page = null;
+    context = null;
+    browser = null;
+    await activeCtx?.close().catch(() => undefined);
+    await activeBrowser?.close().catch(() => undefined);
+  };
+
+  return {
+    submit: (params) =>
+      withGhostBrowserLock(async () => {
+        if (closed) {
+          throw new Error('Ghost browser session is closed');
+        }
+        if (params.signal?.aborted) {
+          throw new Error('Range cancelled before ghost browser submission');
+        }
+
+        if (!proxyResolved) {
+          resolvedProxyUrl = (await resolveProxy())?.url;
+          proxyResolved = true;
+        }
+        const proxy = resolvedProxyUrl ? toPlaywrightProxy(resolvedProxyUrl) : undefined;
+        if (resolvedProxyUrl && !proxy) {
+          throw new Error('LEETCODE_PROXY_INVALID');
+        }
+
+        const userAgent =
+          sessionOptions.userAgent ??
+          currentState.transport?.userAgent ??
+          DEFAULT_DESKTOP_CHROME_USER_AGENT;
+
+        const onAbort = () => {
+          void closeResources();
+        };
+        params.signal?.addEventListener('abort', onAbort, { once: true });
+
+        try {
+          if (!browser || !browser.isConnected() || !context || !page || page.isClosed()) {
+            await closeResources();
+            const headless = config.browser.headless;
+            browser = await chromium.launch({
+              headless,
+              args: buildLaunchArgs(headless),
+              proxy,
+            });
+            const cleanedCookies = pruneExpiredCookies(currentState.cookies ?? []);
+            context = await browser.newContext({
+              userAgent,
+              viewport: getRandomDesktopViewport(),
+              locale: 'en-US',
+              storageState: {
+                cookies: cleanedCookies as never,
+                origins: (currentState.origins ?? []) as never,
+              },
+            });
+            await applyStealthScripts(context, 'chromium');
+            await context.route('**/*', async (route) => {
+              if (
+                blockNonEssentialProblemAssets(route.request().url(), route.request().resourceType())
+              ) {
+                return route.abort().catch(() => undefined);
+              }
+              return route.continue().catch(() => undefined);
+            });
+            page = await context.newPage();
+            hasSettledProblemPage = false;
+          }
+
+          const activePage = page;
+          const activeContext = context;
+          const persistUpdatedState = async (warmReuse: boolean, submissionId: string) => {
+            const latest = (await activeContext.storageState()) as {
+              cookies: StorageStateShape['cookies'];
+              origins: StorageStateShape['origins'];
+            };
+            const updatedState: StorageStateShape = {
+              transport:
+                currentState.transport ??
+                (resolvedProxyUrl ? { proxyUrl: resolvedProxyUrl, userAgent } : { userAgent }),
+              cookies: deduplicateLeetCodeCookies(latest.cookies, ORIGIN),
+              origins: latest.origins ?? currentState.origins ?? [],
+            };
+            currentState = updatedState;
+            if (sessionOptions.onStorageState) {
+              await sessionOptions.onStorageState(updatedState);
+            }
+            logger.info(
+              {
+                slug: params.slug,
+                language: params.lang,
+                submissionId,
+                viaProxy: Boolean(proxy),
+                warmReuse,
+              },
+              'submitted solution via ghost-mode stealth Chromium fallback',
+            );
+            return { submissionId, storageState: updatedState };
+          };
+
+          // Warm fast-path: skip full page.goto() when the warm tab is already settled on LeetCode
+          if (hasSettledProblemPage && !params.forceNavigate && activePage.url().startsWith(`${ORIGIN}/`)) {
+            const currentKind = await detectVerificationPage(activePage).catch(() => 'challenge-page');
+            const cookiesNow = await activeContext.cookies(ORIGIN).catch(() => []);
+            const hasCsrf = Boolean(selectBestCsrfCookie(cookiesNow, ORIGIN));
+            if (!currentKind && hasCsrf) {
+              try {
+                const submissionId = await pageFetch(activePage, {
+                  slug: params.slug,
+                  questionId: params.questionId,
+                  lang: params.lang,
+                  code: params.code,
+                });
+                return await persistUpdatedState(true, submissionId);
+              } catch (fastErr) {
+                const shouldFallbackToNavigate =
+                  (fastErr instanceof LeetCodeHttpError && fastErr.status !== 200) ||
+                  (fastErr instanceof Error && /missing csrftoken/i.test(fastErr.message));
+                if (!shouldFallbackToNavigate) {
+                  throw fastErr;
+                }
+                hasSettledProblemPage = false;
+              }
+            } else {
+              hasSettledProblemPage = false;
+            }
+          }
+
+          const targetUrl = `${ORIGIN}/problems/${params.slug}/`;
+          await activePage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+
+          let verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, 25_000);
+          if (verificationKind && !params.signal?.aborted) {
+            await activePage
+              .goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
+              .catch(() => undefined);
+            verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, 15_000);
+          }
+
+          if (verificationKind) {
+            hasSettledProblemPage = false;
+            const title = await activePage.title().catch(() => '');
+            // Never overwrite stored cookies with unverified challenge-page cookies.
+            throw new LeetCodeHttpError(
+              `submit HTTP 403: Cloudflare verification required (${verificationKind})${title ? ` [${title}]` : ''}`,
+              403,
+            );
+          }
+
+          hasSettledProblemPage = true;
+          const submissionId = await pageFetch(activePage, {
+            slug: params.slug,
+            questionId: params.questionId,
+            lang: params.lang,
+            code: params.code,
+          });
+          return await persistUpdatedState(false, submissionId);
+        } catch (err) {
+          if (params.signal?.aborted || (err instanceof Error && /Target page, context or browser has been closed/i.test(err.message))) {
+            await closeResources();
+          }
+          throw err;
+        } finally {
+          params.signal?.removeEventListener('abort', onAbort);
+        }
+      }),
+    close: async () => {
+      closed = true;
+      await closeResources();
+    },
+  };
 }
 
 /**
@@ -222,120 +484,24 @@ export async function submitViaGhostBrowser(
     throw new Error('Range cancelled before ghost browser submission');
   }
 
-  return withGhostBrowserLock(async () => {
-    if (signal?.aborted) {
-      throw new Error('Range cancelled before ghost browser submission');
-    }
-
-    const resolveProxy = deps.resolveProxy ?? resolveLeetCodeResidentialProxy;
-    const pageFetch = deps.submitPageFetch ?? submitViaPageFetch;
-    const proxyUrl = params.proxyUrl ?? state.transport?.proxyUrl ?? (await resolveProxy())?.url;
-    const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
-    if (proxyUrl && !proxy) {
-      throw new Error('LEETCODE_PROXY_INVALID');
-    }
-
-    const userAgent =
-      params.userAgent ?? state.transport?.userAgent ?? DEFAULT_DESKTOP_CHROME_USER_AGENT;
-    let browser: Browser | null = null;
-    let context: BrowserContext | null = null;
-
-    const onAbort = () => {
-      void context?.close().catch(() => undefined);
-      void browser?.close().catch(() => undefined);
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-
-    try {
-      const headless = config.browser.headless;
-      browser = await chromium.launch({
-        headless,
-        args: buildLaunchArgs(headless),
-        proxy,
-      });
-
-      const cleanedCookies = pruneExpiredCookies(state.cookies ?? []);
-      context = await browser.newContext({
-        userAgent,
-        viewport: getRandomDesktopViewport(),
-        locale: 'en-US',
-        storageState: {
-          cookies: cleanedCookies as never,
-          origins: (state.origins ?? []) as never,
-        },
-      });
-      await applyStealthScripts(context, 'chromium');
-
-      await context.route('**/*', async (route) => {
-        if (blockNonEssentialProblemAssets(route.request().url(), route.request().resourceType())) {
-          return route.abort().catch(() => undefined);
-        }
-        return route.continue().catch(() => undefined);
-      });
-
-      const page = await context.newPage();
-      const targetUrl = `${ORIGIN}/problems/${params.slug}/`;
-      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-      await page.waitForTimeout(800).catch(() => undefined);
-
-      const notifyState = async () => {
-        if (!params.onStorageState) return;
-        const latest = (await context?.storageState().catch(() => null)) as
-          | { cookies: StorageStateShape['cookies']; origins: StorageStateShape['origins'] }
-          | null;
-        if (!latest) return;
-        await params.onStorageState({
-          transport: state.transport ?? (proxyUrl ? { proxyUrl, userAgent } : { userAgent }),
-          cookies: deduplicateLeetCodeCookies(latest.cookies, ORIGIN),
-          origins: latest.origins ?? state.origins ?? [],
-        });
-      };
-
-      const verificationKind = await waitForPassiveChallengeSettle(page, signal);
-      if (verificationKind) {
-        const title = await page.title().catch(() => '');
-        await notifyState();
-        throw new LeetCodeHttpError(
-          `submit HTTP 403: Cloudflare verification required (${verificationKind})${title ? ` [${title}]` : ''}`,
-          403,
-        );
-      }
-
-      let submissionId: string;
-      try {
-        submissionId = await pageFetch(page, {
-          slug: params.slug,
-          questionId: params.questionId,
-          lang: params.lang,
-          code: params.code,
-        });
-      } catch (err) {
-        await notifyState().catch(() => undefined);
-        throw err;
-      }
-
-      const latest = (await context.storageState()) as {
-        cookies: StorageStateShape['cookies'];
-        origins: StorageStateShape['origins'];
-      };
-      const updatedState: StorageStateShape = {
-        transport: state.transport ?? (proxyUrl ? { proxyUrl, userAgent } : { userAgent }),
-        cookies: deduplicateLeetCodeCookies(latest.cookies, ORIGIN),
-        origins: latest.origins ?? state.origins ?? [],
-      };
-      if (params.onStorageState) {
-        await params.onStorageState(updatedState);
-      }
-
-      logger.info(
-        { slug: params.slug, language: params.lang, submissionId, viaProxy: Boolean(proxy) },
-        'submitted solution via ghost-mode stealth Chromium fallback',
-      );
-      return { submissionId, storageState: updatedState };
-    } finally {
-      signal?.removeEventListener('abort', onAbort);
-      await context?.close().catch(() => undefined);
-      await browser?.close().catch(() => undefined);
-    }
-  });
+  const ghostSession = await openGhostBrowserSession(
+    state,
+    {
+      userAgent: params.userAgent,
+      proxyUrl: params.proxyUrl,
+      onStorageState: params.onStorageState,
+    },
+    deps,
+  );
+  try {
+    return await ghostSession.submit({
+      slug: params.slug,
+      questionId: params.questionId,
+      lang: params.lang,
+      code: params.code,
+      signal,
+    });
+  } finally {
+    await ghostSession.close();
+  }
 }

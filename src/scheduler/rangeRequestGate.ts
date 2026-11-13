@@ -18,7 +18,12 @@ export class RangeRequestGate {
     this.blockedUntil = Math.max(this.blockedUntil, this.now() + Math.max(delay ?? 60000, 1000));
   }
   clearCooldown(): void {
+    const now = this.now();
     this.blockedUntil = 0;
+    if (this.nextRequest > now) {
+      this.nextRequest = now;
+    }
+    this.nextSubmit = Math.max(this.nextSubmit, now + this.submitGap);
   }
   async wait(
     submit: boolean,

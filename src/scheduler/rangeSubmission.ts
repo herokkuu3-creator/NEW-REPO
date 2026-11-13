@@ -16,7 +16,7 @@ import {
   SubmissionOutcome,
 } from '../leetcode/apiClient';
 import { persistRotatedCookiesFromContext } from '../leetcode/sessionManager';
-import { submitViaGhostBrowser } from '../leetcode/ghostSubmit';
+import { type GhostBrowserSession, openGhostBrowserSession, submitViaGhostBrowser } from '../leetcode/ghostSubmit';
 import { type StorageStateShape } from '../browser/cookiePayload';
 import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
@@ -1892,7 +1892,9 @@ export async function openRequestSession(
   sessionDeps: {
     resolveProxy?: typeof resolveLeetCodeResidentialProxy;
     submitGhost?: typeof submitViaGhostBrowser;
+    openGhostSession?: typeof openGhostBrowserSession;
     persistCookies?: typeof persistRotatedCookiesFromContext;
+    gate?: RangeRequestGate;
   } = {},
 ): Promise<RangeSession> {
   const state = parseStoredStorageState(account.storageState);
@@ -1900,8 +1902,10 @@ export async function openRequestSession(
 
   const initialState = state.state;
   const resolveProxy = sessionDeps.resolveProxy ?? resolveLeetCodeResidentialProxy;
-  const runGhostSubmit = sessionDeps.submitGhost ?? submitViaGhostBrowser;
+  const customGhostSubmit = sessionDeps.submitGhost;
+  const openGhost = sessionDeps.openGhostSession ?? openGhostBrowserSession;
   const persistCookies = sessionDeps.persistCookies ?? persistRotatedCookiesFromContext;
+  const gate = sessionDeps.gate ?? serverRangeGate;
 
   const proxyUrl = initialState.transport?.proxyUrl ?? (await resolveProxy())?.url;
   const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
@@ -1969,48 +1973,121 @@ export async function openRequestSession(
   const cancelled = new AbortController();
   const requestSignal = signal ? AbortSignal.any([signal, cancelled.signal]) : cancelled.signal;
   const api = new LeetCodeApi(cookieJar as never, {
-    beforeRequest: (deadline) => serverRangeGate.wait(false, abortableSleep, requestSignal, undefined, deadline),
-    observe: (error) => serverRangeGate.observe(error),
+    beforeRequest: (deadline) => gate.wait(false, abortableSleep, requestSignal, undefined, deadline),
+    observe: (error) => gate.observe(error),
     signal: requestSignal,
     timeoutMs: 20_000,
   });
+  let ghostSession: GhostBrowserSession | null = null;
+  let preferGhostSubmit = false;
+  let ghostSyncedDuringSubmit = false;
+
+  const ensureGhostSession = async (): Promise<GhostBrowserSession> => {
+    if (ghostSession) return ghostSession;
+    const snapshot = await activeCtx.storageState().catch(() => null);
+    const latestState: StorageStateShape = snapshot
+      ? {
+          ...currentState,
+          cookies: snapshot.cookies as StorageStateShape['cookies'],
+        }
+      : currentState;
+    ghostSession = await openGhost(latestState, {
+      userAgent,
+      proxyUrl,
+      onStorageState: async (nextState) => {
+        ghostSyncedDuringSubmit = true;
+        await syncContextFromStorage(nextState);
+      },
+    });
+    return ghostSession;
+  };
+
   return {
     api: {
       checkSession: () => checkSession(api),
       question: (slug) => fetchQuestionData(api, slug),
-      submit: (p, progress) => api.submitSolution(p, async () => {
-        await serverRangeGate.wait(true, abortableSleep, requestSignal, progress?.onWait);
-        progress?.onSend();
-      }),
-      submitWithBrowserFallback: async (p, fallbackSignal) => {
-        const snapshot = await activeCtx.storageState().catch(() => null);
-        const latestState: StorageStateShape = snapshot
-          ? {
-              ...currentState,
-              cookies: snapshot.cookies as StorageStateShape['cookies'],
+      submit: async (p, progress) => {
+        if (!customGhostSubmit && preferGhostSubmit && ghostSession) {
+          await gate.wait(true, abortableSleep, requestSignal, progress?.onWait);
+          progress?.onSend();
+          ghostSyncedDuringSubmit = false;
+          try {
+            const res = await ghostSession.submit({
+              slug: p.slug,
+              questionId: p.questionId,
+              lang: p.lang,
+              code: p.code,
+              signal: requestSignal,
+            });
+            if (!ghostSyncedDuringSubmit) {
+              await syncContextFromStorage(res.storageState);
             }
-          : currentState;
-        let synced = false;
-        const ghostResult = await runGhostSubmit(
-          latestState,
-          {
-            slug: p.slug,
-            questionId: p.questionId,
-            lang: p.lang,
-            code: p.code,
-            userAgent,
-            proxyUrl,
-            onStorageState: async (nextState) => {
-              synced = true;
-              await syncContextFromStorage(nextState);
+            gate.clearCooldown();
+            return res.submissionId;
+          } catch (err) {
+            gate.observe(err);
+            throw err;
+          }
+        }
+        return api.submitSolution(p, async () => {
+          await gate.wait(true, abortableSleep, requestSignal, progress?.onWait);
+          progress?.onSend();
+        });
+      },
+      submitWithBrowserFallback: async (p, fallbackSignal) => {
+        const effectiveSignal = fallbackSignal ?? requestSignal;
+        if (customGhostSubmit) {
+          const snapshot = await activeCtx.storageState().catch(() => null);
+          const latestState: StorageStateShape = snapshot
+            ? {
+                ...currentState,
+                cookies: snapshot.cookies as StorageStateShape['cookies'],
+              }
+            : currentState;
+          let synced = false;
+          const ghostResult = await customGhostSubmit(
+            latestState,
+            {
+              slug: p.slug,
+              questionId: p.questionId,
+              lang: p.lang,
+              code: p.code,
+              userAgent,
+              proxyUrl,
+              onStorageState: async (nextState) => {
+                synced = true;
+                await syncContextFromStorage(nextState);
+              },
             },
-          },
-          fallbackSignal ?? requestSignal,
-        );
-        if (!synced) {
+            effectiveSignal,
+          );
+          if (!synced) {
+            await syncContextFromStorage(ghostResult.storageState);
+          }
+          gate.clearCooldown();
+          return ghostResult.submissionId;
+        }
+
+        const hadExistingSession = Boolean(ghostSession && preferGhostSubmit);
+        if (hadExistingSession) {
+          await ghostSession?.close().catch(() => undefined);
+          ghostSession = null;
+        }
+        const activeGhost = await ensureGhostSession();
+        preferGhostSubmit = true;
+        ghostSyncedDuringSubmit = false;
+        const ghostResult = await activeGhost.submit({
+          slug: p.slug,
+          questionId: p.questionId,
+          lang: p.lang,
+          code: p.code,
+          signal: effectiveSignal,
+          forceNavigate: true,
+        });
+        if (!ghostSyncedDuringSubmit) {
           await syncContextFromStorage(ghostResult.storageState);
         }
-        serverRangeGate.clearCooldown();
+        gate.clearCooldown();
         return ghostResult.submissionId;
       },
       awaitResult: (id, slug) => api.awaitSubmission(id, slug, 180_000, { pollIntervalMs: 4_000 }),
@@ -2018,6 +2095,8 @@ export async function openRequestSession(
     },
     close: async () => {
       cancelled.abort();
+      await ghostSession?.close().catch(() => undefined);
+      ghostSession = null;
       await persistCookies(account, initialState, activeCtx).catch(() => false);
       await activeCtx.dispose().catch(() => undefined);
     },

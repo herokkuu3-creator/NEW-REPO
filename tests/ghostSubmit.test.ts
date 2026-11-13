@@ -14,9 +14,13 @@ import { abortableSleep } from '../src/scheduler/rangeSubmission';
 afterEach(() => vi.restoreAllMocks());
 
 describe('Ghost-mode LeetCode submission & cookie rotation', () => {
-  it('blocks heavy media/fonts and analytics while keeping LeetCode and Cloudflare scripts intact', () => {
+  it('blocks heavy media/fonts/stylesheets/assets.leetcode.com and analytics while keeping blob/data and Cloudflare scripts intact', () => {
     expect(blockNonEssentialProblemAssets('https://leetcode.com/problems/nth-highest-salary/', 'document')).toBe(false);
     expect(blockNonEssentialProblemAssets('https://static.leetcode.com/app.js', 'script')).toBe(false);
+    expect(blockNonEssentialProblemAssets('blob:https://leetcode.com/worker-id', 'script')).toBe(false);
+    expect(blockNonEssentialProblemAssets('data:text/javascript,void(0)', 'script')).toBe(false);
+    expect(blockNonEssentialProblemAssets('https://assets.leetcode.com/static_assets/public/webpack_bundles/app.js', 'script')).toBe(true);
+    expect(blockNonEssentialProblemAssets('https://leetcode.com/styles/app.css', 'stylesheet')).toBe(true);
     expect(blockNonEssentialProblemAssets('https://challenges.cloudflare.com/turnstile/v0/api.js', 'script')).toBe(false);
     expect(blockNonEssentialProblemAssets('https://leetcode.com/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1', 'script')).toBe(false);
     expect(blockNonEssentialProblemAssets('https://leetcode.com/hero.png', 'image')).toBe(true);
@@ -24,7 +28,7 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
     expect(blockNonEssentialProblemAssets('https://www.google-analytics.com/collect', 'xhr')).toBe(true);
   });
 
-  it('clears cooldown after ghost recovery so verdict polling runs immediately', async () => {
+  it('clears cooldown for immediate verdict polling while enforcing a full 30s submit gap before the next submit', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     try {
@@ -34,17 +38,33 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
       gate.clearCooldown();
       await gate.wait(false, abortableSleep, signal, undefined, Date.now() + 5_000);
       expect(Date.now()).toBe(0);
+
+      let resolvedNextSubmit = false;
+      const nextSubmitPromise = gate
+        .wait(true, abortableSleep, signal, undefined, Date.now() + 60_000)
+        .then(() => {
+          resolvedNextSubmit = true;
+        });
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(resolvedNextSubmit).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await nextSubmitPromise;
+      expect(resolvedNextSubmit).toBe(true);
+      expect(Date.now()).toBe(30_000);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('upgrades challenged API submit via ghost Chromium behind CONNECT proxy and syncs rotated cookies', async () => {
+  it('upgrades challenged API submit via ghost Chromium behind CONNECT proxy, syncs cookies, and reuses the warm browser session across questions', async () => {
     const sockets = new Set<net.Socket>();
     let observedSubmitAgent = '';
     let observedReferer = '';
+    let observedSecondReferer = '';
     let apiSubmitAttempts = 0;
+    let secondSubmitAttempts = 0;
     let pageVisits = 0;
+    let chromiumLaunchCount = 0;
 
     const fixture = https.createServer({
       key: readFileSync(new URL('./fixtures/auth/key.pem', import.meta.url)),
@@ -61,6 +81,12 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
         return res.end('<!DOCTYPE html><html><head><title>177. Nth Highest Salary - LeetCode</title></head><body>Editor</body></html>');
       }
 
+      if (req.url === '/problems/human-traffic-of-stadium/' && req.method === 'GET') {
+        pageVisits++;
+        res.setHeader('Content-Type', 'text/html');
+        return res.end('<!DOCTYPE html><html><head><title>601. Human Traffic of Stadium - LeetCode</title></head><body>Editor</body></html>');
+      }
+
       if (req.url === '/problems/nth-highest-salary/submit/' && req.method === 'POST') {
         apiSubmitAttempts++;
         observedSubmitAgent = String(req.headers['user-agent'] ?? '');
@@ -73,6 +99,19 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ submission_id: 777177 }));
+      }
+
+      if (req.url === '/problems/human-traffic-of-stadium/submit/' && req.method === 'POST') {
+        secondSubmitAttempts++;
+        observedSecondReferer = String(req.headers.referer ?? '');
+        const hasCleared = cookie.includes('cf_clearance=cf_browser_ok');
+        const hasFreshCsrf = cookie.includes('csrftoken=csrf_fresh_browser') && req.headers['x-csrftoken'] === 'csrf_fresh_browser';
+        if (!hasCleared || !hasFreshCsrf) {
+          res.writeHead(403, { 'Content-Type': 'text/html' });
+          return res.end('<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><div id="cf-chl">Challenge</div></body></html>');
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ submission_id: 777601 }));
       }
 
       if (req.url === '/submissions/detail/777177/v2/check/' && req.method === 'GET') {
@@ -114,6 +153,7 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
     const origLaunch = chromium.launch.bind(chromium);
     const origNewRequest = playwrightRequest.newContext.bind(playwrightRequest);
     vi.spyOn(chromium, 'launch').mockImplementation(async (options) => {
+      chromiumLaunchCount++;
       const browser = await origLaunch(options);
       const origNewContext = browser.newContext.bind(browser);
       vi.spyOn(browser, 'newContext').mockImplementation((opts) => origNewContext({ ...opts, ignoreHTTPSErrors: true }));
@@ -141,6 +181,7 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
     } as any;
 
     const session = await openRequestSession(account, undefined, {
+      gate: new RangeRequestGate(Date.now, 0, 0),
       resolveProxy: async () => ({
         proxy: { index: 1, url: proxyUrl, masked: proxyUrl, hash: 'test', isRemoved: false, isCustom: true, isPreferred: true },
         url: proxyUrl,
@@ -172,12 +213,26 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
 
       expect(submissionId).toBe('777177');
       expect(pageVisits).toBe(1);
+      expect(chromiumLaunchCount).toBe(1);
       expect(apiSubmitAttempts).toBe(2);
       expect(persistCalls).toContain('csrf_fresh_browser');
 
       // Upgraded Tier-1 context now holds cf_clearance & fresh csrftoken and has no 60s block cooldown
       const outcome = await session.api.awaitResult('777177', 'nth-highest-salary');
       expect(outcome.classification).toBe('ACCEPTED');
+
+      // Second question routes directly through the warm GhostBrowserSession without cold-relaunching or re-navigating
+      const secondSubmissionId = await session.api.submit({
+        slug: 'human-traffic-of-stadium',
+        questionId: '601',
+        lang: 'mysql',
+        code: 'SELECT * FROM Stadium WHERE people >= 100',
+      });
+      expect(secondSubmissionId).toBe('777601');
+      expect(secondSubmitAttempts).toBe(1);
+      expect(chromiumLaunchCount).toBe(1);
+      expect(pageVisits).toBe(1);
+      expect(observedSecondReferer).toBe('https://leetcode.com/problems/human-traffic-of-stadium/');
     } finally {
       await session.close();
       for (const s of sockets) s.destroy();

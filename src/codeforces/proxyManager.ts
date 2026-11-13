@@ -420,7 +420,7 @@ export async function resolveLeetCodeResidentialProxy(
   if (isTest && !options.allowInTest && !options.envSource && !options.tester) {
     return null;
   }
-  const log = options.log ?? ((msg: string) => logger.info({ msg }, 'leetcode residential proxy resolver'));
+  const log = options.log ?? ((detail: string) => logger.info({ detail }, 'leetcode residential proxy resolver'));
   const explicitEnv =
     options.envSource ??
     (process.env.LEETCODE_RESIDENTIAL_PROXY || process.env.LEETCODE_PROXY || '');
