@@ -3,6 +3,7 @@ import type { AccountRecord } from '../src/database/accounts';
 import { LeetCodeHttpError } from '../src/leetcode/apiClient';
 import { WalkcccError, WalkcccPage } from '../src/solutions/walkccc';
 import type { CommunitySolution } from '../src/solutions/communitySolutions';
+import { createMemoryQuestionFailureStore } from '../src/scheduler/questionFailureCounter';
 import { config } from '../src/config';
 import {
   calculateSafeRangeConcurrency,
@@ -994,5 +995,274 @@ describe('parallel range submission', () => {
     expect(results[0]!.results).toHaveLength(3);
     expect(results[0]!.results.every((q) => q.status === 'accepted')).toBe(true);
     expect(sleeps.length).toBeGreaterThan(0);
+  });
+
+  it('solves non-C++ questions (e.g. MySQL) using the solution section and submits exact SQL without C++ comment stripping', async () => {
+    const submitted: Array<{ lang: string; code: string }> = [];
+    const requestedLangs: string[] = [];
+    const session: RangeSession = {
+      api: {
+        checkSession: async () => ({ authenticated: true, username: 'userX' }),
+        question: async () => ({
+          questionId: '175',
+          isPaidOnly: false,
+          frontendId: '175',
+          title: 'Combine Two Tables',
+          slug: 'combine-two-tables',
+          difficulty: 'Easy',
+          contentHtml: '<p>Write a SQL query to report firstName, lastName, city, and state.</p>',
+          exampleTestcases: '',
+          metaData: null,
+          codeSnippets: [
+            { lang: 'MySQL', langSlug: 'mysql', code: '# Write your MySQL query statement below' },
+            { lang: 'PostgreSQL', langSlug: 'postgresql', code: '-- Write your PostgreSQL query statement below' },
+          ],
+        }),
+        submit: async (p) => {
+          submitted.push({ lang: p.lang, code: p.code });
+          return 'sub-sql-1';
+        },
+        awaitResult: async (id) => ({
+          submissionId: id,
+          classification: 'ACCEPTED',
+          statusDisplay: 'Accepted',
+          runtime: '300 ms',
+          memory: '0 B',
+          rawStatusMsg: 'Accepted',
+        }),
+      },
+      close: async () => undefined,
+    };
+
+    const { deps } = makeDeps(session, [acc('a1')], {
+      getPage: async () => { throw new WalkcccError('no walkccc page for problem 175'); },
+      resolveSlug: async () => 'combine-two-tables',
+      fetchCommunity: async (_slug, _problem, options) => {
+        requestedLangs.push(options?.language ?? 'unknown');
+        return {
+          code: 'SELECT p.firstName, p.lastName, a.city, a.state FROM Person p LEFT JOIN Address a ON p.personId = a.personId;',
+          sourceUrl: 'https://leetcode.com/problems/combine-two-tables/solutions/1/sql/',
+          title: 'Simple Join',
+          uuid: 'mysql-uuid-1',
+          language: 'mysql',
+        };
+      },
+    });
+
+    const r = await startRangeJob({ from: 175, to: 175 }, 'a1', deps);
+    const results = await r.done;
+
+    expect(requestedLangs).toEqual(['mysql']);
+    expect(submitted).toEqual([
+      {
+        lang: 'mysql',
+        code: 'SELECT p.firstName, p.lastName, a.city, a.state FROM Person p LEFT JOIN Address a ON p.personId = a.personId;',
+      },
+    ]);
+    expect(results[0]!.results[0]).toMatchObject({
+      number: 175,
+      status: 'accepted',
+      submissionId: 'sub-sql-1',
+      capture: { language: 'mysql' },
+    });
+  });
+
+  it('falls back across languages (e.g. Python 3) when C++ community and walkccc have no valid solution', async () => {
+    const submittedLangs: string[] = [];
+    const triedLangs: string[] = [];
+    const session: RangeSession = {
+      api: {
+        checkSession: async () => ({ authenticated: true, username: 'userX' }),
+        question: async () => ({
+          questionId: '1220',
+          isPaidOnly: false,
+          frontendId: '1220',
+          title: 'Count Vowels Permutation',
+          slug: 'count-vowels-permutation',
+          difficulty: 'Hard',
+          contentHtml: '<p>Given n, count strings of length n.</p>',
+          exampleTestcases: '',
+          metaData: null,
+          codeSnippets: [
+            { lang: 'C++', langSlug: 'cpp', code: 'class Solution { public: int countVowelPermutation(int n) {} };' },
+            { lang: 'Python3', langSlug: 'python3', code: 'class Solution:\n    def countVowelPermutation(self, n: int) -> int:' },
+          ],
+        }),
+        submit: async (p) => {
+          submittedLangs.push(p.lang);
+          return 'sub-py-1';
+        },
+        awaitResult: async (id) => ({
+          submissionId: id,
+          classification: 'ACCEPTED',
+          statusDisplay: 'Accepted',
+          runtime: '20 ms',
+          memory: '16 MB',
+          rawStatusMsg: 'Accepted',
+        }),
+      },
+      close: async () => undefined,
+    };
+
+    const { deps } = makeDeps(session, [acc('a1')], {
+      getPage: async () => ({ code: null, sourceUrl: 'u', slug: 'count-vowels-permutation', title: 'Count Vowels Permutation' }),
+      fetchCommunity: async (_slug, _problem, options) => {
+        const lang = options?.language ?? 'cpp';
+        triedLangs.push(lang);
+        if (lang === 'cpp') throw new Error('none of the inspected community solution articles contained cpp');
+        return {
+          code: 'class Solution:\n    def countVowelPermutation(self, n: int) -> int:\n        return 5',
+          sourceUrl: 'u',
+          title: 'DP Python3',
+          uuid: 'py-uuid-1',
+          language: 'python3',
+        };
+      },
+    });
+
+    const r = await startRangeJob({ from: 1220, to: 1220 }, 'a1', deps);
+    const results = await r.done;
+
+    expect(triedLangs).toEqual(['cpp', 'python3']);
+    expect(submittedLangs).toEqual(['python3']);
+    expect(results[0]!.results[0]).toMatchObject({
+      number: 1220,
+      status: 'accepted',
+      capture: { language: 'python3' },
+    });
+  });
+
+  it('tracks persistent failures (excluding failed UUIDs), invokes AI on the 4th attempt, and resets the counter when accepted', async () => {
+    const failureStore = createMemoryQuestionFailureStore();
+    const seenExcludes: string[][] = [];
+    const submittedCodes: Array<{ lang: string; code: string }> = [];
+    let attemptIndex = 0;
+
+    const session: RangeSession = {
+      api: {
+        checkSession: async () => ({ authenticated: true, username: 'userX' }),
+        question: async () => ({
+          questionId: '3331',
+          isPaidOnly: false,
+          frontendId: '3331',
+          title: 'Find Subtree Sizes After Changes',
+          slug: 'find-subtree-sizes-after-changes',
+          difficulty: 'Medium',
+          contentHtml: '<p>Tree problem statement with sufficient characters for parser validation.</p>',
+          exampleTestcases: '',
+          metaData: null,
+          codeSnippets: [{ lang: 'C++', langSlug: 'cpp', code: 'class Solution { public: vector<int> findSubtreeSizes() {} };' }],
+        }),
+        submit: async (p) => {
+          submittedCodes.push({ lang: p.lang, code: p.code });
+          return `sub-${attemptIndex}`;
+        },
+        awaitResult: async (id) => {
+          if (id === 'sub-4') {
+            return { submissionId: id, classification: 'ACCEPTED', statusDisplay: 'Accepted', runtime: '10 ms', memory: '20 MB', rawStatusMsg: 'Accepted' };
+          }
+          return { submissionId: id, classification: 'WRONG_ANSWER', statusDisplay: 'Wrong Answer', runtime: null, memory: null, rawStatusMsg: 'Wrong Answer' };
+        },
+      },
+      close: async () => undefined,
+    };
+
+    const solveWithAi = vi.fn(async (_problem, lang: string) => ({
+      code: 'class Solution { public: vector<int> findSubtreeSizes() { return {1}; } };',
+      model: 'mock-ai-model',
+      providerLabel: `AI (${lang})`,
+    }));
+
+    const fetchCommunity = vi.fn(async (_slug, _problem, options) => {
+      seenExcludes.push([...(options?.excludeUuids ?? [])]);
+      if (attemptIndex === 1) {
+        return { code: 'class Solution { public: vector<int> findSubtreeSizes() { return {0}; } };', sourceUrl: 'u', title: 'S1', uuid: 'uuid-fail-1' };
+      }
+      if (attemptIndex === 2) {
+        return { code: 'class Solution { public: vector<int> findSubtreeSizes() { return {2}; } };', sourceUrl: 'u', title: 'S2', uuid: 'uuid-fail-2' };
+      }
+      throw new Error('no more community articles');
+    });
+
+    const makeRunDeps = () =>
+      makeDeps(session, [acc('a1')], {
+        getPage: async () => ({ code: null, sourceUrl: 'u', slug: 'find-subtree-sizes-after-changes', title: 'Find Subtree Sizes After Changes' }),
+        fetchCommunity,
+        questionFailures: failureStore,
+        solveWithAi,
+      }).deps;
+
+    // Attempt 1 -> community WA -> counter = 1, AI not called
+    attemptIndex = 1;
+    const r1 = await (await startRangeJob({ from: 3331, to: 3331 }, 'a1', makeRunDeps())).done;
+    expect(r1[0]!.results[0]!.status).toBe('failed');
+    expect((await failureStore.get(3331)).failures).toBe(1);
+    expect((await failureStore.get(3331)).failedUuids).toEqual(['uuid-fail-1']);
+    expect(solveWithAi).not.toHaveBeenCalled();
+
+    // Attempt 2 -> excludes uuid-fail-1 -> WA -> counter = 2, AI not called
+    attemptIndex = 2;
+    const r2 = await (await startRangeJob({ from: 3331, to: 3331 }, 'a1', makeRunDeps())).done;
+    expect(r2[0]!.results[0]!.status).toBe('failed');
+    expect(seenExcludes[1]).toContain('uuid-fail-1');
+    expect((await failureStore.get(3331)).failures).toBe(2);
+    expect((await failureStore.get(3331)).failedUuids).toEqual(['uuid-fail-1', 'uuid-fail-2']);
+    expect(solveWithAi).not.toHaveBeenCalled();
+
+    // Attempt 3 -> no valid solution found -> counter = 3, AI not called yet
+    attemptIndex = 3;
+    const r3 = await (await startRangeJob({ from: 3331, to: 3331 }, 'a1', makeRunDeps())).done;
+    expect(r3[0]!.results[0]!.status).toBe('error');
+    expect((await failureStore.get(3331)).failures).toBe(3);
+    expect(solveWithAi).not.toHaveBeenCalled();
+
+    // Attempt 4 (4th time!) -> triggers AI solver using configured keys -> Accepted -> counter resets!
+    attemptIndex = 4;
+    const r4 = await (await startRangeJob({ from: 3331, to: 3331 }, 'a1', makeRunDeps())).done;
+    expect(solveWithAi).toHaveBeenCalledTimes(1);
+    expect(solveWithAi.mock.calls[0]![1]).toBe('cpp');
+    expect(r4[0]!.results[0]).toMatchObject({ number: 3331, status: 'accepted', submissionId: 'sub-4' });
+    expect((await failureStore.get(3331)).failures).toBe(0);
+    expect((await failureStore.get(3331)).failedUuids).toEqual([]);
+  });
+
+  it('does not increment question failure counter on Cloudflare/403 blocked errors', async () => {
+    const failureStore = createMemoryQuestionFailureStore();
+    const session = makeSession(() => 'block403', []);
+    const { deps } = makeDeps(session, [acc('a1')], {
+      blockedBackoffMs: [],
+      questionFailures: failureStore,
+    });
+    const r = await startRangeJob({ from: 2478, to: 2478 }, 'a1', deps);
+    const results = await r.done;
+    expect(results[0]!.results[0]!.status).toBe('error');
+    expect((await failureStore.get(2478)).failures).toBe(0);
+  });
+
+  it('uses actual resolved incomplete count as stepTotal instead of requested rangeSize', async () => {
+    const events: Array<{ phase: string; stepIndex: number; stepTotal: number }> = [];
+    const session = makeSession(() => 'accepted', []);
+    const { deps } = makeDeps(session, [acc('a1')], {
+      onProgress: (ev) => {
+        if (ev.phase === 'accepted') events.push({ phase: ev.phase, stepIndex: ev.stepIndex, stepTotal: ev.stepTotal });
+      },
+    });
+    const r = await startRangeJob(
+      { from: 1, to: 50 },
+      'a1',
+      deps,
+      {
+        jobType: 'incomplete',
+        resolveQuestions: async () => [
+          { number: 3001, slug: 'slug-3001' },
+          { number: 3002, slug: 'slug-3002' },
+        ],
+      },
+    );
+    await r.done;
+    expect(events).toEqual([
+      { phase: 'accepted', stepIndex: 1, stepTotal: 2 },
+      { phase: 'accepted', stepIndex: 2, stepTotal: 2 },
+    ]);
   });
 });

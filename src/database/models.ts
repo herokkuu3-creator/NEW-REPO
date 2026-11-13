@@ -100,6 +100,7 @@ export const SystemKeys = {
   codeforcesPreferredProxy: 'codeforcesPreferredProxy', // string (proxy URL or hash/identifier)
   capzyApiKeys: 'capzyApiKeys', // JSON string[] of Capzy / CapSolver API keys
   capzyActiveKeyIndex: 'capzyActiveKeyIndex', // string of active key index ('0', '1', ...)
+  questionSolutionFailures: 'questionSolutionFailures:v1', // JSON map of per-question solution-section failure counts & failed UUIDs
 } as const;
 
 /**

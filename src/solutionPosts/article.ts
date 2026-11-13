@@ -22,7 +22,11 @@ export const contextSchema = z.object({
   accountId: z.string().min(1), username: z.string().min(1), problemId: z.string().min(1),
   slug: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/), title: z.string().min(1),
   difficulty: z.string(), problem: z.string().min(1).max(60000),
-  submissionId: z.string().regex(/^\d+$/), language: z.enum(['cpp', 'python3', 'javascript', 'typescript', 'java', 'c', 'csharp', 'golang', 'rust']),
+  submissionId: z.string().regex(/^\d+$/), language: z.enum([
+    'cpp', 'python3', 'python', 'pythondata', 'javascript', 'typescript', 'java',
+    'c', 'csharp', 'golang', 'rust', 'mysql', 'postgresql', 'mssql', 'oraclesql',
+    'bash', 'ruby', 'swift', 'kotlin', 'php', 'scala', 'dart',
+  ]),
   code: z.string().min(1).max(100000), challengeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   presentation: presentationSchema.optional(),
   articleImplementation: implementationSchema.optional(),
@@ -158,7 +162,16 @@ function formatProse(markdown: string, templates: string[]): string {
 export function renderArticle(article: Article, context: SubmissionContext, assets: VisualAsset[] = []): string {
   const code = context.articleImplementation?.code ?? context.code;
   const templates = sourceTemplates(code);
-  const language = ({ python3: 'python', javascript: 'javascript', typescript: 'typescript' } as Record<string, string>)[context.language] ?? context.language;
+  const language = ({
+    python3: 'python',
+    pythondata: 'python',
+    javascript: 'javascript',
+    typescript: 'typescript',
+    mysql: 'sql',
+    postgresql: 'sql',
+    mssql: 'sql',
+    oraclesql: 'sql',
+  } as Record<string, string>)[context.language] ?? context.language;
   // Choose a fence longer than any run in source; the code bytes themselves are unchanged.
   const longest = Math.max(2, ...(code.match(/`+/g) ?? []).map(s => s.length));
   const fence = '`'.repeat(longest + 1);

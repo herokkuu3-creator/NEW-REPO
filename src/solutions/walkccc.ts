@@ -43,6 +43,7 @@ export interface WalkcccPage {
   sourceUrl: string;
   slug: string | null;
   title: string | null;
+  byLanguage?: Record<string, string>;
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
@@ -99,10 +100,22 @@ export async function fetchWalkcccPage(questionNumber: number | string): Promise
 
   const html = await res.text();
   const code = extractCppSolution(html);
+  const byLanguage: Record<string, string> = {};
+  if (code) byLanguage.cpp = code;
+  for (const lang of ['mysql', 'python3', 'java'] as const) {
+    const langCode = extractWalkcccSolutionForLanguage(html, lang);
+    if (langCode) byLanguage[lang] = langCode;
+  }
 
-  logger.info({ url, hasSolution: Boolean(code), codeLength: code?.length ?? 0 }, 'walkccc page fetched');
+  logger.info({ url, hasSolution: Boolean(code), codeLength: code?.length ?? 0, languages: Object.keys(byLanguage) }, 'walkccc page fetched');
   const link = extractProblemLink(html);
-  return { code: code ?? null, sourceUrl: url, slug: link?.slug ?? null, title: link?.title ?? null };
+  return {
+    code: code ?? null,
+    sourceUrl: url,
+    slug: link?.slug ?? null,
+    title: link?.title ?? null,
+    ...(Object.keys(byLanguage).length > 0 ? { byLanguage } : {}),
+  };
 }
 
 /** The LeetCode problem a walkccc page is about, from its title link. Exposed for testing. */
@@ -130,6 +143,37 @@ export function extractCppSolution(html: string): string | null {
   // Strategy 2 (fallback): first code block on the page that is a valid C++
   // solution — walkccc puts C++ first.
   return firstUsableCode(html);
+}
+
+/**
+ * Extracts a walkccc solution block for a non-C++ language using walkccc's
+ * language anchors (`<div id="python">`, `<div id="java">`, `<div id="mysql">`, `<div id="sql">`).
+ */
+export function extractWalkcccSolutionForLanguage(html: string, language: string): string | null {
+  const lang = language.trim().toLowerCase();
+  if (lang === 'cpp') return extractCppSolution(html);
+
+  const anchorsByLang: Record<string, string[]> = {
+    python3: ['python', 'python3'],
+    python: ['python', 'python3'],
+    java: ['java'],
+    mysql: ['mysql', 'sql'],
+    postgresql: ['postgresql', 'sql'],
+  };
+  const anchors = anchorsByLang[lang] ?? [lang];
+  for (const anchor of anchors) {
+    const anchored = extractAnchoredLanguageBlock(html, anchor);
+    if (!anchored) continue;
+    const blockRe = /<pre[^>]*>(?:(?!<pre)[\s\S])*?<code[^>]*>([\s\S]*?)<\/code>\s*<\/pre>/gi;
+    const m = blockRe.exec(anchored);
+    if (m?.[1]) {
+      const cleaned = cleanCodeBlock(m[1]);
+      if (cleaned.length >= 10 && !/\b(TODO|FIXME|implement me|your code here)\b/i.test(cleaned)) {
+        return cleaned;
+      }
+    }
+  }
+  return null;
 }
 
 /** Escape a string for use inside a RegExp (anchors like "c++" need this). */

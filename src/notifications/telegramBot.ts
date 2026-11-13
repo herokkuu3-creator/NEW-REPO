@@ -5272,21 +5272,23 @@ export async function handleQuestionRangeTrigger(
         sec.activeLine = `⏳ ${stepPrefix}${qTag} — ${event.waitReason === 'cooldown' ? 'Server cooldown' : 'Waiting for a submission slot'} (~${event.waitSeconds ?? 1}s)…`;
         break;
       case 'submitting':
-        sec.activeLine = `🚀 ${stepPrefix}${qTag} — Submitting…`;
+        sec.activeLine = `🚀 ${stepPrefix}${qTag} — Submitting${event.detail ? ` (${escapeHtml(event.detail)})` : ''}…`;
         break;
       case 'verdict':
         sec.activeLine = `⏳ ${stepPrefix}${qTag} — Waiting for verdict…${event.submissionId ? ` · #${escapeHtml(event.submissionId)}` : ''}`;
         break;
       case 'accepted': {
         const sub = event.submissionId ? ` · #${escapeHtml(event.submissionId)}` : '';
-        sec.completedItems.push(`✅ ${stepPrefix}${qTag} — <b>Accepted</b>${sub}`);
+        const meta = event.detail ? ` (${escapeHtml(event.detail)})` : '';
+        sec.completedItems.push(`✅ ${stepPrefix}${qTag} — <b>Accepted</b>${meta}${sub}`);
         sec.activeLine = undefined;
         break;
       }
       case 'failed': {
         const verdict = escapeHtml(event.verdict ?? event.detail ?? 'Wrong Answer');
+        const meta = event.detail && event.verdict ? ` (${escapeHtml(event.detail)})` : '';
         const sub = event.submissionId ? ` · #${escapeHtml(event.submissionId)}` : '';
-        sec.completedItems.push(`❌ ${stepPrefix}${qTag} — <b>${verdict}</b>${sub}`);
+        sec.completedItems.push(`❌ ${stepPrefix}${qTag} — <b>${verdict}</b>${meta}${sub}`);
         sec.activeLine = undefined;
         break;
       }

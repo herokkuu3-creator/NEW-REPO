@@ -118,4 +118,19 @@ var twoSum = function(nums, target) {
     expect(tests.some((t) => t.label === 'example-1')).toBe(true);
     expect(tests.some((t) => t.label.startsWith('edge-'))).toBe(true);
   });
+
+  it('extracts and validates non-JS/Python code such as MySQL queries, Bash scripts, and C++', async () => {
+    const rawSql = '```mysql\nSELECT a.id FROM Weather a;\n```';
+    expect(extractCode(rawSql, 'mysql')).toBe('SELECT a.id FROM Weather a;');
+    const sqlValidation = await validateSolution(rawSql, { ...problem, starterCode: '# MySQL', language: 'mysql' }, 'mysql');
+    expect(sqlValidation.ok).toBe(true);
+
+    const rawBash = '```bash\n# print tenth line\nsed -n "10p" file.txt\n```';
+    expect(extractCode(rawBash, 'bash')).toContain('sed -n "10p" file.txt');
+    const bashValidation = await validateSolution(rawBash, { ...problem, starterCode: '# Bash', language: 'bash' }, 'bash');
+    expect(bashValidation.ok).toBe(true);
+
+    const rawCpp = '```cpp\nclass Solution {\npublic:\n  vector<int> twoSum(vector<int>& a, int t) { return {}; }\n};\n```';
+    expect(extractCode(rawCpp, 'cpp')).toContain('class Solution');
+  });
 });

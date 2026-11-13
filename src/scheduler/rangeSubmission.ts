@@ -8,7 +8,12 @@ import { LeetCodeApi, LeetCodeHttpError, looksLikeChallenge, isSubmissionLimitEr
 import { RangeRequestGate, RangeRequestWait } from './rangeRequestGate';
 import { fetchQuestionData, RawQuestionData } from '../leetcode/dailyChallenge';
 import { checkSession, SessionCheckResult } from '../browser/sessionCheck';
-import { fetchWalkcccPage, signatureMatchesStarter, WalkcccError, WalkcccPage } from '../solutions/walkccc';
+import {
+  fetchWalkcccPage,
+  signatureMatchesStarter,
+  WalkcccError,
+  WalkcccPage,
+} from '../solutions/walkccc';
 import {
   fetchCommunitySolution,
   resolveLeetCodeSlugByNumber,
@@ -16,12 +21,18 @@ import {
   FetchCommunitySolutionOptions,
 } from '../solutions/communitySolutions';
 import { shouldRetryWithOriginal, stripCppComments } from '../codeforces/codeSanitizer';
-import { ParsedProblem } from '../leetcode/parser';
+import { parseProblem, ParsedProblem } from '../leetcode/parser';
 import { isRunInProgress } from './dailyWorker';
 import { config } from '../config';
 import { accountQuestionOrders, QuestionReservations } from './questionOrder';
 import { refreshLeetCodeAccount, AccountRefreshOutcome } from '../security/sessionAutoRefresh';
 import { claimDailyCheckin } from '../leetcode/dailyCheckin';
+import {
+  AI_SOLVE_FAILURE_THRESHOLD,
+  createDbQuestionFailureStore,
+  QuestionFailureStore,
+} from './questionFailureCounter';
+import { solveQuestionWithConfiguredAi } from '../ai/codeSolver';
 
 /**
  * Question-range submission (Telegram /questionrangesubmission 200-400).
@@ -96,7 +107,7 @@ export interface QuestionResult {
   detail?: string;
   submissionId?: string;
   /** Exact accepted source retained only for the manual article workflow. */
-  capture?: { slug: string; title: string; difficulty: string; language: 'cpp'; code: string };
+  capture?: { slug: string; title: string; difficulty: string; language: string; code: string };
 }
 
 export interface AccountRangeResult {
@@ -144,6 +155,12 @@ export interface RangeSession {
 
 type RangeQuestionMetadata = Pick<RawQuestionData, 'questionId' | 'isPaidOnly' | 'title' | 'difficulty'> & {
   starterCode?: string;
+  codeSnippets?: RawQuestionData['codeSnippets'];
+  contentHtml?: RawQuestionData['contentHtml'];
+  exampleTestcases?: RawQuestionData['exampleTestcases'];
+  metaData?: RawQuestionData['metaData'];
+  frontendId?: RawQuestionData['frontendId'];
+  topicTags?: RawQuestionData['topicTags'];
 };
 
 interface RangeQuestionLookup {
@@ -230,6 +247,13 @@ export interface RangeDeps {
   progressEvery: number;
   /** Keeps the host awake while the job runs; returns a stop function. */
   keepAlive(): () => void;
+  /** Persistent/injectable failure tracker for solution-section attempts per question. */
+  questionFailures?: QuestionFailureStore;
+  /** AI solver invoked after 3 failed solution-section attempts (4th attempt). */
+  solveWithAi?: (
+    problem: ParsedProblem,
+    language: string,
+  ) => Promise<{ code: string; model?: string; providerLabel?: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -794,6 +818,7 @@ async function runAccountRange(
     }
 
     const resolvedSlugs = new Map<number, string>();
+    let accountStepTotal = order.length || rangeSize(range);
     if (options?.resolveQuestions) {
       try {
         const resolved = await options.resolveQuestions(account, session.api);
@@ -808,6 +833,7 @@ async function runAccountRange(
           return finish();
         }
         order = [...numbers];
+        accountStepTotal = order.length || rangeSize(range);
       } catch (err) {
         const errMsg = errText(err);
         logger.warn({ account: account.label, err: errMsg }, 'failed to resolve incomplete questions for account');
@@ -819,7 +845,7 @@ async function runAccountRange(
           accIndex: index - 1,
           accTotal: total,
           stepIndex: 1,
-          stepTotal: rangeSize(range),
+          stepTotal: accountStepTotal,
           questionNumber: order[0] ?? range.from,
           detail: result.fatal,
         });
@@ -848,13 +874,13 @@ async function runAccountRange(
       const n = await reservations.claim(pending, signal, () => {
         void deps.onProgress?.({ phase: 'waiting-question', label: account.label, username: result.username,
           accIndex: index - 1, accTotal: total, stepIndex: result.results.length + 1,
-          stepTotal: rangeSize(range), questionNumber: pending[0]!,
+          stepTotal: accountStepTotal, questionNumber: pending[0]!,
           detail: 'Waiting for another account to finish a remaining question' });
       });
       if (n === null) break;
       pending.splice(pending.indexOf(n), 1);
       const stepIndex = result.results.length + 1;
-      const stepTotal = rangeSize(range);
+      const stepTotal = accountStepTotal;
       info.currentQuestion = n;
       let usedUuids = usedCommunityUuidsByQuestion.get(n);
       if (!usedUuids) {
@@ -965,7 +991,7 @@ async function runAccountRange(
       accIndex: index - 1,
       accTotal: total,
       stepIndex: result.results.length,
-      stepTotal: rangeSize(range),
+      stepTotal: accountStepTotal,
       questionNumber: result.results.at(-1)?.number ?? order[0]!,
     });
 
@@ -1044,6 +1070,97 @@ function isMissingWalkcccPage(error: unknown): boolean {
   return error instanceof WalkcccError && /^no walkccc page for problem\b/i.test(error.message);
 }
 
+const PREFERRED_LANGUAGE_ORDER = [
+  'cpp',
+  'mysql',
+  'postgresql',
+  'mssql',
+  'oraclesql',
+  'pythondata',
+  'python3',
+  'python',
+  'java',
+  'javascript',
+  'typescript',
+  'bash',
+  'c',
+  'csharp',
+  'golang',
+  'rust',
+  'ruby',
+  'swift',
+  'kotlin',
+  'php',
+  'scala',
+  'dart',
+] as const;
+
+const LANGUAGE_RANK = new Map<string, number>(PREFERRED_LANGUAGE_ORDER.map((l, i) => [l, i]));
+const MAX_COMMUNITY_LANGUAGE_PROBES = 4;
+
+function pickCandidateSnippets(
+  codeSnippets?: RawQuestionData['codeSnippets'],
+  fallbackCppStarter?: string,
+): Array<{ langSlug: string; code: string }> {
+  if (codeSnippets?.length) {
+    return [...codeSnippets]
+      .filter((s) => Boolean(s?.langSlug))
+      .sort((a, b) => (LANGUAGE_RANK.get(a.langSlug) ?? 999) - (LANGUAGE_RANK.get(b.langSlug) ?? 999))
+      .map((s) => ({ langSlug: s.langSlug, code: s.code ?? '' }));
+  }
+  if (fallbackCppStarter !== undefined) {
+    return [{ langSlug: 'cpp', code: fallbackCppStarter }];
+  }
+  return [];
+}
+
+function buildProblemForLanguage(
+  n: number,
+  slug: string,
+  questionTitle: string,
+  q: RangeQuestionMetadata,
+  snippet: { langSlug: string; code: string },
+): ParsedProblem {
+  if (q.contentHtml) {
+    try {
+      return parseProblem(
+        {
+          questionId: q.questionId,
+          isPaidOnly: q.isPaidOnly,
+          frontendId: q.frontendId || String(n),
+          title: questionTitle,
+          slug,
+          difficulty: q.difficulty,
+          contentHtml: q.contentHtml,
+          exampleTestcases: q.exampleTestcases ?? '',
+          metaData: q.metaData ?? null,
+          codeSnippets: q.codeSnippets?.length
+            ? q.codeSnippets
+            : [{ lang: snippet.langSlug, langSlug: snippet.langSlug, code: snippet.code }],
+          topicTags: q.topicTags ?? [],
+        },
+        snippet.langSlug,
+      );
+    } catch {
+      // Fall back to minimal problem descriptor when HTML is empty or stubbed in tests.
+    }
+  }
+  return {
+    questionId: q.questionId ?? null,
+    frontendId: q.frontendId || String(n),
+    slug,
+    title: questionTitle,
+    difficulty: q.difficulty,
+    descriptionText: questionTitle,
+    descriptionHtml: q.contentHtml ?? '',
+    examples: [],
+    constraints: [],
+    exampleTestcasesRaw: q.exampleTestcases ?? '',
+    starterCode: snippet.code,
+    language: snippet.langSlug,
+  };
+}
+
 /** Solves + submits ONE question. Never throws. */
 async function solveOne(
   n: number,
@@ -1119,17 +1236,49 @@ async function solveOne(
     if (!slug) return err('no walkccc page', false);
 
     // 2) Premium check: locked questions are skipped before touching solutions or judge
-    let q = questionCache?.get(slug);
-    if (!q) {
-      const { questionId, isPaidOnly, title, difficulty, codeSnippets, slug: returnedSlug, frontendId } = await api.question(slug);
-      q = { questionId, isPaidOnly, title, difficulty, starterCode: codeSnippets?.find(snippet => snippet.langSlug === 'cpp')?.code };
+    let cachedQ = questionCache?.get(slug);
+    if (!cachedQ) {
+      const {
+        questionId,
+        isPaidOnly,
+        title,
+        difficulty,
+        codeSnippets,
+        slug: returnedSlug,
+        frontendId,
+        contentHtml,
+        exampleTestcases,
+        metaData,
+        topicTags,
+      } = await api.question(slug);
+      cachedQ = {
+        questionId,
+        isPaidOnly,
+        title,
+        difficulty,
+        starterCode: codeSnippets?.find(snippet => snippet.langSlug === 'cpp')?.code,
+        codeSnippets,
+        contentHtml,
+        exampleTestcases,
+        metaData,
+        frontendId,
+        topicTags,
+      };
       // Public submission metadata is the same for every authenticated account in this job.
       // Keep only the fields used by the solver and let failures be retried normally.
-      if (questionCache && questionCache.size < MAX_RANGE_SIZE && !isPaidOnly && questionId && q.starterCode &&
-        returnedSlug === slug && Number(frontendId) === n) {
-        questionCache.set(slug, q);
+      if (
+        questionCache &&
+        questionCache.size < MAX_RANGE_SIZE &&
+        !isPaidOnly &&
+        questionId &&
+        (codeSnippets?.length || cachedQ.starterCode) &&
+        returnedSlug === slug &&
+        Number(frontendId) === n
+      ) {
+        questionCache.set(slug, cachedQ);
       }
     }
+    const q: RangeQuestionMetadata = cachedQ;
     questionTitle = q.title ?? questionTitle ?? slug;
     if (q.isPaidOnly) {
       logger.info({ question: n, slug }, 'range question is premium-locked - skipping');
@@ -1153,8 +1302,9 @@ async function solveOne(
     if (!q.questionId) return err('LeetCode returned no question id');
     const questionId = q.questionId;
 
-    if (q.starterCode === undefined) {
-      logger.info({ question: n, slug }, 'range question has no C++ editor/snippet - skipping non-C++ question');
+    const candidateSnippets = pickCandidateSnippets(q.codeSnippets, q.starterCode);
+    if (candidateSnippets.length === 0) {
+      logger.info({ question: n, slug }, 'range question has no code editor/snippet - skipping');
       if (progressCtx) {
         void deps.onProgress?.({
           phase: 'premium',
@@ -1167,44 +1317,28 @@ async function solveOne(
           questionNumber: n,
           questionTitle,
           slug,
-          verdict: 'Skipped (no C++ editor)',
+          verdict: 'Skipped (no code editor)',
         });
       }
-      return { outcome: { number: n, status: 'premium', detail: 'no C++ for this question' }, touchedLeetCode: true, blocked: false };
+      return { outcome: { number: n, status: 'premium', detail: 'no code snippet for this question' }, touchedLeetCode: true, blocked: false };
     }
-    const problem: ParsedProblem = { starterCode: q.starterCode } as ParsedProblem;
 
-    const getWalkcccCode = async () => {
+    const failureState = deps.questionFailures
+      ? await deps.questionFailures.get(n).catch(() => ({ failures: 0, failedUuids: [] as string[], updatedAt: '' }))
+      : { failures: 0, failedUuids: [] as string[], updatedAt: '' };
+    const excludeUuids = new Set<string>([
+      ...(usedCommunityUuids ?? []),
+      ...failureState.failedUuids,
+    ]);
+
+    const getWalkcccForLang = async (langSlug: string, problem: ParsedProblem): Promise<string | null> => {
       const page = await getWalkcccPage();
-      return page?.code && signatureMatchesStarter(page.code, problem) ? page.code : null;
-    };
-
-    let communityCode: string | undefined;
-    let communityError: unknown;
-    if (deps.fetchCommunity) {
-      try {
-        const commSol = await deps.fetchCommunity(slug, problem, {
-          language: 'cpp',
-          excludeUuids: usedCommunityUuids,
-          randomize: true,
-          ...(graphql && { graphql }),
-        });
-        if (commSol?.code) {
-          usedCommunityUuids?.add(commSol.uuid);
-          communityCode = commSol.code;
-        }
-      } catch (commErr) {
-        communityError = commErr;
-        logger.warn({ question: n, slug, err: shortErr(commErr) }, 'community solution fetch failed');
+      if (!page) return null;
+      if (langSlug === 'cpp') {
+        return page.code && signatureMatchesStarter(page.code, problem) ? page.code : null;
       }
-    }
-    const solutionCode = communityCode || await getWalkcccCode();
-
-    if (!solutionCode) {
-      if (looksLikeChallenge(communityError)) throw communityError;
-      if (!deps.fetchCommunity) return err('no walkccc C++ solution for this question');
-      return err('no valid C++ solution found');
-    }
+      return page.byLanguage?.[langSlug] ?? null;
+    };
 
     // Retry verdict reads against the SAME ID; a polling failure must never
     // restart the irreversible submission or choose another source solution.
@@ -1225,22 +1359,22 @@ async function solveOne(
         }
       }
     };
-    const sendCode = async (code: string) => {
+    const sendCode = async (code: string, lang: string) => {
       stage = 'submit';
       if (signal?.aborted) throw Error('Range cancelled before submission');
       const progress = progressCtx && { ...progressCtx, questionNumber: n, questionTitle, slug };
-      return api.submit({ slug: slug!, questionId, lang: 'cpp', code }, progress && {
+      return api.submit({ slug: slug!, questionId, lang, code }, progress && {
         onWait: ({ ms, reason }) => { void deps.onProgress?.({ ...progress, phase: 'waiting-submit', waitSeconds: Math.ceil(ms / 1000), waitReason: reason }); },
-        onSend: () => { void deps.onProgress?.({ ...progress, phase: 'submitting' }); },
+        onSend: () => { void deps.onProgress?.({ ...progress, phase: 'submitting', ...(lang !== 'cpp' ? { detail: lang } : {}) }); },
       });
     };
 
-    // 4) Submit with comment-stripping fallback + judge failure fallback
-    const submitCode = async (code: string) => {
-      const strippedCode = stripCppComments(code);
-      const useStripped = strippedCode.trim().length > 0 && strippedCode !== code;
+    // 4) Submit with comment-stripping fallback (C++ only) + judge failure fallback
+    const submitCode = async (code: string, lang: string) => {
+      const strippedCode = lang === 'cpp' ? stripCppComments(code) : code;
+      const useStripped = lang === 'cpp' && strippedCode.trim().length > 0 && strippedCode !== code;
       const codeToTryFirst = useStripped ? strippedCode : code;
-      const subId = await sendCode(codeToTryFirst);
+      const subId = await sendCode(codeToTryFirst, lang);
 
       let verdict = await readVerdict(subId);
 
@@ -1249,7 +1383,7 @@ async function solveOne(
           { question: n, slug, verdict: verdict.statusDisplay },
           'comment-stripped code failed with compile/runtime error; retrying with original code',
         );
-        const retrySubId = await sendCode(code);
+        const retrySubId = await sendCode(code, lang);
         verdict = await readVerdict(retrySubId);
         return { verdict, submissionId: retrySubId, code };
       }
@@ -1257,17 +1391,8 @@ async function solveOne(
       return { verdict, submissionId: subId, code };
     };
 
-    let { verdict, submissionId, code: acceptedCode } = await submitCode(solutionCode);
-
-    if (communityCode && verdict.classification !== 'ACCEPTED' && verdict.classification !== 'UNKNOWN') {
-      const fallbackCode = await getWalkcccCode();
-      if (fallbackCode && fallbackCode !== solutionCode) {
-        logger.warn({ question: n, slug, verdict: verdict.statusDisplay }, 'judge rejected the solution; trying the alternate source');
-        ({ verdict, submissionId, code: acceptedCode } = await submitCode(fallbackCode));
-      }
-    }
-
-    if (verdict.classification === 'ACCEPTED') {
+    const emitAccepted = async (lang: string, code: string, subId: string, sourceTag?: string) => {
+      await deps.questionFailures?.reset(n).catch(() => undefined);
       if (progressCtx) {
         void deps.onProgress?.({
           phase: 'accepted',
@@ -1279,15 +1404,25 @@ async function solveOne(
           stepTotal: progressCtx.stepTotal,
           questionNumber: n,
           questionTitle,
-          slug,
+          slug: slug!,
           verdict: 'Accepted',
-          submissionId,
+          ...(sourceTag || lang !== 'cpp' ? { detail: sourceTag ? `${sourceTag} · ${lang}` : lang } : {}),
+          submissionId: subId,
         });
       }
-      return { outcome: { number: n, status: 'accepted', submissionId,
-        capture: { slug, title: questionTitle!, difficulty: q.difficulty, language: 'cpp', code: acceptedCode } }, touchedLeetCode: true, blocked: false };
-    }
-    if (verdict.classification === 'UNKNOWN') {
+      return {
+        outcome: {
+          number: n,
+          status: 'accepted' as const,
+          submissionId: subId,
+          capture: { slug: slug!, title: questionTitle!, difficulty: q!.difficulty, language: lang, code },
+        },
+        touchedLeetCode: true,
+        blocked: false,
+      };
+    };
+
+    const emitJudgeTimeout = (subId: string) => {
       if (progressCtx) {
         void deps.onProgress?.({
           phase: 'error',
@@ -1299,38 +1434,183 @@ async function solveOne(
           stepTotal: progressCtx.stepTotal,
           questionNumber: n,
           questionTitle,
-          slug,
+          slug: slug!,
           detail: 'judge timeout',
-          submissionId,
+          submissionId: subId,
         });
       }
       return {
-        outcome: { number: n, status: 'error', detail: 'judge timeout', submissionId },
+        outcome: { number: n, status: 'error' as const, detail: 'judge timeout', submissionId: subId },
         touchedLeetCode: true,
         blocked: false,
       };
-    }
-    if (progressCtx) {
-      void deps.onProgress?.({
-        phase: 'failed',
-        label: progressCtx.label,
-        username: progressCtx.username,
-        accIndex: progressCtx.accIndex,
-        accTotal: progressCtx.accTotal,
-        stepIndex: progressCtx.stepIndex,
-        stepTotal: progressCtx.stepTotal,
-        questionNumber: n,
-        questionTitle,
-        slug,
-        verdict: verdict.statusDisplay,
-        submissionId,
-      });
-    }
-    return {
-      outcome: { number: n, status: 'failed', detail: verdict.statusDisplay, submissionId },
-      touchedLeetCode: true,
-      blocked: false,
     };
+
+    const emitJudgeFailed = async (
+      statusDisplay: string,
+      subId: string,
+      lang: string,
+      communityUuid?: string,
+      sourceTag?: string,
+    ) => {
+      const updated = await deps.questionFailures
+        ?.recordFailure(n, {
+          reason: `${sourceTag ? `${sourceTag} ` : ''}(${lang}): ${statusDisplay}`,
+          ...(communityUuid && { communityUuid }),
+        })
+        .catch(() => null);
+      if (progressCtx) {
+        void deps.onProgress?.({
+          phase: 'failed',
+          label: progressCtx.label,
+          username: progressCtx.username,
+          accIndex: progressCtx.accIndex,
+          accTotal: progressCtx.accTotal,
+          stepIndex: progressCtx.stepIndex,
+          stepTotal: progressCtx.stepTotal,
+          questionNumber: n,
+          questionTitle,
+          slug: slug!,
+          verdict: statusDisplay,
+          ...(updated || sourceTag || lang !== 'cpp'
+            ? {
+                detail: [
+                  sourceTag ?? (lang !== 'cpp' ? lang : ''),
+                  updated ? `attempt ${updated.failures}/${AI_SOLVE_FAILURE_THRESHOLD + 1}` : '',
+                ]
+                  .filter(Boolean)
+                  .join(' · '),
+              }
+            : {}),
+          submissionId: subId,
+        });
+      }
+      return {
+        outcome: { number: n, status: 'failed' as const, detail: statusDisplay, submissionId: subId },
+        touchedLeetCode: true,
+        blocked: false,
+      };
+    };
+
+    // On the 4th+ attempt after 3 solution-section failures, invoke configured AI first.
+    let aiError: string | null = null;
+    if (failureState.failures >= AI_SOLVE_FAILURE_THRESHOLD && deps.solveWithAi) {
+      const aiSnippet = candidateSnippets[0]!;
+      const aiProblem = buildProblemForLanguage(n, slug, questionTitle, q, aiSnippet);
+      logger.info(
+        { question: n, slug, language: aiSnippet.langSlug, priorFailures: failureState.failures },
+        'solution section failed 3+ times; invoking AI solver with configured keys',
+      );
+      if (progressCtx) {
+        void deps.onProgress?.({
+          phase: 'processing',
+          label: progressCtx.label,
+          username: progressCtx.username,
+          accIndex: progressCtx.accIndex,
+          accTotal: progressCtx.accTotal,
+          stepIndex: progressCtx.stepIndex,
+          stepTotal: progressCtx.stepTotal,
+          questionNumber: n,
+          questionTitle,
+          slug,
+          detail: `Using AI (${aiSnippet.langSlug}) after ${failureState.failures} failures`,
+        });
+      }
+      try {
+        const aiResult = await deps.solveWithAi(aiProblem, aiSnippet.langSlug);
+        const aiSubmit = await submitCode(aiResult.code, aiSnippet.langSlug);
+        if (aiSubmit.verdict.classification === 'ACCEPTED') {
+          return emitAccepted(aiSnippet.langSlug, aiSubmit.code, aiSubmit.submissionId, 'AI');
+        }
+        if (aiSubmit.verdict.classification === 'UNKNOWN') {
+          return emitJudgeTimeout(aiSubmit.submissionId);
+        }
+        return emitJudgeFailed(aiSubmit.verdict.statusDisplay, aiSubmit.submissionId, aiSnippet.langSlug, undefined, 'AI');
+      } catch (errVal) {
+        if (looksLikeChallenge(errVal) || isSubmissionLimitError(errVal)) throw errVal;
+        aiError = shortErr(errVal);
+        logger.warn({ question: n, slug, language: aiSnippet.langSlug, err: aiError }, 'AI solver attempt failed; falling back to solution section');
+      }
+    }
+
+    const languagesToTry = candidateSnippets.slice(0, MAX_COMMUNITY_LANGUAGE_PROBES);
+    let chosenLang = languagesToTry[0]!.langSlug;
+    let chosenProblem = buildProblemForLanguage(n, slug, questionTitle, q, languagesToTry[0]!);
+    let communityCode: string | undefined;
+    let communityUuid: string | undefined;
+    let communityError: unknown;
+    let walkcccOnlyCode: string | undefined;
+
+    for (const snippet of languagesToTry) {
+      const langProblem = buildProblemForLanguage(n, slug, questionTitle, q, snippet);
+      if (deps.fetchCommunity) {
+        try {
+          const commSol = await deps.fetchCommunity(slug, langProblem, {
+            language: snippet.langSlug,
+            excludeUuids,
+            randomize: true,
+            ...(graphql && { graphql }),
+          });
+          if (commSol?.code) {
+            usedCommunityUuids?.add(commSol.uuid);
+            excludeUuids.add(commSol.uuid);
+            communityCode = commSol.code;
+            communityUuid = commSol.uuid;
+            chosenLang = snippet.langSlug;
+            chosenProblem = langProblem;
+            break;
+          }
+        } catch (commErr) {
+          communityError = commErr;
+          if (looksLikeChallenge(commErr)) throw commErr;
+          logger.warn(
+            { question: n, slug, language: snippet.langSlug, err: shortErr(commErr) },
+            'community solution fetch failed for language; checking fallback',
+          );
+        }
+      }
+
+      const walkCode = await getWalkcccForLang(snippet.langSlug, langProblem);
+      if (walkCode) {
+        walkcccOnlyCode = walkCode;
+        chosenLang = snippet.langSlug;
+        chosenProblem = langProblem;
+        break;
+      }
+    }
+
+    const solutionCode = communityCode || walkcccOnlyCode;
+
+    if (!solutionCode) {
+      if (looksLikeChallenge(communityError)) throw communityError;
+      const reason = aiError
+        ? `AI solver failed (${aiError}) and no valid solution found`
+        : !deps.fetchCommunity && languagesToTry.length === 1 && chosenLang === 'cpp'
+          ? 'no walkccc C++ solution for this question'
+          : languagesToTry.length === 1 && chosenLang === 'cpp'
+            ? 'no valid C++ solution found'
+            : 'no valid solution found';
+      await deps.questionFailures?.recordFailure(n, { reason }).catch(() => undefined);
+      return err(reason);
+    }
+
+    let { verdict, submissionId, code: acceptedCode } = await submitCode(solutionCode, chosenLang);
+
+    if (communityCode && verdict.classification !== 'ACCEPTED' && verdict.classification !== 'UNKNOWN') {
+      const fallbackCode = await getWalkcccForLang(chosenLang, chosenProblem);
+      if (fallbackCode && fallbackCode !== solutionCode) {
+        logger.warn({ question: n, slug, language: chosenLang, verdict: verdict.statusDisplay }, 'judge rejected the solution; trying the alternate source');
+        ({ verdict, submissionId, code: acceptedCode } = await submitCode(fallbackCode, chosenLang));
+      }
+    }
+
+    if (verdict.classification === 'ACCEPTED') {
+      return emitAccepted(chosenLang, acceptedCode, submissionId);
+    }
+    if (verdict.classification === 'UNKNOWN') {
+      return emitJudgeTimeout(submissionId);
+    }
+    return emitJudgeFailed(verdict.statusDisplay, submissionId, chosenLang, communityUuid);
   } catch (e) {
     const failure = leetCodeRequestFailure(e);
     logger.warn({ account: progressCtx?.label, question: n, slug, stage, submissionId: submittedId,
@@ -1664,6 +1944,8 @@ export function defaultRangeDeps(
     dailyRunPollMs: 15_000,
     progressEvery: 25,
     keepAlive: selfKeepAlive,
+    questionFailures: createDbQuestionFailureStore(),
+    solveWithAi: solveQuestionWithConfiguredAi,
   };
 }
 

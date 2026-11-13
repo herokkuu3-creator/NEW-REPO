@@ -3,6 +3,7 @@ import {
   clearCommunitySolutionsCache,
   clearSlugByNumberCacheForTests,
   CommunitySolutionError,
+  extractCodeForLanguage,
   extractCppCode,
   fetchCommunitySolution,
   resolveLeetCodeSlugByNumber,
@@ -487,5 +488,133 @@ describe('resolveLeetCodeSlugByNumber', () => {
 
     const slug = await resolveLeetCodeSlugByNumber(9999, { fetchFn: mockFetch as unknown as typeof fetch });
     expect(slug).toBeNull();
+  });
+});
+
+describe('extractCodeForLanguage (multi-language)', () => {
+  it('extracts MySQL queries (mysql and sql tags) and ignores PostgreSQL/C++ blocks', () => {
+    const markdown = `
+### PostgreSQL
+\`\`\`postgresql
+SELECT personId, city FROM Address;
+\`\`\`
+
+### MySQL
+\`\`\`mysql []
+# Write your MySQL query statement below
+SELECT p.firstName, p.lastName, a.city, a.state
+FROM Person p
+LEFT JOIN Address a ON p.personId = a.personId;
+\`\`\`
+`;
+    const mysqlProblem = {
+      starterCode: '# Write your MySQL query statement below',
+      language: 'mysql',
+    } as unknown as ParsedProblem;
+
+    const sql = extractCodeForLanguage(markdown, 'mysql', mysqlProblem);
+    expect(sql).toContain('SELECT p.firstName');
+    expect(sql).not.toContain('SELECT personId');
+  });
+
+  it('falls back to generic sql tag for mysql when mysql tag is absent', () => {
+    const markdown = `
+\`\`\`sql
+SELECT name FROM Customer WHERE referee_id != 2 OR referee_id IS NULL;
+\`\`\`
+`;
+    const sql = extractCodeForLanguage(markdown, 'mysql');
+    expect(sql).toContain('FROM Customer');
+  });
+
+  it('extracts Python 3, Java, JavaScript, Pandas, and Bash solutions accurately', () => {
+    const markdown = `
+\`\`\`python3 []
+class Solution:
+    def twoSum(self, nums: List[int], target: int) -> List[int]:
+        seen = {}
+        for i, n in enumerate(nums):
+            if target - n in seen:
+                return [seen[target - n], i]
+            seen[n] = i
+\`\`\`
+
+\`\`\`java []
+class Solution {
+    public int[] twoSum(int[] nums, int target) {
+        return new int[]{0, 1};
+    }
+}
+\`\`\`
+
+\`\`\`javascript []
+var twoSum = function(nums, target) {
+    return [0, 1];
+};
+\`\`\`
+`;
+    const pyProblem = { starterCode: 'class Solution:\n    def twoSum(self, nums: List[int], target: int) -> List[int]:' } as ParsedProblem;
+    const javaProblem = { starterCode: 'class Solution {\n    public int[] twoSum(int[] nums, int target) {' } as ParsedProblem;
+    const jsProblem = { starterCode: 'var twoSum = function(nums, target) {' } as ParsedProblem;
+
+    expect(extractCodeForLanguage(markdown, 'python3', pyProblem)).toContain('def twoSum');
+    expect(extractCodeForLanguage(markdown, 'java', javaProblem)).toContain('public int[] twoSum');
+    expect(extractCodeForLanguage(markdown, 'javascript', jsProblem)).toContain('var twoSum = function');
+
+    const bashMd = `
+\`\`\`bash []
+# Read from the file file.txt and output the tenth line to stdout.
+sed -n '10p' file.txt
+\`\`\`
+`;
+    expect(extractCodeForLanguage(bashMd, 'bash')).toContain("sed -n '10p' file.txt");
+
+    const pandasMd = `
+\`\`\`python
+import pandas as pd
+
+def big_countries(world: pd.DataFrame) -> pd.DataFrame:
+    return world[(world['area'] >= 3000000) | (world['population'] >= 25000000)][['name', 'population', 'area']]
+\`\`\`
+`;
+    const pandasProblem = { starterCode: 'def big_countries(world: pd.DataFrame) -> pd.DataFrame:' } as ParsedProblem;
+    expect(extractCodeForLanguage(pandasMd, 'pythondata', pandasProblem)).toContain('def big_countries');
+  });
+
+  it('fetchCommunitySolution works for non-C++ languages (mysql -> sql fallback tag)', async () => {
+    clearCommunitySolutionsCache();
+    const seenTags: string[][] = [];
+    const mockGraphql = vi.fn(async (_query: string, vars: Record<string, unknown>) => {
+      if (Array.isArray(vars.tagSlugs)) {
+        seenTags.push(vars.tagSlugs as string[]);
+        if (vars.tagSlugs[0] === 'mysql') {
+          return { ugcArticleSolutionArticles: { edges: [] } };
+        }
+        return {
+          ugcArticleSolutionArticles: {
+            edges: [{ node: { uuid: 'sql-uuid-1', title: 'Simple SQL', slug: 'simple-sql', topicId: 42 } }],
+          },
+        };
+      }
+      return {
+        ugcArticleSolutionArticle: {
+          uuid: 'sql-uuid-1',
+          title: 'Simple SQL',
+          slug: 'simple-sql',
+          content: '```sql\nSELECT 1 AS num;\n```',
+        },
+      };
+    });
+
+    const sol = await fetchCommunitySolution(
+      'combine-two-tables',
+      { starterCode: '# Write your MySQL query statement below' } as ParsedProblem,
+      { language: 'mysql', graphql: mockGraphql as never, randomize: false },
+    );
+
+    expect(seenTags).toEqual([['mysql'], ['sql']]);
+    expect(sol.uuid).toBe('sql-uuid-1');
+    expect(sol.code).toBe('SELECT 1 AS num;');
+    expect(sol.language).toBe('mysql');
   });
 });

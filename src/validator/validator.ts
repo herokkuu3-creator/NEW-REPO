@@ -38,24 +38,55 @@ const PLACEHOLDER_PATTERNS: RegExp[] = [
   /\.\.\.\s*(implement|solution)/i,
 ];
 
+const SQL_VALIDATOR_LANGS = new Set(['mysql', 'postgresql', 'mssql', 'oraclesql']);
+
 /** Strips ``` fences and surrounding prose. Returns null if nothing usable. */
-export function extractCode(raw: string): string | null {
+export function extractCode(raw: string, language?: string): string | null {
   let text = raw.trim();
 
   // Full fenced block(s): take the first complete fence body.
-  const fence = /```(?:[a-zA-Z0-9+-]*)\s*\n([\s\S]*?)```/.exec(text);
+  const fence = /```(?:[a-zA-Z0-9_+-]*)\s*\n([\s\S]*?)```/.exec(text);
   if (fence && fence[1]) {
     text = fence[1].trim();
   } else {
     // Stray fence markers without a pair — strip them.
-    text = text.replace(/```[a-zA-Z0-9+-]*/g, '').trim();
+    text = text.replace(/```[a-zA-Z0-9_+-]*/g, '').trim();
+  }
+
+  const lang = language?.trim().toLowerCase();
+  if (lang && SQL_VALIDATOR_LANGS.has(lang)) {
+    const sqlStart = text.search(/^(?:SELECT|WITH|UPDATE|DELETE|INSERT|CREATE|ALTER|--|\/\*|#)/im);
+    if (sqlStart > 0) text = text.slice(sqlStart);
+    const cleaned = text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ').replace(/#[^\n]*/g, ' ').trim();
+    if (
+      cleaned.length < 10 ||
+      !/\b(?:SELECT|WITH|UPDATE|DELETE|INSERT|CREATE|ALTER)\b/i.test(cleaned) ||
+      /^(?:#include|def\s+\w+\s*\(|class\s+Solution\b)/im.test(cleaned)
+    ) {
+      return null;
+    }
+    return text.trim();
+  }
+
+  if (lang === 'bash') {
+    const shStart = text.search(/^(?:#!|#|awk|sed|grep|sort|uniq|cut|tr|cat|head|tail|wc|echo|printf|while|for|if|read|[a-z_][a-z0-9_]*=)\b/im);
+    if (shStart > 0) text = text.slice(shStart);
+    const active = text
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith('#'))
+      .join('\n');
+    if (active.length < 4 || /^(?:#include|class\s+Solution\b|def\s+\w+\s*\()/im.test(active)) {
+      return null;
+    }
+    return text.trim();
   }
 
   // Leading prose line(s) before the first code-ish line.
-  const codeStart = text.search(/^(class|function|var|let|const|def|import|from|export|\/\/|#|\/\*|public|interface|type)\b/m);
+  const codeStart = text.search(/^(?:class|function|var|let|const|def|import|from|export|\/\/|#|\/\*|public|interface|type|using|namespace|impl|pub\s+fn|fn|func|fun|package|object)\b/m);
   if (codeStart > 0) text = text.slice(codeStart);
 
-  if (!/(class\s+\w+|function\s*\w*\s*\(|def\s+\w+\s*\(|=>|\bvar\s+\w+\s*=)/.test(text)) {
+  if (!/(class\s+\w+|function\s*\w*\s*\(|def\s+\w+\s*\(|=>|\bvar\s+\w+\s*=|\bimpl\s+\w+|\bfunc\s+\w+\s*\(|\bfn\s+\w+\s*\(|\bfun\s+\w+\s*\(|\bobject\s+\w+|\b(?:int|long|void|bool|char|double|float|string|vector)\s+[A-Za-z_]\w*\s*\(|\b(?:SELECT|WITH)\b[\s\S]*\bFROM\b)/i.test(text)) {
     return null; // no recognizable code at all
   }
   return text;
@@ -79,7 +110,7 @@ export async function validateSolution(
   language: string,
 ): Promise<ValidationOutcome> {
   // 1) format
-  const code = extractCode(rawModelOutput);
+  const code = extractCode(rawModelOutput, language);
   if (!code) {
     return {
       ok: false,

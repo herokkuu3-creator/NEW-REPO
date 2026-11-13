@@ -157,6 +157,8 @@ const parsedProblemGuard = z.object({
   starterCode: z.string().min(5),
 });
 
+const COMMENT_STARTER_LANGUAGES = new Set(['mysql', 'postgresql', 'mssql', 'oraclesql', 'bash']);
+
 function validateParsedProblem(p: ParsedProblem): void {
   const check = parsedProblemGuard.safeParse(p);
   if (!check.success) {
@@ -166,8 +168,12 @@ function validateParsedProblem(p: ParsedProblem): void {
         .join('; ')}`,
     );
   }
-  // The starter code must define SOMETHING — a class, function, or method.
-  if (!/(class\s+\w+|function\s+\w+|def\s+\w+|var\s+\w+\s*=|const\s+\w+\s*=|[A-Za-z_][\w:<>,\[\]&*]*\s+[A-Za-z_]\w*\s*\()/.test(p.starterCode)) {
+  // SQL and shell problems use comment-only starter templates without classes or functions.
+  if (COMMENT_STARTER_LANGUAGES.has(p.language)) {
+    return;
+  }
+  // The starter code must define SOMETHING — a class, function, method, or object.
+  if (!/(class\s+\w+|object\s+\w+|function\s+\w+|def\s+\w+|func\s+\w+|fn\s+\w+|fun\s+\w+|var\s+\w+\s*=|const\s+\w+\s*=|[A-Za-z_][\w:<>,\[\]&*]*\s+[A-Za-z_]\w*\s*\()/.test(p.starterCode)) {
     throw new ProblemParseError('starter code contains no recognizable function/class definition');
   }
 }

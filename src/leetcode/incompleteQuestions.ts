@@ -60,7 +60,7 @@ export async function fetchIncompleteQuestions(
   api: IncompleteQuestionsApi,
   count: number,
   pageSize = 50,
-  categorySlug = 'algorithms',
+  categorySlug = '',
 ): Promise<IncompleteQuestion[]> {
   const result: IncompleteQuestion[] = [];
   const targetCount = Math.max(1, count);

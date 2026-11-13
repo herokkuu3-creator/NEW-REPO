@@ -119,6 +119,31 @@ export async function createPostRouter(correlation: { postId?: string; accountId
   return createDiscoveryRouter(correlation, reportKey, deadlineAt);
 }
 
+/**
+ * Builds an AI router for solving failed LeetCode questions using configured
+ * Coarena / Discovery / Sage keys (never Firecrawl web-research agent).
+ */
+export async function createCodeSolverRouter(
+  correlation: { postId?: string; accountId?: string } = {},
+  reportKey?: (label: string) => void,
+): Promise<AIModelRouter> {
+  const key = await loadCoarenaKey().catch(() => null);
+  if (key) {
+    reportKey?.('Coarena · ' + maskCoarenaKey(key));
+    return new CoarenaRouter(
+      key,
+      () => createDiscoveryRouter(correlation, reportKey),
+      (attempt) => {
+        if (attempt.outcome === 'SUCCESS') {
+          reportKey?.('Coarena · ' + maskCoarenaKey(key) + ' · ' + attempt.model);
+        }
+        logger.info({ ...correlation, attempt }, 'question AI solver attempt finished');
+      },
+    );
+  }
+  return createDiscoveryRouter(correlation, reportKey);
+}
+
 async function createDiscoveryRouter(correlation: { postId?: string; accountId?: string }, reportKey?: (label: string) => void,
   deadlineAt?: number): Promise<AIModelRouter> {
   let pool = await loadSolutionKeyPool();

@@ -93,4 +93,24 @@ describe('parseProblem', () => {
   it('rejects a missing language snippet', () => {
     expect(() => parseProblem(RAW, 'rust')).toThrow(ProblemParseError);
   });
+
+  it('accepts comment-only SQL and Bash starter templates', () => {
+    const sqlRaw: RawQuestionData = {
+      ...RAW,
+      frontendId: '175',
+      title: 'Combine Two Tables',
+      slug: 'combine-two-tables',
+      codeSnippets: [
+        { lang: 'MySQL', langSlug: 'mysql', code: '# Write your MySQL query statement below' },
+        { lang: 'Bash', langSlug: 'bash', code: '# Read from the file file.txt' },
+      ],
+    };
+    const sqlParsed = parseProblem(sqlRaw, 'mysql');
+    expect(sqlParsed.language).toBe('mysql');
+    expect(sqlParsed.starterCode).toContain('MySQL');
+
+    const bashParsed = parseProblem(sqlRaw, 'bash');
+    expect(bashParsed.language).toBe('bash');
+    expect(bashParsed.starterCode).toContain('file.txt');
+  });
 });

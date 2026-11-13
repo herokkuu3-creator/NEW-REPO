@@ -167,6 +167,25 @@ describe('LeetCode incomplete questions fetching', () => {
     expect(result).toHaveLength(1);
     expect(result[0]!.number).toBe(1000);
   });
+
+  it('queries all categories by default (empty categorySlug) to include database/mysql, shell, and other non-algorithm questions', async () => {
+    const vars: Record<string, unknown>[] = [];
+    const mockGraphQL = vi.fn(async (_query: string, variables: Record<string, unknown>) => {
+      vars.push(variables);
+      return {
+        problemsetQuestionList: {
+          total: 1,
+          questions: [
+            { frontendQuestionId: '175', titleSlug: 'combine-two-tables', title: 'Combine Two Tables', paidOnly: false, status: null },
+          ],
+        },
+      };
+    });
+
+    const result = await fetchIncompleteQuestions({ graphql: mockGraphQL }, 5);
+    expect(vars[0]).toMatchObject({ categorySlug: '' });
+    expect(result.map((q) => q.number)).toEqual([175]);
+  });
 });
 
 describe('Telegram UI for /solveincomplete command', () => {
