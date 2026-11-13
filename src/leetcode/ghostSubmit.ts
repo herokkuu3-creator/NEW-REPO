@@ -8,12 +8,14 @@ import { detectVerificationPage } from '../browser/cloudflareDetector';
 import { DEFAULT_DESKTOP_CHROME_USER_AGENT } from '../codeforces/browserForm';
 import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
+import { solveCloudflareOrchestrated } from '../codeforces/captchaSolver';
 import {
   deduplicateLeetCodeCookies,
   isCsrfRejectionBody,
   isSubmissionLimitError,
   LeetCodeHttpError,
   parseRetryAfter,
+  selectBestCookieByName,
   selectBestCsrfCookie,
   summarizeHttpErrorBody,
 } from './apiClient';
@@ -118,6 +120,91 @@ function pruneExpiredCookies(cookies: StorageStateShape['cookies']): StorageStat
   return deduplicateLeetCodeCookies(cookies, ORIGIN);
 }
 
+function normalizeChromeUserAgent(userAgent?: string): string {
+  if (!userAgent || /Firefox\//i.test(userAgent)) {
+    return DEFAULT_DESKTOP_CHROME_USER_AGENT;
+  }
+  return userAgent;
+}
+
+function isRecoverableBrowserCrash(err: unknown, pageCrashed: boolean): boolean {
+  if (pageCrashed) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /Page crashed|Target page, context or browser has been closed|Session closed|Connection closed|Browser has been closed/i.test(msg);
+}
+
+async function extractChallengeMetadata(page: Page): Promise<{ sitekey?: string; action?: string; cdata?: string }> {
+  return page
+    .evaluate(() => {
+      const w = window as unknown as Record<string, unknown>;
+      let sitekey = typeof w.__turnstileSitekey === 'string' ? w.__turnstileSitekey.trim() : '';
+      if (!sitekey) {
+        const el = document.querySelector('[data-sitekey]');
+        sitekey = el?.getAttribute('data-sitekey')?.trim() ?? '';
+      }
+      if (!sitekey) {
+        const iframes = Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]'));
+        for (const iframe of iframes) {
+          const m = /\/(0x[0-9a-zA-Z_-]{10,})\//.exec(iframe.getAttribute('src') ?? '');
+          if (m?.[1]) {
+            sitekey = m[1];
+            break;
+          }
+        }
+      }
+      return {
+        ...(sitekey ? { sitekey } : {}),
+        ...(typeof w.__turnstileAction === 'string' && w.__turnstileAction ? { action: w.__turnstileAction } : {}),
+        ...(typeof w.__turnstileCdata === 'string' && w.__turnstileCdata ? { cdata: w.__turnstileCdata } : {}),
+      };
+    })
+    .catch(() => ({}));
+}
+
+async function applyCloudflareSolution(
+  page: Page,
+  context: BrowserContext,
+  targetUrl: string,
+  solved: NonNullable<Awaited<ReturnType<typeof solveCloudflareOrchestrated>>>,
+): Promise<void> {
+  const cookiesToSet: Array<{ name: string; value: string; domain: string; path: string; secure: boolean }> = [];
+  if (solved.cookies) {
+    for (const [name, value] of Object.entries(solved.cookies)) {
+      if ((name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf')) && value && value !== 'cleared') {
+        cookiesToSet.push({ name, value: String(value), domain: '.leetcode.com', path: '/', secure: true });
+      }
+    }
+  }
+  if (solved.cfClearance && solved.cfClearance.length > 5 && solved.cfClearance !== 'cleared') {
+    if (!cookiesToSet.some((c) => c.name === 'cf_clearance')) {
+      cookiesToSet.push({ name: 'cf_clearance', value: solved.cfClearance, domain: '.leetcode.com', path: '/', secure: true });
+    }
+  }
+  if (cookiesToSet.length > 0) {
+    await context.addCookies(cookiesToSet).catch(() => undefined);
+  }
+  if (typeof solved.token === 'string' && solved.token.trim().length > 10) {
+    await page
+      .evaluate((token) => {
+        const inputs = Array.from(
+          document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+            'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name="g-recaptcha-response"]',
+          ),
+        );
+        for (const el of inputs) el.value = token;
+        const w = window as unknown as { __turnstileCallback?: (t: string) => void };
+        if (typeof w.__turnstileCallback === 'function') {
+          try {
+            w.__turnstileCallback(token);
+          } catch {}
+        }
+      }, solved.token.trim())
+      .catch(() => undefined);
+    await page.waitForTimeout(1_200).catch(() => undefined);
+  }
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25_000 }).catch(() => undefined);
+}
+
 /**
  * Executes LeetCode's `/problems/<slug>/submit/` POST from INSIDE a loaded
  * Chromium page using `fetch()`, inheriting Chromium's native TLS/HTTP2
@@ -127,7 +214,37 @@ function pruneExpiredCookies(cookies: StorageStateShape['cookies']): StorageStat
 export async function submitViaPageFetch(
   page: Page,
   params: { slug: string; questionId: string; lang: string; code: string },
+  storedCookies?: StorageStateShape['cookies'],
 ): Promise<string> {
+  const restoreSessionCookieIfMissing = async (): Promise<boolean> => {
+    const contextCookies = await page.context().cookies(ORIGIN).catch(() => []);
+    if (selectBestCookieByName(contextCookies, 'LEETCODE_SESSION', ORIGIN)) {
+      return false;
+    }
+    const storedSession = storedCookies?.length
+      ? selectBestCookieByName(storedCookies, 'LEETCODE_SESSION', ORIGIN)
+      : null;
+    if (!storedSession) return false;
+    await page
+      .context()
+      .addCookies([
+        {
+          name: storedSession.name,
+          value: storedSession.value,
+          domain: storedSession.domain || '.leetcode.com',
+          path: storedSession.path || '/',
+          expires: storedSession.expires ?? -1,
+          httpOnly: storedSession.httpOnly ?? true,
+          secure: storedSession.secure ?? true,
+          sameSite: storedSession.sameSite ?? 'Lax',
+        },
+      ])
+      .catch(() => undefined);
+    return true;
+  };
+
+  await restoreSessionCookieIfMissing();
+
   const readCsrf = async (): Promise<string | null> => {
     const contextCookies = await page.context().cookies(ORIGIN).catch(() => []);
     const fromContext = selectBestCsrfCookie(contextCookies, ORIGIN);
@@ -198,6 +315,24 @@ export async function submitViaPageFetch(
       response = await sendInPage(refreshed);
     }
   }
+  if (response.status === 403 && /not\s+authenticated|unauthenticated/i.test(response.text)) {
+    const restored = await restoreSessionCookieIfMissing();
+    if (restored) {
+      const refreshed = (await readCsrf()) ?? token;
+      response = await sendInPage(refreshed);
+    }
+    if (response.status === 403 && /not\s+authenticated|unauthenticated/i.test(response.text)) {
+      const latestCookies = await page.context().cookies(ORIGIN).catch(() => []);
+      logger.warn(
+        {
+          slug: params.slug,
+          hasSessionCookie: Boolean(selectBestCookieByName(latestCookies, 'LEETCODE_SESSION', ORIGIN)),
+          hasCsrfCookie: Boolean(selectBestCsrfCookie(latestCookies, ORIGIN)),
+        },
+        'ghost browser submit rejected with 403 unauthenticated',
+      );
+    }
+  }
 
   if (response.status !== 200) {
     const detail = summarizeHttpErrorBody(response.text);
@@ -262,6 +397,10 @@ async function waitForPassiveChallengeSettle(
 export interface GhostBrowserDeps {
   resolveProxy?: typeof resolveLeetCodeResidentialProxy;
   submitPageFetch?: typeof submitViaPageFetch;
+  solveCloudflare?: typeof solveCloudflareOrchestrated;
+  challengeWaitMs?: number;
+  retryWaitMs?: number;
+  postSolveWaitMs?: number;
 }
 
 /**
@@ -277,6 +416,14 @@ export async function openGhostBrowserSession(
 ): Promise<GhostBrowserSession> {
   const resolveProxy = deps.resolveProxy ?? resolveLeetCodeResidentialProxy;
   const pageFetch = deps.submitPageFetch ?? submitViaPageFetch;
+  const solveCloudflare = deps.solveCloudflare ?? solveCloudflareOrchestrated;
+  const challengeWaitMs = deps.challengeWaitMs ?? 20_000;
+  const retryWaitMs = deps.retryWaitMs ?? 10_000;
+  const postSolveWaitMs = deps.postSolveWaitMs ?? 10_000;
+  const canInvokeExternalSolver = !(
+    (process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST)) &&
+    !deps.solveCloudflare
+  );
 
   let currentState: StorageStateShape = {
     ...initialState,
@@ -287,11 +434,13 @@ export async function openGhostBrowserSession(
   let browser: Browser | null = null;
   let context: BrowserContext | null = null;
   let page: Page | null = null;
+  let pageCrashed = false;
   let hasSettledProblemPage = false;
   let closed = false;
 
   const closeResources = async () => {
     hasSettledProblemPage = false;
+    pageCrashed = false;
     const activeCtx = context;
     const activeBrowser = browser;
     page = null;
@@ -311,27 +460,26 @@ export async function openGhostBrowserSession(
           throw new Error('Range cancelled before ghost browser submission');
         }
 
-        if (!proxyResolved) {
-          resolvedProxyUrl = (await resolveProxy())?.url;
-          proxyResolved = true;
-        }
-        const proxy = resolvedProxyUrl ? toPlaywrightProxy(resolvedProxyUrl) : undefined;
-        if (resolvedProxyUrl && !proxy) {
-          throw new Error('LEETCODE_PROXY_INVALID');
-        }
-
-        const userAgent =
-          sessionOptions.userAgent ??
-          currentState.transport?.userAgent ??
-          DEFAULT_DESKTOP_CHROME_USER_AGENT;
+        const userAgent = normalizeChromeUserAgent(
+          sessionOptions.userAgent ?? currentState.transport?.userAgent,
+        );
 
         const onAbort = () => {
           void closeResources();
         };
         params.signal?.addEventListener('abort', onAbort, { once: true });
 
-        try {
-          if (!browser || !browser.isConnected() || !context || !page || page.isClosed()) {
+        const runAttempt = async (): Promise<GhostSubmitResult> => {
+          if (!proxyResolved) {
+            resolvedProxyUrl = (await resolveProxy())?.url;
+            proxyResolved = true;
+          }
+          const proxy = resolvedProxyUrl ? toPlaywrightProxy(resolvedProxyUrl) : undefined;
+          if (resolvedProxyUrl && !proxy) {
+            throw new Error('LEETCODE_PROXY_INVALID');
+          }
+
+          if (!browser || !browser.isConnected() || !context || !page || pageCrashed || page.isClosed()) {
             await closeResources();
             const headless = config.browser.headless;
             browser = await chromium.launch({
@@ -359,6 +507,11 @@ export async function openGhostBrowserSession(
               return route.continue().catch(() => undefined);
             });
             page = await context.newPage();
+            pageCrashed = false;
+            page.on('crash', () => {
+              pageCrashed = true;
+              hasSettledProblemPage = false;
+            });
             hasSettledProblemPage = false;
           }
 
@@ -400,12 +553,16 @@ export async function openGhostBrowserSession(
             const hasCsrf = Boolean(selectBestCsrfCookie(cookiesNow, ORIGIN));
             if (!currentKind && hasCsrf) {
               try {
-                const submissionId = await pageFetch(activePage, {
-                  slug: params.slug,
-                  questionId: params.questionId,
-                  lang: params.lang,
-                  code: params.code,
-                });
+                const submissionId = await pageFetch(
+                  activePage,
+                  {
+                    slug: params.slug,
+                    questionId: params.questionId,
+                    lang: params.lang,
+                    code: params.code,
+                  },
+                  currentState.cookies,
+                );
                 return await persistUpdatedState(true, submissionId);
               } catch (fastErr) {
                 const shouldFallbackToNavigate =
@@ -424,12 +581,56 @@ export async function openGhostBrowserSession(
           const targetUrl = `${ORIGIN}/problems/${params.slug}/`;
           await activePage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
-          let verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, 25_000);
+          let verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, challengeWaitMs);
+          if (verificationKind && !params.signal?.aborted && canInvokeExternalSolver) {
+            const cfMeta = await extractChallengeMetadata(activePage);
+            const currentCookies = await activeContext.cookies(ORIGIN).catch(() => []);
+            logger.info(
+              {
+                slug: params.slug,
+                verificationKind,
+                viaProxy: Boolean(proxy),
+                hasSitekey: Boolean(cfMeta.sitekey),
+              },
+              'invoking orchestrated Cloudflare solver for ghost Chromium session',
+            );
+            const solved = await solveCloudflare({
+              websiteURL: activePage.url() || targetUrl,
+              proxyUrl: resolvedProxyUrl,
+              userAgent,
+              cookies: currentCookies,
+              sitekey: cfMeta.sitekey,
+              action: cfMeta.action,
+              cdata: cfMeta.cdata,
+              timeoutMs: 45_000,
+            }).catch((solveErr) => {
+              logger.warn(
+                { slug: params.slug, err: solveErr instanceof Error ? solveErr.message : String(solveErr) },
+                'orchestrated Cloudflare solver failed for ghost session',
+              );
+              return null;
+            });
+            logger.info(
+              {
+                slug: params.slug,
+                ok: Boolean(solved),
+                source: solved?.source,
+                hasClearance: Boolean(solved?.cfClearance),
+                hasToken: Boolean(solved?.token),
+              },
+              'orchestrated Cloudflare solver completed for ghost session',
+            );
+            if (solved && !params.signal?.aborted) {
+              await applyCloudflareSolution(activePage, activeContext, targetUrl, solved);
+              verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, postSolveWaitMs);
+            }
+          }
+
           if (verificationKind && !params.signal?.aborted) {
             await activePage
               .goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
               .catch(() => undefined);
-            verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, 15_000);
+            verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, retryWaitMs);
           }
 
           if (verificationKind) {
@@ -443,16 +644,48 @@ export async function openGhostBrowserSession(
           }
 
           hasSettledProblemPage = true;
-          const submissionId = await pageFetch(activePage, {
-            slug: params.slug,
-            questionId: params.questionId,
-            lang: params.lang,
-            code: params.code,
-          });
+          const submissionId = await pageFetch(
+            activePage,
+            {
+              slug: params.slug,
+              questionId: params.questionId,
+              lang: params.lang,
+              code: params.code,
+            },
+            currentState.cookies,
+          );
           return await persistUpdatedState(false, submissionId);
+        };
+
+        try {
+          try {
+            return await runAttempt();
+          } catch (firstErr) {
+            if (!params.signal?.aborted && isRecoverableBrowserCrash(firstErr, pageCrashed)) {
+              logger.warn(
+                { slug: params.slug, err: firstErr instanceof Error ? firstErr.message : String(firstErr) },
+                'ghost Chromium page crashed; relaunching fresh browser for recovery attempt',
+              );
+              await closeResources();
+              return await runAttempt();
+            }
+            throw firstErr;
+          }
         } catch (err) {
-          if (params.signal?.aborted || (err instanceof Error && /Target page, context or browser has been closed/i.test(err.message))) {
+          if (
+            params.signal?.aborted ||
+            isRecoverableBrowserCrash(err, pageCrashed) ||
+            (err instanceof LeetCodeHttpError && err.status === 403)
+          ) {
             await closeResources();
+            if (
+              !sessionOptions.proxyUrl &&
+              !initialState.transport?.proxyUrl &&
+              err instanceof LeetCodeHttpError &&
+              err.status === 403
+            ) {
+              proxyResolved = false;
+            }
           }
           throw err;
         } finally {

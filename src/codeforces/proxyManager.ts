@@ -414,6 +414,7 @@ export async function resolveLeetCodeResidentialProxy(
     tester?: (proxyUrl: string) => Promise<boolean | ProxyTestResult>;
     log?: (msg: string) => void;
     allowInTest?: boolean;
+    fallbackToSharedPool?: boolean;
   } = {},
 ): Promise<ActiveProxyResult | null> {
   const isTest = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
@@ -426,6 +427,16 @@ export async function resolveLeetCodeResidentialProxy(
     (process.env.LEETCODE_RESIDENTIAL_PROXY || process.env.LEETCODE_PROXY || '');
   const candidates = parseProxyList(explicitEnv);
   if (candidates.length === 0) {
+    if (options.envSource === undefined && options.fallbackToSharedPool !== false) {
+      const sharedProxy = await resolveActiveProxy({
+        tester: options.tester,
+        log,
+      }).catch(() => null);
+      if (sharedProxy) {
+        log(`Using shared residential proxy pool (${sharedProxy.proxy.masked}) for LeetCode.`);
+        return sharedProxy;
+      }
+    }
     log('No LeetCode residential proxies configured.');
     return null;
   }

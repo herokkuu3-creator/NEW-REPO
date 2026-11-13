@@ -15,6 +15,8 @@ import {
 it('distinguishes CSRF rejection, transient server throttling, HTML verification and actual quota', () => {
   const csrf = new LeetCodeHttpError('submit HTTP 403: CSRF verification failed', 403);
   expect(leetCodeRequestFailure(csrf).category).toBe('session-csrf'); expect(looksLikeChallenge(csrf)).toBe(false);
+  const unauth = new LeetCodeHttpError('submit HTTP 403: User is not authenticated', 403);
+  expect(leetCodeRequestFailure(unauth).category).toBe('session-auth'); expect(looksLikeChallenge(unauth)).toBe(false);
   const rate = new LeetCodeHttpError('GraphQL HTTP 429', 429);
   expect(leetCodeRequestFailure(rate).category).toBe('rate-limit'); expect(isSubmissionLimitError(rate)).toBe(false);
   expect(leetCodeRequestFailure(new LeetCodeHttpError('submit HTTP 403: <!DOCTYPE html> Just a moment', 403)).category).toBe('challenge');

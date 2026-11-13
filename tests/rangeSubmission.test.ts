@@ -1330,4 +1330,36 @@ describe('parallel range submission', () => {
     expect(ghostSubmit).not.toHaveBeenCalled();
     expect(r429[0]!.results[0]!.status).toBe('error');
   });
+
+  it('renews session via refreshAccount on 403 User is not authenticated without invoking ghost fallback', async () => {
+    const ghostSubmit = vi.fn(async () => 'should-not-run');
+    const baseOld = makeSession(() => 'accepted', []);
+    const old: RangeSession = {
+      ...baseOld,
+      api: {
+        ...baseOld.api,
+        submit: vi.fn(async () => {
+          throw new LeetCodeHttpError('submit HTTP 403: User is not authenticated', 403);
+        }),
+        submitWithBrowserFallback: ghostSubmit,
+      },
+    };
+    const nextLog: string[] = [];
+    const next = makeSession(() => 'accepted', nextLog);
+    const refreshAccount = vi.fn(async () => ({
+      status: 'refreshed' as const,
+      site: 'leetcode' as const,
+      label: 'a1',
+      username: 'userX',
+    }));
+    const { deps } = makeDeps(old, [acc('a1')], {
+      refreshAccount,
+      openSession: vi.fn().mockResolvedValueOnce(old).mockResolvedValue(next),
+    });
+
+    const res = await (await startRangeJob({ from: 601, to: 601 }, 'a1', deps)).done;
+    expect(ghostSubmit).not.toHaveBeenCalled();
+    expect(refreshAccount).toHaveBeenCalledTimes(1);
+    expect(res[0]!.results[0]!.status).toBe('accepted');
+  });
 });

@@ -219,7 +219,7 @@ export function leetCodeRequestFailure(err: unknown): { category: string; detail
   const msg = err instanceof Error ? err.message : String(err);
   if (isSubmissionLimitError(err)) return { category: 'submission-limit', detail: 'LeetCode explicitly reported a submission quota' };
   if (/csrf|csrftoken|origin checking failed/i.test(msg)) return { category: 'session-csrf', detail: 'Server session CSRF token rejected; refresh the account session' };
-  if (/not.*(?:signed|logged).*in|unauthenticated|authentication|session.*expired/i.test(msg) || (err instanceof LeetCodeHttpError && err.status === 401)) {
+  if (/not.*(?:signed|logged).*in|not\s+authenticated|unauthenticated|authentication|session.*expired/i.test(msg) || (err instanceof LeetCodeHttpError && err.status === 401)) {
     return { category: 'session-auth', detail: 'Server session requires authentication' };
   }
   const html = /<!doctype|<html|cloudflare|cf-chl|just a moment/i.test(msg);
@@ -250,7 +250,7 @@ export function isSubmissionLimitError(err: unknown): boolean {
 export function looksLikeChallenge(err: unknown): boolean {
   if (isSubmissionLimitError(err)) return false;
   if (leetCodeRequestFailure(err).category === 'rate-limit') return true;
-  if (/csrf|csrftoken|not.*(?:signed|logged).*in|session.*expired/i.test(err instanceof Error ? err.message : String(err))) return false;
+  if (/csrf|csrftoken|not.*(?:signed|logged).*in|not\s+authenticated|unauthenticated|authentication|session.*expired/i.test(err instanceof Error ? err.message : String(err))) return false;
   if (err instanceof LeetCodeHttpError) {
     if (err.status === 403 || err.status === 429) return true;
     if (/non-JSON body/i.test(err.message)) return true;

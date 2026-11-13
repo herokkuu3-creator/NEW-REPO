@@ -1391,6 +1391,7 @@ async function solveOne(
         const failure = leetCodeRequestFailure(submitErr);
         const canUpgradeGhost =
           typeof api.submitWithBrowserFallback === 'function' &&
+          !ghostAttemptedErrors.has(submitErr as object) &&
           !signal?.aborted &&
           !(submitErr instanceof LeetCodeHttpError && submitErr.status === 200) &&
           (failure.category === 'challenge' ||
@@ -1884,6 +1885,7 @@ function shortErr(err: unknown): string {
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const serverRangeGate = new RangeRequestGate();
+const ghostAttemptedErrors = new WeakSet<object>();
 
 /** One HTTP session carrying the account's cookies, transport UA, and proxy, with ghost-mode Chromium upgrade on challenge. */
 export async function openRequestSession(
@@ -1907,7 +1909,11 @@ export async function openRequestSession(
   const persistCookies = sessionDeps.persistCookies ?? persistRotatedCookiesFromContext;
   const gate = sessionDeps.gate ?? serverRangeGate;
 
-  const proxyUrl = initialState.transport?.proxyUrl ?? (await resolveProxy())?.url;
+  const proxyUrl =
+    initialState.transport?.proxyUrl ??
+    (sessionDeps.resolveProxy
+      ? (await sessionDeps.resolveProxy())?.url
+      : (await resolveProxy({ fallbackToSharedPool: false }))?.url);
   const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
   if (proxyUrl && !proxy) {
     throw new Error('LEETCODE_PROXY_INVALID');
@@ -2026,6 +2032,12 @@ export async function openRequestSession(
             return res.submissionId;
           } catch (err) {
             gate.observe(err);
+            if (err && typeof err === 'object') {
+              ghostAttemptedErrors.add(err);
+            }
+            preferGhostSubmit = false;
+            await ghostSession.close().catch(() => undefined);
+            ghostSession = null;
             throw err;
           }
         }
@@ -2074,21 +2086,28 @@ export async function openRequestSession(
           ghostSession = null;
         }
         const activeGhost = await ensureGhostSession();
-        preferGhostSubmit = true;
         ghostSyncedDuringSubmit = false;
-        const ghostResult = await activeGhost.submit({
-          slug: p.slug,
-          questionId: p.questionId,
-          lang: p.lang,
-          code: p.code,
-          signal: effectiveSignal,
-          forceNavigate: true,
-        });
-        if (!ghostSyncedDuringSubmit) {
-          await syncContextFromStorage(ghostResult.storageState);
+        try {
+          const ghostResult = await activeGhost.submit({
+            slug: p.slug,
+            questionId: p.questionId,
+            lang: p.lang,
+            code: p.code,
+            signal: effectiveSignal,
+            forceNavigate: true,
+          });
+          preferGhostSubmit = true;
+          if (!ghostSyncedDuringSubmit) {
+            await syncContextFromStorage(ghostResult.storageState);
+          }
+          gate.clearCooldown();
+          return ghostResult.submissionId;
+        } catch (ghostErr) {
+          preferGhostSubmit = false;
+          await ghostSession?.close().catch(() => undefined);
+          ghostSession = null;
+          throw ghostErr;
         }
-        gate.clearCooldown();
-        return ghostResult.submissionId;
       },
       awaitResult: (id, slug) => api.awaitSubmission(id, slug, 180_000, { pollIntervalMs: 4_000 }),
       graphql: (q, v, s) => api.graphql(q, v, s as never),

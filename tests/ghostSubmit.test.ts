@@ -5,7 +5,7 @@ import net from 'node:net';
 import { readFileSync } from 'node:fs';
 import { chromium, request as playwrightRequest } from 'playwright';
 import { AccountStatus } from '@prisma/client';
-import { blockNonEssentialProblemAssets } from '../src/leetcode/ghostSubmit';
+import { blockNonEssentialProblemAssets, openGhostBrowserSession } from '../src/leetcode/ghostSubmit';
 import { openRequestSession } from '../src/scheduler/rangeSubmission';
 import { RangeRequestGate } from '../src/scheduler/rangeRequestGate';
 import { LeetCodeHttpError } from '../src/leetcode/apiClient';
@@ -242,4 +242,271 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
       ]);
     }
   }, 30_000);
+
+  it('invokes orchestrated Cloudflare solver on persistent challenge pages, injects clearance cookies, and auto-recovers from renderer crashes', async () => {
+    const sockets = new Set<net.Socket>();
+    let cleared = false;
+    const fixture = https.createServer(
+      {
+        key: readFileSync(new URL('./fixtures/auth/key.pem', import.meta.url)),
+        cert: readFileSync(new URL('./fixtures/auth/cert.pem', import.meta.url)),
+      },
+      (req, res) => {
+        const cookie = req.headers.cookie ?? '';
+        if (req.url === '/problems/friend-requests-ii/' && req.method === 'GET') {
+          if (!cookie.includes('cf_clearance=cf_solved_token_123') && !cleared) {
+            res.writeHead(403, { 'Content-Type': 'text/html' });
+            return res.end(
+              '<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><div class="challenge-page">Verify</div></body></html>',
+            );
+          }
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          return res.end('<!DOCTYPE html><html><head><title>602. Friend Requests II - LeetCode</title></head><body>OK</body></html>');
+        }
+        if (req.url === '/problems/friend-requests-ii/submit/' && req.method === 'POST') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ submission_id: 777602 }));
+        }
+        res.writeHead(404).end();
+      },
+    );
+    await new Promise<void>((resolve) => fixture.listen(0, '127.0.0.1', resolve));
+    const port = (fixture.address() as net.AddressInfo).port;
+    const proxy = net.createServer((clientSocket) => {
+      sockets.add(clientSocket);
+      clientSocket.once('data', (chunk) => {
+        const firstLine = chunk.toString('utf8').split('\r\n')[0] ?? '';
+        if (!firstLine.startsWith('CONNECT ')) {
+          clientSocket.destroy();
+          return;
+        }
+        const upstream = net.connect(port, '127.0.0.1', () => {
+          clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          upstream.pipe(clientSocket);
+          clientSocket.pipe(upstream);
+        });
+        sockets.add(upstream);
+        upstream.on('error', () => clientSocket.destroy());
+      });
+      clientSocket.on('error', () => undefined);
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const proxyUrl = `http://127.0.0.1:${(proxy.address() as net.AddressInfo).port}`;
+
+    const origLaunch = chromium.launch.bind(chromium);
+    let launchCount = 0;
+    let firstGoto = true;
+    vi.spyOn(chromium, 'launch').mockImplementation(async (opts) => {
+      launchCount++;
+      const browser = await origLaunch(opts);
+      const origNewContext = browser.newContext.bind(browser);
+      browser.newContext = async (ctxOpts) => {
+        const ctx = await origNewContext({ ...ctxOpts, ignoreHTTPSErrors: true });
+        const origNewPage = ctx.newPage.bind(ctx);
+        ctx.newPage = async () => {
+          const p = await origNewPage();
+          const origGoto = p.goto.bind(p);
+          p.goto = (async (...args: Parameters<typeof p.goto>) => {
+            if (firstGoto) {
+              firstGoto = false;
+              throw new Error('page.goto: Page crashed');
+            }
+            return origGoto(...args);
+          }) as typeof p.goto;
+          return p;
+        };
+        return ctx;
+      };
+      return browser;
+    });
+
+    const solveCloudflare = vi.fn(async () => {
+      cleared = true;
+      return {
+        cfClearance: 'cf_solved_token_123',
+        cookies: { cf_clearance: 'cf_solved_token_123' },
+        source: 'cpsolver' as const,
+        durationMs: 50,
+      };
+    });
+
+    const ghost = await openGhostBrowserSession(
+      {
+        transport: { proxyUrl },
+        cookies: [
+          { name: 'LEETCODE_SESSION', value: 'valid_session_token_123', domain: '.leetcode.com', path: '/', expires: -1, httpOnly: true, secure: true, sameSite: 'Lax' },
+          { name: 'csrftoken', value: 'csrf_123', domain: '.leetcode.com', path: '/', expires: -1, httpOnly: false, secure: true, sameSite: 'Lax' },
+        ],
+        origins: [],
+      },
+      {},
+      {
+        solveCloudflare,
+        challengeWaitMs: 50,
+        retryWaitMs: 50,
+        postSolveWaitMs: 50,
+      },
+    );
+
+    try {
+      const res = await ghost.submit({
+        slug: 'friend-requests-ii',
+        questionId: '602',
+        lang: 'mysql',
+        code: 'SELECT 1',
+      });
+      expect(res.submissionId).toBe('777602');
+      expect(launchCount).toBe(2); // relaunched once after simulated Page crashed
+      expect(solveCloudflare).toHaveBeenCalledTimes(1);
+    } finally {
+      await ghost.close();
+      for (const s of sockets) s.destroy();
+      await Promise.all([
+        new Promise<void>((r) => proxy.close(() => r())),
+        new Promise<void>((r) => fixture.close(() => r())),
+      ]);
+    }
+  }, 30_000);
+
+  it('prevents duplicate ghost Chromium launches within one sendCode attempt when warm ghost submit fails', async () => {
+    const account = {
+      id: 'acc-ghost-2',
+      label: 'chris_grif',
+      username: 'chris_grif',
+      status: AccountStatus.ACTIVE,
+      storageState: JSON.stringify({
+        cookies: [
+          { name: 'LEETCODE_SESSION', value: 'valid_session_token_123', domain: '.leetcode.com', path: '/', expires: -1, httpOnly: true, secure: true, sameSite: 'Lax' },
+          { name: 'csrftoken', value: 'initial_csrf', domain: '.leetcode.com', path: '/', expires: -1, httpOnly: false, secure: true, sameSite: 'Lax' },
+        ],
+        origins: [],
+      }),
+    } as any;
+
+    let ghostCalls = 0;
+    const closedCount = vi.fn(async () => undefined);
+    const session = await openRequestSession(account, undefined, {
+      gate: new RangeRequestGate(Date.now, 0, 0),
+      resolveProxy: async () => null,
+      persistCookies: async () => true,
+      openGhostSession: async () => ({
+        submit: async ({ slug }) => {
+          ghostCalls++;
+          if (slug === 'first-problem') {
+            return {
+              submissionId: '101',
+              storageState: JSON.parse(account.storageState),
+            };
+          }
+          throw new LeetCodeHttpError('submit HTTP 403: Cloudflare verification required (challenge-page)', 403);
+        },
+        close: closedCount,
+      }),
+    });
+
+    try {
+      await expect(
+        session.api.submitWithBrowserFallback!({
+          slug: 'first-problem',
+          questionId: '1',
+          lang: 'mysql',
+          code: 'SELECT 1',
+        }),
+      ).resolves.toBe('101');
+      expect(ghostCalls).toBe(1);
+
+      const secondErr = await session.api
+        .submit({
+          slug: 'second-problem',
+          questionId: '2',
+          lang: 'mysql',
+          code: 'SELECT 1',
+        })
+        .catch((e) => e);
+      expect(secondErr).toBeInstanceOf(LeetCodeHttpError);
+      expect(closedCount).toHaveBeenCalledTimes(1);
+
+      const { startRangeJob } = await import('../src/scheduler/rangeSubmission');
+      let secondAttemptGhostCalls = 0;
+      const run = await startRangeJob({ from: 1, to: 2 }, 'chris_grif', {
+        questionOrder: (nums) => [...nums],
+        listAccounts: async () => [account],
+        getAccount: async () => account,
+        blockedBackoffMs: [],
+        questionGapMs: 0,
+        blockedStreakLimit: 99,
+        blockedCooldownMs: 0,
+        dailyRunPollMs: 10,
+        progressEvery: 0,
+        keepAlive: () => () => undefined,
+        isDailyRunInProgress: () => false,
+        sleep: async () => undefined,
+        now: Date.now,
+        notify: async () => undefined,
+        getPage: async () => {
+          throw new Error('no walkccc');
+        },
+        openSession: async () => {
+          const s = await openRequestSession(account, undefined, {
+            gate: new RangeRequestGate(Date.now, 0, 0),
+            resolveProxy: async () => null,
+            persistCookies: async () => true,
+            openGhostSession: async () => ({
+              submit: async () => {
+                secondAttemptGhostCalls++;
+                if (secondAttemptGhostCalls === 1) {
+                  return { submissionId: '200', storageState: JSON.parse(account.storageState) };
+                }
+                throw new LeetCodeHttpError('submit HTTP 403: Cloudflare verification required (challenge-page)', 403);
+              },
+              close: async () => undefined,
+            }),
+          });
+          s.api.checkSession = async () => ({ authenticated: true, username: 'chris_grif' });
+          s.api.question = async (slug) => ({
+            questionId: slug === 'q-1' ? '1' : '2',
+            isPaidOnly: false,
+            title: slug,
+            slug,
+            frontendId: slug === 'q-1' ? '1' : '2',
+            difficulty: 'Easy',
+            codeSnippets: [{ lang: 'MySQL', langSlug: 'mysql', code: 'SELECT 1' }],
+            contentHtml: '<p>test</p>',
+            exampleTestcases: '',
+            metaData: null,
+            topicTags: [],
+          });
+          s.api.awaitResult = async (id) => ({
+            submissionId: id,
+            classification: 'ACCEPTED',
+            statusDisplay: 'Accepted',
+            runtime: null,
+            memory: null,
+            rawStatusMsg: 'Accepted',
+          });
+          const origSubmit = s.api.submit.bind(s.api);
+          return {
+            api: {
+              ...s.api,
+              submit: async (p, prog) => {
+                if (secondAttemptGhostCalls === 0) {
+                  throw new LeetCodeHttpError('submit HTTP 403: <!DOCTYPE html> Just a moment...', 403);
+                }
+                return origSubmit(p, prog);
+              },
+            },
+            close: s.close,
+          };
+        },
+        resolveSlug: async (num) => `q-${num}`,
+        fetchCommunity: async () => ({ code: 'SELECT 2', uuid: 'u1', articleTitle: 'sol', sourceUrl: 'https://x', author: 'a', rank: 1 }),
+      });
+      const done = await run.done;
+      expect(done[0]!.results.map((r) => r.status)).toEqual(['accepted', 'error']);
+      // Q1 upgrades once to ghost (call 1); Q2 runs warm ghost once and does NOT double-launch fallback (call 2)
+      expect(secondAttemptGhostCalls).toBe(2);
+    } finally {
+      await session.close();
+    }
+  });
 });

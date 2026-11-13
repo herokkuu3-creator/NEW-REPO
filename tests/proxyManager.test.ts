@@ -70,6 +70,11 @@ vi.mock('../src/codeforces/proxyRotator', async (importOriginal) => {
 describe('proxyManager', () => {
   beforeEach(() => {
     for (const k of Object.keys(dbMock)) delete dbMock[k];
+    delete process.env.LEETCODE_RESIDENTIAL_PROXY;
+    delete process.env.LEETCODE_PROXY;
+    delete process.env.CODEFORCES_RESIDENTIAL_PROXY;
+    delete process.env.FALLBACK_CODEFORCES_PROXY;
+    delete process.env.CODEFORCES_PROXY;
   });
 
   it('adds and gets removed proxies', async () => {
@@ -317,6 +322,11 @@ describe('proxyManager', () => {
 describe('telegram proxy commands', () => {
   beforeEach(() => {
     for (const k of Object.keys(dbMock)) delete dbMock[k];
+    delete process.env.LEETCODE_RESIDENTIAL_PROXY;
+    delete process.env.LEETCODE_PROXY;
+    delete process.env.CODEFORCES_RESIDENTIAL_PROXY;
+    delete process.env.FALLBACK_CODEFORCES_PROXY;
+    delete process.env.CODEFORCES_PROXY;
   });
 
   it('handles /testproxy with results', async () => {
@@ -684,13 +694,27 @@ describe('telegram proxy commands', () => {
       expect(isLikelyProxyPayload('hello how are you')).toBe(false);
     });
 
-    it('loads LeetCode residential proxy strictly from environment variables and converts to Playwright format', async () => {
+    it('loads LeetCode residential proxy from LEETCODE_* env or falls back to shared residential proxy pool', async () => {
       const prevLeetCodeResProxy = process.env.LEETCODE_RESIDENTIAL_PROXY;
       const prevLeetCodeProxy = process.env.LEETCODE_PROXY;
+      const prevCfResProxy = process.env.CODEFORCES_RESIDENTIAL_PROXY;
       try {
         delete process.env.LEETCODE_RESIDENTIAL_PROXY;
         delete process.env.LEETCODE_PROXY;
+        delete process.env.CODEFORCES_RESIDENTIAL_PROXY;
         expect(await resolveLeetCodeResidentialProxy({ allowInTest: true })).toBeNull();
+
+        const sharedProxy = 'http://shareduser:sharedpass@shared.example.test:3129';
+        process.env.CODEFORCES_RESIDENTIAL_PROXY = sharedProxy;
+        const skippedFallback = await resolveLeetCodeResidentialProxy({
+          allowInTest: true,
+          fallbackToSharedPool: false,
+        });
+        expect(skippedFallback).toBeNull();
+
+        const fallbackResolved = await resolveLeetCodeResidentialProxy({ allowInTest: true });
+        expect(fallbackResolved?.host).toBe('shared.example.test:3129');
+        expect(fallbackResolved?.username).toBe('shareduser');
 
         const fixtureProxy = 'http://fixtureuser:fixturepass@proxy.example.test:10000';
         expect(toPlaywrightProxy(fixtureProxy)).toEqual({
@@ -708,7 +732,16 @@ describe('telegram proxy commands', () => {
         else process.env.LEETCODE_RESIDENTIAL_PROXY = prevLeetCodeResProxy;
         if (prevLeetCodeProxy === undefined) delete process.env.LEETCODE_PROXY;
         else process.env.LEETCODE_PROXY = prevLeetCodeProxy;
+        if (prevCfResProxy === undefined) delete process.env.CODEFORCES_RESIDENTIAL_PROXY;
+        else process.env.CODEFORCES_RESIDENTIAL_PROXY = prevCfResProxy;
       }
+    });
+
+    it('falls back to custom DB proxies configured via /setproxies when env proxies are unset', async () => {
+      await addCustomProxy('http://dbuser:dbpass@dbproxy.example.test:8000');
+      const resolved = await resolveLeetCodeResidentialProxy({ allowInTest: true });
+      expect(resolved?.host).toBe('dbproxy.example.test:8000');
+      expect(resolved?.username).toBe('dbuser');
     });
   });
 });
