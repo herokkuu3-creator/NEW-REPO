@@ -116,8 +116,25 @@ export function blockNonEssentialProblemAssets(url: string, type: string): boole
   return !isLeetCode;
 }
 
+function normalizeLeetCodeSessionCookies(
+  cookies: StorageStateShape['cookies'],
+): StorageStateShape['cookies'] {
+  return deduplicateLeetCodeCookies(cookies, ORIGIN).map((c) => {
+    if (c.name === 'LEETCODE_SESSION' || c.name === 'csrftoken' || c.name === 'cf_clearance') {
+      return {
+        ...c,
+        domain: '.leetcode.com',
+        path: '/',
+        secure: true,
+        sameSite: c.sameSite === 'None' || c.sameSite === 'Strict' ? c.sameSite : 'Lax',
+      };
+    }
+    return c;
+  });
+}
+
 function pruneExpiredCookies(cookies: StorageStateShape['cookies']): StorageStateShape['cookies'] {
-  return deduplicateLeetCodeCookies(cookies, ORIGIN);
+  return normalizeLeetCodeSessionCookies(cookies);
 }
 
 function normalizeChromeUserAgent(userAgent?: string): string {
@@ -216,34 +233,55 @@ export async function submitViaPageFetch(
   params: { slug: string; questionId: string; lang: string; code: string },
   storedCookies?: StorageStateShape['cookies'],
 ): Promise<string> {
-  const restoreSessionCookieIfMissing = async (): Promise<boolean> => {
+  const restoreSessionCookieIfMissing = async (forceReinject = false): Promise<boolean> => {
     const contextCookies = await page.context().cookies(ORIGIN).catch(() => []);
-    if (selectBestCookieByName(contextCookies, 'LEETCODE_SESSION', ORIGIN)) {
-      return false;
-    }
+    const existingSession = selectBestCookieByName(contextCookies, 'LEETCODE_SESSION', ORIGIN);
     const storedSession = storedCookies?.length
       ? selectBestCookieByName(storedCookies, 'LEETCODE_SESSION', ORIGIN)
       : null;
     if (!storedSession) return false;
-    await page
-      .context()
-      .addCookies([
-        {
-          name: storedSession.name,
-          value: storedSession.value,
-          domain: storedSession.domain || '.leetcode.com',
-          path: storedSession.path || '/',
-          expires: storedSession.expires ?? -1,
-          httpOnly: storedSession.httpOnly ?? true,
-          secure: storedSession.secure ?? true,
-          sameSite: storedSession.sameSite ?? 'Lax',
-        },
-      ])
-      .catch(() => undefined);
+    if (
+      !forceReinject &&
+      existingSession &&
+      existingSession.value === storedSession.value &&
+      (existingSession.domain === '.leetcode.com' || existingSession.domain === 'leetcode.com')
+    ) {
+      return false;
+    }
+    const storedCsrf = storedCookies?.length
+      ? selectBestCookieByName(storedCookies, 'csrftoken', ORIGIN)
+      : null;
+    const cookiesToRestore = [
+      {
+        name: 'LEETCODE_SESSION',
+        value: storedSession.value,
+        domain: '.leetcode.com',
+        path: '/',
+        expires: storedSession.expires ?? -1,
+        httpOnly: storedSession.httpOnly ?? true,
+        secure: true,
+        sameSite: 'Lax' as const,
+      },
+      ...(storedCsrf && !selectBestCsrfCookie(contextCookies, ORIGIN)
+        ? [
+            {
+              name: 'csrftoken',
+              value: storedCsrf.value,
+              domain: '.leetcode.com',
+              path: '/',
+              expires: storedCsrf.expires ?? -1,
+              httpOnly: false,
+              secure: true,
+              sameSite: 'Lax' as const,
+            },
+          ]
+        : []),
+    ];
+    await page.context().addCookies(cookiesToRestore).catch(() => undefined);
     return true;
   };
 
-  await restoreSessionCookieIfMissing();
+  await restoreSessionCookieIfMissing(false);
 
   const readCsrf = async (): Promise<string | null> => {
     const contextCookies = await page.context().cookies(ORIGIN).catch(() => []);
@@ -316,8 +354,11 @@ export async function submitViaPageFetch(
     }
   }
   if (response.status === 403 && /not\s+authenticated|unauthenticated/i.test(response.text)) {
-    const restored = await restoreSessionCookieIfMissing();
+    const restored = await restoreSessionCookieIfMissing(true);
     if (restored) {
+      await page
+        .goto(`${ORIGIN}/problems/${params.slug}/`, { waitUntil: 'domcontentloaded', timeout: 20_000 })
+        .catch(() => undefined);
       const refreshed = (await readCsrf()) ?? token;
       response = await sendInPage(refreshed);
     }

@@ -969,8 +969,15 @@ async function runAccountRange(
       }
 
       // Blocked handling: a streak means LeetCode is refusing this IP/session.
-      blockedStreak = blocked ? blockedStreak + 1 : 0;
-      if (!blocked) cooledDown = false;
+      const countsAsBlockedStreak =
+        blocked ||
+        solved.sessionFailure === true ||
+        (outcome.status === 'error' &&
+          /page crashed|browser has been closed|target page, context or browser has been closed|unexpected page|cloudflare|verification required|request denied \(http 403\)/i.test(
+            outcome.detail ?? '',
+          ));
+      blockedStreak = countsAsBlockedStreak ? blockedStreak + 1 : 0;
+      if (!countsAsBlockedStreak) cooledDown = false;
       if (blockedStreak >= deps.blockedStreakLimit) {
         if (cooledDown) {
           result.stoppedEarly = 'blocked';

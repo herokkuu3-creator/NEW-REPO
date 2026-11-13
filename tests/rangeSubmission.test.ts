@@ -1362,4 +1362,25 @@ describe('parallel range submission', () => {
     expect(refreshAccount).toHaveBeenCalledTimes(1);
     expect(res[0]!.results[0]!.status).toBe('accepted');
   });
+
+  it('counts unrecovered browser crashes and persistent session rejections toward blockedStreak so 100+ questions cannot fail in a runaway loop', async () => {
+    const crashSession = makeSession(() => 'accepted', []);
+    crashSession.api.submit = vi.fn(async () => {
+      throw new Error('page.goto: Page crashed');
+    });
+    const sleeps: number[] = [];
+    const { deps } = makeDeps(crashSession, [acc('a1')], {
+      blockedStreakLimit: 2,
+      blockedCooldownMs: 600_000,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+    const res = await (await startRangeJob({ from: 1, to: 6 }, 'a1', deps)).done;
+    expect(res[0]!.stoppedEarly).toBe('blocked');
+    expect(res[0]!.results.length).toBe(4);
+    expect(res[0]!.notAttempted).toEqual([5, 6]);
+    expect(sleeps).toContain(600_000);
+  });
 });

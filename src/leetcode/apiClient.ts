@@ -582,9 +582,12 @@ export class LeetCodeApi {
     let res = await sendSubmitPost(token, beforeSend);
     let { status, text, retryAfterMs } = await readResponse(res);
 
-    if (status === 403 && isCsrfRejectionBody(text)) {
+    if (
+      status === 403 &&
+      (isCsrfRejectionBody(text) || /not\s+authenticated|unauthenticated/i.test(text))
+    ) {
       const refreshed = await this.refreshCsrfToken(params.slug, token);
-      if (refreshed && refreshed !== token) {
+      if (refreshed) {
         res = await sendSubmitPost(refreshed);
         ({ status, text, retryAfterMs } = await readResponse(res));
       }

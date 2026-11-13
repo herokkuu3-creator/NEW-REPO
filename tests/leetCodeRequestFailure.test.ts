@@ -96,6 +96,47 @@ describe('CSRF, headers, and HTML diagnostic helpers', () => {
     expect(postCalls[1]!.headers['x-csrftoken']).toBe('fresh_csrf');
   });
 
+  it('refreshes CSRF / session cookies and retries once on 403 User is not authenticated', async () => {
+    let csrf = 'initial_csrf';
+    let calls = 0;
+    const get = vi.fn(async () => {
+      csrf = 'refreshed_csrf';
+      return { status: () => 200, text: async () => '{}', headers: () => ({}), dispose: async () => undefined };
+    });
+    const post = vi.fn(async () => {
+      calls++;
+      if (calls === 1) {
+        return {
+          status: () => 403,
+          text: async () => JSON.stringify({ error: 'User is not authenticated' }),
+          headers: () => ({}),
+          dispose: async () => undefined,
+        };
+      }
+      return {
+        status: () => 200,
+        text: async () => JSON.stringify({ submission_id: 601999 }),
+        headers: () => ({}),
+        dispose: async () => undefined,
+      };
+    });
+
+    const api = new LeetCodeApi({
+      request: { post, get },
+      cookies: async () => [{ name: 'csrftoken', value: csrf, domain: '.leetcode.com' }],
+    } as any);
+
+    const id = await api.submitSolution({
+      slug: 'human-traffic-of-stadium',
+      questionId: '601',
+      lang: 'mysql',
+      code: 'SELECT 1;',
+    });
+    expect(id).toBe('601999');
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
   it('deduplicates stale .leetcode.com vs host-only leetcode.com singleton cookies while preserving other cookies', () => {
     const nowSec = Math.floor(Date.now() / 1000);
     const deduped = deduplicateLeetCodeCookies([

@@ -1813,7 +1813,8 @@ export async function solveCloudflareOrchestrated(params: {
       const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Cloudflare Challenge via CPSolver (${solverHost})...</b>`;
       await sendSolverTelegramNotification(attemptNotice).catch(() => undefined);
 
-      const proxyForCPSolver = process.env.CPSOLVER_FORWARD_PROXY === 'true' ? params.proxyUrl : undefined;
+      const proxyForCPSolver =
+        process.env.CPSOLVER_FORWARD_PROXY !== 'false' ? params.proxyUrl || undefined : undefined;
       const res = await solveCloudflareWithCPSolver({
         siteurl: params.websiteURL,
         proxy: proxyForCPSolver,
