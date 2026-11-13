@@ -37,10 +37,188 @@ export function parseRetryAfter(value: string | undefined, now = Date.now()): nu
   return Number.isFinite(delay) ? Math.max(0, delay) : undefined;
 }
 
+export interface CookieLike {
+  name: string;
+  value: string;
+  domain?: string;
+  path?: string;
+  expires?: number;
+}
+
+/**
+ * Matches a cookie domain cleanly against a target URL or origin while enforcing
+ * RFC-6265 subdomain boundaries (`.leetcode.com` matches `leetcode.com` and
+ * `assets.leetcode.com`, never `notleetcode.com`).
+ */
+export function cookieMatchesOrigin(cookieDomain: string | undefined, originOrUrl: string): boolean {
+  if (!cookieDomain) return true;
+  let host: string;
+  try {
+    host = new URL(originOrUrl).hostname.toLowerCase();
+  } catch {
+    host = originOrUrl.toLowerCase();
+  }
+  const normalized = cookieDomain.trim().toLowerCase().replace(/^\./, '');
+  if (!normalized) return false;
+  return host === normalized || host.endsWith(`.${normalized}`);
+}
+
+export function selectBestCookieByName<T extends CookieLike>(
+  cookies: ReadonlyArray<T>,
+  cookieName: string,
+  origin = ORIGIN,
+): T | null {
+  const nowMs = Date.now();
+  const candidates: Array<{ cookie: T; index: number; value: string; exactHost: boolean; pathLen: number; expires: number }> = [];
+  let host = 'leetcode.com';
+  try {
+    host = new URL(origin).hostname.toLowerCase();
+  } catch {}
+
+  for (let i = 0; i < cookies.length; i++) {
+    const c = cookies[i];
+    if (!c || c.name !== cookieName) continue;
+    const val = typeof c.value === 'string' ? c.value.trim() : '';
+    if (!val) continue;
+    if (!cookieMatchesOrigin(c.domain, origin)) continue;
+    if (typeof c.expires === 'number' && c.expires > 0 && c.expires * 1000 <= nowMs) continue;
+    const dom = (c.domain ?? '').trim().toLowerCase().replace(/^\./, '');
+    candidates.push({
+      cookie: c,
+      index: i,
+      value: val,
+      exactHost: dom === host,
+      pathLen: (c.path ?? '/').length,
+      expires: typeof c.expires === 'number' && Number.isFinite(c.expires) ? c.expires : -1,
+    });
+  }
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => {
+    if (a.expires > 0 && b.expires > 0 && a.expires !== b.expires) return b.expires - a.expires;
+    if (a.expires > 0 && b.expires <= 0) return -1;
+    if (b.expires > 0 && a.expires <= 0) return 1;
+    if (a.pathLen !== b.pathLen) return b.pathLen - a.pathLen;
+    if (a.exactHost !== b.exactHost) return a.exactHost ? -1 : 1;
+    return b.index - a.index;
+  });
+  return candidates[0]!.cookie;
+}
+
+/**
+ * Selects the newest non-expired `csrftoken` cookie for the target origin.
+ * Avoids `.find()` picking a stale duplicate `.leetcode.com` cookie when a
+ * rotated `Set-Cookie` updated a host-only or newer-expiry cookie.
+ */
+export function selectBestCsrfCookie(cookies: ReadonlyArray<CookieLike>, origin = ORIGIN): string | null {
+  return selectBestCookieByName(cookies, 'csrftoken', origin)?.value.trim() ?? null;
+}
+
+const SINGLETON_SESSION_COOKIES = new Set(['csrftoken', 'LEETCODE_SESSION', 'cf_clearance']);
+
+/**
+ * Collapses duplicate `.leetcode.com` vs `leetcode.com` domain copies of
+ * singleton auth/security cookies (`csrftoken`, `LEETCODE_SESSION`, `cf_clearance`)
+ * so Playwright HTTP requests never send conflicting duplicate `Cookie:` pairs
+ * to Django / Cloudflare after a `Set-Cookie` rotation.
+ */
+export function deduplicateLeetCodeCookies<T extends CookieLike>(
+  cookies: ReadonlyArray<T>,
+  origin = ORIGIN,
+): T[] {
+  const nowSec = Date.now() / 1000;
+  const active = cookies.filter((c) => !c.expires || c.expires <= 0 || c.expires > nowSec);
+  const winners = new Map<string, T>();
+  for (const name of SINGLETON_SESSION_COOKIES) {
+    const best = selectBestCookieByName(active, name, origin);
+    if (best) winners.set(name, best);
+  }
+  const emittedSingleton = new Set<string>();
+  const out: T[] = [];
+  for (const c of active) {
+    if (SINGLETON_SESSION_COOKIES.has(c.name) && cookieMatchesOrigin(c.domain, origin)) {
+      const winner = winners.get(c.name);
+      if (!winner || emittedSingleton.has(c.name)) continue;
+      if (c === winner) {
+        emittedSingleton.add(c.name);
+        out.push(c);
+      }
+      continue;
+    }
+    out.push(c);
+  }
+  return out;
+}
+
+/** Builds consistent desktop Chrome client hints matching the active User-Agent. */
+export function buildBrowserClientHeaders(userAgent?: string): Record<string, string> {
+  const ua = userAgent || '';
+  const headers: Record<string, string> = {
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  if (/Firefox\//i.test(ua)) return headers;
+  const chromeMatch = /Chrome\/(\d+)/i.exec(ua);
+  const major = chromeMatch?.[1] ?? '126';
+  const platform = /Windows/i.test(ua)
+    ? '"Windows"'
+    : /Macintosh|Mac OS X/i.test(ua)
+      ? '"macOS"'
+      : /Android/i.test(ua)
+        ? '"Android"'
+        : '"Linux"';
+  headers['sec-ch-ua'] = `"Not/A)Brand";v="8", "Chromium";v="${major}", "Google Chrome";v="${major}"`;
+  headers['sec-ch-ua-mobile'] = '?0';
+  headers['sec-ch-ua-platform'] = platform;
+  return headers;
+}
+
+export function isCsrfRejectionBody(text: string): boolean {
+  return /csrf(?:_?token)?|csrf verification failed|csrfmiddlewaretoken|csrf cookie not set|origin checking failed/i.test(text);
+}
+
+/**
+ * Summarizes an HTTP error response from the FULL body before slicing so
+ * verbose HTML `<head><style>` blocks cannot truncate `"CSRF verification failed"`
+ * or Cloudflare `<title>` / challenge markers.
+ */
+export function summarizeHttpErrorBody(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      const fields = ['error', 'detail', 'message', 'msg']
+        .map((k) => parsed[k])
+        .filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+      if (fields.length > 0) return fields.join(' | ').replace(/\s+/g, ' ').trim().slice(0, 300);
+    } catch {}
+  }
+
+  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(trimmed);
+  const title = titleMatch?.[1]?.replace(/\s+/g, ' ').trim();
+  const signals: string[] = [];
+  if (isCsrfRejectionBody(trimmed)) {
+    const csrfPhrase = /(?:CSRF verification failed\.?[^<]*|Origin checking failed[^<]*|CSRF cookie not set\.?)/i.exec(trimmed)?.[0];
+    signals.push(csrfPhrase ? csrfPhrase.replace(/\s+/g, ' ').trim() : 'CSRF verification failed');
+  }
+  if (/cf-chl|challenge-platform|just a moment|attention required|sorry, you have been blocked/i.test(trimmed)) {
+    const cfMatch = /(?:Just a moment\.\.\.|Attention Required!\s*\|?\s*Cloudflare|Sorry, you have been blocked|cf-chl|challenge-platform)/i.exec(trimmed)?.[0];
+    if (cfMatch) signals.push(cfMatch.replace(/\s+/g, ' ').trim());
+  }
+
+  const normalized = trimmed.replace(/\s+/g, ' ');
+  if (title || signals.length > 0) {
+    const prefix = [title ? `[${title}]` : '', ...signals].filter(Boolean).join(' ');
+    const remaining = Math.max(0, 300 - prefix.length - 1);
+    return (remaining > 20 ? `${prefix} ${normalized.slice(0, remaining)}` : prefix).slice(0, 300);
+  }
+  return normalized.slice(0, 300);
+}
+
 export function leetCodeRequestFailure(err: unknown): { category: string; detail: string } {
   const msg = err instanceof Error ? err.message : String(err);
   if (isSubmissionLimitError(err)) return { category: 'submission-limit', detail: 'LeetCode explicitly reported a submission quota' };
-  if (/csrf|csrftoken/i.test(msg)) return { category: 'session-csrf', detail: 'Server session CSRF token rejected; refresh the account session' };
+  if (/csrf|csrftoken|origin checking failed/i.test(msg)) return { category: 'session-csrf', detail: 'Server session CSRF token rejected; refresh the account session' };
   if (/not.*(?:signed|logged).*in|unauthenticated|authentication|session.*expired/i.test(msg) || (err instanceof LeetCodeHttpError && err.status === 401)) {
     return { category: 'session-auth', detail: 'Server session requires authentication' };
   }
@@ -308,7 +486,59 @@ export class LeetCodeApi {
   /** The CSRF cookie LeetCode issues to the session; used for state-changing POSTs. */
   private async csrfToken(): Promise<string | null> {
     const cookies = await this.context.cookies(ORIGIN);
-    return cookies.find((c) => c.name === 'csrftoken')?.value ?? null;
+    return selectBestCsrfCookie(cookies, ORIGIN);
+  }
+
+  /**
+   * Attempts a single lightweight same-origin GET refresh when Django rejects or
+   * rotates `csrftoken`. Never runs when the underlying transport omits `.get`.
+   */
+  private async refreshCsrfToken(slug?: string, previousToken?: string | null): Promise<string | null> {
+    const rotatedAlready = await this.csrfToken().catch(() => null);
+    if (rotatedAlready && rotatedAlready !== previousToken) {
+      return rotatedAlready;
+    }
+    if (typeof this.request.get !== 'function') return null;
+
+    const endpoints: Array<{ url: string; headers: Record<string, string> }> = [
+      {
+        url: `${ORIGIN}/api/problems/algorithms/`,
+        headers: {
+          Accept: 'application/json, text/plain, */*',
+          Referer: slug ? `${ORIGIN}/problems/${slug}/` : `${ORIGIN}/`,
+          'Sec-Fetch-Dest': 'empty',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Site': 'same-origin',
+        },
+      },
+      ...(slug
+        ? [{
+            url: `${ORIGIN}/problems/${slug}/`,
+            headers: {
+              Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              Referer: `${ORIGIN}/problemset/`,
+              'Sec-Fetch-Dest': 'document',
+              'Sec-Fetch-Mode': 'navigate',
+              'Sec-Fetch-Site': 'same-origin',
+            },
+          }]
+        : []),
+    ];
+
+    for (const target of endpoints) {
+      try {
+        const res = await this.request.get(target.url, {
+          headers: target.headers,
+          ...await this.requestOptions(),
+        });
+        await res.dispose?.().catch(() => undefined);
+      } catch {
+        // Best-effort cookie refresh only; check jar before failing.
+      }
+      const next = await this.csrfToken().catch(() => null);
+      if (next && next !== previousToken) return next;
+    }
+    return await this.csrfToken().catch(() => null);
   }
 
   /**
@@ -329,25 +559,39 @@ export class LeetCodeApi {
       );
     }
 
-    const res = await this.request.post(`${ORIGIN}/problems/${params.slug}/submit/`, {
-      headers: {
-        'x-csrftoken': token,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        Origin: ORIGIN,
-        Referer: `${ORIGIN}/problems/${params.slug}/submissions/`,
-      },
-      data: {
-        lang: params.lang,
-        question_id: params.questionId,
-        typed_code: params.code,
-      },
-      ...await this.requestOptions(undefined, beforeSend),
-    });
+    const sendSubmitPost = async (csrf: string, waitBeforeSend?: () => Promise<void>) =>
+      this.request.post(`${ORIGIN}/problems/${params.slug}/submit/`, {
+        headers: {
+          'x-csrftoken': csrf,
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/plain, */*',
+          Origin: ORIGIN,
+          Referer: `${ORIGIN}/problems/${params.slug}/`,
+          'Sec-Fetch-Dest': 'empty',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Site': 'same-origin',
+        },
+        data: {
+          lang: params.lang,
+          question_id: params.questionId,
+          typed_code: params.code,
+        },
+        ...await this.requestOptions(undefined, waitBeforeSend),
+      });
 
-    const { status, text, retryAfterMs } = await readResponse(res);
+    let res = await sendSubmitPost(token, beforeSend);
+    let { status, text, retryAfterMs } = await readResponse(res);
+
+    if (status === 403 && isCsrfRejectionBody(text)) {
+      const refreshed = await this.refreshCsrfToken(params.slug, token);
+      if (refreshed && refreshed !== token) {
+        res = await sendSubmitPost(refreshed);
+        ({ status, text, retryAfterMs } = await readResponse(res));
+      }
+    }
+
     if (status !== 200) {
-      const detail = text.replace(/\s+/g, ' ').trim().slice(0, 300);
+      const detail = summarizeHttpErrorBody(text);
       this.fail(new LeetCodeHttpError(
         `submit HTTP ${status}${detail ? `: ${detail}` : ''}`,
         status,

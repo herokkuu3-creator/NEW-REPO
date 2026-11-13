@@ -4,7 +4,22 @@ import { request as playwrightRequest } from 'playwright';
 import { z } from 'zod';
 import { logger } from '../logger';
 import { AccountRecord, getAccountById, listEnabledAccounts, parseStoredStorageState } from '../database/accounts';
-import { LeetCodeApi, LeetCodeHttpError, looksLikeChallenge, isSubmissionLimitError, leetCodeRequestFailure, SubmissionOutcome } from '../leetcode/apiClient';
+import {
+  buildBrowserClientHeaders,
+  cookieMatchesOrigin,
+  deduplicateLeetCodeCookies,
+  isSubmissionLimitError,
+  LeetCodeApi,
+  LeetCodeHttpError,
+  leetCodeRequestFailure,
+  looksLikeChallenge,
+  SubmissionOutcome,
+} from '../leetcode/apiClient';
+import { persistRotatedCookiesFromContext } from '../leetcode/sessionManager';
+import { submitViaGhostBrowser } from '../leetcode/ghostSubmit';
+import { type StorageStateShape } from '../browser/cookiePayload';
+import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
+import { toPlaywrightProxy } from '../codeforces/proxyRotator';
 import { RangeRequestGate, RangeRequestWait } from './rangeRequestGate';
 import { fetchQuestionData, RawQuestionData } from '../leetcode/dailyChallenge';
 import { checkSession, SessionCheckResult } from '../browser/sessionCheck';
@@ -144,6 +159,10 @@ export interface RangeApi {
   checkSession(): Promise<SessionCheckResult>;
   question(slug: string): Promise<RawQuestionData>;
   submit(p: { slug: string; questionId: string; lang: string; code: string }, progress?: RangeSubmitProgress): Promise<string>;
+  submitWithBrowserFallback?(
+    p: { slug: string; questionId: string; lang: string; code: string },
+    signal?: AbortSignal,
+  ): Promise<string>;
   awaitResult(submissionId: string, slug: string): Promise<SubmissionOutcome>;
   graphql?<T>(query: string, variables: Record<string, unknown>, schema: unknown): Promise<T>;
 }
@@ -1363,10 +1382,43 @@ async function solveOne(
       stage = 'submit';
       if (signal?.aborted) throw Error('Range cancelled before submission');
       const progress = progressCtx && { ...progressCtx, questionNumber: n, questionTitle, slug };
-      return api.submit({ slug: slug!, questionId, lang, code }, progress && {
-        onWait: ({ ms, reason }) => { void deps.onProgress?.({ ...progress, phase: 'waiting-submit', waitSeconds: Math.ceil(ms / 1000), waitReason: reason }); },
-        onSend: () => { void deps.onProgress?.({ ...progress, phase: 'submitting', ...(lang !== 'cpp' ? { detail: lang } : {}) }); },
-      });
+      try {
+        return await api.submit({ slug: slug!, questionId, lang, code }, progress && {
+          onWait: ({ ms, reason }) => { void deps.onProgress?.({ ...progress, phase: 'waiting-submit', waitSeconds: Math.ceil(ms / 1000), waitReason: reason }); },
+          onSend: () => { void deps.onProgress?.({ ...progress, phase: 'submitting', ...(lang !== 'cpp' ? { detail: lang } : {}) }); },
+        });
+      } catch (submitErr) {
+        const failure = leetCodeRequestFailure(submitErr);
+        const canUpgradeGhost =
+          typeof api.submitWithBrowserFallback === 'function' &&
+          !signal?.aborted &&
+          !(submitErr instanceof LeetCodeHttpError && submitErr.status === 200) &&
+          (failure.category === 'challenge' ||
+            failure.category === 'access-denied' ||
+            failure.category === 'session-csrf');
+        if (!canUpgradeGhost) throw submitErr;
+
+        logger.warn(
+          {
+            account: progressCtx?.label,
+            question: n,
+            slug,
+            language: lang,
+            category: failure.category,
+            httpStatus: submitErr instanceof LeetCodeHttpError ? submitErr.status : undefined,
+            rawErr: shortErr(submitErr),
+          },
+          'API submit challenged/rejected; retrying via ghost-mode stealth Chromium session',
+        );
+        if (progress) {
+          void deps.onProgress?.({
+            ...progress,
+            phase: 'submitting',
+            detail: `${lang} · ghost browser`,
+          });
+        }
+        return await api.submitWithBrowserFallback!({ slug: slug!, questionId, lang, code }, signal);
+      }
     };
 
     // 4) Submit with comment-stripping fallback (C++ only) + judge failure fallback
@@ -1613,8 +1665,17 @@ async function solveOne(
     return emitJudgeFailed(verdict.statusDisplay, submissionId, chosenLang, communityUuid);
   } catch (e) {
     const failure = leetCodeRequestFailure(e);
-    logger.warn({ account: progressCtx?.label, question: n, slug, stage, submissionId: submittedId,
-      category: failure.category, reason: failure.detail }, 'range request failed');
+    logger.warn({
+      account: progressCtx?.label,
+      question: n,
+      slug,
+      stage,
+      submissionId: submittedId,
+      category: failure.category,
+      httpStatus: e instanceof LeetCodeHttpError ? e.status : undefined,
+      rawErr: shortErr(e),
+      reason: failure.detail,
+    }, 'range request failed');
     if (isSubmissionLimitError(e)) {
       const msg = `LeetCode submission limit reached: ${shortErr(e)}`;
       if (progressCtx) {
@@ -1824,21 +1885,85 @@ const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const serverRangeGate = new RangeRequestGate();
 
-/** One HTTP session (no browser) carrying the account's own cookies. */
-async function openRequestSession(account: AccountRecord, signal?: AbortSignal): Promise<RangeSession> {
+/** One HTTP session carrying the account's cookies, transport UA, and proxy, with ghost-mode Chromium upgrade on challenge. */
+export async function openRequestSession(
+  account: AccountRecord,
+  signal?: AbortSignal,
+  sessionDeps: {
+    resolveProxy?: typeof resolveLeetCodeResidentialProxy;
+    submitGhost?: typeof submitViaGhostBrowser;
+    persistCookies?: typeof persistRotatedCookiesFromContext;
+  } = {},
+): Promise<RangeSession> {
   const state = parseStoredStorageState(account.storageState);
   if (!state.ok) throw new Error(state.error);
-  const ctx = await playwrightRequest.newContext({
-    userAgent: USER_AGENT,
-    storageState: { cookies: state.state.cookies, origins: [] },
-    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
-  });
+
+  const initialState = state.state;
+  const resolveProxy = sessionDeps.resolveProxy ?? resolveLeetCodeResidentialProxy;
+  const runGhostSubmit = sessionDeps.submitGhost ?? submitViaGhostBrowser;
+  const persistCookies = sessionDeps.persistCookies ?? persistRotatedCookiesFromContext;
+
+  const proxyUrl = initialState.transport?.proxyUrl ?? (await resolveProxy())?.url;
+  const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
+  if (proxyUrl && !proxy) {
+    throw new Error('LEETCODE_PROXY_INVALID');
+  }
+  const userAgent = initialState.transport?.userAgent ?? USER_AGENT;
+
+  const createCtx = (s: StorageStateShape) =>
+    playwrightRequest.newContext({
+      userAgent,
+      proxy,
+      storageState: {
+        cookies: deduplicateLeetCodeCookies(s.cookies ?? []) as never,
+        origins: [],
+      },
+      extraHTTPHeaders: buildBrowserClientHeaders(userAgent),
+    });
+
+  let currentState: StorageStateShape = {
+    ...initialState,
+    cookies: deduplicateLeetCodeCookies(initialState.cookies ?? []),
+    transport: initialState.transport ?? (proxyUrl ? { proxyUrl, userAgent } : { userAgent }),
+  };
+  let activeCtx = await createCtx(currentState);
+
+  const syncContextFromStorage = async (nextState: StorageStateShape) => {
+    const mergedState: StorageStateShape = {
+      ...nextState,
+      cookies: deduplicateLeetCodeCookies(nextState.cookies ?? []),
+      transport: nextState.transport ?? currentState.transport,
+      origins: nextState.origins?.length ? nextState.origins : currentState.origins,
+    };
+    const previousCtx = activeCtx;
+    activeCtx = await createCtx(mergedState);
+    currentState = mergedState;
+    await previousCtx.dispose().catch(() => undefined);
+    await persistCookies(account, initialState, { storageState: async () => mergedState }).catch(() => false);
+  };
+
+  const requestProxy = {
+    get: (...args: Parameters<typeof activeCtx.get>) => activeCtx.get(...args),
+    post: (...args: Parameters<typeof activeCtx.post>) => activeCtx.post(...args),
+    head: (...args: Parameters<typeof activeCtx.head>) => activeCtx.head(...args),
+    delete: (...args: Parameters<typeof activeCtx.delete>) => activeCtx.delete(...args),
+    fetch: (...args: Parameters<typeof activeCtx.fetch>) => activeCtx.fetch(...args),
+    put: (...args: Parameters<typeof activeCtx.put>) => activeCtx.put(...args),
+    patch: (...args: Parameters<typeof activeCtx.patch>) => activeCtx.patch(...args),
+    storageState: (...args: Parameters<typeof activeCtx.storageState>) => activeCtx.storageState(...args),
+    dispose: () => activeCtx.dispose(),
+  };
+
   const cookieJar = {
-    request: ctx,
+    request: requestProxy,
     cookies: async (url?: string | readonly string[]) => {
-      const all = (await ctx.storageState()).cookies;
-      const host = typeof url === 'string' ? new URL(url).hostname : null;
-      return host ? all.filter((c) => host === c.domain.replace(/^\./, '') || host.endsWith(c.domain)) : all;
+      const storage = await activeCtx.storageState();
+      const nowSec = Date.now() / 1000;
+      const all = (storage.cookies ?? []).filter(
+        (c) => !c.expires || c.expires <= 0 || c.expires > nowSec,
+      );
+      const targetUrl = typeof url === 'string' ? url : Array.isArray(url) ? url[0] : undefined;
+      return targetUrl ? all.filter((c) => cookieMatchesOrigin(c.domain, targetUrl)) : all;
     },
   };
   const cancelled = new AbortController();
@@ -1857,10 +1982,45 @@ async function openRequestSession(account: AccountRecord, signal?: AbortSignal):
         await serverRangeGate.wait(true, abortableSleep, requestSignal, progress?.onWait);
         progress?.onSend();
       }),
+      submitWithBrowserFallback: async (p, fallbackSignal) => {
+        const snapshot = await activeCtx.storageState().catch(() => null);
+        const latestState: StorageStateShape = snapshot
+          ? {
+              ...currentState,
+              cookies: snapshot.cookies as StorageStateShape['cookies'],
+            }
+          : currentState;
+        let synced = false;
+        const ghostResult = await runGhostSubmit(
+          latestState,
+          {
+            slug: p.slug,
+            questionId: p.questionId,
+            lang: p.lang,
+            code: p.code,
+            userAgent,
+            proxyUrl,
+            onStorageState: async (nextState) => {
+              synced = true;
+              await syncContextFromStorage(nextState);
+            },
+          },
+          fallbackSignal ?? requestSignal,
+        );
+        if (!synced) {
+          await syncContextFromStorage(ghostResult.storageState);
+        }
+        serverRangeGate.clearCooldown();
+        return ghostResult.submissionId;
+      },
       awaitResult: (id, slug) => api.awaitSubmission(id, slug, 180_000, { pollIntervalMs: 4_000 }),
       graphql: (q, v, s) => api.graphql(q, v, s as never),
     },
-    close: () => { cancelled.abort(); return ctx.dispose(); },
+    close: async () => {
+      cancelled.abort();
+      await persistCookies(account, initialState, activeCtx).catch(() => false);
+      await activeCtx.dispose().catch(() => undefined);
+    },
   };
 }
 

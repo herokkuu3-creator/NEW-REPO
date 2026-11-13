@@ -1265,4 +1265,69 @@ describe('parallel range submission', () => {
       { phase: 'accepted', stepIndex: 2, stepTotal: 2 },
     ]);
   });
+
+  it('upgrades a 403 challenge or CSRF failure at submit time to ghost-mode browser fallback without backing off', async () => {
+    const ghostSubmit = vi.fn(async () => 'ghost-sub-177');
+    const baseSession = makeSession(() => 'accepted', []);
+    const session: RangeSession = {
+      ...baseSession,
+      api: {
+        ...baseSession.api,
+        submit: async () => {
+          throw new LeetCodeHttpError('submit HTTP 403: <!DOCTYPE html> <title>Just a moment...</title>', 403);
+        },
+        submitWithBrowserFallback: ghostSubmit,
+      },
+    };
+    const { deps, sleeps } = makeDeps(session, [acc('a1')], {
+      blockedBackoffMs: [60_000, 120_000],
+    });
+    const r = await startRangeJob({ from: 177, to: 177 }, 'a1', deps);
+    const results = await r.done;
+
+    expect(ghostSubmit).toHaveBeenCalledTimes(1);
+    expect(sleeps).toEqual([]);
+    expect(results[0]!.results[0]).toMatchObject({
+      number: 177,
+      status: 'accepted',
+      submissionId: 'ghost-sub-177',
+    });
+  });
+
+  it('never upgrades HTTP 200 non-JSON submit ambiguity or HTTP 429 rate limits to ghost browser fallback', async () => {
+    const ghostSubmit = vi.fn(async () => 'should-not-run');
+    const baseSession = makeSession(() => 'accepted', []);
+    const session200: RangeSession = {
+      ...baseSession,
+      api: {
+        ...baseSession.api,
+        submit: async () => {
+          throw new LeetCodeHttpError('submit returned non-JSON body', 200);
+        },
+        submitWithBrowserFallback: ghostSubmit,
+      },
+    };
+    const { deps: deps200 } = makeDeps(session200, [acc('a1')]);
+    const r200 = await (await startRangeJob({ from: 177, to: 177 }, 'a1', deps200)).done;
+    expect(ghostSubmit).not.toHaveBeenCalled();
+    expect(r200[0]!.results[0]).toMatchObject({
+      status: 'error',
+      detail: expect.stringContaining('outcome unknown'),
+    });
+
+    const session429: RangeSession = {
+      ...baseSession,
+      api: {
+        ...baseSession.api,
+        submit: async () => {
+          throw new LeetCodeHttpError('submit HTTP 429', 429, 50);
+        },
+        submitWithBrowserFallback: ghostSubmit,
+      },
+    };
+    const { deps: deps429 } = makeDeps(session429, [acc('a1')], { blockedBackoffMs: [] });
+    const r429 = await (await startRangeJob({ from: 178, to: 178 }, 'a1', deps429)).done;
+    expect(ghostSubmit).not.toHaveBeenCalled();
+    expect(r429[0]!.results[0]!.status).toBe('error');
+  });
 });

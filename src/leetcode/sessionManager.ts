@@ -13,7 +13,7 @@ import { getSystemState, setSystemState } from '../database/models';
 import { checkSession, type SessionCheckResult } from '../browser/sessionCheck';
 import { extractSessionIdentity, type SessionIdentity } from '../browser/sessionIdentity';
 import { type StorageStateShape } from '../browser/cookiePayload';
-import { LeetCodeApi } from './apiClient';
+import { buildBrowserClientHeaders, cookieMatchesOrigin, deduplicateLeetCodeCookies, LeetCodeApi } from './apiClient';
 import { logger } from '../logger';
 import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
@@ -61,7 +61,7 @@ export async function persistRotatedCookiesFromContext(
     }
     const updatedState: StorageStateShape = {
       transport: initialState.transport,
-      cookies: latest.cookies as StorageStateShape['cookies'],
+      cookies: deduplicateLeetCodeCookies(latest.cookies as StorageStateShape['cookies']),
       origins: Array.isArray(initialState.origins) ? initialState.origins : [],
     };
     const prevFp = cookieFingerprint(initialState);
@@ -112,27 +112,27 @@ export async function openLightweightLeetCodeSession(
   const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
   if (proxyUrl && !proxy) throw new Error('LEETCODE_PROXY_INVALID');
 
+  const userAgent = state.transport?.userAgent ?? DEFAULT_USER_AGENT;
   const ctx = await playwrightRequest.newContext({
-    userAgent: state.transport?.userAgent ?? DEFAULT_USER_AGENT,
+    userAgent,
     proxy,
     storageState: {
-      cookies: state.cookies as never,
+      cookies: deduplicateLeetCodeCookies(state.cookies ?? []) as never,
       origins: [],
     },
-    extraHTTPHeaders: {
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
+    extraHTTPHeaders: buildBrowserClientHeaders(userAgent),
   });
 
   const cookieJar = {
     request: ctx,
     cookies: async (url?: string | readonly string[]) => {
       const current = await ctx.storageState();
-      const all = current.cookies ?? [];
-      const host = typeof url === 'string' ? new URL(url).hostname : null;
-      return host
-        ? all.filter((c) => host === c.domain.replace(/^\./, '') || host.endsWith(c.domain))
-        : all;
+      const nowSec = Date.now() / 1000;
+      const all = (current.cookies ?? []).filter(
+        (c) => !c.expires || c.expires <= 0 || c.expires > nowSec,
+      );
+      const targetUrl = typeof url === 'string' ? url : Array.isArray(url) ? url[0] : undefined;
+      return targetUrl ? all.filter((c) => cookieMatchesOrigin(c.domain, targetUrl)) : all;
     },
   };
 

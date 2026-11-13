@@ -36,7 +36,8 @@ import {
   fetchDailyChallenge,
   fetchQuestionData,
 } from '../leetcode/dailyChallenge';
-import { LeetCodeApi, looksLikeChallenge } from '../leetcode/apiClient';
+import { LeetCodeApi, LeetCodeHttpError, leetCodeRequestFailure, looksLikeChallenge } from '../leetcode/apiClient';
+import { submitViaGhostBrowser } from '../leetcode/ghostSubmit';
 import { parseProblem, ProblemParseError } from '../leetcode/parser';
 import { createLLMProvider } from '../ai/provider';
 import { solveProblem, SolveResult } from '../ai/solver';
@@ -833,13 +834,44 @@ async function submitViaApi(
     });
   }
 
+  const questionId = problem.questionId;
   try {
-    const submissionId = await api.submitSolution({
-      slug: problem.slug,
-      questionId: problem.questionId,
-      lang: config.llm.language,
-      code,
-    });
+    let submissionId: string;
+    try {
+      submissionId = await api.submitSolution({
+        slug: problem.slug,
+        questionId,
+        lang: config.llm.language,
+        code,
+      });
+    } catch (submitErr) {
+      const failure = leetCodeRequestFailure(submitErr);
+      const parsedState = parseStoredStorageState(account.storageState);
+      const canUpgradeGhost =
+        parsedState.ok &&
+        !(submitErr instanceof LeetCodeHttpError && submitErr.status === 200) &&
+        (looksLikeChallenge(submitErr) ||
+          failure.category === 'access-denied' ||
+          failure.category === 'session-csrf');
+      if (!canUpgradeGhost) throw submitErr;
+
+      logger.warn(
+        { label: account.label, slug: problem.slug, category: failure.category },
+        'daily API submit challenged/rejected; retrying via ghost-mode stealth Chromium fallback',
+      );
+      const ghostResult = await submitViaGhostBrowser(parsedState.state, {
+        slug: problem.slug,
+        questionId,
+        lang: config.llm.language,
+        code,
+        onStorageState: async (updatedState) => {
+          await persistRotatedCookiesFromContext(account, parsedState.state, {
+            storageState: async () => updatedState,
+          });
+        },
+      });
+      submissionId = ghostResult.submissionId;
+    }
     const result = await api.awaitSubmission(submissionId, problem.slug);
 
     if (result.classification === 'ACCEPTED') {
@@ -1049,6 +1081,8 @@ export const DAILY_RETRY_GAP_MS = 60 * 60 * 1000; // 1 hour gap between retry at
 
 async function triggerDailyRetry(): Promise<void> {
   if (runInProgress) return;
+  const { isRangeJobActive } = await import('./rangeSubmission').catch(() => ({ isRangeJobActive: () => false }));
+  if (isRangeJobActive()) return;
   if (!isPastScheduledDailyTime()) return;
   const today = leetcodeDayKey();
   const accounts = await listEnabledAccounts().catch(() => []);

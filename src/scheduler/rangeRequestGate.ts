@@ -17,6 +17,9 @@ export class RangeRequestGate {
     const delay = error instanceof LeetCodeHttpError ? error.retryAfterMs : undefined;
     this.blockedUntil = Math.max(this.blockedUntil, this.now() + Math.max(delay ?? 60000, 1000));
   }
+  clearCooldown(): void {
+    this.blockedUntil = 0;
+  }
   async wait(
     submit: boolean,
     sleep: (ms: number, signal: AbortSignal) => Promise<void>,
