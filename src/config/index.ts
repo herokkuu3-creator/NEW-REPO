@@ -87,7 +87,7 @@ const envSchema = z.object({
   BAZAARLINK_API_KEY: z.string().default(''),
   BAZAARLINK_API_KEYS: z.string().default(''),
   SOLUTION_POST_BASE_URL: z.string().url().default(DEFAULT_SOLUTION_POST_BASE_URL),
-  SOLUTION_POST_MODELS: z.string().default('minimax-m3,deepseek-v4.1-flash-1017,qwen3.8-27b'),
+  SOLUTION_POST_MODELS: z.string().default('deepseek-v4.1-flash-1017,qwen3.8-27b,Sage-A1.5'),
   SOLUTION_POST_TIMEOUT_MS: intFromString(90000).pipe(z.number().min(1000).max(300000)),
   SOLUTION_POST_RETRIES: intFromString(3).pipe(z.number().min(0).max(5)),
   SOLUTION_POST_MAX_TOKENS: intFromString(8192).pipe(z.number().min(2048).max(32768)),

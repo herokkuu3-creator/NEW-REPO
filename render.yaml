@@ -92,7 +92,7 @@ services:
       - key: SOLUTION_POST_BASE_URL
         value: https://discovery-api.intern-ai.org.cn/v1
       - key: SOLUTION_POST_MODELS
-        value: minimax-m3,deepseek-v4.1-flash-1017,qwen3.8-27b
+        value: deepseek-v4.1-flash-1017,qwen3.8-27b,Sage-A1.5
       - key: SOLUTION_POST_API_KEY
         value: sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056
       - key: SOLUTION_AI_PROVIDER
