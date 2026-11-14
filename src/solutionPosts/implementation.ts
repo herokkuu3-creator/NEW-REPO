@@ -44,7 +44,12 @@ export async function generateImplementation(router: AIModelRouter, context: Sub
       const fallback = await writeImplementation(await router.fallback(), context, previous, reserve);
       return { ...fallback, attempts: [...error.attempts, ...fallback.attempts] };
     } catch (fallbackError) {
-      if (fallbackError instanceof RoutingError) throw new RoutingError([...error.attempts, ...fallbackError.attempts], fallbackError.lastFailure);
+      if (fallbackError instanceof RoutingError) {
+        if (fallbackError.lastFailure === 'ARTICLE_TIME_BUDGET_EXCEEDED') {
+          throw new CoarenaPause('COARENA_CAPACITY', new Date(Date.now() + 60_000), [...error.attempts, ...fallbackError.attempts]);
+        }
+        throw new RoutingError([...error.attempts, ...fallbackError.attempts], fallbackError.lastFailure);
+      }
       throw fallbackError;
     }
   }

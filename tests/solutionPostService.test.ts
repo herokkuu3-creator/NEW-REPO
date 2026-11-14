@@ -41,7 +41,7 @@ import { prisma } from '../src/database/prisma';
 import { assertTransition, approvePost, move } from '../src/solutionPosts/store';
 import { ArticleReviewError, contextSchema, hash } from '../src/solutionPosts/article';
 import { CoarenaPause } from '../src/solutionPosts/coarenaLimits';
-import { RoutingError } from '../src/solutionPosts/router';
+import { RoutingError, SOLUTION_ARTICLE_WORK_MS } from '../src/solutionPosts/router';
 const context = contextSchema.parse({ accountId: 'a', username: 'alice', problemId: '1', slug: 'example',
   title: 'Example', difficulty: 'Easy', problem: 'An example problem', submissionId: '123', language: 'cpp', code: 'source\r\n', challengeDate: '2026-10-15' });
 const implementation = { code: 'class Solution { public: int count() { return 1; } };', approach: 'Return the only possible count.' };
@@ -116,7 +116,7 @@ describe('solution workflow and persistence', () => {
   });
   it('requeues only the exact observed stale generation and preserves the accepted source', async () => {
     await generatePost(context, {} as never);
-    const stale = new Date(Date.now() - 10 * 60_000);
+    const stale = new Date(Date.now() - (SOLUTION_ARTICLE_WORK_MS + 60_000));
     h.row.status = 'GENERATING';
     h.row.updatedAt = stale;
     await expect(requeueInterruptedGeneration('post1', new Date(stale.getTime() - 1000)))
@@ -178,6 +178,12 @@ describe('solution workflow and persistence', () => {
     expect(await retryPost(paused.id)).toMatchObject({ status: 'AWAITING_APPROVAL', lastError: null, retryCount: 1 });
     expect(h.verdict).not.toHaveBeenCalled();
     expect(h.generation).toHaveBeenCalledTimes(2);
+  });
+  it('pauses on ARTICLE_TIME_BUDGET_EXCEEDED without consuming retries or wiping draft', async () => {
+    h.generation.mockRejectedValueOnce(new RoutingError([{ model: 'discovery', attempt: 1, outcome: 'ARTICLE_TIME_BUDGET_EXCEEDED', elapsedMs: 1 }], 'ARTICLE_TIME_BUDGET_EXCEEDED'));
+    const paused = await generatePost(context, {} as never);
+    expect(paused).toMatchObject({ status: 'RETRY_PENDING', lastError: 'COARENA_CAPACITY', retryCount: 0 });
+    expect(paused.leaseUntil).toBeDefined();
   });
   it('reports provider throttling as a retryable rate limit, including during technical review', async () => {
     h.generation.mockRejectedValue(new ArticleReviewError([{ model: 'qwen', attempt: 1,

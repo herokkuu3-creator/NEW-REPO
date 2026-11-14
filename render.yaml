@@ -110,7 +110,7 @@ services:
       - key: LLM_PROVIDER
         value: gemini
       - key: LLM_MODEL
-        value: gemini-3.5-flash
+        value: gemini-3.8-flash
       - key: LLM_MAX_TOKENS
         value: "8192"
       # Only set this if you switch SOLUTION_SOURCE to llm:

@@ -56,7 +56,7 @@ const envSchema = z.object({
   // fallback so a Google AI Studio key can be pasted under either name.
   LLM_API_KEY: z.string().default(''),
   GEMINI_API_KEY: z.string().default(''),
-  LLM_MODEL: z.string().default('gemini-3.5-flash'),
+  LLM_MODEL: z.string().default('gemini-3.8-flash'),
   LLM_BASE_URL: z.string().default(''),
   LLM_TIMEOUT_MS: intFromString(120_000),
   LLM_MAX_TOKENS: intFromString(8192),

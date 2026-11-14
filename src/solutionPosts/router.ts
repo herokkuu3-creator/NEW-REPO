@@ -11,7 +11,7 @@ let nextSageRequestAt = 0;
 let sageBlockedUntil = 0;
 const sageModelHealth = new Map<string, { failures: number; until: number; lastFailureAt: number }>();
 const SAGE_MODEL_COOLDOWN_MS = 30 * 60 * 1000;
-export const SOLUTION_ARTICLE_WORK_MS = 5 * 60_000;
+export const SOLUTION_ARTICLE_WORK_MS = Number(process.env.SOLUTION_ARTICLE_WORK_MS) || 12 * 60_000;
 export const SAGE_REPAIR_TIMEOUT_MS = 300000;
 export const SAGE_REVIEW_TIMEOUT_MS = 300000;
 

@@ -8,6 +8,7 @@ import { getSystemState, setSystemState } from '../database/models';
 import { parseStoredStorageState } from '../database/accounts';
 import { checkSession } from '../browser/sessionCheck';
 import { LeetCodeApi } from '../leetcode/apiClient';
+import { htmlToText } from '../leetcode/parser';
 import { fetchDailyChallenge, fetchQuestionData } from '../leetcode/dailyChallenge';
 import { AIModelRouter, RoutingError, SOLUTION_ARTICLE_WORK_MS } from './router';
 import { FirecrawlAgentRouter } from './firecrawlAgent';
@@ -90,7 +91,7 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
       throw new PostError('PROBLEM_UNAVAILABLE');
     }
     return contextSchema.parse({ accountId, username, problemId: question.questionId, slug: run.problemSlug,
-      title: run.title, difficulty: run.difficulty, problem: question.contentHtml,
+      title: run.title, difficulty: run.difficulty, problem: htmlToText(question.contentHtml) || question.contentHtml,
       submissionId: run.submissionId, language: run.language, code: run.solution,
       challengeDate: contextDate, topicTags: question.topicTags ?? [] });
   });
@@ -285,13 +286,17 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     await onStage?.('draft_ready', 'Article ready with both GIFs verified');
     return post;
   } catch (error) {
-    if (error instanceof CoarenaPause) {
-      const attempts = [...implementationAttempts, ...error.attempts];
-      if (!error.attempts.length) attempts.push({ model: 'limits', provider: 'coarena',
-        attempt: 0, elapsedMs: 0, outcome: error.code, deferred: true });
-      post = await move(post, 'RETRY_PENDING', { leaseUntil: error.retryAt, lastError: error.code,
+    if (error instanceof CoarenaPause || (error instanceof RoutingError && error.lastFailure === 'ARTICLE_TIME_BUDGET_EXCEEDED')) {
+      const isBudget = error instanceof RoutingError && error.lastFailure === 'ARTICLE_TIME_BUDGET_EXCEEDED';
+      const code = isBudget ? 'COARENA_CAPACITY' : (error as CoarenaPause).code;
+      const retryAt = isBudget ? new Date(Date.now() + 60_000) : (error as CoarenaPause).retryAt;
+      const errorAttempts = isBudget ? (error as RoutingError).attempts : (error as CoarenaPause).attempts;
+      const attempts = [...implementationAttempts, ...errorAttempts];
+      if (!errorAttempts.length) attempts.push({ model: 'limits', provider: 'coarena',
+        attempt: 0, elapsedMs: 0, outcome: code, deferred: true });
+      post = await move(post, 'RETRY_PENDING', { leaseUntil: retryAt, lastError: code,
         attempts: JSON.stringify(attempts), retryCount: priorRetryCount });
-      logger.info({ postId: post.id, accountId: post.accountId, code: error.code, retryAt: error.retryAt },
+      logger.info({ postId: post.id, accountId: post.accountId, code, retryAt },
         'solution article waiting for Coarena');
       return post;
     }

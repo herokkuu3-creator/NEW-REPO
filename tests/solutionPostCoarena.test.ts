@@ -184,3 +184,21 @@ it('saves a preferred pair, keeps the alternate models, and restores automatic o
   await expect(setCoarenaModelPreference('auto')).resolves.toMatchObject({ mode: 'auto' });
   expect((await loadCoarenaModelOrder()).writers[0]).toBe(COARENA_WRITER);
 });
+
+it('converts ARTICLE_TIME_BUDGET_EXCEEDED from fallback into a CoarenaPause capacity pause', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ data: { free: true, usd_per_day: 5, today: {
+    used_usd: 0, left_usd: 5, resets_at: Date.now() + 60_000, requests_left: null,
+  } } })));
+  vi.spyOn(AIModelRouter.prototype, 'generate').mockRejectedValueOnce(new RoutingError([{ model: COARENA_WRITER,
+    provider: 'coarena', attempt: 1, elapsedMs: 1, outcome: 'MODEL_NOT_FOUND', httpStatus: 404 }]));
+  const fallback = vi.fn(async () => ({
+    generate: vi.fn(async () => {
+      throw new RoutingError([{ model: 'discovery', attempt: 1, outcome: 'ARTICLE_TIME_BUDGET_EXCEEDED', elapsedMs: 1 }], 'ARTICLE_TIME_BUDGET_EXCEEDED');
+    }),
+  } as unknown as AIModelRouter));
+  const router = new CoarenaRouter('coa_fallback_budget', fallback);
+  await expect(router.generate(request, validate)).rejects.toMatchObject({
+    code: 'COARENA_CAPACITY',
+  });
+  expect(fallback).toHaveBeenCalledOnce();
+});

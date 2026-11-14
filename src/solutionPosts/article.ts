@@ -371,7 +371,12 @@ export async function generateArticle(router: AIModelRouter, context: Submission
       return { ...result, attempts: [...primaryAttempts, ...result.attempts] };
     } catch (error) {
       if (error instanceof ArticleReviewError) throw new ArticleReviewError([...primaryAttempts, ...error.attempts], error.draft, error.lastFailure);
-      if (error instanceof RoutingError) throw new RoutingError([...primaryAttempts, ...error.attempts], error.lastFailure);
+      if (error instanceof RoutingError) {
+        if (error.lastFailure === 'ARTICLE_TIME_BUDGET_EXCEEDED') {
+          throw new CoarenaPause('COARENA_CAPACITY', new Date(Date.now() + 60_000), [...primaryAttempts, ...error.attempts]);
+        }
+        throw new RoutingError([...primaryAttempts, ...error.attempts], error.lastFailure);
+      }
       throw error;
     }
   }

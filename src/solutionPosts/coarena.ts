@@ -235,7 +235,12 @@ export class CoarenaRouter extends AIModelRouter {
       const result = await (await this.fallback()).generate(messages, validate, maxTokens, jsonMode, stage);
       return { ...result, attempts: [...primaryAttempts, ...result.attempts] };
     } catch (error) {
-      if (error instanceof RoutingError) throw new RoutingError([...primaryAttempts, ...error.attempts], error.lastFailure);
+      if (error instanceof RoutingError) {
+        if (error.lastFailure === 'ARTICLE_TIME_BUDGET_EXCEEDED') {
+          throw new CoarenaPause('COARENA_CAPACITY', new Date(Date.now() + 60_000), [...primaryAttempts, ...error.attempts]);
+        }
+        throw new RoutingError([...primaryAttempts, ...error.attempts], error.lastFailure);
+      }
       throw error;
     }
   }
