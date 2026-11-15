@@ -154,7 +154,14 @@ function parseStorageStateJson(text: string): ParseResult {
       });
     }
   }
-  return finalize(cookies, origins, 'storageState JSON');
+  let transport: { userAgent?: string } | undefined;
+  if (obj.transport && typeof obj.transport === 'object' && !Array.isArray(obj.transport)) {
+    const rawUa = (obj.transport as Record<string, unknown>).userAgent;
+    if (typeof rawUa === 'string' && rawUa.trim().length > 0 && rawUa.trim().length <= 512) {
+      transport = { userAgent: rawUa.trim() };
+    }
+  }
+  return finalize(cookies, origins, 'storageState JSON', transport);
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +173,12 @@ function parseStorageStateJson(text: string): ParseResult {
  * dedupes by name+domain (last wins), and requires the two cookies the
  * pipeline actually needs: LEETCODE_SESSION (auth) and csrftoken (submit).
  */
-function finalize(cookies: StorageCookie[], origins: StorageOrigin[], format: string): ParseResult {
+function finalize(
+  cookies: StorageCookie[],
+  origins: StorageOrigin[],
+  format: string,
+  transport?: { userAgent?: string },
+): ParseResult {
   const leetcodeOnly = cookies.filter((c) => c.domain.includes('leetcode.com'));
   const deduped = [...new Map(leetcodeOnly.map((c) => [`${c.name}@${c.domain}`, c])).values()];
 
@@ -190,7 +202,15 @@ function finalize(cookies: StorageCookie[], origins: StorageOrigin[], format: st
         'the csrftoken cookie is missing — it is required for submissions. Copy it together with LEETCODE_SESSION (DevTools → Application → Cookies, or export everything with Cookie-Editor)',
     };
   }
-  return { ok: true, storageState: { cookies: deduped, origins }, format };
+  return {
+    ok: true,
+    storageState: {
+      cookies: deduped,
+      origins,
+      ...(transport?.userAgent ? { transport } : {}),
+    },
+    format,
+  };
 }
 
 // ---------------------------------------------------------------------------

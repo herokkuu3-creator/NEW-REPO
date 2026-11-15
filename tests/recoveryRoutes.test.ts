@@ -295,4 +295,175 @@ describe('Recovery Routes', () => {
       expect(blockedRes.body).toContain('Too many requests');
     });
   });
+
+  describe('Local-IP Recovery Routes', () => {
+    const validToken = 'valid-token-1234567890123456789012345678901';
+    const usedToken = 'used-token-12345678901234567890123456789012';
+
+    beforeEach(() => {
+      mockService.bootstrapLocalRecovery = vi.fn(async (token: string) => {
+        if (token === validToken) {
+          return {
+            ok: true as const,
+            label: 'black_sheep_7',
+            expectedUsername: 'black_sheep_7',
+            credentials: { identifier: 'black_sheep_7', password: 'secret-password' },
+          };
+        }
+        return { ok: false as const, reason: 'expired' as const };
+      });
+      mockService.getRecoveryPollStatus = vi.fn(async (token: string) => {
+        if (token === usedToken) {
+          return { state: 'recovered' as const, label: 'black_sheep_7', username: 'black_sheep_7' };
+        }
+        if (token === validToken) {
+          return { state: 'valid' as const, label: 'black_sheep_7', username: 'black_sheep_7' };
+        }
+        return { state: 'invalid' as const };
+      });
+      mockService.completeLocalRecovery = vi.fn(async (token: string, body: unknown) => {
+        if (token !== validToken) {
+          return {
+            ok: false as const,
+            httpStatus: 410 as const,
+            reason: 'expired' as const,
+            error: 'This recovery link has expired.',
+          };
+        }
+        if (!body || (typeof body === 'object' && !('storageState' in body) && !('cookies' in body))) {
+          return {
+            ok: false as const,
+            httpStatus: 400 as const,
+            reason: 'invalid_payload' as const,
+            error: 'Missing session payload.',
+          };
+        }
+        return {
+          ok: true as const,
+          httpStatus: 200 as const,
+          label: 'black_sheep_7',
+          username: 'black_sheep_7',
+          serverVerified: true,
+        };
+      });
+    });
+
+    it('renders local-IP recovery options and collapsible server-browser fallback on GET /auth/recover/:token', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/auth/recover/${validToken}`,
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toContain(`/auth/recover/${validToken}/launch.cmd`);
+      expect(res.body).toContain(`/auth/recover/${validToken}/script.ps1`);
+      expect(res.body).toContain('/auth/recover/userscript.user.js');
+      expect(res.body).toContain('id="directUploadForm"');
+      expect(res.body).toContain('<details class="card">');
+    });
+
+    it('renders Session Restored page for GET /auth/recover/:token?completed=1 when token was used', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/auth/recover/${usedToken}?completed=1`,
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toContain('Session Restored');
+    });
+
+    it('returns poll status on GET /auth/recover/:token/poll', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/auth/recover/${validToken}/poll`,
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({
+        state: 'valid',
+        label: 'black_sheep_7',
+        username: 'black_sheep_7',
+      });
+    });
+
+    it('returns bootstrap details with Cache-Control: no-store on POST /auth/recover/:token/bootstrap', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/auth/recover/${validToken}/bootstrap`,
+        payload: {},
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(JSON.parse(res.body)).toEqual({
+        ok: true,
+        label: 'black_sheep_7',
+        expectedUsername: 'black_sheep_7',
+        credentials: { identifier: 'black_sheep_7', password: 'secret-password' },
+      });
+    });
+
+    it('handles POST /auth/recover/:token/complete and POST /auth/recover/:token', async () => {
+      const resComplete = await app.inject({
+        method: 'POST',
+        url: `/auth/recover/${validToken}/complete`,
+        payload: { cookies: 'LEETCODE_SESSION=abc; csrftoken=xyz' },
+      });
+      expect(resComplete.statusCode).toBe(200);
+      expect(JSON.parse(resComplete.body)).toEqual({
+        ok: true,
+        httpStatus: 200,
+        label: 'black_sheep_7',
+        username: 'black_sheep_7',
+        serverVerified: true,
+        redirectUrl: `/auth/recover/${validToken}?completed=1`,
+      });
+
+      const resDirect = await app.inject({
+        method: 'POST',
+        url: `/auth/recover/${validToken}`,
+        payload: { storageState: { cookies: [{ name: 'LEETCODE_SESSION', value: 'abc' }], origins: [] } },
+      });
+      expect(resDirect.statusCode).toBe(200);
+      expect(JSON.parse(resDirect.body).redirectUrl).toBe(`/auth/recover/${validToken}?completed=1`);
+
+      const resBad = await app.inject({
+        method: 'POST',
+        url: `/auth/recover/${validToken}/complete`,
+        payload: {},
+      });
+      expect(resBad.statusCode).toBe(400);
+
+      const resExpired = await app.inject({
+        method: 'POST',
+        url: `/auth/recover/expired-token-1234567890123456789012345678/complete`,
+        payload: { cookies: 'LEETCODE_SESSION=abc' },
+      });
+      expect(resExpired.statusCode).toBe(410);
+    });
+
+    it('serves launch.cmd, script.ps1, script.sh, and userscript.user.js', async () => {
+      const cmdRes = await app.inject({ method: 'GET', url: `/auth/recover/${validToken}/launch.cmd` });
+      expect(cmdRes.statusCode).toBe(200);
+      expect(cmdRes.headers['content-type']).toContain('application/x-bat');
+      expect(cmdRes.body).toContain('ExecutionPolicy Bypass');
+      expect(cmdRes.body).toContain(`/auth/recover/${validToken}/script.ps1`);
+
+      const psRes = await app.inject({ method: 'GET', url: `/auth/recover/${validToken}/script.ps1` });
+      expect(psRes.statusCode).toBe(200);
+      expect(psRes.headers['content-type']).toContain('text/plain');
+      expect(psRes.body).toContain('FromBase64String');
+
+      const shRes = await app.inject({ method: 'GET', url: `/auth/recover/${validToken}/script.sh` });
+      expect(shRes.statusCode).toBe(200);
+      expect(shRes.headers['content-type']).toContain('text/plain');
+      expect(shRes.body).toContain('exec node');
+
+      const userJsRes = await app.inject({ method: 'GET', url: '/auth/recover/userscript.user.js' });
+      expect(userJsRes.statusCode).toBe(200);
+      expect(userJsRes.headers['content-type']).toContain('text/javascript');
+      expect(userJsRes.body).toContain('==UserScript==');
+      expect(userJsRes.body).toContain('GM_cookie');
+    });
+  });
 });

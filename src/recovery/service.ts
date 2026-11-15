@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { AccountStatus } from '@prisma/client';
 import { logger } from '../logger';
-import type { StorageStateShape } from '../browser/cookiePayload';
+import { parseCookiePayload, type StorageStateShape } from '../browser/cookiePayload';
+import { extractSessionIdentity } from '../browser/sessionIdentity';
 import { driveLeetCodeLogin, type DriverPhase } from './loginDriver';
 import type { RemoteBrowser, RemoteInput } from './remoteBrowser';
 import {
@@ -92,7 +93,9 @@ export interface RecoveryDeps {
   /** Live GraphQL userStatus check of the STORED session (never opens a login page). */
   verifyStoredSession(account: RecoveryAccount): Promise<LiveVerification>;
   /** Live GraphQL userStatus check of a freshly captured storageState (server API transport). */
-  verifyCapturedSession(state: StorageStateShape): Promise<{ authenticated: boolean; username?: string | null }>;
+  verifyCapturedSession(
+    state: StorageStateShape,
+  ): Promise<{ authenticated: boolean; username?: string | null; cause?: 'signed-out' | 'query-failed' }>;
   getCredentials(account: RecoveryAccount): Promise<RecoveryCredentials | null>;
   openBrowser(): Promise<RemoteBrowser>;
   sendTelegram(text: string, markup?: TelegramMarkup): Promise<boolean>;
@@ -178,6 +181,90 @@ interface PortalSession {
 export type OpenResult =
   | { ok: true; secret: string; label: string }
   | { ok: false; reason: 'invalid' | 'expired' | 'used' | 'cancelled' | 'busy' | 'unavailable'; message?: string };
+
+export type BootstrapRecoveryResult =
+  | {
+      ok: true;
+      label: string;
+      expectedUsername: string | null;
+      credentials: { identifier: string; password: string } | null;
+    }
+  | {
+      ok: false;
+      reason: 'invalid' | 'expired' | 'used' | 'cancelled' | 'unavailable';
+      message?: string;
+    };
+
+export interface RecoveryPollStatus {
+  state: 'valid' | 'in_session' | 'recovered' | 'expired' | 'used' | 'cancelled' | 'invalid';
+  label?: string;
+  username?: string | null;
+}
+
+export interface CompleteLocalRecoveryPayload {
+  storageState?: unknown;
+  cookies?: unknown;
+  localVerifiedUsername?: string | null;
+  userAgent?: string | null;
+}
+
+export type CompleteLocalRecoveryResult =
+  | {
+      ok: true;
+      httpStatus: 200;
+      label: string;
+      username: string;
+      serverVerified: boolean;
+    }
+  | {
+      ok: false;
+      httpStatus: 400 | 404 | 409 | 410 | 422;
+      reason:
+        | 'invalid'
+        | 'expired'
+        | 'used'
+        | 'cancelled'
+        | 'unavailable'
+        | 'busy'
+        | 'invalid_payload'
+        | 'verification_failed'
+        | 'username_mismatch'
+        | 'wrong_account'
+        | 'database_error';
+      error: string;
+      label?: string;
+    };
+
+function extractLocalPayload(payload: unknown): {
+  raw: string | null;
+  localVerifiedUsername: string | null;
+  userAgent: string | null;
+} {
+  if (typeof payload === 'string') {
+    const trimmed = payload.trim();
+    return { raw: trimmed || null, localVerifiedUsername: null, userAgent: null };
+  }
+  if (!payload || typeof payload !== 'object') {
+    return { raw: null, localVerifiedUsername: null, userAgent: null };
+  }
+  const obj = payload as Record<string, unknown>;
+  const localVerifiedUsername =
+    typeof obj.localVerifiedUsername === 'string' ? obj.localVerifiedUsername.trim() || null : null;
+  const userAgent =
+    typeof obj.userAgent === 'string' && obj.userAgent.trim().length > 0 && obj.userAgent.trim().length <= 512
+      ? obj.userAgent.trim()
+      : null;
+
+  let raw: string | null = null;
+  if (obj.storageState !== undefined) {
+    raw = typeof obj.storageState === 'string' ? obj.storageState.trim() : JSON.stringify(obj.storageState);
+  } else if (obj.cookies !== undefined && !Array.isArray(obj.origins)) {
+    raw = typeof obj.cookies === 'string' ? obj.cookies.trim() : JSON.stringify(obj.cookies);
+  } else if (Array.isArray(obj.cookies)) {
+    raw = JSON.stringify(obj);
+  }
+  return { raw: raw || null, localVerifiedUsername, userAgent };
+}
 
 export interface MonitorSummary {
   checked: number;
@@ -361,7 +448,12 @@ export class RecoveryService {
       if (recovery.lastErrorCategory) lines.push(`Last attempt: ${esc(describeCategory(recovery.lastErrorCategory))}`);
       lines.push('');
       if (link) {
-        lines.push('Your account credentials are already securely saved.', '', 'Open the recovery link to complete verification and restore your session.');
+        lines.push(
+          'Your account credentials are already securely saved.',
+          '',
+          'Open the recovery link to verify from your <b>local IP</b> (bypasses datacenter Cloudflare blocks) and automatically sync your session back to the bot:',
+          `<code>npm.cmd run auth:login -- "${esc(link)}"</code>`,
+        );
         buttons.push([{ text: '🔗 Reconnect Account', url: link }]);
       } else {
         lines.push(`Action needed: ${esc(describeCategory(recovery.lastErrorCategory ?? ''))}. Re-save the account with <code>/lclogin ${esc(account.label)}</code>.`);
@@ -411,6 +503,289 @@ export class RecoveryService {
     if (!row.tokenExpiresAt || row.tokenExpiresAt <= this.deps.now()) return { state: 'expired' };
     const account = await this.deps.getAccount(row.accountId);
     return { state: 'valid', label: account?.label };
+  }
+
+  /** Polls recovery progress for the open browser tab without consuming the token. */
+  async getRecoveryPollStatus(token: string): Promise<RecoveryPollStatus> {
+    if (!isWellFormedToken(token)) return { state: 'invalid' };
+    const row = await this.deps.store.findByTokenHash(hashRecoveryToken(token));
+    if (!row) return { state: 'invalid' };
+    const account = await this.deps.getAccount(row.accountId);
+    if (row.status === RecoveryStatus.RECOVERED) {
+      return { state: 'recovered', label: account?.label, username: account?.username ?? null };
+    }
+    if (row.status === RecoveryStatus.CANCELLED) return { state: 'cancelled', label: account?.label };
+    if (IN_SESSION_STATUSES.includes(row.status)) return { state: 'in_session', label: account?.label };
+    if (row.tokenUsedAt) return { state: 'used', label: account?.label };
+    if (!row.tokenExpiresAt || row.tokenExpiresAt <= this.deps.now()) return { state: 'expired', label: account?.label };
+    return { state: 'valid', label: account?.label, username: account?.username ?? null };
+  }
+
+  /**
+   * Returns target account info and saved credentials (if any) to a local-IP
+   * recovery script or browser userscript WITHOUT consuming the single-use token.
+   */
+  async bootstrapLocalRecovery(token: string): Promise<BootstrapRecoveryResult> {
+    if (!isWellFormedToken(token)) return { ok: false, reason: 'invalid' };
+    const row = await this.deps.store.findByTokenHash(hashRecoveryToken(token));
+    if (!row) return { ok: false, reason: 'invalid' };
+    if (row.status === RecoveryStatus.CANCELLED) return { ok: false, reason: 'cancelled' };
+    if (row.status === RecoveryStatus.RECOVERED || row.tokenUsedAt || IN_SESSION_STATUSES.includes(row.status)) {
+      return { ok: false, reason: 'used' };
+    }
+    if (!row.tokenExpiresAt || row.tokenExpiresAt <= this.deps.now()) return { ok: false, reason: 'expired' };
+    if (row.telegramChatId !== this.deps.chatId()) return { ok: false, reason: 'invalid' };
+
+    const account = await this.deps.getAccount(row.accountId);
+    if (!account || account.status === AccountStatus.DISABLED) {
+      return { ok: false, reason: 'unavailable', message: 'This account is no longer available.' };
+    }
+    const creds = await this.deps.getCredentials(account);
+    const exp = creds
+      ? expectedUsername(account, creds)
+      : account.username && !account.username.includes('@')
+        ? account.username
+        : account.label && !account.label.includes('@')
+          ? account.label
+          : null;
+    return {
+      ok: true,
+      label: account.label,
+      expectedUsername: exp,
+      credentials: creds ? { identifier: creds.username, password: creds.password } : null,
+    };
+  }
+
+  /**
+   * Completes recovery using cookies / storageState captured on the user's own
+   * local IP (bypassing Cloudflare datacenter blocks), validates identity, and
+   * atomically replaces the stored session.
+   */
+  async completeLocalRecovery(token: string, payload: unknown): Promise<CompleteLocalRecoveryResult> {
+    if (!isWellFormedToken(token)) {
+      return { ok: false, httpStatus: 404, reason: 'invalid', error: 'This recovery link is not valid.' };
+    }
+    const tokenHash = hashRecoveryToken(token);
+    const row = await this.deps.store.findByTokenHash(tokenHash);
+    if (!row) {
+      return { ok: false, httpStatus: 404, reason: 'invalid', error: 'This recovery link is not valid.' };
+    }
+    if (row.status === RecoveryStatus.CANCELLED) {
+      return { ok: false, httpStatus: 410, reason: 'cancelled', error: 'This recovery was cancelled.' };
+    }
+    if (row.status === RecoveryStatus.RECOVERED || row.tokenUsedAt || IN_SESSION_STATUSES.includes(row.status)) {
+      return {
+        ok: false,
+        httpStatus: 409,
+        reason: 'used',
+        error: 'This single-use link was already used. Wait for the next Telegram reminder for a new link.',
+      };
+    }
+    if (!row.tokenExpiresAt || row.tokenExpiresAt <= this.deps.now()) {
+      return { ok: false, httpStatus: 410, reason: 'expired', error: 'This recovery link has expired.' };
+    }
+    if (row.telegramChatId !== this.deps.chatId()) {
+      return { ok: false, httpStatus: 404, reason: 'invalid', error: 'This recovery link is not valid.' };
+    }
+
+    const account = await this.deps.getAccount(row.accountId);
+    if (!account || account.status === AccountStatus.DISABLED) {
+      return {
+        ok: false,
+        httpStatus: 422,
+        reason: 'unavailable',
+        error: 'This account is no longer available.',
+      };
+    }
+
+    // Validate and parse cookie payload BEFORE consuming the single-use token so a
+    // malformed upload can be retried cleanly without burning the user's link.
+    const { raw, localVerifiedUsername, userAgent } = extractLocalPayload(payload);
+    if (!raw) {
+      return {
+        ok: false,
+        httpStatus: 400,
+        reason: 'invalid_payload',
+        error: 'Missing session payload. Provide storageState JSON or LeetCode cookies.',
+        label: account.label,
+      };
+    }
+    const parsed = parseCookiePayload(raw);
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        httpStatus: 400,
+        reason: 'invalid_payload',
+        error: parsed.error,
+        label: account.label,
+      };
+    }
+    const state = parsed.storageState;
+    if (userAgent && !state.transport?.userAgent) {
+      state.transport = { ...state.transport, userAgent };
+    }
+
+    if (this.lockedAccounts.has(account.id)) {
+      return {
+        ok: false,
+        httpStatus: 409,
+        reason: 'busy',
+        error: 'Another recovery for this account is running right now.',
+        label: account.label,
+      };
+    }
+
+    this.lockedAccounts.add(account.id);
+    try {
+      const consumed = await this.deps.store.consumeToken(tokenHash, this.deps.now());
+      if (!consumed.ok) {
+        if (consumed.reason === 'invalid') {
+          return { ok: false, httpStatus: 404, reason: 'invalid', error: 'This recovery link is not valid.' };
+        }
+        if (consumed.reason === 'expired') {
+          return { ok: false, httpStatus: 410, reason: 'expired', error: 'This recovery link has expired.' };
+        }
+        if (consumed.reason === 'cancelled') {
+          return { ok: false, httpStatus: 410, reason: 'cancelled', error: 'This recovery was cancelled.' };
+        }
+        return { ok: false, httpStatus: 409, reason: 'used', error: 'This recovery link was already used.' };
+      }
+      const recovery = consumed.recovery;
+
+      const verifying = await this.deps.store.setStatus(
+        recovery.id,
+        [RecoveryStatus.AWAITING_VERIFICATION],
+        RecoveryStatus.VERIFYING,
+      );
+      if (!verifying) {
+        return {
+          ok: false,
+          httpStatus: 409,
+          reason: 'used',
+          error: 'Recovery session state changed concurrently.',
+          label: account.label,
+        };
+      }
+
+      const creds = await this.deps.getCredentials(account);
+      const expected = creds
+        ? expectedUsername(account, creds)
+        : account.username && !account.username.includes('@')
+          ? account.username
+          : account.label && !account.label.includes('@')
+            ? account.label
+            : null;
+      const allowAnyUnclaimedHandle = creds
+        ? isFirstTimeEmailAccount(account, creds)
+        : !account.username || account.username.includes('@');
+
+      const check = await this.deps
+        .verifyCapturedSession(state)
+        .catch(() => ({ authenticated: false as const, username: null, cause: 'query-failed' as const }));
+      const identity = extractSessionIdentity(state);
+
+      let verifiedUsername: string | null = null;
+      let serverVerified = false;
+      if (check.authenticated && check.username) {
+        verifiedUsername = check.username;
+        serverVerified = true;
+      } else if (check.cause === 'query-failed' && !identity.expired && (localVerifiedUsername || identity.username)) {
+        // Server GraphQL check can be transiently challenged by Cloudflare on datacenter IPs
+        // immediately after local-IP login; accept the verified local JWT identity when unexpired.
+        verifiedUsername = (localVerifiedUsername || identity.username)!;
+      }
+
+      if (!verifiedUsername) {
+        await this.failRecovery(recovery, null, 'SERVER_VERIFICATION_FAILED', describeCategory('SERVER_VERIFICATION_FAILED'), {
+          notify: true,
+        });
+        return {
+          ok: false,
+          httpStatus: 422,
+          reason: 'verification_failed',
+          error: describeCategory('SERVER_VERIFICATION_FAILED'),
+          label: account.label,
+        };
+      }
+
+      if (!allowAnyUnclaimedHandle && expected && lower(verifiedUsername) !== lower(expected)) {
+        await this.failRecovery(recovery, null, 'USERNAME_MISMATCH', describeCategory('USERNAME_MISMATCH'), {
+          notify: true,
+        });
+        return {
+          ok: false,
+          httpStatus: 422,
+          reason: 'username_mismatch',
+          error: describeCategory('USERNAME_MISMATCH'),
+          label: account.label,
+        };
+      }
+
+      const others = (await this.deps.listAccounts()).filter((a) => a.id !== account.id);
+      if (others.some((a) => lower(a.username) === lower(verifiedUsername))) {
+        await this.failRecovery(recovery, null, 'WRONG_ACCOUNT', describeCategory('WRONG_ACCOUNT'), {
+          notify: true,
+        });
+        return {
+          ok: false,
+          httpStatus: 422,
+          reason: 'wrong_account',
+          error: describeCategory('WRONG_ACCOUNT'),
+          label: account.label,
+        };
+      }
+
+      try {
+        await this.deps.store.commitRecovered({
+          recoveryId: recovery.id,
+          accountId: account.id,
+          storageState: JSON.stringify(state),
+          username: verifiedUsername,
+          now: this.deps.now(),
+        });
+      } catch (err) {
+        const category = err instanceof RecoveryCommitError ? 'INTERNAL_ERROR' : 'DATABASE_ERROR';
+        await this.failRecovery(recovery, null, category, describeCategory(category), { notify: true });
+        return {
+          ok: false,
+          httpStatus: 422,
+          reason: 'database_error',
+          error: describeCategory(category),
+          label: account.label,
+        };
+      }
+
+      const verifyNote = serverVerified
+        ? 'Verification: Successful (Local IP + Server API)'
+        : 'Verification: Successful (Local IP; Server API transiently rate-limited)';
+      await this.deps.sendTelegram(
+        [
+          '✅ <b>LeetCode Session Restored</b>',
+          '',
+          `Account: <code>${esc(account.label)}</code>`,
+          verifyNote,
+          'Session: ACTIVE',
+          `Username: <code>${esc(verifiedUsername)}</code>`,
+          '',
+          'Your automated LeetCode tasks can resume.',
+        ].join('\n'),
+      );
+      logger.info({ label: account.label, serverVerified }, 'LeetCode session recovered via local IP');
+      try {
+        await this.deps.onRecovered?.(account);
+      } catch {
+        /* resuming automation is best-effort */
+      }
+      return {
+        ok: true,
+        httpStatus: 200,
+        label: account.label,
+        username: verifiedUsername,
+        serverVerified,
+      };
+    } finally {
+      this.lockedAccounts.delete(account.id);
+    }
   }
 
   /** Consumes the one-time token and starts the isolated recovery browser session. */

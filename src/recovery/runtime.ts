@@ -52,7 +52,7 @@ export function createProductionRecoveryService(hooks: RecoveryRuntimeHooks = {}
       const session = await openLightweightLeetCodeSession(state);
       try {
         const res = await checkSession(session.api);
-        return { authenticated: res.authenticated, username: res.username ?? null };
+        return { authenticated: res.authenticated, username: res.username ?? null, cause: res.cause };
       } finally {
         await session.close();
       }

@@ -574,4 +574,183 @@ describe('RecoveryService', () => {
       expect(open?.tokenHash).not.toBeNull();
     });
   });
+
+  describe('Local-IP Verification & Redirection Recovery', () => {
+    it('bootstrapLocalRecovery returns saved credentials and expectedUsername without consuming the token, or null credentials when missing', async () => {
+      accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
+      const svc = createService();
+      await svc.openRecovery(accountsMap.get('acc-1')!, 'EXPIRED');
+      await svc.tick();
+
+      const token = telegramMessages[0].markup.inline_keyboard[0][0].url.split('/auth/recover/')[1];
+      const boot = await svc.bootstrapLocalRecovery(token);
+      expect(boot).toEqual({
+        ok: true,
+        label: 'account_one',
+        expectedUsername: 'test_user_1',
+        credentials: {
+          identifier: 'test_user_1',
+          password: 'password_123',
+        },
+      });
+
+      // Bootstrapping must not consume the single-use token
+      expect((await svc.inspectToken(token)).state).toBe('valid');
+
+      // Missing credentials still bootstraps with credentials: null
+      credentialsMap.delete('acc-1');
+      const bootNoCreds = await svc.bootstrapLocalRecovery(token);
+      expect(bootNoCreds).toEqual({
+        ok: true,
+        label: 'account_one',
+        expectedUsername: 'test_user_1',
+        credentials: null,
+      });
+
+      // Invalid, expired, and already-used tokens return ok: false
+      expect(await svc.bootstrapLocalRecovery('short')).toEqual({ ok: false, reason: 'invalid' });
+
+      const expiredSvc = createService();
+      currentTime = new Date(currentTime.getTime() + 46 * 60_000);
+      expect(await expiredSvc.bootstrapLocalRecovery(token)).toEqual({ ok: false, reason: 'expired' });
+    });
+
+    it('getRecoveryPollStatus reports valid, recovered, and invalid states accurately', async () => {
+      accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
+      const svc = createService();
+      await svc.openRecovery(accountsMap.get('acc-1')!, 'EXPIRED');
+      await svc.tick();
+
+      const token = telegramMessages[0].markup.inline_keyboard[0][0].url.split('/auth/recover/')[1];
+      expect(await svc.getRecoveryPollStatus(token)).toEqual({
+        state: 'valid',
+        label: 'account_one',
+        username: 'test_user_1',
+      });
+      expect(await svc.getRecoveryPollStatus('short')).toEqual({ state: 'invalid' });
+
+      await svc.completeLocalRecovery(token, {
+        storageState: {
+          cookies: [
+            { name: 'LEETCODE_SESSION', value: 'local-active-jwt-token-value-123456', domain: '.leetcode.com', path: '/' },
+            { name: 'csrftoken', value: 'csrf-123', domain: '.leetcode.com', path: '/' },
+          ],
+          origins: [],
+        },
+      });
+
+      expect(await svc.getRecoveryPollStatus(token)).toEqual({
+        state: 'recovered',
+        label: 'account_one',
+        username: 'test_user_1',
+      });
+    });
+
+    it('completeLocalRecovery verifies session, commits ACTIVE state with transport userAgent, prevents replay, and notifies Telegram', async () => {
+      accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
+      const svc = createService();
+      await svc.openRecovery(accountsMap.get('acc-1')!, 'EXPIRED');
+      await svc.tick();
+
+      const token = telegramMessages[0].markup.inline_keyboard[0][0].url.split('/auth/recover/')[1];
+      const result = await svc.completeLocalRecovery(token, {
+        cookies: [
+          { name: 'LEETCODE_SESSION', value: 'fresh-local-session-token-1234567890', domain: '.leetcode.com', path: '/' },
+          { name: 'csrftoken', value: 'fresh-csrf-token-123456', domain: '.leetcode.com', path: '/' },
+        ],
+        localVerifiedUsername: 'test_user_1',
+        userAgent: 'Mozilla/5.0 Custom Local Browser',
+      });
+
+      expect(result).toEqual({
+        ok: true,
+        httpStatus: 200,
+        label: 'account_one',
+        username: 'test_user_1',
+        serverVerified: true,
+      });
+
+      const updated = accountsMap.get('acc-1')!;
+      expect(updated.status).toBe(AccountStatus.ACTIVE);
+      expect(updated.storageState).toContain('fresh-local-session-token-1234567890');
+      expect(updated.storageState).toContain('Mozilla/5.0 Custom Local Browser');
+
+      const restoredMsg = telegramMessages.find((m) => m.text.includes('✅ <b>LeetCode Session Restored</b>'));
+      expect(restoredMsg).toBeDefined();
+      expect(restoredMsg?.text).toContain('account_one');
+
+      // Single-use replay rejected with 409 used
+      const replay = await svc.completeLocalRecovery(token, {
+        cookies: 'LEETCODE_SESSION=fresh-local-session-token-1234567890; csrftoken=fresh-csrf-token-123456',
+      });
+      expect(replay.ok).toBe(false);
+      if (!replay.ok) {
+        expect(replay.httpStatus).toBe(409);
+        expect(replay.reason).toBe('used');
+      }
+    });
+
+    it('completeLocalRecovery falls back to unexpired JWT / localVerifiedUsername on transient server query-failed error', async () => {
+      accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
+      const svc = createService({
+        verifyCapturedSession: async () => ({
+          authenticated: false,
+          cause: 'query-failed',
+        }),
+      });
+      await svc.openRecovery(accountsMap.get('acc-1')!, 'EXPIRED');
+      await svc.tick();
+
+      const jwtPayload = Buffer.from(
+        JSON.stringify({
+          username: 'test_user_1',
+          refreshed_at: Math.floor(Date.now() / 1000),
+          _session_expiry: 1209600,
+        }),
+      ).toString('base64url');
+      const token = telegramMessages[0].markup.inline_keyboard[0][0].url.split('/auth/recover/')[1];
+
+      const result = await svc.completeLocalRecovery(token, {
+        storageState: {
+          cookies: [
+            { name: 'LEETCODE_SESSION', value: `eyJhbGciOiJIUzI1NiJ9.${jwtPayload}.sig`, domain: '.leetcode.com', path: '/' },
+            { name: 'csrftoken', value: 'csrf-ok', domain: '.leetcode.com', path: '/' },
+          ],
+          origins: [],
+        },
+        localVerifiedUsername: 'test_user_1',
+      });
+
+      expect(result).toEqual({
+        ok: true,
+        httpStatus: 200,
+        label: 'account_one',
+        username: 'test_user_1',
+        serverVerified: false,
+      });
+      expect(accountsMap.get('acc-1')?.status).toBe(AccountStatus.ACTIVE);
+    });
+
+    it('completeLocalRecovery rejects USERNAME_MISMATCH without overwriting DB', async () => {
+      accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
+      const svc = createService({
+        verifyCapturedSession: async () => ({ authenticated: true, username: 'different_user_99' }),
+      });
+      await svc.openRecovery(accountsMap.get('acc-1')!, 'EXPIRED');
+      await svc.tick();
+
+      const token = telegramMessages[0].markup.inline_keyboard[0][0].url.split('/auth/recover/')[1];
+      const res = await svc.completeLocalRecovery(token, {
+        cookies: 'LEETCODE_SESSION=wrong-user-session-1234567890; csrftoken=csrf-1',
+      });
+
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.httpStatus).toBe(422);
+        expect(res.reason).toBe('username_mismatch');
+      }
+      expect(accountsMap.get('acc-1')?.storageState).toContain('old-1');
+      expect(accountsMap.get('acc-1')?.status).not.toBe(AccountStatus.ACTIVE);
+    });
+  });
 });

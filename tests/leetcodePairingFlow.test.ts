@@ -24,7 +24,11 @@ import {
   getLeetCodePairingSession,
   renderLeetCodePairingPortalHtml,
 } from '../src/leetcode/loginHandoff';
-import { parseCompanionCliArgs, pushSessionToPairingEndpoint } from '../scripts/auth-setup';
+import {
+  fetchRecoveryBootstrap,
+  parseCompanionCliArgs,
+  pushSessionToPairingEndpoint,
+} from '../scripts/auth-setup';
 
 const SAMPLE_JWT_COOKIE =
   'LEETCODE_SESSION=eyJhbGciOiJIUzI1NiJ9.eyJ1c2VybmFtZSI6ImJsYWNrX3NoZWVwXzciLCJyZWZyZXNoZWRfYXQiOjE3OTM5MzAwMDAsIl9zZXNzaW9uX2V4cGlyeSI6MTIwOTYwMH0.sig; csrftoken=csrf12345';
@@ -283,5 +287,44 @@ describe('Telegram-Initiated LeetCode Interactive Pairing & Companion Flow', () 
         method: 'POST',
       }),
     );
+  });
+
+  it('fetchRecoveryBootstrap posts to /bootstrap for /auth/recover URLs and returns null for non-recovery URLs', async () => {
+    const recoverUrl = 'https://leetcode-daily-agent-ascq.onrender.com/auth/recover/ZB3m0IALSspuUhxIxRWH4wc4aBFgn_1sJGiA3cDJqn0';
+    const parsed = parseCompanionCliArgs([recoverUrl]);
+    expect(parsed.pairingUrl).toBe(recoverUrl);
+
+    const mockFetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        label: 'scale5558',
+        expectedUsername: 'scale5558',
+        credentials: { identifier: 'scale5558', password: 'saved-password' },
+      }),
+    })) as unknown as typeof fetch;
+
+    const boot = await fetchRecoveryBootstrap(recoverUrl, mockFetch);
+    expect(mockFetch).toHaveBeenCalledWith(
+      `${recoverUrl}/bootstrap`,
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    expect(boot).toEqual({
+      ok: true,
+      label: 'scale5558',
+      expectedUsername: 'scale5558',
+      credentials: { identifier: 'scale5558', password: 'saved-password' },
+    });
+
+    const nonRecovery = await fetchRecoveryBootstrap(
+      'https://leetcode-daily-agent-ascq.onrender.com/auth/leetcode/abcDEF1234567890_token',
+      mockFetch,
+    );
+    expect(nonRecovery).toBeNull();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 });
