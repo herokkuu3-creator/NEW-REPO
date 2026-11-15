@@ -2,7 +2,12 @@ import { chromium, type BrowserContext, type Page } from 'playwright';
 import { buildLaunchArgs } from '../browser/playwright';
 import { applyStealthScripts, getRandomDesktopViewport } from '../browser/stealth';
 import { DEFAULT_DESKTOP_CHROME_USER_AGENT } from './browserForm';
-import { solveCloudflareOrchestrated, getLastCapzyError } from './captchaSolver';
+import {
+  solveCloudflareOrchestrated,
+  getLastCapzyError,
+  sanitizeChallengeUrl,
+  extractTurnstileSitekeyFromFrames,
+} from './captchaSolver';
 import { getPreferredProxy } from './proxyManager';
 import { toPlaywrightProxy } from './proxyRotator';
 import { StorageStateShape } from '../browser/cookiePayload';
@@ -138,7 +143,7 @@ export async function loginToCodeforces(
 
       const currentCookies = await context.cookies('https://codeforces.com').catch(() => []);
       const solved = await solveCloudflareOrchestrated({
-        websiteURL: page.url(),
+        websiteURL: sanitizeChallengeUrl(page.url()),
         ...(sitekey ? { sitekey } : {}),
         proxyUrl,
         userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
@@ -372,7 +377,7 @@ async function extractTurnstileSitekey(page: Page): Promise<string | undefined> 
       }
       return key;
     }).catch(() => null);
-    return extracted || undefined;
+    return extracted || extractTurnstileSitekeyFromFrames(page) || undefined;
   } catch {
     return undefined;
   }

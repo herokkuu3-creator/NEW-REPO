@@ -8,7 +8,13 @@ import { detectVerificationPage } from '../browser/cloudflareDetector';
 import { DEFAULT_DESKTOP_CHROME_USER_AGENT } from '../codeforces/browserForm';
 import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
-import { solveCloudflareOrchestrated } from '../codeforces/captchaSolver';
+import {
+  solveCloudflareOrchestrated,
+  sanitizeChallengeUrl,
+  extractTurnstileSitekeyFromFrames,
+  TURNSTILE_URL_SITEKEY_RE,
+} from '../codeforces/captchaSolver';
+import { installTurnstileMetadataHook } from './auth';
 import {
   deduplicateLeetCodeCookies,
   isCsrfRejectionBody,
@@ -150,32 +156,87 @@ function isRecoverableBrowserCrash(err: unknown, pageCrashed: boolean): boolean 
   return /Page crashed|Target page, context or browser has been closed|Session closed|Connection closed|Browser has been closed/i.test(msg);
 }
 
+const observedGhostTurnstileSitekey = new WeakMap<Page, string>();
+
 async function extractChallengeMetadata(page: Page): Promise<{ sitekey?: string; action?: string; cdata?: string }> {
-  return page
+  const detail = await page
     .evaluate(() => {
       const w = window as unknown as Record<string, unknown>;
+      const resourceSitekey = (): string => {
+        try {
+          const entries = performance.getEntriesByType?.('resource') as Array<{ name?: string }> | undefined;
+          if (!Array.isArray(entries)) return '';
+          for (const entry of entries) {
+            if (!entry?.name || !entry.name.includes('challenges.cloudflare.com')) continue;
+            const m = /challenges\.cloudflare\.com\/.*?\/(0x4[a-zA-Z0-9_-]{16,})(?:[/?#]|$)/i.exec(entry.name);
+            if (m?.[1]) return m[1];
+          }
+        } catch {}
+        return '';
+      };
+      const scriptSitekey = (): string => {
+        try {
+          const scripts = Array.from(document.querySelectorAll('script'));
+          for (const s of scripts) {
+            if (s.src && s.src.includes('challenges.cloudflare.com')) {
+              const m = /challenges\.cloudflare\.com\/.*?\/(0x4[a-zA-Z0-9_-]{16,})(?:[/?#]|$)/i.exec(s.src);
+              if (m?.[1]) return m[1];
+            }
+            const txt = s.textContent || '';
+            if (txt.includes('turnstile') || txt.includes('sitekey')) {
+              const m = /["']?sitekey["']?\s*[:=]\s*["'](0x4[a-zA-Z0-9_-]{16,})["']/i.exec(txt);
+              if (m?.[1]) return m[1];
+            }
+          }
+        } catch {}
+        return '';
+      };
+
       let sitekey = typeof w.__turnstileSitekey === 'string' ? w.__turnstileSitekey.trim() : '';
-      if (!sitekey) {
-        const el = document.querySelector('[data-sitekey]');
-        sitekey = el?.getAttribute('data-sitekey')?.trim() ?? '';
+      const el = document.querySelector('[data-sitekey], [data-key], .cf-turnstile') as HTMLElement | null;
+      if (!sitekey && el) {
+        sitekey = (el.getAttribute('data-sitekey') || el.getAttribute('data-key') || el.dataset?.sitekey || '').trim();
       }
       if (!sitekey) {
         const iframes = Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]'));
         for (const iframe of iframes) {
-          const m = /\/(0x[0-9a-zA-Z_-]{10,})\//.exec(iframe.getAttribute('src') ?? '');
+          const m = /\/(0x[0-9a-zA-Z_-]{10,})(?:[/?#]|$)/.exec(iframe.getAttribute('src') ?? '');
           if (m?.[1]) {
             sitekey = m[1];
             break;
           }
         }
       }
+      if (!sitekey) {
+        sitekey = resourceSitekey() || scriptSitekey();
+      }
+      const action =
+        (typeof w.__turnstileAction === 'string' && w.__turnstileAction) ||
+        el?.getAttribute('data-action') ||
+        el?.dataset?.action ||
+        undefined;
+      const cdata =
+        (typeof w.__turnstileCData === 'string' && w.__turnstileCData) ||
+        (typeof w.__turnstileCdata === 'string' && w.__turnstileCdata) ||
+        el?.getAttribute('data-cdata') ||
+        el?.dataset?.cdata ||
+        undefined;
       return {
         ...(sitekey ? { sitekey } : {}),
-        ...(typeof w.__turnstileAction === 'string' && w.__turnstileAction ? { action: w.__turnstileAction } : {}),
-        ...(typeof w.__turnstileCdata === 'string' && w.__turnstileCdata ? { cdata: w.__turnstileCdata } : {}),
+        ...(action ? { action } : {}),
+        ...(cdata ? { cdata } : {}),
       };
     })
-    .catch(() => ({}));
+    .catch((): { sitekey?: string; action?: string; cdata?: string } => ({}));
+
+  if (!detail.sitekey) {
+    const fallbackSitekey =
+      extractTurnstileSitekeyFromFrames(page) || observedGhostTurnstileSitekey.get(page);
+    if (fallbackSitekey) {
+      return { ...detail, sitekey: fallbackSitekey };
+    }
+  }
+  return detail;
 }
 
 async function applyCloudflareSolution(
@@ -548,6 +609,16 @@ export async function openGhostBrowserSession(
               return route.continue().catch(() => undefined);
             });
             page = await context.newPage();
+            await installTurnstileMetadataHook(page);
+            const ghostPage = page;
+            page.on('response', (response) => {
+              try {
+                const match = TURNSTILE_URL_SITEKEY_RE.exec(response.url());
+                if (match?.[1]) {
+                  observedGhostTurnstileSitekey.set(ghostPage, match[1]);
+                }
+              } catch {}
+            });
             pageCrashed = false;
             page.on('crash', () => {
               pageCrashed = true;
@@ -636,14 +707,14 @@ export async function openGhostBrowserSession(
               'invoking orchestrated Cloudflare solver for ghost Chromium session',
             );
             const solved = await solveCloudflare({
-              websiteURL: activePage.url() || targetUrl,
+              websiteURL: sanitizeChallengeUrl(activePage.url() || targetUrl),
               proxyUrl: resolvedProxyUrl,
               userAgent,
               cookies: currentCookies,
               sitekey: cfMeta.sitekey,
               action: cfMeta.action,
               cdata: cfMeta.cdata,
-              timeoutMs: 45_000,
+              timeoutMs: 65_000,
             }).catch((solveErr) => {
               logger.warn(
                 { slug: params.slug, err: solveErr instanceof Error ? solveErr.message : String(solveErr) },

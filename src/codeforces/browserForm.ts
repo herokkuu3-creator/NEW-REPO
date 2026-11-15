@@ -116,6 +116,8 @@ import {
   solveCloudflareOrchestrated,
   solveTurnstileWithCapzy,
   solveCloudflareWithCapzy,
+  sanitizeChallengeUrl,
+  extractTurnstileSitekeyFromFrames,
 } from './captchaSolver';
 
 async function injectTurnstileToken(form: ReturnType<Page['locator']>, token: string, callbackName?: string | null): Promise<void> {
@@ -255,14 +257,16 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
 
   // 3. A Turnstile widget IS present. Extract sitekey and launch background solver.
   const extractWidgetInfo = async () => {
-    return page.evaluate(() => {
+    const evaluated = await page.evaluate(() => {
       const win = window as any;
       const elements = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey], [data-key]'));
       const inline = Array.from(document.scripts).map((s) => s.textContent ?? '').join('\n');
       const fullHtml = document.body ? document.body.innerHTML : '';
       let sitekey: string | null = (typeof win.__turnstileSitekey === 'string' && win.__turnstileSitekey ? win.__turnstileSitekey : null);
       let action: string | null = (typeof win.__turnstileAction === 'string' && win.__turnstileAction ? win.__turnstileAction : null);
-      let cdata: string | null = (typeof win.__turnstileCdata === 'string' && win.__turnstileCdata ? win.__turnstileCdata : null);
+      let cdata: string | null =
+        (typeof win.__turnstileCData === 'string' && win.__turnstileCData ? win.__turnstileCData : null) ??
+        (typeof win.__turnstileCdata === 'string' && win.__turnstileCdata ? win.__turnstileCdata : null);
       let callback: string | null = (typeof win.__turnstileCallback === 'string' && win.__turnstileCallback ? win.__turnstileCallback : null);
 
       for (const el of elements) {
@@ -296,7 +300,15 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         }
       }
       return { sitekey, action, cdata, callback };
-    }).catch(() => ({ sitekey: null, action: null, cdata: null, callback: null }));
+    }).catch(() => ({ sitekey: null as string | null, action: null as string | null, cdata: null as string | null, callback: null as string | null }));
+
+    if (!evaluated.sitekey) {
+      const frameSitekey = extractTurnstileSitekeyFromFrames(page);
+      if (frameSitekey) {
+        return { ...evaluated, sitekey: frameSitekey };
+      }
+    }
+    return evaluated;
   };
 
   let solverStarted = false;
@@ -316,7 +328,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
 
       if (info.sitekey) {
         const solution = await solveTurnstileOrchestrated({
-          siteurl: page.url(),
+          siteurl: sanitizeChallengeUrl(page.url()),
           sitekey: info.sitekey,
           action: info.action ?? undefined,
           cdata: info.cdata ?? undefined,
@@ -355,7 +367,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         // Direct Capzy fallback if orchestrated solver didn't yield a token
         log({}, 'ensureFormTurnstile: orchestrated solver did not yield a token; invoking direct Capzy fallback');
         const capzySolution = await solveTurnstileWithCapzy(
-          page.url(),
+          sanitizeChallengeUrl(page.url()),
           info.sitekey,
           proxyUrl,
           userAgent,
@@ -385,7 +397,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         }
       } else {
         const cloudflareSol = await solveCloudflareOrchestrated({
-          websiteURL: page.url(),
+          websiteURL: sanitizeChallengeUrl(page.url()),
           proxyUrl,
           userAgent,
           cookies: currentCookies,
@@ -419,7 +431,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         // Direct Capzy fallback
         log({}, 'ensureFormTurnstile: orchestrated Cloudflare solver did not yield a token; invoking direct Capzy fallback');
         const capzySol = await solveCloudflareWithCapzy(
-          page.url(),
+          sanitizeChallengeUrl(page.url()),
           proxyUrl,
           userAgent,
           timeoutMs,
@@ -575,7 +587,7 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   if (!await hasToken() && widgetInfo.sitekey) {
     log({}, 'ensureFormTurnstile: final emergency Capzy Turnstile solve attempt');
     const emergencySol = await solveTurnstileWithCapzy(
-      page.url(),
+      sanitizeChallengeUrl(page.url()),
       widgetInfo.sitekey,
       proxyUrl,
       await page.evaluate(() => navigator.userAgent).catch(() => undefined),

@@ -10,6 +10,9 @@ import {
   getCPSolverUrl,
   getCPSolverApiToken,
   isRealClearanceValue,
+  sanitizeChallengeUrl,
+  isSolverProxyFailure,
+  extractTurnstileSitekeyFromFrames,
   checkCPSolverHealth,
   getLastCapzyDiagnostic,
   getLastCapzyError,
@@ -1471,6 +1474,145 @@ describe('Solver Orchestration & Fallback Engine', () => {
         expect(h.Authorization).toBe('Bearer test_service_secret_12345');
         expect(h['x-api-key']).toBe('test_service_secret_12345');
       }
+    });
+
+    it('strips __cf_chl_rt_tk and fragments before sending siteurl to CPSolver', async () => {
+      process.env.CPSOLVER_URL = 'https://cpsolver.test.com';
+      const sentPayloads: Array<Record<string, unknown>> = [];
+
+      expect(
+        sanitizeChallengeUrl('https://leetcode.com/accounts/login/?__cf_chl_rt_tk=tok1&next=/problems/#form'),
+      ).toBe('https://leetcode.com/accounts/login/?next=%2Fproblems%2F');
+
+      vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const urlStr = String(url);
+        if (urlStr.includes('cpsolver.test.com/solve')) {
+          sentPayloads.push(JSON.parse(String(init?.body || '{}')));
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              ok: true,
+              token: '0.clean_url_turnstile_token_123456',
+              cfClearance: 'valid_clearance_cookie_123456',
+              cookies: { cf_clearance: 'valid_clearance_cookie_123456' },
+            }),
+          } as Response;
+        }
+        return { ok: true, status: 200, json: async () => ({ ok: true }) } as Response;
+      }));
+
+      await solveTurnstileWithCPSolver({
+        siteurl: 'https://leetcode.com/accounts/login/?__cf_chl_rt_tk=stale_token_value&__cf_chl_f_tk=abc#top',
+        sitekey: '0x4AAAAAAADnPIDROrmt1Wwj',
+      });
+      await solveCloudflareOrchestrated({
+        websiteURL: 'https://leetcode.com/problems/two-sum/?__cf_chl_rt_tk=stale_problem_token&tab=description#code',
+        timeoutMs: 5_000,
+      });
+
+      expect(sentPayloads.length).toBe(2);
+      expect(sentPayloads[0]?.siteurl).toBe('https://leetcode.com/accounts/login/');
+      expect(sentPayloads[1]?.siteurl).toBe('https://leetcode.com/problems/two-sum/?tab=description');
+    });
+
+    it('delegates empty-sitekey solveTurnstileOrchestrated calls to CPSolver navigate mode', async () => {
+      process.env.CPSOLVER_URL = 'https://cpsolver.test.com';
+      const sentPayloads: Array<Record<string, unknown>> = [];
+
+      vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const urlStr = String(url);
+        if (urlStr.includes('cpsolver.test.com/solve')) {
+          sentPayloads.push(JSON.parse(String(init?.body || '{}')));
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              ok: true,
+              cfClearance: 'real_cf_clearance_from_navigate_123',
+              cookies: { cf_clearance: 'real_cf_clearance_from_navigate_123' },
+            }),
+          } as Response;
+        }
+        return { ok: true, status: 200, json: async () => ({ ok: true }) } as Response;
+      }));
+
+      const res = await solveTurnstileOrchestrated({
+        siteurl: 'https://leetcode.com/accounts/login/?__cf_chl_rt_tk=xyz',
+        sitekey: '',
+        timeoutMs: 5_000,
+      });
+
+      expect(res?.source).toBe('cpsolver');
+      expect(res?.cfClearance).toBe('real_cf_clearance_from_navigate_123');
+      expect(sentPayloads.length).toBe(1);
+      expect(sentPayloads[0]?.mode).toBe('navigate');
+      expect(sentPayloads[0]?.siteurl).toBe('https://leetcode.com/accounts/login/');
+    });
+
+    it('retries CPSolver with proxy=direct after ERR_HTTP_RESPONSE_CODE_FAILURE in orchestrated solvers', async () => {
+      process.env.CPSOLVER_URL = 'https://cpsolver.test.com';
+      process.env.CPSOLVER_MAX_TRIES = '2';
+
+      expect(isSolverProxyFailure('CPSolver HTTP 422: {"error":"page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE"}')).toBe(true);
+      expect(isSolverProxyFailure('All 2 proxies in pool failed to solve challenge')).toBe(true);
+
+      const seenProxies: Array<unknown> = [];
+      vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const urlStr = String(url);
+        if (urlStr.includes('cpsolver.test.com/solve')) {
+          const body = JSON.parse(String(init?.body || '{}'));
+          seenProxies.push(body.proxy ?? null);
+          if (seenProxies.length === 1) {
+            return {
+              ok: false,
+              status: 422,
+              text: async () => JSON.stringify({ ok: false, error: 'page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE' }),
+            } as Response;
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              ok: true,
+              token: '0.direct_fallback_token_123456',
+              cfClearance: 'direct_fallback_clearance_123456',
+              cookies: { cf_clearance: 'direct_fallback_clearance_123456' },
+              proxyUsed: 'direct',
+            }),
+          } as Response;
+        }
+        return { ok: true, status: 200, json: async () => ({ ok: true }) } as Response;
+      }));
+
+      const tsResult = await solveTurnstileOrchestrated({
+        siteurl: 'https://leetcode.com/accounts/login/',
+        sitekey: '0x4AAAAAAADnPIDROrmt1Wwj',
+        timeoutMs: 10_000,
+      });
+
+      expect(tsResult?.token).toBe('0.direct_fallback_token_123456');
+      expect(seenProxies).toEqual([null, 'direct']);
+
+      seenProxies.length = 0;
+      const cfResult = await solveCloudflareOrchestrated({
+        websiteURL: 'https://leetcode.com/problems/two-sum/',
+        timeoutMs: 10_000,
+      });
+
+      expect(cfResult?.cfClearance).toBe('direct_fallback_clearance_123456');
+      expect(seenProxies).toEqual([null, 'direct']);
+    });
+
+    it('extracts Turnstile sitekey from Playwright child frame URLs inside closed shadow DOMs', () => {
+      const mockPage = {
+        frames: () => [
+          { url: () => 'https://leetcode.com/accounts/login/' },
+          { url: () => 'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/f/av0/rch/abc12/0x4AAAAAAAQrSHUTor4iGTpW/auto/fbE/new/normal' },
+        ],
+      };
+      expect(extractTurnstileSitekeyFromFrames(mockPage)).toBe('0x4AAAAAAAQrSHUTor4iGTpW');
+      expect(extractTurnstileSitekeyFromFrames({ frames: () => [{ url: () => 'https://example.com/' }] })).toBeUndefined();
     });
   });
 });

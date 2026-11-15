@@ -387,6 +387,59 @@ function hasClearanceCookie(value: unknown): boolean {
   return isRealClearanceValue((value as Record<string, unknown>).cf_clearance);
 }
 
+const SOLVER_PROXY_FAILURE_RE =
+  /ERR_HTTP_RESPONSE_CODE_FAILURE|ERR_PROXY_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED|ERR_SOCKS_CONNECTION_FAILED|All \d+ proxies in pool failed|Proxy connection failed|Challenge iframe network failure/i;
+
+/**
+ * Strips single-use Cloudflare challenge token query parameters (e.g., `__cf_chl_rt_tk`)
+ * and URL fragments before forwarding a target URL to an external solver context.
+ */
+export function sanitizeChallengeUrl(rawUrl: string): string {
+  if (typeof rawUrl !== 'string') return '';
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (key.toLowerCase().startsWith('__cf_chl_')) {
+        parsed.searchParams.delete(key);
+      }
+    }
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return trimmed.split('#')[0] ?? trimmed;
+  }
+}
+
+/**
+ * Identifies transport/proxy tunnel failures returned by CPSolver so callers can
+ * retry via direct egress instead of repeating broken proxy pool entries.
+ */
+export function isSolverProxyFailure(errorMsg?: string): boolean {
+  return typeof errorMsg === 'string' && SOLVER_PROXY_FAILURE_RE.test(errorMsg);
+}
+
+export const TURNSTILE_URL_SITEKEY_RE =
+  /challenges\.cloudflare\.com\/.*?\/(0x4[a-zA-Z0-9_-]{16,})(?:[/?#]|$)/i;
+
+/**
+ * Inspects Playwright child frames (including iframes inside closed Shadow DOMs)
+ * to extract a Turnstile sitekey from challenge URLs.
+ */
+export function extractTurnstileSitekeyFromFrames(
+  page: { frames?: () => Array<{ url(): string }> },
+): string | undefined {
+  if (!page || typeof page.frames !== 'function') return undefined;
+  for (const frame of page.frames()) {
+    const match = TURNSTILE_URL_SITEKEY_RE.exec(frame.url());
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+  return undefined;
+}
+
 /**
  * Configure solver overrides in memory (useful when called from isolated worker or tests).
  */
@@ -558,13 +611,14 @@ export async function solveTurnstileWithCPSolver(params: {
 
   const startTime = Date.now();
   const timeout = params.timeoutMs ?? 90_000;
+  const targetUrl = sanitizeChallengeUrl(params.siteurl);
 
   try {
     const response = await fetch(`${solverUrl}/solve`, {
       method: 'POST',
       headers: buildCPSolverHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
-        siteurl: params.siteurl,
+        siteurl: targetUrl,
         sitekey: params.sitekey,
         action: params.action,
         cdata: params.cdata,
@@ -669,13 +723,14 @@ export async function solveCloudflareWithCPSolver(params: {
 
   const startTime = Date.now();
   const timeout = params.timeoutMs ?? 65_000;
+  const targetUrl = sanitizeChallengeUrl(params.siteurl);
 
   try {
     const response = await fetch(`${solverUrl}/solve`, {
       method: 'POST',
       headers: buildCPSolverHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
-        siteurl: params.siteurl,
+        siteurl: targetUrl,
         proxy: params.proxy,
         timeout,
         mode: 'navigate',
@@ -1292,7 +1347,7 @@ export async function solveTurnstileWithCapzy(
     const maxAttempts = getMaxCapzyAttempts();
     const retryDelayMs = getCapzyRetryDelayMs();
 
-    const targetUrl = typeof websiteURL === 'string' ? websiteURL.split('#')[0] : '';
+    const targetUrl = sanitizeChallengeUrl(websiteURL);
     const sanitizedUa =
       userAgent && !/HeadlessChrome/i.test(userAgent)
         ? userAgent
@@ -1503,7 +1558,7 @@ export async function solveCloudflareWithCapzy(
         ? userAgent
         : DEFAULT_DESKTOP_CHROME_USER_AGENT;
     const isRefusingProxy = !!proxy && (proxy.includes('joyproxy.com') || proxy.includes('busyip.com'));
-    const targetUrl = typeof websiteURL === 'string' ? websiteURL.split('#')[0] : '';
+    const targetUrl = sanitizeChallengeUrl(websiteURL);
 
     if (proxy && !isRefusingProxy) {
       let cfTask: Record<string, unknown> | null = null;
@@ -1631,7 +1686,24 @@ export async function solveTurnstileOrchestrated(params: {
 }): Promise<SolverResult | null> {
   const solverUrl = getCPSolverUrl();
   const timeoutMs = params.timeoutMs ?? 90_000;
+  const cleanSiteurl = sanitizeChallengeUrl(params.siteurl);
   const hasRuntimeSitekey = typeof params.sitekey === 'string' && params.sitekey.trim().length > 0;
+
+  // When CPSolver is configured without an extracted Turnstile sitekey,
+  // delegate to CPSolver navigate mode instead of failing Capzy preflight.
+  if (solverUrl && !hasRuntimeSitekey) {
+    return solveCloudflareOrchestrated({
+      websiteURL: cleanSiteurl,
+      proxyUrl: params.proxyUrl,
+      userAgent: params.userAgent,
+      cookies: params.cookies,
+      timeoutMs: params.timeoutMs,
+      sitekey: undefined,
+      action: params.action,
+      cdata: params.cdata,
+      overrideKeys: params.overrideKeys,
+    });
+  }
 
   // Phase 1: Local / Render CPSolver. Explicit no-token verification timeouts
   // stop here; only other failures retain the existing retry policy.
@@ -1643,18 +1715,19 @@ export async function solveTurnstileOrchestrated(params: {
 
     const maxTries = Math.min(10, positiveInteger(process.env.CPSOLVER_MAX_TRIES, 3));
     const cpsolverTimeoutMs = Math.min(timeoutMs, positiveInteger(process.env.CPSOLVER_TIMEOUT_MS, 90_000));
-    log({ solverUrl, maxTries, siteurl: params.siteurl, cpsolverTimeoutMs }, 'Starting Turnstile solve with local CPSolver');
+    log({ solverUrl, maxTries, siteurl: cleanSiteurl, cpsolverTimeoutMs }, 'Starting Turnstile solve with local CPSolver');
 
+    let useDirectFallback = false;
     for (let attempt = 1; attempt <= maxTries; attempt++) {
       throwIfAttemptAborted();
       const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Turnstile via CPSolver (${solverHost})...</b>`;
       await sendSolverTelegramNotification(attemptNotice).catch(() => undefined);
 
-      log({ attempt, maxTries }, 'Invoking CPSolver');
+      log({ attempt, maxTries, directFallback: useDirectFallback }, 'Invoking CPSolver');
       const attemptStartTime = Date.now();
-      const proxyForCPSolver = params.proxyUrl || undefined;
+      const proxyForCPSolver = useDirectFallback ? 'direct' : (params.proxyUrl || undefined);
       const res = await solveTurnstileWithCPSolver({
-        siteurl: params.siteurl,
+        siteurl: cleanSiteurl,
         sitekey: params.sitekey,
         action: params.action,
         cdata: params.cdata,
@@ -1706,6 +1779,10 @@ export async function solveTurnstileOrchestrated(params: {
         }
       }
 
+      if (!res.ok && isSolverProxyFailure(res.error)) {
+        useDirectFallback = true;
+      }
+
       const errBrief = res.error ? ` (${res.error.slice(0, 100)})` : '';
       logWarn({ attempt, error: res.error, durationMs: Date.now() - attemptStartTime }, 'CPSolver attempt failed');
       const failNotice = `⚠️ <b>[Attempt ${attempt}/${maxTries} failed]</b><i>${errBrief}</i>`;
@@ -1730,7 +1807,7 @@ export async function solveTurnstileOrchestrated(params: {
   await sendSolverTelegramNotification(capzyNotice).catch(() => undefined);
 
   const capzySol = await solveTurnstileWithCapzy(
-    params.siteurl,
+    cleanSiteurl,
     params.sitekey,
     params.proxyUrl,
     params.userAgent,
@@ -1780,10 +1857,12 @@ export async function solveCloudflareOrchestrated(params: {
   cdata?: string;
   overrideKeys?: string[];
 }): Promise<SolverResult | null> {
+  const cleanWebsiteUrl = sanitizeChallengeUrl(params.websiteURL);
+  const solverUrl = getCPSolverUrl();
   const resolvedSitekey = params.sitekey;
-  if (resolvedSitekey) {
+  if (resolvedSitekey && !solverUrl) {
     return solveTurnstileOrchestrated({
-      siteurl: params.websiteURL,
+      siteurl: cleanWebsiteUrl,
       sitekey: resolvedSitekey,
       action: params.action,
       cdata: params.cdata,
@@ -1795,7 +1874,6 @@ export async function solveCloudflareOrchestrated(params: {
     });
   }
 
-  const solverUrl = getCPSolverUrl();
   const timeoutMs = params.timeoutMs ?? 65_000;
 
   // Phase 1: Local / Render CPSolver (up to 3 tries)
@@ -1806,17 +1884,19 @@ export async function solveCloudflareOrchestrated(params: {
     } catch {}
 
     const maxTries = Math.min(10, positiveInteger(process.env.CPSOLVER_MAX_TRIES, 3));
-    log({ solverUrl, maxTries, url: params.websiteURL }, 'Starting Cloudflare clearance solve with local CPSolver');
+    log({ solverUrl, maxTries, url: cleanWebsiteUrl }, 'Starting Cloudflare clearance solve with local CPSolver');
 
+    let useDirectFallback = false;
     for (let attempt = 1; attempt <= maxTries; attempt++) {
       throwIfAttemptAborted();
       const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Cloudflare Challenge via CPSolver (${solverHost})...</b>`;
       await sendSolverTelegramNotification(attemptNotice).catch(() => undefined);
 
-      const proxyForCPSolver =
-        process.env.CPSOLVER_FORWARD_PROXY !== 'false' ? params.proxyUrl || undefined : undefined;
+      const proxyForCPSolver = useDirectFallback
+        ? 'direct'
+        : (process.env.CPSOLVER_FORWARD_PROXY !== 'false' ? params.proxyUrl || undefined : undefined);
       const res = await solveCloudflareWithCPSolver({
-        siteurl: params.websiteURL,
+        siteurl: cleanWebsiteUrl,
         proxy: proxyForCPSolver,
         userAgent: params.userAgent,
         cookies: params.cookies,
@@ -1851,6 +1931,10 @@ export async function solveCloudflareOrchestrated(params: {
         break;
       }
 
+      if (!res.ok && isSolverProxyFailure(res.error)) {
+        useDirectFallback = true;
+      }
+
       const errBrief = res.error ? ` (${res.error.slice(0, 100)})` : '';
       logWarn({ attempt, error: res.error }, 'CPSolver challenge attempt failed');
       const failNotice = `⚠️ <b>[Attempt ${attempt}/${maxTries} failed]</b><i>${errBrief}</i>`;
@@ -1871,7 +1955,7 @@ export async function solveCloudflareOrchestrated(params: {
   await sendSolverTelegramNotification(capzyNotice).catch(() => undefined);
 
   const capzySol = await solveCloudflareWithCapzy(
-    params.websiteURL,
+    cleanWebsiteUrl,
     params.proxyUrl,
     params.userAgent,
     timeoutMs,

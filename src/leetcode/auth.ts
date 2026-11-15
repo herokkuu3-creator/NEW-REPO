@@ -2,12 +2,17 @@ import { randomUUID } from 'node:crypto';
 import { chromium, type Browser, type Page, type Response } from 'playwright';
 import { config } from '../config';
 import { StorageStateShape } from '../browser/cookiePayload';
+import { buildLaunchArgs } from '../browser/playwright';
+import { applyStealthScripts } from '../browser/stealth';
 import { logger } from '../logger';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
 import {
   getCPSolverUrl,
   solveTurnstileOrchestrated,
   solveCloudflareOrchestrated,
+  sanitizeChallengeUrl,
+  TURNSTILE_URL_SITEKEY_RE,
+  extractTurnstileSitekeyFromFrames,
   withCapzyRequestContext,
   type SolverResult,
   DEFAULT_DESKTOP_CHROME_USER_AGENT,
@@ -112,7 +117,79 @@ class LoginFailure extends Error {
 }
 
 const observedPageTurnstileSitekey = new WeakMap<Page, string>();
-const TURNSTILE_URL_SITEKEY_RE = /challenges\.cloudflare\.com\/.*?\/(0x4[a-zA-Z0-9_-]{16,})(?:[/?#]|$)/i;
+
+/**
+ * Installs a read-only `window.turnstile.render` observer hook on the given Page
+ * so sitekey, action, and cData metadata can be forwarded accurately to solvers.
+ */
+export async function installTurnstileMetadataHook(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const win = window as any;
+    let realTurnstile: any;
+    const wrapRenderFn = (origRender: any) => {
+      if (typeof origRender !== 'function' || origRender.__hookedRender) return origRender;
+      const wrapped = function (this: any, container: unknown, params?: Record<string, unknown>) {
+        if (params && typeof params === 'object') {
+          if (typeof params.sitekey === 'string' && params.sitekey) win.__turnstileSitekey = params.sitekey;
+          if (typeof params.action === 'string' && params.action) win.__turnstileAction = params.action;
+          const rawCData =
+            typeof params.cData === 'string' && params.cData
+              ? params.cData
+              : typeof params.cdata === 'string' && params.cdata
+                ? params.cdata
+                : '';
+          if (rawCData) {
+            win.__turnstileCData = rawCData;
+            win.__turnstileCdata = rawCData;
+          }
+          if (typeof params.callback === 'function') win.__turnstileCallback = params.callback;
+        }
+        return origRender.apply(this, arguments);
+      };
+      wrapped.__hookedRender = true;
+      return wrapped;
+    };
+    const hookTurnstile = (ts: any) => {
+      if (!ts || typeof ts !== 'object' || ts.__hooked) return ts;
+      try {
+        let currentRender = wrapRenderFn(ts.render);
+        Object.defineProperty(ts, 'render', {
+          configurable: true,
+          enumerable: true,
+          get() {
+            return currentRender;
+          },
+          set(nextFn) {
+            currentRender = wrapRenderFn(nextFn);
+          },
+        });
+        ts.__hooked = true;
+      } catch {
+        const origRender = typeof ts.render === 'function' ? ts.render : undefined;
+        if (origRender) {
+          ts.render = wrapRenderFn(origRender);
+          ts.__hooked = true;
+        }
+      }
+      return ts;
+    };
+    if (win.turnstile && typeof win.turnstile === 'object') {
+      realTurnstile = hookTurnstile(win.turnstile);
+    }
+    try {
+      Object.defineProperty(win, 'turnstile', {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return realTurnstile;
+        },
+        set(val) {
+          realTurnstile = hookTurnstile(val);
+        },
+      });
+    } catch {}
+  }).catch(() => undefined);
+}
 
 /** Detailed inspection of Cloudflare interstitial, Turnstile, and other challenge widgets. */
 export async function detectVerificationDetail(page: Page): Promise<VerificationDetail> {
@@ -169,7 +246,12 @@ export async function detectVerificationDetail(page: Page): Promise<Verification
           scriptSitekey() ||
           undefined;
         const action = win.__turnstileAction || el?.getAttribute('data-action') || el?.dataset?.action || undefined;
-        const cdata = win.__turnstileCData || el?.getAttribute('data-cdata') || el?.dataset?.cdata || undefined;
+        const cdata =
+          win.__turnstileCData ||
+          win.__turnstileCdata ||
+          el?.getAttribute('data-cdata') ||
+          el?.dataset?.cdata ||
+          undefined;
         return {
           type: 'cloudflare_interstitial' as const,
           required: true,
@@ -187,13 +269,20 @@ export async function detectVerificationDetail(page: Page): Promise<Verification
         document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"], iframe[src*="cloudflare.com"]') ||
         document.querySelector('input[id^="cf-chl-widget-"][id$="_response"]');
       if (turnstileWidget) {
-        const hasToken = Boolean(turnstileInput && turnstileInput.value && turnstileInput.value.trim().length > 0);
+        const win = window as any;
+        const hasToken =
+          Boolean(turnstileInput && turnstileInput.value && turnstileInput.value.trim().length > 0) ||
+          Boolean(typeof win.__turnstileToken === 'string' && win.__turnstileToken.trim().length > 0);
         let sitekey: string | undefined;
         const el = (document.querySelector('[data-sitekey], [data-key]') || document.querySelector('.cf-turnstile')) as HTMLElement | null;
-        const win = window as any;
         sitekey = win.__turnstileSitekey || el?.getAttribute('data-sitekey') || el?.getAttribute('data-key') || el?.dataset?.sitekey;
         const action = win.__turnstileAction || el?.getAttribute('data-action') || el?.dataset?.action || undefined;
-        const cdata = win.__turnstileCData || el?.getAttribute('data-cdata') || el?.dataset?.cdata || undefined;
+        const cdata =
+          win.__turnstileCData ||
+          win.__turnstileCdata ||
+          el?.getAttribute('data-cdata') ||
+          el?.dataset?.cdata ||
+          undefined;
         if (!sitekey) {
           const iframe = document.querySelector<HTMLIFrameElement>('iframe[src*="challenges.cloudflare.com"], iframe[src*="cloudflare.com"]');
           if (iframe?.src) {
@@ -237,8 +326,9 @@ export async function detectVerificationDetail(page: Page): Promise<Verification
       return { type: 'none' as const, required: false };
     });
     const observedSitekey = observedPageTurnstileSitekey.get(page);
+    const frameSitekey = extractTurnstileSitekeyFromFrames(page);
     if (detail.required && (detail.type === 'turnstile' || detail.type === 'cloudflare_interstitial')) {
-      const resolvedSitekey = detail.sitekey || observedSitekey;
+      const resolvedSitekey = detail.sitekey || observedSitekey || frameSitekey;
       if (resolvedSitekey) {
         return { ...detail, sitekey: resolvedSitekey };
       }
@@ -271,6 +361,48 @@ export async function signedInUser(page: Page, timeoutMs: number): Promise<strin
       return user?.isSignedIn === true && typeof user.username === 'string' && user.username.trim() ? user.username : null;
     } catch { return null; }
   }, Math.max(1, Math.min(timeoutMs, 8000))).catch(() => null);
+}
+
+/** Apply a solved Turnstile token across hidden inputs, globals, and widget callbacks. */
+async function applyTurnstileTokenToPage(page: Page, token: string): Promise<void> {
+  await page.evaluate((tok) => {
+    const win = window as any;
+    win.__turnstileToken = tok;
+    if (win.turnstile && typeof win.turnstile === 'object') {
+      win.turnstile.getResponse = () => tok;
+      win.turnstile.isExpired = () => false;
+    }
+    const selector = '[name="cf-turnstile-response"], [name="turnstileToken"], input[id^="cf-chl-widget-"][id$="_response"]';
+    let inputs = Array.from(document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(selector));
+    if (inputs.length === 0) {
+      const container = document.querySelector('form') || document.querySelector('.cf-turnstile, #cf-turnstile') || document.body;
+      if (container) {
+        const hidden = document.createElement('input');
+        hidden.type = 'hidden';
+        hidden.name = 'cf-turnstile-response';
+        container.appendChild(hidden);
+        inputs = [hidden];
+      }
+    }
+    for (const input of inputs) {
+      input.value = tok;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (typeof win.__turnstileCallback === 'function') {
+      try {
+        win.__turnstileCallback(tok);
+      } catch {}
+    }
+    const widgetEl = document.querySelector('.cf-turnstile[data-callback], [data-callback]') as HTMLElement | null;
+    const widgetCb = widgetEl?.getAttribute('data-callback');
+    if (widgetCb) {
+      const fn = widgetCb.split('.').reduce<unknown>((val, key) => (val && typeof val === 'object' ? (val as Record<string, unknown>)[key] : undefined), window);
+      if (typeof fn === 'function') {
+        try { (fn as (t: string) => void)(tok); } catch {}
+      }
+    }
+  }, token).catch(() => undefined);
 }
 
 /** Exposed for local browser fixtures; all navigation remains in the caller's context. */
@@ -319,61 +451,7 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
       attemptId,
       deadline,
       () => withCapzyRequestContext(async () => {
-        await page.addInitScript(() => {
-      const win = window as any;
-      let realTurnstile: any;
-      const wrapRenderFn = (origRender: any) => {
-        if (typeof origRender !== 'function' || origRender.__hookedRender) return origRender;
-        const wrapped = function (this: any, container: unknown, params?: Record<string, unknown>) {
-          if (params && typeof params === 'object') {
-            if (typeof params.sitekey === 'string' && params.sitekey) win.__turnstileSitekey = params.sitekey;
-            if (typeof params.action === 'string' && params.action) win.__turnstileAction = params.action;
-            if (typeof params.cData === 'string' && params.cData) win.__turnstileCData = params.cData;
-            if (typeof params.cdata === 'string' && params.cdata) win.__turnstileCData = params.cdata;
-            if (typeof params.callback === 'function') win.__turnstileCallback = params.callback;
-          }
-          return origRender.apply(this, arguments);
-        };
-        wrapped.__hookedRender = true;
-        return wrapped;
-      };
-      const hookTurnstile = (ts: any) => {
-        if (!ts || typeof ts !== 'object' || ts.__hooked) return ts;
-        try {
-          let currentRender = wrapRenderFn(ts.render);
-          Object.defineProperty(ts, 'render', {
-            configurable: true,
-            enumerable: true,
-            get() {
-              return currentRender;
-            },
-            set(nextFn) {
-              currentRender = wrapRenderFn(nextFn);
-            },
-          });
-          ts.__hooked = true;
-        } catch {
-          const origRender = typeof ts.render === 'function' ? ts.render : undefined;
-          if (origRender) {
-            ts.render = wrapRenderFn(origRender);
-            ts.__hooked = true;
-          }
-        }
-        return ts;
-      };
-      try {
-        Object.defineProperty(win, 'turnstile', {
-          configurable: true,
-          enumerable: true,
-          get() {
-            return realTurnstile;
-          },
-          set(val) {
-            realTurnstile = hookTurnstile(val);
-          },
-        });
-      } catch {}
-    }).catch(() => undefined);
+        await installTurnstileMetadataHook(page);
     await report('LOGIN_PAGE_LOADING', '🌐 Opening LeetCode login page…');
     const response = await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: remaining() });
     const status = response?.status();
@@ -431,29 +509,30 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
       diagnostic.solverAttempted = true;
       let solved: SolverResult | null = null;
       try {
+        const cleanWebsiteUrl = sanitizeChallengeUrl(page.url() || LOGIN_URL);
         if (options.solver) {
           solved = await options.solver({
-            websiteURL: page.url() || LOGIN_URL,
+            websiteURL: cleanWebsiteUrl,
             sitekey: challengeDetail.sitekey,
             action: challengeDetail.action,
             cdata: challengeDetail.cdata,
             proxyUrl: options.proxyUrl,
             userAgent: await page.evaluate(() => navigator.userAgent).catch(() => DEFAULT_DESKTOP_CHROME_USER_AGENT),
-            timeoutMs: Math.min(45_000, remaining()),
+            timeoutMs: Math.min(75_000, remaining()),
           });
           diagnostic.providerRequestAccepted = solved !== null;
           diagnostic.providerOperationCompleted = solved !== null;
           diagnostic.taskLifecycleState = solved ? 'ready' : 'failed';
         } else if (challengeDetail.type === 'turnstile') {
           solved = await solveTurnstileOrchestrated({
-            siteurl: page.url() || LOGIN_URL,
+            siteurl: cleanWebsiteUrl,
             sitekey: challengeDetail.sitekey ?? '',
             action: challengeDetail.action,
             cdata: challengeDetail.cdata,
             proxyUrl: options.proxyUrl,
             userAgent: await page.evaluate(() => navigator.userAgent).catch(() => DEFAULT_DESKTOP_CHROME_USER_AGENT),
             cookies: await page.context().cookies('https://leetcode.com').catch(() => []),
-            timeoutMs: Math.min(45_000, remaining()),
+            timeoutMs: Math.min(75_000, remaining()),
           });
           const capzyDiag = getLastCapzyDiagnostic();
           diagnostic.providerRequestAccepted = capzyDiag.requestAccepted || (solved !== null);
@@ -469,14 +548,14 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
           }
         } else {
           solved = await solveCloudflareOrchestrated({
-            websiteURL: page.url() || LOGIN_URL,
+            websiteURL: cleanWebsiteUrl,
             sitekey: challengeDetail.sitekey,
             action: challengeDetail.action,
             cdata: challengeDetail.cdata,
             proxyUrl: options.proxyUrl,
             userAgent: await page.evaluate(() => navigator.userAgent).catch(() => DEFAULT_DESKTOP_CHROME_USER_AGENT),
             cookies: await page.context().cookies('https://leetcode.com').catch(() => []),
-            timeoutMs: Math.min(45_000, remaining()),
+            timeoutMs: Math.min(75_000, remaining()),
           });
           const capzyDiag = getLastCapzyDiagnostic();
           diagnostic.providerRequestAccepted = capzyDiag.requestAccepted || (solved !== null);
@@ -521,22 +600,7 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
           }]).catch(() => undefined);
         }
         if (solved.token) {
-          await page.evaluate((tok) => {
-            const inputs = Array.from(document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
-              '[name="cf-turnstile-response"], [name="turnstileToken"], input[id^="cf-chl-widget-"][id$="_response"]'
-            ));
-            for (const input of inputs) {
-              input.value = tok;
-              input.dispatchEvent(new Event('input', { bubbles: true }));
-              input.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            const win = window as any;
-            if (typeof win.__turnstileCallback === 'function') {
-              try {
-                win.__turnstileCallback(tok);
-              } catch {}
-            }
-          }, solved.token).catch(() => undefined);
+          await applyTurnstileTokenToPage(page, solved.token);
         }
 
         if (challengeDetail.type === 'cloudflare_interstitial') {
@@ -544,7 +608,9 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
         }
 
         const postCheck = await detectVerificationDetail(page);
-        if (!postCheck.required) {
+        const interstitialClearedToForm =
+          challengeDetail.type === 'cloudflare_interstitial' && postCheck.type === 'turnstile';
+        if (!postCheck.required || interstitialClearedToForm) {
           diagnostic.verificationCompleted = true;
           diagnostic.solverResult = 'success';
           diagnostic.continuationStatus = 'resumed';
@@ -577,7 +643,7 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
 
     if (status && status >= 400 && status !== 403) throw new LoginFailure('LOGIN_PAGE_HTTP_ERROR', `LeetCode login page returned HTTP ${status}.`);
     const usernameInput = page.locator(USERNAME).first();
-    try { await usernameInput.waitFor({ state: 'visible', timeout: Math.min(options.proxyUrl ? 25_000 : 5000, remaining()) }); }
+    try { await usernameInput.waitFor({ state: 'visible', timeout: Math.min(options.proxyUrl ? 25_000 : 15_000, remaining()) }); }
     catch {
       const verified = await signedInUser(page, remaining());
       if (verified) {
@@ -589,8 +655,14 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
       const lateDetail = await detectVerificationDetail(page);
       if (lateDetail.required) {
         await attemptSolverVerification(lateDetail, status);
+        try {
+          await usernameInput.waitFor({ state: 'visible', timeout: Math.min(15_000, remaining()) });
+        } catch {
+          throw new LoginFailure('LOGIN_FORM_UNAVAILABLE', 'LeetCode login form is unavailable. Use /renew after signing in in your browser.', diagnostic, 'LOGIN_FAILED');
+        }
+      } else {
+        throw new LoginFailure('LOGIN_FORM_UNAVAILABLE', 'LeetCode login form is unavailable. Use /renew after signing in in your browser.', diagnostic, 'LOGIN_FAILED');
       }
-      throw new LoginFailure('LOGIN_FORM_UNAVAILABLE', 'LeetCode login form is unavailable. Use /renew after signing in in your browser.', diagnostic, 'LOGIN_FAILED');
     }
     const form = page.locator('form').filter({ has: usernameInput }).first();
     const hasForm = await form.count() > 0;
@@ -609,8 +681,18 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
     }
     await submit.waitFor({ state: 'visible', timeout: remaining() });
     if (!await submit.isEnabled()) {
+      const storedToken = await page
+        .evaluate(() => (typeof (window as any).__turnstileToken === 'string' ? (window as any).__turnstileToken : null))
+        .catch(() => null);
+      if (storedToken) {
+        await applyTurnstileTokenToPage(page, storedToken);
+      }
+    }
+    if (!await submit.isEnabled()) {
       const hasDeferredTurnstile = await page.evaluate(() => Boolean(
-        document.querySelector('#cf-turnstile, #cf-turnstile-script, script[src*="challenges.cloudflare.com/turnstile"], [data-sitekey]')
+        document.querySelector(
+          '#cf-turnstile, #cf-turnstile-script, script[src*="challenges.cloudflare.com/turnstile"], [data-sitekey], input[id^="cf-chl-widget-"][id$="_response"], [name="cf-turnstile-response"], iframe[src*="challenges.cloudflare.com"]',
+        ) || (window as any).turnstile,
       )).catch(() => false);
       if (hasDeferredTurnstile) {
         const waitUntil = Date.now() + Math.min(15_000, remaining());
@@ -628,9 +710,26 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
           if (options.signal?.aborted) throw new LoginFailure('LOGIN_CANCELLED', 'Login cancelled.');
           await new Promise(resolve => setTimeout(resolve, 100));
         }
+        if (!await submit.isEnabled() && diagnostic.solverAttempted && diagnostic.verificationCompleted) {
+          await submit.evaluate((el) => {
+            el.removeAttribute('disabled');
+            if ('disabled' in el) (el as HTMLButtonElement).disabled = false;
+          }).catch(() => undefined);
+        }
       }
       if (!await submit.isEnabled()) throw new LoginFailure('LOGIN_FORM_NOT_READY', 'The login button is disabled. Complete the form or verification in your browser and use /renew.', diagnostic, 'LOGIN_FAILED');
     }
+
+    const retryPostSubmit = async (postSubmitDetail: VerificationDetail, codeStatus?: number): Promise<void> => {
+      await attemptSolverVerification(postSubmitDetail, codeStatus);
+      loginStatus = undefined;
+      if (postSubmitDetail.type === 'cloudflare_interstitial') {
+        await usernameInput.waitFor({ state: 'visible', timeout: Math.min(15_000, remaining()) });
+        await usernameInput.fill(username, { timeout: remaining() });
+        await scope.locator(PASSWORD).first().fill(password, { timeout: remaining() });
+      }
+      await submit.click({ timeout: remaining() });
+    };
 
     await report('AUTHENTICATING', '📤 Submitting login once…');
     logger.info({ attemptId }, '[AUTH] Credentials submitted');
@@ -639,10 +738,26 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
     while (remaining() > 0) {
       if (page.isClosed()) throw new LoginFailure('LOGIN_BROWSER_CLOSED', 'The login browser closed before authentication was verified.', diagnostic, 'LOGIN_FAILED');
       if (loginStatus === 400 || loginStatus === 401) throw new LoginFailure('LOGIN_REJECTED', 'LeetCode rejected the sign-in. Check credentials or complete account verification in your browser.', diagnostic, 'LOGIN_FAILED');
-      if (loginStatus === 403) throw new LoginFailure('VERIFICATION_REQUIRED', VERIFICATION_MESSAGE, diagnostic, 'AWAITING_USER_VERIFICATION');
+      if (loginStatus === 403) {
+        if (!diagnostic.solverAttempted && diagnostic.adapterInitialized) {
+          const postSubmitDetail = await detectVerificationDetail(page);
+          await retryPostSubmit(postSubmitDetail.required ? postSubmitDetail : { type: 'cloudflare_interstitial', required: true }, loginStatus);
+          continue;
+        }
+        throw new LoginFailure('VERIFICATION_REQUIRED', VERIFICATION_MESSAGE, diagnostic, 'AWAITING_USER_VERIFICATION');
+      }
       if (loginStatus === 429) throw new LoginFailure('LOGIN_RATE_LIMITED', 'LeetCode has rate limited sign-in. Wait before retrying.', diagnostic, 'LOGIN_FAILED');
       if (loginStatus && loginStatus >= 500) throw new LoginFailure('LOGIN_SERVICE_ERROR', `LeetCode sign-in returned HTTP ${loginStatus}. Retry later.`, diagnostic, 'LOGIN_FAILED');
-      if (await verificationState(page).catch(() => 'none') === 'required') throw new LoginFailure('VERIFICATION_REQUIRED', VERIFICATION_MESSAGE, diagnostic, 'AWAITING_USER_VERIFICATION');
+      if (await verificationState(page).catch(() => 'none') === 'required') {
+        if (!diagnostic.solverAttempted && diagnostic.adapterInitialized) {
+          const postSubmitDetail = await detectVerificationDetail(page);
+          if (postSubmitDetail.required) {
+            await retryPostSubmit(postSubmitDetail, loginStatus);
+            continue;
+          }
+        }
+        throw new LoginFailure('VERIFICATION_REQUIRED', VERIFICATION_MESSAGE, diagnostic, 'AWAITING_USER_VERIFICATION');
+      }
       const verified = await signedInUser(page, remaining());
       if (verified) {
         logger.info({ attemptId }, '[AUTH] Authentication response received');
@@ -688,40 +803,62 @@ export async function loginToLeetCode(loginInput: string, password: string,
   const timeoutMs = options.timeoutMs ?? (options.proxyUrl ? 150_000 : 90_000);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return { ok: false, code: 'INVALID_TIMEOUT', error: 'Login timeout must be a positive number.', state: 'LOGIN_FAILED' };
   if (options.signal?.aborted) return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.', state: 'LOGIN_FAILED' };
+  const initialProxy = options.proxyUrl ? toPlaywrightProxy(options.proxyUrl) : undefined;
+  if (options.proxyUrl && !initialProxy) return { ok: false, code: 'LOGIN_PROXY_INVALID', error: 'Invalid login proxy configuration; direct fallback disabled.', state: 'LOGIN_FAILED' };
   const deadline = Date.now() + timeoutMs;
-  let browser: Browser | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const close = () => { void browser?.close().catch(() => undefined); };
-  options.signal?.addEventListener('abort', close, { once: true });
-  try {
-    const proxy = options.proxyUrl ? toPlaywrightProxy(options.proxyUrl) : undefined;
-    if (options.proxyUrl && !proxy) return { ok: false, code: 'LOGIN_PROXY_INVALID', error: 'Invalid login proxy configuration; direct fallback disabled.', state: 'LOGIN_FAILED' };
-    browser = await chromium.launch({
-      headless: config.browser.headless,
-      timeout: timeoutMs,
-      args: ['--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu', '--js-flags=--max-old-space-size=256'],
-      proxy,
-    });
-    if (options.signal?.aborted) return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.', state: 'LOGIN_FAILED' };
-    if (Date.now() >= deadline) return { ok: false, code: 'LOGIN_TIMEOUT', error: 'Login timed out while launching the browser.', state: 'LOGIN_FAILED' };
-    timer = setTimeout(close, Math.max(1, deadline - Date.now()));
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
-      locale: 'en-US',
-      userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
-    });
-    const page = await context.newPage();
-    return await loginOnLeetCodePage(page, loginInput.trim(), password, { ...options, timeoutMs: Math.max(1, deadline - Date.now()) });
-  } catch {
-    return {
-      ok: false,
-      code: options.signal?.aborted ? 'LOGIN_CANCELLED' : 'LOGIN_BROWSER_ERROR',
-      error: options.signal?.aborted ? 'Login cancelled.' : 'Could not initialize the login browser. Check the browser installation and server resources.',
-      state: 'LOGIN_FAILED',
-    };
-  } finally {
-    if (timer) clearTimeout(timer);
-    options.signal?.removeEventListener('abort', close);
-    await browser?.close().catch(() => undefined);
+
+  const runSingleBrowserLogin = async (proxyUrlToUse?: string): Promise<LeetCodeLoginResult> => {
+    let browser: Browser | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const close = () => { void browser?.close().catch(() => undefined); };
+    options.signal?.addEventListener('abort', close, { once: true });
+    try {
+      const proxy = proxyUrlToUse ? toPlaywrightProxy(proxyUrlToUse) : undefined;
+      browser = await chromium.launch({
+        headless: config.browser.headless,
+        timeout: Math.max(1, deadline - Date.now()),
+        args: buildLaunchArgs(config.browser.headless),
+        proxy,
+      });
+      if (options.signal?.aborted) return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.', state: 'LOGIN_FAILED' };
+      if (Date.now() >= deadline) return { ok: false, code: 'LOGIN_TIMEOUT', error: 'Login timed out while launching the browser.', state: 'LOGIN_FAILED' };
+      timer = setTimeout(close, Math.max(1, deadline - Date.now()));
+      const context = await browser.newContext({
+        viewport: { width: 1280, height: 800 },
+        locale: 'en-US',
+        userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
+      });
+      await applyStealthScripts(context, 'chromium');
+      const page = await context.newPage();
+      return await loginOnLeetCodePage(page, loginInput.trim(), password, {
+        ...options,
+        proxyUrl: proxyUrlToUse,
+        timeoutMs: Math.max(1, deadline - Date.now()),
+      });
+    } catch {
+      return {
+        ok: false,
+        code: options.signal?.aborted ? 'LOGIN_CANCELLED' : 'LOGIN_BROWSER_ERROR',
+        error: options.signal?.aborted ? 'Login cancelled.' : 'Could not initialize the login browser. Check the browser installation and server resources.',
+        state: 'LOGIN_FAILED',
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+      options.signal?.removeEventListener('abort', close);
+      await browser?.close().catch(() => undefined);
+    }
+  };
+
+  const firstResult = await runSingleBrowserLogin(options.proxyUrl);
+  if (
+    options.proxyUrl &&
+    firstResult.code === 'LOGIN_BROWSER_ERROR' &&
+    process.env.LEETCODE_DISABLE_DIRECT_FALLBACK !== 'true' &&
+    !options.signal?.aborted &&
+    deadline - Date.now() > 15_000
+  ) {
+    logger.warn({ remainingMs: deadline - Date.now() }, 'Proxy LeetCode login failed with browser/navigation error; retrying direct without proxy');
+    return await runSingleBrowserLogin(undefined);
   }
+  return firstResult;
 }

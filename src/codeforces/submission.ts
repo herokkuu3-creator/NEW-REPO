@@ -1,6 +1,6 @@
 import type { Page, Response } from 'playwright';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, solveCloudflareWithCapzy, solveCloudflareOrchestrated } from './browserForm';
-import { getCPSolverUrl } from './captchaSolver';
+import { getCPSolverUrl, sanitizeChallengeUrl } from './captchaSolver';
 import { interactWithTurnstileCheckbox } from '../browser/stealth';
 import type { BrowserSession } from '../browser/playwright';
 import { logger } from '../logger';
@@ -340,7 +340,7 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
 
       const solveStart = Date.now();
       const result = await solveCloudflareOrchestrated({
-        websiteURL: currentUrl,
+        websiteURL: sanitizeChallengeUrl(currentUrl),
         proxyUrl,
         userAgent,
         cookies: currentCookies,

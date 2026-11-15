@@ -33,7 +33,7 @@ import { ActionBroker, dispatchAction } from './actionBroker';
 import { submissionLogSummary } from './submissionLog';
 import { BrowserFormError, clickSubmitForm, ensureFormTurnstile, fillSource, isSubmissionHistory, blockCodeforcesResource, solveCloudflareWithCapzy, getDefaultUserAgent } from './browserForm';
 import { initCapzyKeys, getActiveCapzyKeyIndex } from './capzyKeyManager';
-import { solveCloudflareOrchestrated, initCPSolverConfig, getCPSolverUrl } from './captchaSolver';
+import { solveCloudflareOrchestrated, initCPSolverConfig, getCPSolverUrl, sanitizeChallengeUrl } from './captchaSolver';
 import { applyStealthScripts, interactWithTurnstileCheckbox } from '../browser/stealth';
 import { parseProxyList } from './proxyRotator';
 import { chromium, firefox, type Browser, type BrowserContext, type Page } from 'playwright';
@@ -463,7 +463,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
 
       const solveStart = Date.now();
       const result = await solveCloudflareOrchestrated({
-        websiteURL: currentUrl,
+        websiteURL: sanitizeChallengeUrl(currentUrl),
         proxyUrl,
         userAgent,
         cookies: currentCookies,
