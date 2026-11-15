@@ -16,11 +16,19 @@ export function assertTransition(from: string, to: string): void {
 
 export async function ensurePost(context: SubmissionContext): Promise<SolutionPost> {
   contextSchema.parse(context);
+  const intent = context.intent ?? 'community-solution';
   // The empty update must never replace the accepted source on a retry.
   return prisma.solutionPost.upsert({
-    where: { accountId_problemSlug_intent: { accountId: context.accountId, problemSlug: context.slug, intent: 'community-solution' } },
-    create: { accountId: context.accountId, problemSlug: context.slug, submissionId: context.submissionId,
-      context: JSON.stringify(context), codeHash: hash(context.code) }, update: {},
+    where: { accountId_problemSlug_intent: { accountId: context.accountId, problemSlug: context.slug, intent } },
+    create: {
+      accountId: context.accountId,
+      problemSlug: context.slug,
+      submissionId: context.submissionId,
+      ...(context.intent ? { intent: context.intent } : {}),
+      context: JSON.stringify(context),
+      codeHash: hash(context.code),
+    },
+    update: {},
   });
 }
 

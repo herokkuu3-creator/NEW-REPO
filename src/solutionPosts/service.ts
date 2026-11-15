@@ -78,11 +78,11 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
   if (run.accountId !== accountId || run.state !== 'SUCCESS' || !run.solution || !run.submissionId ||
     run.submissionStatus !== 'Accepted') throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
   const account = await prisma.account.findUniqueOrThrow({ where: { id: accountId } });
-  // Manual question submissions use a namespaced DailyRun key so they never
-  // collide with the real calendar-day run. The article context still needs a
+  // Manual and contest question submissions use namespaced DailyRun keys so they
+  // never collide with the real calendar-day run. The article context still needs a
   // normal ISO challenge date for validation and presentation.
   const contextDate = /^\d{4}-\d{2}-\d{2}$/.test(run.date) ? run.date :
-    /^manual:\d+:(\d{4}-\d{2}-\d{2})$/.exec(run.date)?.[1] ?? new Date().toISOString().slice(0, 10);
+    /^(?:manual:\d+|contest:[^:]+:[^:]+):(\d{4}-\d{2}-\d{2})$/.exec(run.date)?.[1] ?? new Date().toISOString().slice(0, 10);
   return withAccount(account, async (api, _page, username) => {
     const verdict = await api.awaitSubmission(run.submissionId!, run.problemSlug, 30000, { firstPollDelayMs: 0 });
     if (verdict.classification !== 'ACCEPTED') throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
@@ -250,13 +250,18 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     });
     useCoarena = activeRouter instanceof CoarenaRouter;
     let implementation = { value: savedContext.articleImplementation, attempts: implementationAttempts };
-    if (!implementation.value) {
+    if (!implementation.value && (savedContext.articleStyle !== 'one-liner' || previous.length > 0)) {
       await onStage?.('generating_article', 'Writing and reviewing a distinct implementation…');
-      implementation = await generateImplementation(activeRouter, savedContext, previous,
-        fingerprint => reserveImplementation(post, savedContext, fingerprint));
+      implementation = savedContext.articleStyle === 'one-liner'
+        ? await generateImplementation(activeRouter, savedContext, previous,
+            fingerprint => reserveImplementation(post, savedContext, fingerprint), { oneLiner: true })
+        : await generateImplementation(activeRouter, savedContext, previous,
+            fingerprint => reserveImplementation(post, savedContext, fingerprint));
     }
     implementationAttempts = implementation.attempts;
-    const articleContext = { ...savedContext, articleImplementation: implementation.value };
+    const articleContext = implementation.value
+      ? { ...savedContext, articleImplementation: implementation.value }
+      : savedContext;
     let priorFailure: { markdown: string; issues: string[] } | undefined;
     try {
       const feedback = (JSON.parse(post.attempts ?? '[]') as Array<{ reviewIssues?: string[] }>).reverse().find(a => a.reviewIssues?.length);
@@ -337,12 +342,26 @@ function draftNeedsRefresh(context: SubmissionContext): boolean {
     (presentation?.visualVersion === 6 && questionIllustration(context) === 'grid');
 }
 
+async function interruptedLockKey(post: SolutionPost, updatedAt: Date): Promise<string | null> {
+  let intent = (post as { intent?: string }).intent;
+  if (!intent && typeof post.context === 'string') {
+    try { intent = contextSchema.safeParse(JSON.parse(post.context)).data?.intent; } catch { /* ignore unreadable context */ }
+  }
+  if (intent !== 'contest-solution') return 'solution-post-job:' + post.accountId + ':' + updatedAt.toISOString().slice(0, 10);
+  if (!post.submissionId) return null;
+  const run = await prisma.dailyRun?.findFirst?.({ where: { accountId: post.accountId, submissionId: post.submissionId } });
+  const contestSlug = /^contest:([^:]+):[^:]+:\d{4}-\d{2}-\d{2}$/.exec(run?.date ?? '')?.[1];
+  return contestSlug ? 'contest-post-job:' + contestSlug : null;
+}
+
 export async function generateForRun(accountId: string, runId: string, force = false, onStage?: StageCallback,
-  publicationMode?: PublicationMode): Promise<SolutionPost> {
+  publicationMode?: PublicationMode,
+  options?: { intent?: SubmissionContext['intent']; articleStyle?: SubmissionContext['articleStyle'] }): Promise<SolutionPost> {
   const run = await prisma.dailyRun.findUniqueOrThrow({ where: { id: runId } });
   if (run.accountId !== accountId) throw new PostError('ACCOUNT_IDENTITY_MISMATCH');
+  const intent = options?.intent ?? 'community-solution';
   const existing = await prisma.solutionPost.findUnique({ where: { accountId_problemSlug_intent: {
-    accountId, problemSlug: run.problemSlug, intent: 'community-solution',
+    accountId, problemSlug: run.problemSlug, intent,
   } } });
   if (existing && awaitingCoarena(existing)) return existing;
   if (existing && !['PENDING', 'RETRY_PENDING'].includes(existing.status)) {
@@ -352,7 +371,13 @@ export async function generateForRun(accountId: string, runId: string, force = f
     }
     return existing;
   }
-  return generatePost(await loadContext(accountId, runId), undefined, force, onStage, publicationMode);
+  const loaded = await loadContext(accountId, runId);
+  const context = options ? {
+    ...loaded,
+    ...(options.intent ? { intent: options.intent } : {}),
+    ...(options.articleStyle ? { articleStyle: options.articleStyle } : {}),
+  } : loaded;
+  return generatePost(context, undefined, force, onStage, publicationMode);
 }
 
 export async function requeueInterruptedGeneration(id: string, updatedAt: Date): Promise<SolutionPost> {
@@ -361,13 +386,13 @@ export async function requeueInterruptedGeneration(id: string, updatedAt: Date):
       post.updatedAt.getTime() !== updatedAt.getTime() || Date.now() - updatedAt.getTime() < SOLUTION_ARTICLE_WORK_MS) {
     throw new PostError('GENERATION_RECOVERY_CONFLICT');
   }
-  const key = 'solution-post-job:' + post.accountId + ':' + updatedAt.toISOString().slice(0, 10);
-  const lock = await prisma.systemState.findUnique({ where: { key } });
+  const key = await interruptedLockKey(post, updatedAt);
+  const lock = key ? await prisma.systemState.findUnique({ where: { key } }) : null;
   const recovered = await move(post, 'RETRY_PENDING', isCoarenaPauseCode(post.lastError)
     ? { leaseUntil: new Date(), retryCount: { decrement: 1 } }
     : { leaseUntil: null, lastError: 'GENERATION_INTERRUPTED' });
-  // Remove only the account lock observed before this generation made progress.
-  if (lock && lock.updatedAt <= updatedAt) await prisma.systemState.deleteMany({ where: { key, value: lock.value } });
+  // Remove only the lock observed before this generation made progress.
+  if (key && lock && lock.updatedAt <= updatedAt) await prisma.systemState.deleteMany({ where: { key, value: lock.value } });
   return recovered;
 }
 
