@@ -88,7 +88,10 @@ describe('leetcode/contest GraphQL helpers', () => {
       };
     });
 
-    const contests = await fetchRecentContestsByType('biweekly', 2, { graphql });
+    const contests = await fetchRecentContestsByType('biweekly', 2, {
+      graphql,
+      now: new Date(1_760_005_500 * 1000),
+    });
 
     expect(calls).toHaveLength(2);
     expect(calls[0]?.query).toBe(PAST_CONTESTS_QUERY);
@@ -262,5 +265,126 @@ describe('leetcode/contest GraphQL helpers', () => {
     await expect(fetchContestBySlug('weekly-contest-432')).rejects.toThrow(
       /LeetCode contest GraphQL error: rate limited/
     );
+  });
+
+  it('prepends newly-ended <prefix><N+1> when pastContests lags right after contest end and slices to limit', async () => {
+    const prevEndSec = 1_762_000_000;
+    const latestStartSec = prevEndSec + 7 * 86400 - 5400; // ends prevEndSec + 7 days
+    const latestEndSec = latestStartSec + 5400;
+    const now = new Date((latestEndSec + 60) * 1000); // 60s after 09:30 / 21:30 end
+
+    const graphql = vi.fn(async (query: string, variables?: Record<string, unknown>) => {
+      if (query === PAST_CONTESTS_QUERY) {
+        return {
+          data: {
+            pastContests: {
+              currentPage: 1,
+              pageNum: 1,
+              totalNum: 1,
+              data: [
+                {
+                  title: 'Weekly Contest 526',
+                  titleSlug: 'weekly-contest-526',
+                  startTime: prevEndSec - 5400,
+                  originStartTime: prevEndSec - 5400,
+                  duration: 5400,
+                  isVirtual: false,
+                  questions: [
+                    { title: 'Old Q1', titleSlug: 'old-q1', questionId: '100', credit: 3 },
+                  ],
+                },
+              ],
+            },
+          },
+        };
+      }
+      expect(query).toBe(CONTEST_QUERY);
+      expect(variables).toEqual({ titleSlug: 'weekly-contest-527' });
+      return {
+        data: {
+          contest: {
+            title: 'Weekly Contest 527',
+            titleSlug: 'weekly-contest-527',
+            startTime: latestStartSec,
+            duration: 5400,
+            questions: [
+              { title: 'New Q1', titleSlug: 'new-q1', questionId: '5271', credit: 3 },
+              { title: 'New Q2', titleSlug: 'new-q2', questionId: '5272', credit: 4 },
+            ],
+          },
+        },
+      };
+    });
+
+    const recentOne = await fetchRecentContestsByType('weekly', 1, { graphql, now });
+    expect(recentOne.map((c) => c.titleSlug)).toEqual(['weekly-contest-527']);
+    expect(recentOne[0]?.questions.map((q) => q.titleSlug)).toEqual(['new-q1', 'new-q2']);
+
+    const latest = await fetchLatestEndedContest('weekly', now, { graphql });
+    expect(latest?.titleSlug).toBe('weekly-contest-527');
+  });
+
+  it('does not prepend <prefix><N+1> if contest is still live or fetchContestBySlug returns null', async () => {
+    const prevEndSec = 1_762_000_000;
+    const nextStartSec = prevEndSec + 7 * 86400 - 5400;
+    const nowDuringContest = new Date((nextStartSec + 1800) * 1000); // still live (endTimeSec > nowSec)
+
+    const pastResponse = {
+      data: {
+        pastContests: {
+          currentPage: 1,
+          pageNum: 1,
+          totalNum: 1,
+          data: [
+            {
+              title: 'Biweekly Contest 194',
+              titleSlug: 'biweekly-contest-194',
+              startTime: prevEndSec - 5400,
+              originStartTime: prevEndSec - 5400,
+              duration: 5400,
+              isVirtual: false,
+              questions: [],
+            },
+          ],
+        },
+      },
+    };
+
+    const liveGraphql = vi.fn(async (query: string, variables?: Record<string, unknown>) => {
+      if (query === PAST_CONTESTS_QUERY) {
+        return pastResponse;
+      }
+      expect(variables).toEqual({ titleSlug: 'biweekly-contest-195' });
+      return {
+        data: {
+          contest: {
+            title: 'Biweekly Contest 195',
+            titleSlug: 'biweekly-contest-195',
+            startTime: nextStartSec,
+            duration: 5400,
+            questions: [],
+          },
+        },
+      };
+    });
+
+    const whileLive = await fetchRecentContestsByType('biweekly', 5, {
+      graphql: liveGraphql,
+      now: nowDuringContest,
+    });
+    expect(whileLive.map((c) => c.titleSlug)).toEqual(['biweekly-contest-194']);
+
+    const nullProbeGraphql = vi.fn(async (query: string) => {
+      if (query === PAST_CONTESTS_QUERY) {
+        return pastResponse;
+      }
+      return { data: { contest: null } };
+    });
+
+    const whenNull = await fetchRecentContestsByType('biweekly', 5, {
+      graphql: nullProbeGraphql,
+      now: nowDuringContest,
+    });
+    expect(whenNull.map((c) => c.titleSlug)).toEqual(['biweekly-contest-194']);
   });
 });

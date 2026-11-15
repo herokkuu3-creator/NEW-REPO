@@ -22,6 +22,7 @@ export interface ContestSummary {
 
 export interface FetchContestsOptions {
   graphql?: (query: string, variables?: Record<string, unknown>) => Promise<unknown>;
+  now?: Date;
 }
 
 export const PAST_CONTESTS_QUERY =
@@ -208,7 +209,7 @@ export async function fetchRecentContestsByType(
   const collected: ContestSummary[] = [];
   const seenSlugs = new Set<string>();
 
-  for (let pageNo = 1; pageNo <= MAX_PAST_CONTEST_PAGES; pageNo++) {
+  pageLoop: for (let pageNo = 1; pageNo <= MAX_PAST_CONTEST_PAGES; pageNo++) {
     const raw = await graphql(PAST_CONTESTS_QUERY, {
       pageNo,
       numPerPage: DEFAULT_NUM_PER_PAGE,
@@ -257,7 +258,7 @@ export async function fetchRecentContestsByType(
       );
 
       if (collected.length >= targetLimit) {
-        return collected;
+        break pageLoop;
       }
     }
 
@@ -270,7 +271,26 @@ export async function fetchRecentContestsByType(
     }
   }
 
-  return collected;
+  // Right after a contest ends (e.g. 09:31 / 21:31 IST), pastContests can lag briefly
+  // even though contest(titleSlug: "<prefix><N+1>") is already queryable.
+  const nowSec = Math.floor((options?.now ?? new Date()).getTime() / 1000);
+  const newest = collected[0];
+  if (newest && newest.endTimeSec <= nowSec - 3600) {
+    const suffixMatch = newest.titleSlug.slice(prefix.length).match(/^(\d+)$/);
+    if (suffixMatch) {
+      const nextSlug = `${prefix}${Number(suffixMatch[1]) + 1}`;
+      try {
+        const next = await fetchContestBySlug(nextSlug, options);
+        if (next && next.endTimeSec <= nowSec && !seenSlugs.has(next.titleSlug)) {
+          collected.unshift(next);
+        }
+      } catch {
+        // Best-effort lag probe only; preserve collected pastContests items on error.
+      }
+    }
+  }
+
+  return collected.slice(0, targetLimit);
 }
 
 export async function fetchContestBySlug(
@@ -313,7 +333,7 @@ export async function fetchLatestEndedContest(
   options?: FetchContestsOptions
 ): Promise<ContestSummary | null> {
   const nowSec = Math.floor(now.getTime() / 1000);
-  const recent = await fetchRecentContestsByType(kind, 10, options);
+  const recent = await fetchRecentContestsByType(kind, 10, { ...options, now });
   const ended = recent
     .filter((contest) => contest.endTimeSec <= nowSec)
     .sort((a, b) => b.endTimeSec - a.endTimeSec || b.startTimeSec - a.startTimeSec);
