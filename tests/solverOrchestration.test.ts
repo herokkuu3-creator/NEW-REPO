@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import {
   initCPSolverConfig,
+  loginLeetCodeWithCPSolver,
   solveTurnstileOrchestrated,
   solveCloudflareOrchestrated,
   solveTurnstileWithCPSolver,
@@ -25,6 +26,7 @@ import {
   CAPZY_RETRY_DELAY_MS,
 } from '../src/codeforces/captchaSolver';
 import { withAttemptContext } from '../src/codeforces/attemptContext';
+import { loginToLeetCode } from '../src/leetcode/auth';
 
 describe('Solver Orchestration & Fallback Engine', () => {
   const originalEnv = process.env;
@@ -1613,6 +1615,90 @@ describe('Solver Orchestration & Fallback Engine', () => {
       };
       expect(extractTurnstileSitekeyFromFrames(mockPage)).toBe('0x4AAAAAAAQrSHUTor4iGTpW');
       expect(extractTurnstileSitekeyFromFrames({ frames: () => [{ url: () => 'https://example.com/' }] })).toBeUndefined();
+    });
+
+    it('delegates zero-proxy LeetCode login to CPSolver /leetcode-login and normalizes storageState', async () => {
+      process.env.CPSOLVER_URL = 'https://cpsolver.test.com';
+      process.env.CPSOLVER_API_TOKEN = 'remote_secret_token_999';
+
+      const calledEndpoints: Array<{ url: string; auth?: string; key?: string; body: Record<string, unknown> }> = [];
+      vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const hdrs = (init?.headers ?? {}) as Record<string, string>;
+        calledEndpoints.push({
+          url: String(url),
+          auth: hdrs.Authorization,
+          key: hdrs['x-api-key'],
+          body: JSON.parse(String(init?.body || '{}')),
+        });
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            username: 'scale5558',
+            storageState: {
+              cookies: [
+                { name: 'LEETCODE_SESSION', value: 'jwt_session_val', domain: '.leetcode.com', path: '/' },
+                { name: 'csrftoken', value: 'csrf_val', domain: '.leetcode.com', path: '/' },
+              ],
+              origins: [],
+            },
+            durationMs: 1200,
+            proxyUsed: 'direct',
+            challengeObserved: 'cloudflare_interstitial',
+          }),
+        } as Response;
+      }));
+
+      const directClientRes = await loginLeetCodeWithCPSolver({
+        username: 'scale5558',
+        password: 'pw',
+      });
+      expect(directClientRes.ok).toBe(true);
+      expect(directClientRes.username).toBe('scale5558');
+
+      const loginRes = await loginToLeetCode('scale5558', 'pw', { timeoutMs: 30_000 });
+      expect(loginRes.ok).toBe(true);
+      expect(loginRes.username).toBe('scale5558');
+      expect(loginRes.state).toBe('AUTHENTICATED');
+      expect(loginRes.storageState?.cookies[0]).toMatchObject({
+        name: 'LEETCODE_SESSION',
+        value: 'jwt_session_val',
+        sameSite: 'Lax',
+        expires: -1,
+      });
+      expect(calledEndpoints[0]).toMatchObject({
+        url: 'https://cpsolver.test.com/leetcode-login',
+        auth: 'Bearer remote_secret_token_999',
+        key: 'remote_secret_token_999',
+        body: { username: 'scale5558', password: 'pw' },
+      });
+    });
+
+    it('reports unavailable on 404 and short-circuits on LOGIN_REJECTED from CPSolver /leetcode-login', async () => {
+      process.env.CPSOLVER_URL = 'https://cpsolver.test.com';
+      let callNum = 0;
+      vi.stubGlobal('fetch', vi.fn(async () => {
+        callNum += 1;
+        if (callNum === 1) {
+          return { ok: false, status: 404, json: async () => ({}) } as Response;
+        }
+        return {
+          ok: false,
+          status: 422,
+          json: async () => ({ ok: false, code: 'LOGIN_REJECTED', error: 'Invalid username or password' }),
+        } as Response;
+      }));
+
+      const notDeployed = await loginLeetCodeWithCPSolver({ username: 'scale5558', password: 'pw' });
+      expect(notDeployed.ok).toBe(false);
+      expect(notDeployed.available).toBe(false);
+      expect(notDeployed.statusCode).toBe(404);
+
+      const rejected = await loginToLeetCode('scale5558', 'wrongpw', { timeoutMs: 30_000 });
+      expect(rejected.ok).toBe(false);
+      expect(rejected.code).toBe('LOGIN_REJECTED');
+      expect(rejected.state).toBe('LOGIN_FAILED');
     });
   });
 });

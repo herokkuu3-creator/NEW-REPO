@@ -806,6 +806,138 @@ export async function solveCloudflareWithCPSolver(params: {
   }
 }
 
+export interface CPSolverLeetCodeLoginResult {
+  ok: boolean;
+  available: boolean;
+  username?: string;
+  storageState?: {
+    cookies: Array<{
+      name: string;
+      value: string;
+      domain: string;
+      path: string;
+      expires?: number;
+      httpOnly?: boolean;
+      secure?: boolean;
+      sameSite?: 'Strict' | 'Lax' | 'None';
+    }>;
+    origins: Array<{
+      origin: string;
+      localStorage: Array<{ name: string; value: string }>;
+    }>;
+  };
+  code?: string;
+  error?: string;
+  statusCode?: number;
+  durationMs: number;
+  proxyUsed?: string;
+  challengeObserved?: string;
+}
+
+/**
+ * Delegates LeetCode sign-in to CPSolver (/leetcode-login) so any Cloudflare
+ * challenge, Turnstile interaction, and credential form submission happen in
+ * one single Patchright browser context on one IP (no cross-IP cf_clearance mismatch).
+ */
+export async function loginLeetCodeWithCPSolver(params: {
+  username: string;
+  password: string;
+  proxyUrl?: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}): Promise<CPSolverLeetCodeLoginResult> {
+  const solverUrl = getCPSolverUrl();
+  if (!solverUrl) {
+    return {
+      ok: false,
+      available: false,
+      durationMs: 0,
+      error: 'CPSolver URL is not configured',
+    };
+  }
+
+  const startTime = Date.now();
+  const timeout = Math.min(180_000, Math.max(15_000, params.timeoutMs ?? 110_000));
+  const httpTimeoutSignal = AbortSignal.timeout(timeout + 10_000);
+  const combinedSignal = params.signal
+    ? AbortSignal.any([params.signal, httpTimeoutSignal])
+    : httpTimeoutSignal;
+
+  try {
+    const response = await fetch(`${solverUrl}/leetcode-login`, {
+      method: 'POST',
+      headers: buildCPSolverHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        username: params.username,
+        password: params.password,
+        ...(params.proxyUrl ? { proxy: params.proxyUrl } : {}),
+        timeout,
+      }),
+      signal: combinedSignal,
+    });
+
+    const durationMs = Date.now() - startTime;
+    if (response.status === 404) {
+      return {
+        ok: false,
+        available: false,
+        statusCode: 404,
+        durationMs,
+        error: 'CPSolver /leetcode-login endpoint is not deployed (HTTP 404)',
+      };
+    }
+
+    const data = (await response.json().catch(() => ({}))) as {
+      ok?: boolean;
+      username?: string;
+      storageState?: {
+        cookies?: CPSolverLeetCodeLoginResult['storageState'] extends { cookies: infer C } ? C : never;
+        origins?: CPSolverLeetCodeLoginResult['storageState'] extends { origins: infer O } ? O : never;
+      };
+      code?: string;
+      error?: string;
+      durationMs?: number;
+      proxyUsed?: string;
+      challengeObserved?: string;
+    };
+
+    const rawCookies = Array.isArray(data.storageState?.cookies) ? data.storageState!.cookies : [];
+    if (response.ok && data.ok === true && typeof data.username === 'string' && data.username.trim() && rawCookies.length > 0) {
+      return {
+        ok: true,
+        available: true,
+        username: data.username.trim(),
+        storageState: {
+          cookies: rawCookies,
+          origins: Array.isArray(data.storageState?.origins) ? data.storageState!.origins : [],
+        },
+        durationMs: data.durationMs ?? durationMs,
+        proxyUsed: data.proxyUsed,
+        challengeObserved: data.challengeObserved,
+      };
+    }
+
+    return {
+      ok: false,
+      available: response.status < 500 && response.status !== 401 && response.status !== 403,
+      statusCode: response.status,
+      code: data.code || (response.status === 408 ? 'LOGIN_TIMEOUT' : 'VERIFICATION_REQUIRED'),
+      error: data.error || `CPSolver /leetcode-login HTTP ${response.status}`,
+      durationMs: data.durationMs ?? durationMs,
+      proxyUsed: data.proxyUsed,
+      challengeObserved: data.challengeObserved,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      available: false,
+      code: params.signal?.aborted ? 'LOGIN_CANCELLED' : 'CPSOLVER_UNAVAILABLE',
+      error: err instanceof Error ? err.message : String(err),
+      durationMs: Date.now() - startTime,
+    };
+  }
+}
+
 /**
  * Execute a single Capzy task (createTask + getTaskResult polling) to completion, terminal failure, or timeout.
  * Enforces pre-flight schema validation, sanitized request recording, duplicate-task prevention,

@@ -279,7 +279,7 @@ describe('Autonomous Server-Side LeetCode Session Manager & Orchestrator', () =>
     expect(expiredStatus.coolingDown).toBe(false);
   });
 
-  it('blocks redundant /lclogin browser launches while an account is in Cloudflare login cooldown', async () => {
+  it('allows /lclogin browser launches immediately even if a prior cooldown record exists', async () => {
     await recordLeetCodeLoginCooldown(
       'cooldown_user',
       'VERIFICATION_REQUIRED',
@@ -287,12 +287,21 @@ describe('Autonomous Server-Side LeetCode Session Manager & Orchestrator', () =>
       30 * 60 * 1000,
     );
 
+    vi.mocked(loginToLeetCode).mockResolvedValueOnce({
+      ok: true,
+      username: 'cooldown_user',
+      storageState: {
+        cookies: [{ name: 'LEETCODE_SESSION', value: 'fresh_jwt', domain: '.leetcode.com', path: '/' }],
+        origins: [],
+      },
+    } as any);
+
     const reply = vi.fn(async (_msg: string) => undefined);
     await handleExecuteLogin('leetcode', 'cooldown_user', 'cooldown_user', 'pw123', reply);
 
-    expect(loginToLeetCode).not.toHaveBeenCalled();
-    expect(reply).toHaveBeenCalledOnce();
-    expect(reply.mock.calls[0]?.[0]).toContain('LeetCode Login Cooldown Active');
+    expect(loginToLeetCode).toHaveBeenCalledOnce();
+    const sentMessages = reply.mock.calls.map((c) => c[0]).join('\n');
+    expect(sentMessages).not.toContain('LeetCode Login Cooldown Active');
   });
 
   it('executes autonomous server-side verification on /lclogin without asking for a password when accounts are stored', async () => {

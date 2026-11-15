@@ -1,13 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { chromium, type Browser, type Page, type Response } from 'playwright';
 import { config } from '../config';
-import { StorageStateShape } from '../browser/cookiePayload';
+import { StorageStateShape, type StorageCookie } from '../browser/cookiePayload';
 import { buildLaunchArgs } from '../browser/playwright';
 import { applyStealthScripts } from '../browser/stealth';
 import { logger } from '../logger';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
 import {
   getCPSolverUrl,
+  loginLeetCodeWithCPSolver,
   solveTurnstileOrchestrated,
   solveCloudflareOrchestrated,
   sanitizeChallengeUrl,
@@ -88,6 +89,7 @@ export interface LeetCodeLoginOptions {
   proxyUrl?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  disableRemoteLogin?: boolean;
   onProgress?: (status: string, state?: LoginState) => Promise<void> | void;
   solver?: (params: {
     websiteURL: string;
@@ -800,12 +802,75 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
 export async function loginToLeetCode(loginInput: string, password: string,
   options: LeetCodeLoginOptions = {}): Promise<LeetCodeLoginResult> {
   if (!loginInput.trim() || !password) return { ok: false, code: 'CREDENTIALS_REQUIRED', error: 'Username/email and password are required.', state: 'LOGIN_FAILED' };
-  const timeoutMs = options.timeoutMs ?? (options.proxyUrl ? 150_000 : 90_000);
+  const hasRemoteSolver = !options.proxyUrl && !options.disableRemoteLogin && !options.solver && Boolean(getCPSolverUrl());
+  const timeoutMs = options.timeoutMs ?? (options.proxyUrl ? 150_000 : (hasRemoteSolver ? 140_000 : 90_000));
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return { ok: false, code: 'INVALID_TIMEOUT', error: 'Login timeout must be a positive number.', state: 'LOGIN_FAILED' };
   if (options.signal?.aborted) return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.', state: 'LOGIN_FAILED' };
   const initialProxy = options.proxyUrl ? toPlaywrightProxy(options.proxyUrl) : undefined;
   if (options.proxyUrl && !initialProxy) return { ok: false, code: 'LOGIN_PROXY_INVALID', error: 'Invalid login proxy configuration; direct fallback disabled.', state: 'LOGIN_FAILED' };
   const deadline = Date.now() + timeoutMs;
+
+  if (hasRemoteSolver) {
+    await options.onProgress?.('🌐 Signing in via remote solver browser (single-IP session)…', 'LOGIN_PAGE_LOADING');
+    if (options.signal?.aborted) {
+      return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.', state: 'LOGIN_FAILED' };
+    }
+
+    const remoteBudgetMs = Math.max(15_000, Math.min(90_000, deadline - Date.now()));
+    const remoteRes = await loginLeetCodeWithCPSolver({
+      username: loginInput.trim(),
+      password,
+      timeoutMs: remoteBudgetMs,
+      signal: options.signal,
+    });
+
+    if (remoteRes.ok && remoteRes.storageState && remoteRes.username) {
+      const normalizedCookies: StorageCookie[] = remoteRes.storageState.cookies.map((c) => ({
+        name: String(c.name ?? ''),
+        value: String(c.value ?? ''),
+        domain: String(c.domain || '.leetcode.com'),
+        path: String(c.path || '/'),
+        expires: typeof c.expires === 'number' && Number.isFinite(c.expires) ? c.expires : -1,
+        httpOnly: Boolean(c.httpOnly),
+        secure: Boolean(c.secure),
+        sameSite: c.sameSite === 'Strict' || c.sameSite === 'None' ? c.sameSite : 'Lax',
+      }));
+      await options.onProgress?.('✅ Remote single-IP browser login succeeded.', 'AUTHENTICATED');
+      return {
+        ok: true,
+        username: remoteRes.username,
+        storageState: {
+          cookies: normalizedCookies,
+          origins: remoteRes.storageState.origins ?? [],
+        },
+        state: 'AUTHENTICATED',
+      };
+    }
+
+    if (options.signal?.aborted || remoteRes.code === 'LOGIN_CANCELLED') {
+      return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.', state: 'LOGIN_FAILED' };
+    }
+
+    if (remoteRes.code === 'LOGIN_REJECTED' || remoteRes.code === 'LOGIN_RATE_LIMITED') {
+      return {
+        ok: false,
+        code: remoteRes.code,
+        error: remoteRes.error || 'LeetCode rejected the sign-in.',
+        state: 'LOGIN_FAILED',
+      };
+    }
+
+    logger.warn(
+      {
+        available: remoteRes.available,
+        statusCode: remoteRes.statusCode,
+        code: remoteRes.code,
+        error: remoteRes.error,
+        remainingMs: Math.max(0, deadline - Date.now()),
+      },
+      'Remote CPSolver /leetcode-login did not complete; falling back to local browser login',
+    );
+  }
 
   const runSingleBrowserLogin = async (proxyUrlToUse?: string): Promise<LeetCodeLoginResult> => {
     let browser: Browser | undefined;

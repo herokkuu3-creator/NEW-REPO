@@ -33,18 +33,18 @@ import {
   clearLeetCodeLoginCooldownsForTests,
   findStoredLeetCodeAccount,
   formatRemainingTtl,
-  getLeetCodeLoginCooldown,
-  recordLeetCodeLoginCooldown,
   verifyStoredLeetCodeAccount,
   withSingleFlightLogin,
 } from '../leetcode/sessionManager';
 import { extractSessionIdentity } from '../browser/sessionIdentity';
 import { getRecoveryService, hasRecoveryService } from '../recovery/runtime';
+import { getMobileTunnel, getOrCreateRecoveryTunnelToken } from '../recovery/mobileTunnel';
 import {
   cancelAllLeetCodePairingSessions,
   createLeetCodePairingSession,
   formatTelegramPairingPrompt,
   getLatestPendingLeetCodePairingSession,
+  resolvePublicBaseUrl,
   type CreatedLeetCodePairingSession,
 } from '../leetcode/loginHandoff';
 import { loginToCodeforces } from '../codeforces/auth';
@@ -832,6 +832,25 @@ export async function handleMessage(
             : outcome === 'none'
               ? 'That account has no open recovery.'
               : `No stored LeetCode account matches "${commandArg.trim()}".`,
+        );
+        return;
+      }
+      case '/mobile':
+      case '/mobiletunnel':
+      case '/tunnel': {
+        const status = getMobileTunnel().getStatus();
+        const origin = resolvePublicBaseUrl();
+        const token = await getOrCreateRecoveryTunnelToken();
+        const cmd = `curl -fsSL '${origin}/auth/recover/termux-setup.sh' | sh -s -- '${token}'`;
+        const stateLine = status.connected
+          ? `🟢 <b>Phone-IP Tunnel ACTIVE</b> (connected ${escapeHtml(status.connectedAt ?? 'just now')}${status.remoteIp ? `, IP: <code>${escapeHtml(status.remoteIp)}</code>` : ''})`
+          : '⚪ <b>Phone-IP Tunnel Offline</b>';
+        await replyHtml(
+          `📱 <b>Mobile Chrome Recovery Tunnel</b>\n\n` +
+          `${stateLine}\n\n` +
+          `Run this <b>one-time command</b> in <b>Termux</b> on Android so every Mobile Chrome recovery exits from your phone IP (bypasses Render datacenter Cloudflare blocks):\n\n` +
+          `<pre>${escapeHtml(cmd)}</pre>\n` +
+          `After running once, keep Termux running (or install Termux:Boot/Termux:Widget), then just tap <b>Reconnect Account</b> in Mobile Chrome and solve Cloudflare only.`,
         );
         return;
       }
@@ -7752,24 +7771,12 @@ export async function handleExecuteLogin(
         logger.info({ operationId, label, authenticated: false, cause: 'no-existing-account' }, '[LOGIN] Existing session checked');
       }
 
-      // 2. Check Server Login Cooldown to avoid hammering Cloudflare /accounts/login/ on direct datacenter IP
+      // 2. Resolve optional residential proxy for browser login
       lcProxy = await resolveLeetCodeResidentialProxy().catch((err) => {
         logger.warn({ err: errText(err), label }, 'LeetCode residential proxy unavailable');
         return null;
       });
       logger.info({ operationId, label, proxyHost: lcProxy?.host ?? 'direct' }, '[LOGIN] Proxy configuration resolved');
-      const cooldown = await getLeetCodeLoginCooldown(label);
-      if (cooldown.coolingDown && !lcProxy) {
-        const mins = Math.max(1, Math.ceil(cooldown.remainingSeconds / 60));
-        await replyFunc(
-          `⏳ <b>LeetCode Login Cooldown Active (${mins}m remaining)</b>\n` +
-          `• Account label: <code>${escapeHtml(label)}</code>\n` +
-          `• Reason: Cloudflare blocked headless datacenter login on <code>/accounts/login/</code> (<code>${escapeHtml(cooldown.code ?? 'VERIFICATION_REQUIRED')}</code>).\n` +
-          `• The server enforces a cooldown so repeated login attempts do not rate-limit or lock out the account.`,
-        );
-        logger.info({ operationId, label, status: 'cooldown_active' }, '[TELEGRAM] Final result delivered');
-        return;
-      }
     }
 
     await replyFunc(
@@ -7797,12 +7804,6 @@ export async function handleExecuteLogin(
 
       if (!res.ok || !res.storageState) {
         if (res.code === 'VERIFICATION_REQUIRED') {
-          await recordLeetCodeLoginCooldown(
-            label,
-            res.code,
-            res.error || 'Cloudflare verification required on /accounts/login/',
-          );
-
           pendingRenewalLabel = label;
           pendingLeetCodeVerificationHandoff = {
             label,
@@ -7936,7 +7937,7 @@ export async function handleExecuteLogin(
               reason: 'verification_required',
               diagnosticError: `Challenge: ${challengeType}, Adapter: ${selectedAdapter} (${solverResult})`,
             }) +
-              `\n\n<i>(Server login cooldown armed for 30m to prevent Cloudflare rate-limiting. Optional recovery: <code>/renew</code> is also armed for <code>${escapeHtml(label)}</code>.)</i>`,
+              `\n\n<i>(Optional recovery: <code>/renew</code> is also armed for <code>${escapeHtml(label)}</code>.)</i>`,
           );
           logger.info({ operationId, label, status: 'verification_required_pairing_prompt' }, '[TELEGRAM] Final result delivered');
           return;
