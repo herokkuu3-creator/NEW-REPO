@@ -66,19 +66,11 @@ const CODE_SHAPE_HINTS: Record<string, string> = {
     'Keep `public class Solution` and the exact method signature from the starter code.',
 };
 
-export function buildSolvePrompt(problem: ParsedProblem, language: string): LLMMessage[] {
-  const system = [
-    'You are an expert competitive-programming and database solver producing LeetCode submissions.',
-    '',
-    'OUTPUT CONTRACT (non-negotiable):',
-    '- Return ONLY the solution source code or SQL query.',
-    '- NO markdown, NO code fences (```), NO explanations, NO comments describing the approach.',
-    '- The code must compile/run as-is in the LeetCode environment for the target language.',
-    '- Follow the exact class/function/method/query signature expected by the starter code.',
-    '- Handle every stated constraint; prefer the most efficient correct algorithm.',
-    '- Never output TODO, placeholder bodies, or unfinished code.',
-  ].join('\n');
-
+function buildProblemUserContent(
+  problem: ParsedProblem,
+  language: string,
+  closingInstruction: string
+): string {
   const examples = problem.examples
     .map(
       (ex, i) =>
@@ -91,7 +83,7 @@ export function buildSolvePrompt(problem: ParsedProblem, language: string): LLMM
     ? problem.constraints.map((c) => `- ${c}`).join('\n')
     : '(none extracted — infer from the statement)';
 
-  const user = [
+  return [
     `Problem ${problem.frontendId}: ${problem.title} (${problem.difficulty})`,
     '',
     'Statement:',
@@ -107,14 +99,35 @@ export function buildSolvePrompt(problem: ParsedProblem, language: string): LLMM
     'Starter code you must complete:',
     problem.starterCode,
     '',
-    'Return ONLY the complete solution source code now.',
+    closingInstruction,
   ]
     .filter((line) => line !== '')
     .join('\n');
+}
+
+export function buildSolvePrompt(problem: ParsedProblem, language: string): LLMMessage[] {
+  const system = [
+    'You are an expert competitive-programming and database solver producing LeetCode submissions.',
+    '',
+    'OUTPUT CONTRACT (non-negotiable):',
+    '- Return ONLY the solution source code or SQL query.',
+    '- NO markdown, NO code fences (```), NO explanations, NO comments describing the approach.',
+    '- The code must compile/run as-is in the LeetCode environment for the target language.',
+    '- Follow the exact class/function/method/query signature expected by the starter code.',
+    '- Handle every stated constraint; prefer the most efficient correct algorithm.',
+    '- Never output TODO, placeholder bodies, or unfinished code.',
+  ].join('\n');
 
   return [
     { role: 'system', content: system },
-    { role: 'user', content: user },
+    {
+      role: 'user',
+      content: buildProblemUserContent(
+        problem,
+        language,
+        'Return ONLY the complete solution source code now.'
+      ),
+    },
   ];
 }
 
@@ -135,6 +148,102 @@ export function buildRepairMessage(failedCode: string, failureReport: string): L
       failedCode.slice(0, 8000),
       '',
       'Return ONLY the corrected, complete source code. Same output contract as before: no markdown, no explanation.',
+    ].join('\n'),
+  };
+}
+
+export interface JudgeFailureDetail {
+  statusMsg: string;
+  compileError?: string | null;
+  runtimeError?: string | null;
+  lastTestcase?: string | null;
+  expectedOutput?: string | null;
+  codeOutput?: string | null;
+}
+
+/**
+ * Contest Q1/Q2 prompt requesting either a clean helper-free 1-liner inside the
+ * starter signature or (when relaxed) the shortest clean idiomatic solution.
+ */
+export function buildContestOneLinerSolvePrompt(
+  problem: ParsedProblem,
+  language: string,
+  preferOneLiner = true
+): LLMMessage[] {
+  const styleGuidelines = preferOneLiner
+    ? [
+        'STYLE GOAL (Contest 1-Liner):',
+        '- Produce a clean, idiomatic, helper-free 1-liner solution inside LeetCode\'s required class/method signature.',
+        '- Prefer a single concise `return ...;` expression or a compact single-statement STL/lambda/list-comprehension/generator expression.',
+        '- Do NOT use preprocessor macros (#define), comma-operator obfuscation, or unreadably compressed hacks.',
+        '- Only fall back to 2-3 minimal, clean statements if the logic is truly impossible as a single statement.',
+      ]
+    : [
+        'STYLE GOAL (Shortest Clean Fallback):',
+        '- Produce the shortest, cleanest, beginner-friendly idiomatic solution inside LeetCode\'s required class/method signature.',
+        '- Avoid helper classes, unnecessary abstractions, verbose boilerplate, or over-engineering.',
+      ];
+
+  const system = [
+    'You are an expert competitive-programming solver producing clean LeetCode contest submissions.',
+    '',
+    'OUTPUT CONTRACT (non-negotiable):',
+    '- Return ONLY the solution source code.',
+    '- NO markdown, NO code fences (```), NO explanations, NO comments describing the approach.',
+    '- The code must compile/run as-is in the LeetCode environment for the target language.',
+    '- Follow the exact class/function/method signature expected by the starter code.',
+    '- Handle every stated constraint and edge case accurately (overflow, empty/single-element inputs, negative values, duplicates).',
+    '- Never output TODO, placeholder bodies, or unfinished code.',
+    '',
+    ...styleGuidelines,
+  ].join('\n');
+
+  const closingInstruction = preferOneLiner
+    ? 'Return ONLY the complete 1-liner contest solution source code now.'
+    : 'Return ONLY the complete shortest clean contest solution source code now.';
+
+  return [
+    { role: 'system', content: system },
+    { role: 'user', content: buildProblemUserContent(problem, language, closingInstruction) },
+  ];
+}
+
+/**
+ * Follow-up message when LeetCode Judge rejected a submitted contest candidate.
+ */
+export function buildJudgeRepairMessage(
+  failedCode: string,
+  judgeFeedback: JudgeFailureDetail
+): LLMMessage {
+  const details: string[] = [`Judge verdict: ${judgeFeedback.statusMsg || 'Rejected'}`];
+
+  if (judgeFeedback.compileError) {
+    details.push(`Compile error:\n${judgeFeedback.compileError.slice(0, 2000)}`);
+  }
+  if (judgeFeedback.runtimeError) {
+    details.push(`Runtime error:\n${judgeFeedback.runtimeError.slice(0, 2000)}`);
+  }
+  if (judgeFeedback.lastTestcase !== undefined && judgeFeedback.lastTestcase !== null && judgeFeedback.lastTestcase !== '') {
+    details.push(`Last testcase input:\n${judgeFeedback.lastTestcase.slice(0, 1500)}`);
+  }
+  if (judgeFeedback.expectedOutput !== undefined && judgeFeedback.expectedOutput !== null && judgeFeedback.expectedOutput !== '') {
+    details.push(`Expected output:\n${judgeFeedback.expectedOutput.slice(0, 1000)}`);
+  }
+  if (judgeFeedback.codeOutput !== undefined && judgeFeedback.codeOutput !== null && judgeFeedback.codeOutput !== '') {
+    details.push(`Your code output:\n${judgeFeedback.codeOutput.slice(0, 1000)}`);
+  }
+
+  return {
+    role: 'user',
+    content: [
+      'Your previous submission was REJECTED by LeetCode Judge. Fix the bug completely.',
+      '',
+      ...details,
+      '',
+      'The rejected code was:',
+      failedCode.slice(0, 8000),
+      '',
+      'Return ONLY the corrected, complete source code. Same output contract as before: no markdown, no explanation, no comments.',
     ].join('\n'),
   };
 }
