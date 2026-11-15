@@ -133,6 +133,15 @@ import {
 } from '../scheduler/dailyWorker';
 import { formatAccountMessage, summarizeReport } from '../scheduler/report';
 import { claimContestRewardForAccount, ContestRewardResult } from '../leetcode/contestReward';
+import type {
+  ContestKind,
+  ContestQuestionSummary,
+  ContestSummary,
+} from '../leetcode/contest';
+import type {
+  ContestAccountResult,
+  ContestProgressEvent,
+} from '../solutionPosts/contestScheduler';
 import { humanLocal } from '../time';
 import {
   AccountRangeResult,
@@ -309,6 +318,7 @@ export const HELP_TEXT = [
   '<b>✨ 𝗔𝗜 𝗦𝗢𝗟𝗨𝗧𝗜𝗢𝗡 𝗔𝗥𝗧𝗜𝗖𝗟𝗘𝗦 (Intern-AI / Sage)</b>',
   '├ /dailysolution — Choose cached accounts for 6 AM daily submit + article',
   '├ /manualsolution — Run the selected accounts for daily or one question number',
+  '├ /contestsolution — Submit Weekly/Biweekly contest Q1 &amp; Q2 1-liner articles + GIFs',
   '├ /boostviews [url/id] — Boost views for published solution article(s) (20+ views per account)',
   '├ /addsolkey &lt;key&gt; — Add new Intern-AI API key to rotation pool',
   '├ /delsolkey &lt;# or key&gt; — Remove an API key from pool (e.g. /delsolkey 2)',
@@ -544,7 +554,10 @@ export function isLikelyProxyPayload(text: string): boolean {
   });
 }
 
-export async function handleMessage(msg: TgMessage): Promise<void> {
+export async function handleMessage(
+  msg: TgMessage,
+  contestSolutionUi: ContestSolutionUiDeps = defaultContestSolutionUiDeps,
+): Promise<void> {
   // Access control: one allowed chat only.
   if (String(msg.chat.id) !== config.telegram.chatId) {
     logger.warn('telegram: ignored a message from an unknown chat');
@@ -1085,6 +1098,12 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
       case '/manual_solution':
         await handleManualSolutionCommand(commandArg);
         return;
+      case '/contestsolution':
+      case '/contest_solution':
+      case '/contestarticle':
+      case '/contestsolutions':
+        await handleContestSolutionCommand(commandArg, contestSolutionUi, msg.chat.id);
+        return;
       case '/claimcoins':
       case '/claim_coins':
       case '/claimoffer':
@@ -1233,6 +1252,10 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
           await reply('✖️ Pending session renewal cancelled.');
           return;
         }
+        if (contestSolutionSelections.delete(String(msg.chat.id))) {
+          await reply('✖️ Contest solution selection cancelled.');
+          return;
+        }
         await reply(
           currentRangeJob()
             ? '❌ No renewal is in progress. To stop the question-range job, send /cancelrange.'
@@ -1241,7 +1264,7 @@ export async function handleMessage(msg: TgMessage): Promise<void> {
         return;
       }
       default:
-        await reply('🤔 Unknown command. Available: /lclogin, /cflogin, /checksessions, /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /capsolver, /capsolverstatus, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /startqueue, /queuestatus, /clearqueue, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /lclogin, /cflogin, /checksessions, /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /dailysolution, /manualsolution, /contestsolution, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /capsolver, /capsolverstatus, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /startqueue, /queuestatus, /clearqueue, /cancel, /help');
         return;
     }
   }
@@ -2321,6 +2344,820 @@ async function handleManualSolutionButton(chatId: number | string, messageId: nu
   } else { await defaultCoinClaimUiDeps.answer(callbackId); return; }
   const picker = buildManualSolutionPicker(accounts, selected);
   await defaultCoinClaimUiDeps.edit(chatId, messageId, picker.text, picker.buttons);
+}
+
+// ---------------------------------------------------------------------------
+// Contest solution picker & workflow (/contestsolution)
+// ---------------------------------------------------------------------------
+
+export interface ContestSolutionPickerState {
+  step: 'contest' | 'questions' | 'accounts';
+  kind: ContestKind;
+  contestsByKind: {
+    weekly?: ContestSummary[];
+    biweekly?: ContestSummary[];
+  };
+  selectedContestIndex: number | null;
+  selectedQuestions: Set<0 | 1>;
+  selectedAccountIds: Set<string>;
+  fetchErrorByKind?: {
+    weekly?: string;
+    biweekly?: string;
+  };
+}
+
+export const contestSolutionSelections = new Map<string, ContestSolutionPickerState>();
+
+export interface ContestQuestionWorkflowState {
+  questionIndex: 0 | 1;
+  questionLabel: 'Q1' | 'Q2';
+  questionTitle: string;
+  stage: string;
+  detail?: string;
+  error?: string;
+  publishedUrl?: string | null;
+  articleProvider?: string;
+}
+
+export interface ContestSolutionUiDeps {
+  listEnabledAccounts: () => Promise<AccountRecord[]>;
+  selectedAccountIds: () => Promise<string[]>;
+  fetchRecentContestsByType: (kind: ContestKind, limit?: number) => Promise<ContestSummary[]>;
+  selectStartingContestQuestions: (
+    contest: ContestSummary,
+    indices?: readonly (0 | 1)[],
+  ) => Promise<ContestQuestionSummary[]> | ContestQuestionSummary[];
+  runContestSolutionWorkflow: (params: {
+    contest: ContestSummary;
+    questionIndices: readonly (0 | 1)[];
+    accountIds: string[];
+    onProgress?: (event: ContestProgressEvent) => void | Promise<void>;
+    force?: boolean;
+    now?: Date;
+  }) => Promise<ContestAccountResult[]>;
+  resetFailedSolutionPostRetries: () => Promise<unknown>;
+  resetSolutionApiKeyPool: () => Promise<unknown>;
+  send: (text: string, buttons?: InlineButton[][]) => Promise<number | undefined>;
+  edit: (chatId: number | string, messageId: number, text: string, buttons?: InlineButton[][]) => Promise<void>;
+  answer: (callbackId: string, text?: string) => Promise<void>;
+  reply: (text: string) => Promise<void>;
+}
+
+const defaultContestSolutionUiDeps: ContestSolutionUiDeps = {
+  listEnabledAccounts,
+  selectedAccountIds,
+  fetchRecentContestsByType: async (kind, limit = 5) => {
+    const { fetchRecentContestsByType } = await import('../leetcode/contest');
+    return fetchRecentContestsByType(kind, limit);
+  },
+  selectStartingContestQuestions: async (contest, indices) => {
+    const { selectStartingContestQuestions } = await import('../leetcode/contest');
+    return selectStartingContestQuestions(contest, indices);
+  },
+  runContestSolutionWorkflow: async (params) => {
+    const { runContestSolutionWorkflow } = await import('../solutionPosts/contestScheduler');
+    return runContestSolutionWorkflow(params);
+  },
+  resetFailedSolutionPostRetries,
+  resetSolutionApiKeyPool,
+  send: async (text, buttons) => {
+    const sent = await tgApi<{ message_id: number }>('sendMessage', {
+      chat_id: config.telegram.chatId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+    });
+    return sent?.message_id;
+  },
+  edit: async (chatId, messageId, text, buttons) => {
+    await tgApi('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: buttons ?? [] },
+    });
+  },
+  answer: async (callbackId, text) => {
+    await tgApi('answerCallbackQuery', {
+      callback_query_id: callbackId,
+      ...(text ? { text, show_alert: true } : {}),
+    });
+  },
+  reply,
+};
+
+const CONTEST_SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function formatContestDateShortIST(epochSec: number): string {
+  if (!Number.isFinite(epochSec) || epochSec <= 0) return '';
+  const date = new Date(epochSec * 1000);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Kolkata',
+    day: 'numeric',
+    month: 'numeric',
+  }).formatToParts(date);
+  const day = parts.find((p) => p.type === 'day')?.value ?? '';
+  const monthNum = Number(parts.find((p) => p.type === 'month')?.value ?? '0');
+  const month = CONTEST_SHORT_MONTHS[monthNum - 1] ?? '';
+  return day && month ? `${day} ${month}` : '';
+}
+
+function truncateContestLabel(value: string, maxLen: number): string {
+  return value.length > maxLen ? `${value.slice(0, maxLen - 1)}…` : value;
+}
+
+function getContestStarterQuestions(
+  contest: ContestSummary,
+  startingQuestions?: readonly ContestQuestionSummary[],
+): Array<ContestQuestionSummary & { index: 0 | 1 }> {
+  const source = startingQuestions ?? contest.questions;
+  return [...source]
+    .filter((q): q is ContestQuestionSummary & { index: 0 | 1 } => q.index === 0 || q.index === 1)
+    .sort((a, b) => a.index - b.index);
+}
+
+function contestAccountCallbackData(accountId: string, index: number): string {
+  const direct = `ccsol:a:${accountId}`;
+  return Buffer.byteLength(direct) <= 64 ? direct : `ccsol:ai:${index}`;
+}
+
+export function buildContestPicker(state: ContestSolutionPickerState): { text: string; buttons: InlineButton[][] } {
+  const kindLabel = state.kind === 'weekly' ? 'Weekly' : 'Biweekly';
+  const contests = (state.contestsByKind[state.kind] ?? []).slice(0, 5);
+  const fetchErr = state.fetchErrorByKind?.[state.kind];
+
+  const buttons: InlineButton[][] = [
+    [
+      { text: state.kind === 'weekly' ? '✅ Weekly' : 'Weekly', callback_data: 'ccsol:t:w' },
+      { text: state.kind === 'biweekly' ? '✅ Biweekly' : 'Biweekly', callback_data: 'ccsol:t:b' },
+    ],
+  ];
+
+  if (fetchErr) {
+    buttons.push([{ text: '🔄 Retry loading contests', callback_data: 'ccsol:retry' }]);
+  } else if (contests.length === 0) {
+    buttons.push([{ text: '🔄 Refresh contests', callback_data: 'ccsol:retry' }]);
+  } else {
+    contests.forEach((contest, idx) => {
+      const shortDate = formatContestDateShortIST(contest.startTimeSec || contest.endTimeSec);
+      const dateSuffix = shortDate ? ` (${shortDate})` : '';
+      const prefix = `${idx + 1}. `;
+      const maxTitleLen = Math.max(12, 60 - prefix.length - dateSuffix.length);
+      const title = truncateContestLabel(contest.title, maxTitleLen);
+      buttons.push([
+        {
+          text: `${prefix}${title}${dateSuffix}`.slice(0, 60),
+          callback_data: `ccsol:c:${idx}`,
+        },
+      ]);
+    });
+  }
+
+  buttons.push([{ text: '✖️ Cancel', callback_data: 'ccsol:x' }]);
+
+  const lines = [
+    '🏆 <b>Contest Solution Articles (Last 5 Contests)</b>',
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+  ];
+  if (fetchErr) {
+    lines.push(`⚠️ Could not load ${kindLabel} contests: <i>${escapeHtml(fetchErr.slice(0, 200))}</i>`);
+    lines.push('Tap <b>Retry</b> or switch contest type.');
+  } else if (contests.length === 0) {
+    lines.push(`📭 No recent ${kindLabel} contests found.`);
+  } else {
+    lines.push(`Showing last <b>${contests.length}</b> ${kindLabel} contests.`);
+    lines.push('Select a contest to submit 1-liner articles + GIFs for <b>Q1 &amp; Q2</b>:');
+  }
+
+  return { text: lines.join('\n'), buttons };
+}
+
+export function buildContestQuestionPicker(
+  contest: ContestSummary,
+  selectedQuestions: ReadonlySet<0 | 1>,
+  startingQuestions?: readonly ContestQuestionSummary[],
+): { text: string; buttons: InlineButton[][] } {
+  const starter = getContestStarterQuestions(contest, startingQuestions);
+  const shortDate = formatContestDateShortIST(contest.startTimeSec || contest.endTimeSec);
+  const buttons: InlineButton[][] = [];
+
+  for (const q of starter) {
+    const checked = selectedQuestions.has(q.index);
+    const shortTitle = truncateContestLabel(q.title, 42);
+    buttons.push([
+      {
+        text: `${checked ? '✅' : '▫️'} ${q.label} · ${shortTitle}`.slice(0, 60),
+        callback_data: `ccsol:q:${q.index}`,
+      },
+    ]);
+  }
+
+  buttons.push([{ text: 'Next: Select Accounts →', callback_data: 'ccsol:next' }]);
+  buttons.push([
+    { text: '← Contests', callback_data: 'ccsol:back:c' },
+    { text: '✖️ Cancel', callback_data: 'ccsol:x' },
+  ]);
+
+  const lines = [
+    `🏆 <b>${escapeHtml(contest.title)}</b>${shortDate ? ` (${escapeHtml(shortDate)})` : ''}`,
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    '<i>Focusing on Q1 &amp; Q2 (easy/starter 1-liner articles + GIFs; Q3–Q4 disabled for now).</i>',
+    '',
+  ];
+
+  if (starter.length === 0) {
+    lines.push('⚠️ No Q1/Q2 questions found on this contest.');
+  } else {
+    for (const q of starter) {
+      const checked = selectedQuestions.has(q.index);
+      lines.push(`${checked ? '✅' : '▫️'} <b>${q.label}:</b> ${escapeHtml(q.title)}`);
+    }
+    const countSelected = starter.filter((q) => selectedQuestions.has(q.index)).length;
+    lines.push('', `Selected questions: <b>${countSelected}/${starter.length}</b>`);
+  }
+
+  return { text: lines.join('\n'), buttons };
+}
+
+export function buildContestAccountPicker(
+  contest: ContestSummary,
+  selectedQuestions: ReadonlySet<0 | 1>,
+  accounts: AccountRecord[],
+  selectedAccountIds: ReadonlySet<string>,
+): { text: string; buttons: InlineButton[][] } {
+  const starter = getContestStarterQuestions(contest);
+  const chosenQuestions = starter.filter((q) => selectedQuestions.has(q.index));
+  const qLabels = chosenQuestions.length > 0
+    ? chosenQuestions.map((q) => `${q.label} (${escapeHtml(truncateContestLabel(q.title, 28))})`).join(' · ')
+    : ([0, 1] as const).filter((i) => selectedQuestions.has(i)).map((i) => `Q${i + 1}`).join(' · ');
+
+  const allSelected = accounts.length > 0 && accounts.every((a) => selectedAccountIds.has(a.id));
+  const selectedCount = accounts.filter((a) => selectedAccountIds.has(a.id)).length;
+
+  const buttons: InlineButton[][] = accounts.map((account, idx) => [{
+    text: `${selectedAccountIds.has(account.id) ? '✅' : '▫️'} ${accountName(account)}`.slice(0, 60),
+    callback_data: contestAccountCallbackData(account.id, idx),
+  }]);
+
+  buttons.push([{
+    text: `${allSelected ? '✅' : '👥'} All accounts (${accounts.length})`,
+    callback_data: 'ccsol:all',
+  }]);
+  buttons.push([{
+    text: '🚀 Run Contest Article Workflow',
+    callback_data: 'ccsol:run',
+  }]);
+  buttons.push([
+    { text: '← Questions', callback_data: 'ccsol:back:q' },
+    { text: '✖️ Cancel', callback_data: 'ccsol:x' },
+  ]);
+
+  const text = [
+    `🏆 <b>${escapeHtml(contest.title)}</b>`,
+    `📝 <b>Questions:</b> ${qLabels || 'Q1 &amp; Q2'}`,
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    'Choose LeetCode account(s) for fresh 1-liner submission + human-style article + 2 GIFs.',
+    '<i>Pre-seeded from your saved /dailysolution preference; changes apply to this contest run only.</i>',
+    '',
+    `Selected accounts: <b>${selectedCount}/${accounts.length}</b>`,
+  ].join('\n');
+
+  return { text, buttons };
+}
+
+export function contestStageText(
+  stage: string,
+  error?: string,
+  detail?: string,
+  publishedUrl?: string | null,
+): string {
+  switch (stage) {
+    case 'queued':
+      return '⏳ Queued…';
+    case 'starting':
+      return detail ? `⏳ ${escapeHtml(detail)}` : '⏳ Starting…';
+    case 'resolving_contest':
+      return detail ? `🔎 ${escapeHtml(detail)}` : '🔎 Loading contest problem…';
+    case 'solving_code':
+      return detail ? `🧠 ${escapeHtml(detail)}` : '🧠 Solving fresh 1-liner…';
+    case 'retrying_judge':
+      return detail ? `🔁 ${escapeHtml(detail)}` : '🔁 Refining 1-liner from Judge feedback…';
+    case 'submitting':
+      return detail ? `📤 ${escapeHtml(detail)}` : '📤 Submitting fresh 1-liner…';
+    case 'accepted':
+      return detail ? `✅ ${escapeHtml(detail)}` : '✅ Submitted & Accepted';
+    case 'generating_article':
+      return detail ? `✍️ ${escapeHtml(detail)}` : '✍️ Generating human 1-liner article + GIFs…';
+    case 'drafting_intuition':
+      return detail ? `💡 ${escapeHtml(detail)}` : '💡 Drafting human 1-liner intuition…';
+    case 'drafting_approach':
+      return detail ? `📝 ${escapeHtml(detail)}` : '📝 Breaking down the 1-liner…';
+    case 'planning_animations':
+      return detail ? `🎬 ${escapeHtml(detail)}` : '🎬 Designing visual animation frames…';
+    case 'technical_review':
+      return detail ? `🔍 ${escapeHtml(detail)}` : '🔍 AI technical review in progress…';
+    case 'rendering_gifs':
+      return detail ? `🎨 ${escapeHtml(detail)}` : '🎨 Rendering & uploading animation GIFs…';
+    case 'draft_ready':
+      return detail ? `✨ ${escapeHtml(detail)}` : '✨ Draft & GIFs ready';
+    case 'publishing_article':
+      return '📮 Publishing article to LeetCode…';
+    case 'published':
+      return publishedUrl
+        ? `Published ✅ · <a href="${escapeHtml(publishedUrl)}">View Article</a>`
+        : 'Published ✅';
+    case 'article_ready':
+      return '📝 Draft ready (awaiting approval)';
+    case 'provider_paused':
+      return `⏸️ ${escapeHtml(detail ?? 'Waiting for AI provider cooldown…')}`;
+    case 'skipped':
+      return `⏭️ Skipped: ${escapeHtml(error ?? detail ?? 'already completed')}`;
+    case 'failed':
+      if (error === 'CONTEST_PROBLEM_LOCKED') {
+        return '⏳ Contest problem not unlocked yet by LeetCode; retry queued.';
+      }
+      return solutionStageText('failed', error, undefined, detail);
+    default:
+      return detail ? `⏳ ${escapeHtml(detail)}` : '⏳ Processing…';
+  }
+}
+
+export function renderContestWorkflowProgress(
+  contest: ContestSummary,
+  accounts: AccountRecord[],
+  questionIndices: readonly (0 | 1)[],
+  states: ReadonlyMap<string, ContestQuestionWorkflowState>,
+): string {
+  const starter = getContestStarterQuestions(contest);
+  const lines = [
+    `🏆 <b>CONTEST SOLUTION ARTICLES · ${escapeHtml(contest.title)}</b>`,
+    '<code>━━━━━━━━━━━━━━━━━━━━</code>',
+    '',
+  ];
+
+  accounts.forEach((account, accIdx) => {
+    lines.push(`👤 <b>Account ${accIdx + 1}/${accounts.length} · ${escapeHtml(accountName(account))}</b>`);
+    questionIndices.forEach((qIdx, pos) => {
+      const qMeta = starter.find((q) => q.index === qIdx);
+      const state = states.get(`${account.id}:${qIdx}`);
+      const qLabel = state?.questionLabel ?? qMeta?.label ?? (`Q${qIdx + 1}` as 'Q1' | 'Q2');
+      const qTitle = state?.questionTitle ?? qMeta?.title ?? qLabel;
+      const isLast = pos === questionIndices.length - 1;
+      const branch = isLast ? '└' : '├';
+      const cont = isLast ? '   ' : '│  ';
+      lines.push(`${branch} <b>${qLabel} · ${escapeHtml(truncateContestLabel(qTitle, 38))}</b>`);
+      if (state?.articleProvider) {
+        lines.push(`${cont}├ 🔑 ${escapeHtml(state.articleProvider)}`);
+      }
+      lines.push(`${cont}└ ${contestStageText(state?.stage ?? 'queued', state?.error, state?.detail, state?.publishedUrl)}`);
+    });
+    lines.push('');
+  });
+
+  return truncateHtml(lines.join('\n'), 3900);
+}
+
+async function safeEditContestPicker(
+  deps: Pick<ContestSolutionUiDeps, 'edit'>,
+  chatId: number | string,
+  messageId: number,
+  text: string,
+  buttons?: InlineButton[][],
+): Promise<void> {
+  try {
+    await deps.edit(chatId, messageId, text, buttons);
+  } catch (err) {
+    if (/message is not modified/i.test(errText(err))) return;
+    throw err;
+  }
+}
+
+async function loadContestsIntoState(
+  state: ContestSolutionPickerState,
+  kind: ContestKind,
+  deps: ContestSolutionUiDeps,
+): Promise<void> {
+  state.fetchErrorByKind ??= {};
+  try {
+    const list = await deps.fetchRecentContestsByType(kind, 5);
+    state.contestsByKind[kind] = list.slice(0, 5);
+    delete state.fetchErrorByKind[kind];
+  } catch (err) {
+    state.fetchErrorByKind[kind] = errText(err);
+  }
+}
+
+function getSelectedContestFromState(state: ContestSolutionPickerState): ContestSummary | undefined {
+  if (state.selectedContestIndex === null) return undefined;
+  const contests = state.contestsByKind[state.kind] ?? [];
+  return contests[state.selectedContestIndex];
+}
+
+export async function startContestSolutionWorkflow(
+  contest: ContestSummary,
+  questionIndices: readonly (0 | 1)[],
+  accountIds: string[],
+  deps: ContestSolutionUiDeps = defaultContestSolutionUiDeps,
+): Promise<{ done: Promise<ContestAccountResult[]> } | undefined> {
+  if (!accountIds.length || !questionIndices.length) {
+    await deps.reply('⚠️ Select at least one question and one account.');
+    return undefined;
+  }
+
+  await deps.resetFailedSolutionPostRetries().catch(() => 0);
+  await deps.resetSolutionApiKeyPool().catch(() => null);
+
+  const accounts = (await deps.listEnabledAccounts()).filter((account) => accountIds.includes(account.id));
+  if (accounts.length !== accountIds.length) {
+    await deps.reply('⚠️ One or more selected accounts are no longer available. Run /contestsolution again.');
+    return undefined;
+  }
+
+  const starter = getContestStarterQuestions(contest);
+  const states = new Map<string, ContestQuestionWorkflowState>();
+  for (const account of accounts) {
+    for (const qIdx of questionIndices) {
+      const qMeta = starter.find((q) => q.index === qIdx);
+      states.set(`${account.id}:${qIdx}`, {
+        questionIndex: qIdx,
+        questionLabel: qMeta?.label === 'Q2' ? 'Q2' : 'Q1',
+        questionTitle: qMeta?.title ?? `Q${qIdx + 1}`,
+        stage: 'queued',
+      });
+    }
+  }
+
+  let rendered = renderContestWorkflowProgress(contest, accounts, questionIndices, states);
+  let messageId: number | undefined;
+  try {
+    messageId = await deps.send(rendered);
+  } catch {
+    messageId = undefined;
+  }
+  if (!messageId) {
+    await deps.reply(
+      `🚀 Starting ${contest.title} (${questionIndices.map((i) => `Q${i + 1}`).join(' & ')}) for ${accounts.length} account(s).`,
+    );
+  }
+
+  let lastEditTime = 0;
+  let pendingTimer: NodeJS.Timeout | null = null;
+  const EDIT_GAP_MS = 1200;
+
+  const flushEdit = async () => {
+    if (!messageId) return;
+    const next = renderContestWorkflowProgress(contest, accounts, questionIndices, states);
+    if (next === rendered) return;
+    rendered = next;
+    try {
+      await safeEditContestPicker(deps, config.telegram.chatId, messageId, next, []);
+      lastEditTime = Date.now();
+    } catch (error) {
+      logger.warn({ err: errText(error) }, 'telegram contest workflow progress edit failed');
+    }
+  };
+
+  const scheduleEdit = (immediate = false) => {
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
+    const elapsed = Date.now() - lastEditTime;
+    if (immediate || elapsed >= EDIT_GAP_MS) {
+      void flushEdit();
+    } else {
+      pendingTimer = setTimeout(() => {
+        void flushEdit();
+      }, EDIT_GAP_MS - elapsed);
+    }
+  };
+
+  const update = async (event: ContestProgressEvent) => {
+    const stateKey = `${event.accountId}:${event.questionIndex}`;
+    const prev: ContestQuestionWorkflowState = states.get(stateKey) ?? {
+      questionIndex: event.questionIndex,
+      questionLabel: event.questionLabel,
+      questionTitle: event.questionTitle,
+      stage: 'queued',
+    };
+    if (event.stage === 'article_provider') {
+      states.set(stateKey, { ...prev, articleProvider: event.detail });
+      scheduleEdit();
+      return;
+    }
+    states.set(stateKey, {
+      questionIndex: event.questionIndex,
+      questionLabel: event.questionLabel || prev.questionLabel,
+      questionTitle: event.questionTitle || prev.questionTitle,
+      stage: event.stage,
+      detail: event.detail,
+      error: event.error,
+      publishedUrl: event.publishedUrl ?? prev.publishedUrl,
+      articleProvider: prev.articleProvider,
+    });
+    const isTerminal = ['published', 'failed', 'skipped', 'article_ready', 'provider_paused'].includes(event.stage);
+    scheduleEdit(isTerminal);
+  };
+
+  const done = (async () => {
+    try {
+      const results = await deps.runContestSolutionWorkflow({
+        contest,
+        questionIndices,
+        accountIds,
+        onProgress: update,
+        force: true,
+        now: new Date(),
+      });
+      for (const r of results) {
+        const qIdx: 0 | 1 = r.questionLabel === 'Q2' ? 1 : 0;
+        const stateKey = `${r.accountId}:${qIdx}`;
+        const prev = states.get(stateKey);
+        if (prev) {
+          const finalStage =
+            r.status === 'PUBLISHED'
+              ? 'published'
+              : r.status === 'SKIPPED'
+                ? 'skipped'
+                : r.status === 'FAILED'
+                  ? 'failed'
+                  : r.status === 'RETRY_PENDING'
+                    ? 'provider_paused'
+                    : 'article_ready';
+          states.set(stateKey, {
+            ...prev,
+            stage: finalStage,
+            error: r.error ?? prev.error,
+            publishedUrl: r.publishedUrl ?? prev.publishedUrl,
+          });
+        }
+      }
+      if (pendingTimer) {
+        clearTimeout(pendingTimer);
+        pendingTimer = null;
+      }
+      await flushEdit();
+      const published = results.filter((r) => r.status === 'PUBLISHED').length;
+      const failed = results.filter((r) => r.status === 'FAILED').length;
+      const skipped = results.filter((r) => r.status === 'SKIPPED').length;
+      const pending = results.length - published - failed - skipped;
+      const acceptedArticleFailed = results.filter(
+        (r) => r.status === 'FAILED' && r.error === 'AI_MODELS_EXHAUSTED',
+      ).length;
+      await deps.reply(
+        `🏁 Contest Workflow finished: ${contest.title} — ${published} published · ${failed} failed · ${skipped} skipped${pending ? ` · ${pending} draft/pending` : ''}.${acceptedArticleFailed ? ` ${acceptedArticleFailed} stopped at article generation; accepted code was retained.` : ''}`,
+      );
+      return results;
+    } catch (error) {
+      if (pendingTimer) {
+        clearTimeout(pendingTimer);
+        pendingTimer = null;
+      }
+      await flushEdit();
+      await deps.reply(`⚠️ Contest solution workflow failed: ${errText(error)}`).catch(() => undefined);
+      return [];
+    }
+  })();
+
+  return { done };
+}
+
+export async function handleContestSolutionCommand(
+  argument = '',
+  deps: ContestSolutionUiDeps = defaultContestSolutionUiDeps,
+  chatId: number | string = config.telegram.chatId,
+): Promise<void> {
+  const accounts = await deps.listEnabledAccounts();
+  if (!accounts.length) {
+    await deps.reply('📭 No active LeetCode accounts are configured.');
+    return;
+  }
+
+  const normalizedArg = argument.trim().toLowerCase();
+  const initialKind: ContestKind =
+    normalizedArg === 'biweekly' || normalizedArg === 'bw' ? 'biweekly' : 'weekly';
+
+  const savedIds = new Set(await deps.selectedAccountIds().catch(() => []));
+  const preselected = new Set(
+    accounts.filter((account) => savedIds.has(account.id)).map((account) => account.id),
+  );
+
+  const state: ContestSolutionPickerState = {
+    step: 'contest',
+    kind: initialKind,
+    contestsByKind: {},
+    selectedContestIndex: null,
+    selectedQuestions: new Set([0, 1]),
+    selectedAccountIds: preselected,
+    fetchErrorByKind: {},
+  };
+
+  await loadContestsIntoState(state, initialKind, deps);
+
+  contestSolutionSelections.set(String(chatId), state);
+  const picker = buildContestPicker(state);
+  await deps.send(picker.text, picker.buttons);
+}
+
+export async function handleContestSolutionButton(
+  chatId: number | string,
+  messageId: number,
+  callbackId: string,
+  data: string,
+  deps: ContestSolutionUiDeps = defaultContestSolutionUiDeps,
+): Promise<void> {
+  const key = String(chatId);
+
+  if (data === 'ccsol:x') {
+    contestSolutionSelections.delete(key);
+    await deps.answer(callbackId, 'Cancelled');
+    await safeEditContestPicker(deps, chatId, messageId, '✖️ Contest solution article workflow cancelled.');
+    return;
+  }
+
+  const state = contestSolutionSelections.get(key);
+  if (!state) {
+    await deps.answer(callbackId, 'Session expired — run /contestsolution again');
+    await safeEditContestPicker(deps, chatId, messageId, '⌛ Session expired — run /contestsolution again.').catch(() => undefined);
+    return;
+  }
+
+  if (data === 'ccsol:t:w' || data === 'ccsol:t:b') {
+    const nextKind: ContestKind = data === 'ccsol:t:b' ? 'biweekly' : 'weekly';
+    state.kind = nextKind;
+    state.step = 'contest';
+    state.selectedContestIndex = null;
+    if (!state.contestsByKind[nextKind] || state.fetchErrorByKind?.[nextKind]) {
+      await loadContestsIntoState(state, nextKind, deps);
+    }
+    await deps.answer(callbackId, nextKind === 'weekly' ? 'Weekly contests' : 'Biweekly contests');
+    const picker = buildContestPicker(state);
+    await safeEditContestPicker(deps, chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data === 'ccsol:retry') {
+    state.step = 'contest';
+    state.selectedContestIndex = null;
+    await loadContestsIntoState(state, state.kind, deps);
+    await deps.answer(callbackId, 'Refreshed');
+    const picker = buildContestPicker(state);
+    await safeEditContestPicker(deps, chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data.startsWith('ccsol:c:')) {
+    const idx = Number.parseInt(data.slice('ccsol:c:'.length), 10);
+    const contests = state.contestsByKind[state.kind] ?? [];
+    const contest = Number.isInteger(idx) && idx >= 0 && idx < 5 ? contests[idx] : undefined;
+    if (!contest) {
+      await deps.answer(callbackId, 'Contest not found — please refresh');
+      return;
+    }
+    const starter = await deps.selectStartingContestQuestions(contest, [0, 1]);
+    const starterIndices = starter
+      .map((q) => q.index)
+      .filter((qIdx): qIdx is 0 | 1 => qIdx === 0 || qIdx === 1);
+    if (starterIndices.length === 0) {
+      await deps.answer(callbackId, 'No Q1/Q2 questions found for this contest');
+      return;
+    }
+    state.selectedContestIndex = idx;
+    state.selectedQuestions = new Set(starterIndices);
+    state.step = 'questions';
+    await deps.answer(callbackId, contest.title);
+    const picker = buildContestQuestionPicker(contest, state.selectedQuestions, starter);
+    await safeEditContestPicker(deps, chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data === 'ccsol:back:c') {
+    state.step = 'contest';
+    await deps.answer(callbackId, 'Back to contests');
+    const picker = buildContestPicker(state);
+    await safeEditContestPicker(deps, chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  const selectedContest = getSelectedContestFromState(state);
+  if (!selectedContest) {
+    state.step = 'contest';
+    state.selectedContestIndex = null;
+    await deps.answer(callbackId, 'Select a contest first');
+    const picker = buildContestPicker(state);
+    await safeEditContestPicker(deps, chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data === 'ccsol:q:0' || data === 'ccsol:q:1') {
+    const qIdx: 0 | 1 = data === 'ccsol:q:1' ? 1 : 0;
+    const starter = getContestStarterQuestions(selectedContest);
+    if (!starter.some((q) => q.index === qIdx)) {
+      await deps.answer(callbackId, `Q${qIdx + 1} is not available for this contest`);
+      return;
+    }
+    if (state.selectedQuestions.has(qIdx)) {
+      state.selectedQuestions.delete(qIdx);
+    } else {
+      state.selectedQuestions.add(qIdx);
+    }
+    await deps.answer(callbackId, state.selectedQuestions.has(qIdx) ? `Q${qIdx + 1} selected` : `Q${qIdx + 1} unselected`);
+    const picker = buildContestQuestionPicker(selectedContest, state.selectedQuestions, starter);
+    await safeEditContestPicker(deps, chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data === 'ccsol:next') {
+    if (state.selectedQuestions.size === 0) {
+      await deps.answer(callbackId, 'Select at least one question (Q1 or Q2)');
+      return;
+    }
+    const accounts = await deps.listEnabledAccounts();
+    if (!accounts.length) {
+      await deps.answer(callbackId, 'No active LeetCode accounts');
+      await safeEditContestPicker(deps, chatId, messageId, '📭 No active LeetCode accounts are configured.');
+      return;
+    }
+    state.selectedAccountIds = new Set(
+      [...state.selectedAccountIds].filter((id) => accounts.some((a) => a.id === id)),
+    );
+    state.step = 'accounts';
+    await deps.answer(callbackId, 'Select accounts');
+    const picker = buildContestAccountPicker(selectedContest, state.selectedQuestions, accounts, state.selectedAccountIds);
+    await safeEditContestPicker(deps, chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data === 'ccsol:back:q') {
+    state.step = 'questions';
+    await deps.answer(callbackId, 'Back to questions');
+    const picker = buildContestQuestionPicker(selectedContest, state.selectedQuestions);
+    await safeEditContestPicker(deps, chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data === 'ccsol:all' || data.startsWith('ccsol:a:') || data.startsWith('ccsol:ai:')) {
+    const accounts = await deps.listEnabledAccounts();
+    if (!accounts.length) {
+      await deps.answer(callbackId, 'No active LeetCode accounts');
+      await safeEditContestPicker(deps, chatId, messageId, '📭 No active LeetCode accounts are configured.');
+      return;
+    }
+    if (data === 'ccsol:all') {
+      const all = accounts.every((account) => state.selectedAccountIds.has(account.id));
+      if (all) state.selectedAccountIds.clear();
+      else accounts.forEach((account) => state.selectedAccountIds.add(account.id));
+      await deps.answer(callbackId, all ? 'Cleared all' : 'All accounts selected');
+    } else {
+      let targetId: string | undefined;
+      if (data.startsWith('ccsol:ai:')) {
+        const idx = Number.parseInt(data.slice('ccsol:ai:'.length), 10);
+        targetId = Number.isInteger(idx) ? accounts[idx]?.id : undefined;
+      } else {
+        targetId = data.slice('ccsol:a:'.length);
+      }
+      if (!targetId || !accounts.some((account) => account.id === targetId)) {
+        await deps.answer(callbackId, 'Account no longer available');
+        return;
+      }
+      if (state.selectedAccountIds.has(targetId)) state.selectedAccountIds.delete(targetId);
+      else state.selectedAccountIds.add(targetId);
+      await deps.answer(callbackId, state.selectedAccountIds.has(targetId) ? 'Selected' : 'Unselected');
+    }
+    const picker = buildContestAccountPicker(selectedContest, state.selectedQuestions, accounts, state.selectedAccountIds);
+    await safeEditContestPicker(deps, chatId, messageId, picker.text, picker.buttons);
+    return;
+  }
+
+  if (data === 'ccsol:run') {
+    if (state.selectedQuestions.size === 0) {
+      await deps.answer(callbackId, 'Select at least one question (Q1 or Q2)');
+      return;
+    }
+    const accounts = await deps.listEnabledAccounts();
+    const chosenIds = accounts.filter((a) => state.selectedAccountIds.has(a.id)).map((a) => a.id);
+    if (!chosenIds.length) {
+      await deps.answer(callbackId, 'Select at least one account');
+      return;
+    }
+    const questionIndices = ([0, 1] as const).filter((idx) => state.selectedQuestions.has(idx));
+    contestSolutionSelections.delete(key);
+    await deps.answer(callbackId, 'Starting contest article workflow');
+    const qSummary = questionIndices.map((idx) => `Q${idx + 1}`).join(' &amp; ');
+    await safeEditContestPicker(
+      deps,
+      chatId,
+      messageId,
+      `🚀 Starting <b>${escapeHtml(selectedContest.title)}</b> (${qSummary}) for ${chosenIds.length} account(s)…`,
+    );
+    await startContestSolutionWorkflow(selectedContest, questionIndices, chosenIds, deps);
+    return;
+  }
+
+  await deps.answer(callbackId);
 }
 
 /** /submitnextsolution — run the next queued Codeforces source solution once per account. */
@@ -4733,6 +5570,7 @@ export async function handleCallbackQuery(
   codeforcesNetworkUi: CodeforcesNetworkUiDeps = defaultCodeforcesNetworkUiDeps,
   coinClaimUi: CoinClaimUiDeps = defaultCoinClaimUiDeps,
   codechefUi: CodeChefUiDeps = defaultCodeChefUiDeps,
+  contestSolutionUi: ContestSolutionUiDeps = defaultContestSolutionUiDeps,
 ): Promise<void> {
   const chatId = q.message?.chat.id;
   const messageId = q.message?.message_id;
@@ -4747,6 +5585,11 @@ export async function handleCallbackQuery(
   if (data.startsWith('lcsol:')) {
     if (data.startsWith('lcsol:m:')) { await handleManualSolutionButton(chatId, messageId, q.id, data); return; }
     await handleDailySolutionButton(chatId, messageId, q.id, data);
+    return;
+  }
+
+  if (data.startsWith('ccsol:')) {
+    await handleContestSolutionButton(chatId, messageId, q.id, data, contestSolutionUi);
     return;
   }
 
