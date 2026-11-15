@@ -7,6 +7,15 @@ import { approvePost } from './store';
 import { publishPost, reconcilePost, reserveBrowserPublication, inspectPublication } from './publisher';
 import { runCombined, setSelectedAccounts, POST_CRON, POST_TIMEZONE, runScheduledSolutionPosts,
   isScheduledSolutionRunInProgress, SCHEDULE_STATE_KEY } from './scheduler';
+import {
+  BIWEEKLY_CONTEST_CRON,
+  CONTEST_TIMEZONE,
+  WEEKLY_CONTEST_CRON,
+  getContestSchedulerDiagnostics,
+  isContestScheduledRunInProgress,
+  isInContestCatchupWindow,
+  runScheduledContestPosts,
+} from './contestScheduler';
 import { appendSolutionApiKeys, solutionKeyPoolStatus, testSolutionApiKey } from './keyPool';
 import { PROVIDER_CHECK_STATE_KEY } from './providerDiagnostics';
 import { probeOxion } from './oxionProbe';
@@ -95,6 +104,7 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       models: config.solutionPosts.aiProvider === 'firecrawl' ? ['firecrawl/spark-2'] : config.solutionPosts.models,
       selected: await prisma.solutionPostPreference.findMany({ where: { enabled: true } }),
       scheduler: await prisma.systemState.findUnique({ where: { key: SCHEDULE_STATE_KEY } }),
+      contestScheduler: await getContestSchedulerDiagnostics(),
       provider: config.solutionPosts.aiProvider === 'firecrawl' ? null : await prisma.systemState.findUnique({ where: { key: PROVIDER_CHECK_STATE_KEY } }),
       keys: config.solutionPosts.aiProvider === 'firecrawl' ? null : await solutionKeyPoolStatus(),
       credentialConfiguration: config.solutionPosts.aiProvider === 'firecrawl' ?
@@ -107,6 +117,37 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       // Return before a cold-start proxy timeout. Durable diagnostics record completion.
       void runScheduledSolutionPosts();
       return reply.code(202).send({ status: 'ACCEPTED', cron: POST_CRON, timezone: POST_TIMEZONE });
+    });
+    scoped.post('/admin/solutions/contest/scheduled', async (req, reply) => {
+      const body = z.object({ kind: z.enum(['weekly', 'biweekly']).optional() }).strict().parse(req.body ?? {});
+      const targets: Array<'weekly' | 'biweekly'> = body.kind
+        ? [body.kind]
+        : (['weekly', 'biweekly'] as const).filter(k => isInContestCatchupWindow(k));
+      const kindsToRun: Array<'weekly' | 'biweekly'> = targets.length ? targets : ['weekly', 'biweekly'];
+      if (kindsToRun.every(k => isContestScheduledRunInProgress(k))) {
+        return reply.code(202).send({ status: 'ALREADY_RUNNING', kinds: kindsToRun });
+      }
+      // Return before proxy timeouts; durable diagnostics record the outcome.
+      if (kindsToRun.length === 1) {
+        const onlyKind = kindsToRun[0]!;
+        void runScheduledContestPosts(onlyKind, new Date(), body.kind ? 'manual' : 'recovery').catch(error => {
+          logger.warn({ kind: onlyKind, err: error }, 'scheduled contest solution trigger failed');
+        });
+      } else {
+        void (async () => {
+          for (const kind of kindsToRun) {
+            await runScheduledContestPosts(kind, new Date(), 'recovery').catch(error => {
+              logger.warn({ kind, err: error }, 'scheduled contest solution trigger failed');
+            });
+          }
+        })();
+      }
+      return reply.code(202).send({
+        status: 'ACCEPTED',
+        kinds: kindsToRun,
+        cron: { weekly: WEEKLY_CONTEST_CRON, biweekly: BIWEEKLY_CONTEST_CRON },
+        timezone: CONTEST_TIMEZONE,
+      });
     });
     scoped.post('/admin/solutions/generate', async req => {
       const body = z.object({ accountId: z.string().min(1), runId: z.string().min(1) }).strict().parse(req.body);

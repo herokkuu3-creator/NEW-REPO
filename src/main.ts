@@ -15,6 +15,7 @@ import { startCodeChefScheduler } from './codechef/worker';
 import { startMorningSessionCheckScheduler } from './security/sessionAutoRefresh';
 import { getRecoveryService, startRecoveryScheduler } from './recovery/runtime';
 import { startSolutionPostScheduler } from './solutionPosts/scheduler';
+import { startContestPostScheduler } from './solutionPosts/contestScheduler';
 import { verifySolutionProviderOnBoot } from './solutionPosts/providerDiagnostics';
 
 /**
@@ -66,6 +67,7 @@ async function main(): Promise<void> {
   const stopMorningSessionCheck = startMorningSessionCheckScheduler();
   const stopRecovery = startRecoveryScheduler(recovery);
   const stopSolutionPosts = startSolutionPostScheduler();
+  const stopContestPosts = startContestPostScheduler();
   void verifySolutionProviderOnBoot().catch(() => logger.warn('solution provider startup probe could not complete'));
 
   const shutdown = async (signal: string) => {
@@ -77,6 +79,7 @@ async function main(): Promise<void> {
     stopMorningSessionCheck();
     stopRecovery();
     stopSolutionPosts();
+    stopContestPosts();
     await app.close().catch(() => undefined);
     await disconnectDatabase().catch(() => undefined);
     process.exit(0);
