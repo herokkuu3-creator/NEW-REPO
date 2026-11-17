@@ -1,13 +1,12 @@
 import type { VisualPlan } from './visuals';
-import { paletteForAccount, type AnimatedScene } from './visualStyles';
+import { escapeSvgText, paletteForAccount, type AnimatedScene } from './visualStyles';
 
 export const animatedSceneDimensions: Record<AnimatedScene, [number, number]> = {
   orbit: [720, 490], switchboard: [780, 410], grid: [680, 505], stage: [690, 450],
   film: [780, 400], terminal: [800, 510], waterfall: [650, 540], split: [760, 440],
 };
 
-const escape = (value: string) => value.replace(/[&<>"']/g, char =>
-  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[char]!);
+const escape = escapeSvgText;
 const ease = (value: number) => value * value * (3 - 2 * value);
 const mix = (from: number, to: number, progress: number) => from + (to - from) * progress;
 

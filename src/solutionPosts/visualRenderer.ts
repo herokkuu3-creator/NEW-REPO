@@ -1,5 +1,5 @@
 import type { VisualPlan } from './visuals';
-import { AccountDiagramLayout, paletteForAccount, VisualMotion } from './visualStyles';
+import { AccountDiagramLayout, escapeSvgText, paletteForAccount, VisualMotion } from './visualStyles';
 
 const dimensions: Record<AccountDiagramLayout, [number, number]> = {
   timeline: [900, 420], spotlight: [640, 520], 'notebook-board': [760, 500], 'split-screen': [900, 480],
@@ -9,17 +9,22 @@ const dimensions: Record<AccountDiagramLayout, [number, number]> = {
 export function visualDimensions(plan: Pick<VisualPlan, 'layout'>): [number, number] {
   return dimensions[plan.layout as AccountDiagramLayout] ?? [720, 360];
 }
-const escape = (value: string) => value.replace(/[<>&"']/g, character => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[character]!);
+const escape = escapeSvgText;
 const fontFamily = (kind: string) => kind === 'mono' ? 'DejaVu Sans Mono,Consolas,monospace' :
   kind === 'serif' ? 'DejaVu Serif,Georgia,serif' : 'DejaVu Sans,Arial,sans-serif';
 const words = (value: string, length: number) => {
-  const lines: string[] = []; let rest = value;
-  while (rest.length > length) {
-    let cut = rest.lastIndexOf(' ', length);
-    if (cut < length / 2) cut = length;
-    lines.push(rest.slice(0, cut)); rest = rest.slice(cut).trimStart();
+  const lines: string[] = [];
+  const chars = Array.from(value);
+  let start = 0;
+  while (chars.length - start > length) {
+    let cut = chars.lastIndexOf(' ', start + length);
+    if (cut < start || cut - start < length / 2) cut = start + length;
+    lines.push(chars.slice(start, cut).join(''));
+    start = cut;
+    while (start < chars.length && /\s/.test(chars[start]!)) start++;
   }
-  lines.push(rest); return lines;
+  lines.push(chars.slice(start).join(''));
+  return lines;
 };
 
 /** Fifteen actual compositions. All show the same reviewed state data; none invent a trace. */

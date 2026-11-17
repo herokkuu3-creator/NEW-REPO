@@ -13,7 +13,8 @@ vi.mock('../src/database/prisma', () => {
       findMany: vi.fn(async ({ where }: any) => [...h.runs.values()].filter(r => where.accountId.in.includes(r.accountId))),
       upsert: vi.fn(async ({ create }: any) => ({ id: `manual-${create.accountId}`, ...create })) },
     solutionPost: { findUnique: vi.fn(async ({ where }: any) => h.posts.find(p => p.accountId === where.accountId_problemSlug_intent.accountId) ?? null), findMany: vi.fn(async ({ where }: any) => where.status === 'RETRY_PENDING' ?
-      h.posts.filter(p => p.status === where.status && where.lastError.in.includes(p.lastError) && p.leaseUntil) : h.posts) },
+      h.posts.filter(p => p.status === where.status && where.lastError.in.includes(p.lastError) && p.leaseUntil) :
+      h.posts.filter(p => !where.intent || (p.intent ?? 'community-solution') === where.intent)) },
     solutionPostPreference: {
       updateMany: vi.fn(async () => { h.preferences = []; }),
       upsert: vi.fn(async ({ create }: any) => { h.preferences.push(create); }),
@@ -290,7 +291,7 @@ describe('daily AI drafts', () => {
       select: { accountId: true, problemSlug: true, state: true, submissionId: true, submissionStatus: true },
     }));
     expect(prisma.solutionPost.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { accountId: { in: ['a'] }, problemSlug: { in: ['today'] } },
+      where: { accountId: { in: ['a'] }, problemSlug: { in: ['today'] }, intent: 'community-solution' },
       select: { accountId: true, problemSlug: true, status: true, lastError: true, retryCount: true, updatedAt: true },
     }));
 

@@ -2,7 +2,7 @@ import { Account, Prisma } from '@prisma/client';
 import { Page } from 'playwright';
 import { z } from 'zod';
 import { prisma } from '../database/prisma';
-import { LeetCodeApi } from '../leetcode/apiClient';
+import { deduplicateLeetCodeCookies, LeetCodeApi } from '../leetcode/apiClient';
 import { logger } from '../logger';
 import { editTelegramMessage, sendTelegramMessage, sendTelegramMessageWithId } from '../notifications/telegram';
 import { startArticleWorkKeepAlive } from './keepAlive';
@@ -99,6 +99,7 @@ const ACCOUNT_CREDENTIAL_SELECT = {
   storageState: true,
 } satisfies Prisma.AccountSelect;
 
+const schedulingIds = new Set<string>();
 const activeUpvoteJobs = new Set<string>();
 const activeViewBoosts = new Set<string>();
 let upvoteRecoveryInProgress = false;
@@ -261,9 +262,11 @@ const PER_ACCOUNT_TIMEOUT_MS = 90_000;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 export function cookieGraphqlClient(account: AccountCredentialRecord): { graphql: LeetCodeApi['graphql'] } | null {
-  let cookies: Array<{ name: string; value: string; domain?: string }> = [];
+  let cookies: Array<{ name: string; value: string; domain?: string; path?: string; expires?: number }> = [];
   try { cookies = (JSON.parse(account.storageState) as { cookies?: typeof cookies }).cookies ?? []; } catch { return null; }
-  const lc = cookies.filter(c => !c.domain || /leetcode\.com$/i.test(c.domain.replace(/^\./, '')));
+  const lc = deduplicateLeetCodeCookies(
+    cookies.filter(c => !c.domain || /(?:^|\.)leetcode\.com$/i.test(c.domain.replace(/^\./, ''))),
+  );
   const session = lc.find(c => c.name === 'LEETCODE_SESSION')?.value;
   const csrf = lc.find(c => c.name === 'csrftoken')?.value;
   if (!session || !csrf) return null;
@@ -377,14 +380,16 @@ export async function generateArticleViewsWithAccount(
   targetViews = VIEWS_PER_ACCOUNT,
   delayMs = 60,
 ): Promise<AccountViewResult> {
-  let cookies: Array<{ name: string; value: string; domain?: string }> = [];
+  let cookies: Array<{ name: string; value: string; domain?: string; path?: string; expires?: number }> = [];
   try {
     cookies = (JSON.parse(account.storageState) as { cookies?: typeof cookies }).cookies ?? [];
   } catch {
     return { viewsGenerated: 0 };
   }
 
-  const lc = cookies.filter((c) => !c.domain || /leetcode\.com$/i.test(c.domain.replace(/^\./, '')));
+  const lc = deduplicateLeetCodeCookies(
+    cookies.filter((c) => !c.domain || /(?:^|\.)leetcode\.com$/i.test(c.domain.replace(/^\./, ''))),
+  );
   const csrf = lc.find((c) => c.name === 'csrftoken')?.value || '';
   const cookieHeader = lc.map((c) => `${c.name}=${c.value}`).join('; ');
   const slug = problemSlug || (/problems\/([^/]+)/.exec(publishedUrl)?.[1] ?? '');
@@ -520,6 +525,7 @@ export async function upvoteSolutionArticleWithAccount(
   options?: { generateViews?: boolean; viewsCount?: number; delayMs?: number; problemSlug?: string },
 ): Promise<AccountUpvoteResult> {
   let viewsGenerated = 0;
+  let latestHitCount: number | undefined;
   if (publishedUrl && options?.generateViews !== false) {
     try {
       const vRes = await generateArticleViewsWithAccount(
@@ -531,11 +537,13 @@ export async function upvoteSolutionArticleWithAccount(
         options?.delayMs ?? 60,
       );
       viewsGenerated = vRes.viewsGenerated;
+      latestHitCount = vRes.latestHitCount;
     } catch {
       // Views generation non-blocking for upvoting
     }
   }
 
+  const hitExtra = typeof latestHitCount === 'number' ? { latestHitCount } : {};
   const client = cookieGraphqlClient(account);
   if (client) {
     try {
@@ -545,15 +553,14 @@ export async function upvoteSolutionArticleWithAccount(
         const username = status.userStatus.username ?? account.username ?? account.label;
         return upvoteArticleWithSession(client as unknown as LeetCodeApi, undefined, topicId, publishedUrl, username);
       })(), PER_ACCOUNT_TIMEOUT_MS, 'UPVOTE');
-      return { ...res, viewsGenerated };
+      return { ...res, viewsGenerated, ...hitExtra };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       logger.warn({ accountId: account.id, err: msg }, 'cookie GraphQL upvote failed; trying browser session');
-      if (msg === 'UPVOTE_NOT_VERIFIED_ON_LEETCODE') throw error;
     }
   }
   const browserRes = await withTimeout(upvoteWithBrowser(account, topicId, publishedUrl), PER_ACCOUNT_TIMEOUT_MS * 2, 'UPVOTE_BROWSER');
-  return { ...browserRes, viewsGenerated };
+  return { ...browserRes, viewsGenerated, ...hitExtra };
 }
 
 async function upvoteWithBrowser(
@@ -928,71 +935,76 @@ export async function scheduleSolutionArticleUpvotes(
     return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
   }
 
-  // Single time guarantee: never re-schedule if already running or queued
-  if (activeUpvoteJobs.has(post.id) || upvoteQueue.some((item) => item.post.id === post.id)) {
+  // Single time guarantee: never re-schedule if already scheduling, running, or queued
+  if (schedulingIds.has(post.id) || activeUpvoteJobs.has(post.id) || upvoteQueue.some((item) => item.post.id === post.id)) {
     logger.info({ postId: post.id, topicId }, 'upvote job already active or queued for this post');
     return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
   }
 
-  const stateKey = `solution-post-upvotes:${post.id}`;
-  if (typeof prisma.systemState?.findUnique === 'function') {
-    const existingState = await Promise.resolve(
-      prisma.systemState.findUnique({ where: { key: stateKey }, select: { value: true } }),
-    ).catch(() => null);
-    if (existingState) {
-      try {
-        const parsed = JSON.parse(existingState.value) as { status?: string; verified?: boolean; attempts?: number };
-        // If already completed or attempted, never run again (single time guarantee)
-        if (!options.force && (parsed.status === 'COMPLETED' || (parsed.attempts ?? 0) >= 1)) {
-          logger.info({ postId: post.id, topicId }, 'upvotes already processed for this post; single time rule applied');
-          return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
+  schedulingIds.add(post.id);
+  try {
+    const stateKey = `solution-post-upvotes:${post.id}`;
+    if (typeof prisma.systemState?.findUnique === 'function') {
+      const existingState = await Promise.resolve(
+        prisma.systemState.findUnique({ where: { key: stateKey }, select: { value: true } }),
+      ).catch(() => null);
+      if (existingState) {
+        try {
+          const parsed = JSON.parse(existingState.value) as { status?: string; verified?: boolean; attempts?: number };
+          // If already completed or attempted, never run again (single time guarantee)
+          if (!options.force && (parsed.status === 'COMPLETED' || (parsed.attempts ?? 0) >= 1)) {
+            logger.info({ postId: post.id, topicId }, 'upvotes already processed for this post; single time rule applied');
+            return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
+          }
+        } catch {
+          // Proceed if corrupt
         }
-      } catch {
-        // Proceed if corrupt
       }
     }
-  }
 
-  let authorAccount: AccountCredentialRecord | null = null;
-  if (typeof prisma.account?.findFirst === 'function') {
-    authorAccount = await prisma.account
-      .findFirst({ where: { id: post.accountId, status: { not: 'DISABLED' } }, select: ACCOUNT_CREDENTIAL_SELECT })
-      .catch(() => null);
-  } else if (typeof prisma.account?.findUniqueOrThrow === 'function') {
-    authorAccount = await prisma.account
-      .findUniqueOrThrow({ where: { id: post.accountId }, select: ACCOUNT_CREDENTIAL_SELECT })
-      .catch(() => null);
-    if (authorAccount && (authorAccount.id !== post.accountId || authorAccount.status === 'DISABLED')) {
-      authorAccount = null;
+    let authorAccount: AccountCredentialRecord | null = null;
+    if (typeof prisma.account?.findFirst === 'function') {
+      authorAccount = await prisma.account
+        .findFirst({ where: { id: post.accountId, status: { not: 'DISABLED' } }, select: ACCOUNT_CREDENTIAL_SELECT })
+        .catch(() => null);
+    } else if (typeof prisma.account?.findUniqueOrThrow === 'function') {
+      authorAccount = await prisma.account
+        .findUniqueOrThrow({ where: { id: post.accountId }, select: ACCOUNT_CREDENTIAL_SELECT })
+        .catch(() => null);
+      if (authorAccount && (authorAccount.id !== post.accountId || authorAccount.status === 'DISABLED')) {
+        authorAccount = null;
+      }
     }
+
+    const otherAccounts = await prisma.account.findMany({
+      where: { id: { not: post.accountId }, status: { not: 'DISABLED' } },
+      select: ACCOUNT_CREDENTIAL_SELECT,
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const totalAccounts = (authorAccount ? 1 : 0) + otherAccounts.length;
+    if (totalAccounts === 0 || (!options.initialDelayMs && otherAccounts.length === 0 && !authorAccount)) {
+      logger.info({ postId: post.id }, 'no accounts available to upvote solution');
+      return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
+    }
+
+    if (otherAccounts.length === 0 && !authorAccount) {
+      logger.info({ postId: post.id }, 'no other accounts available to upvote solution');
+      return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
+    }
+
+    logger.info(
+      { postId: post.id, topicId, totalAccounts, initialDelayMs: initialDelay, gapMs: gap },
+      'enqueued solution article upvote job',
+    );
+
+    upvoteQueue.push({ post, options, authorAccount, otherAccounts });
+    void processUpvoteQueue();
+
+    return { scheduled: true, count: otherAccounts.length || totalAccounts, initialDelayMs: initialDelay, accountGapMs: gap };
+  } finally {
+    schedulingIds.delete(post.id);
   }
-
-  const otherAccounts = await prisma.account.findMany({
-    where: { id: { not: post.accountId }, status: { not: 'DISABLED' } },
-    select: ACCOUNT_CREDENTIAL_SELECT,
-    orderBy: { createdAt: 'asc' },
-  });
-
-  const totalAccounts = (authorAccount ? 1 : 0) + otherAccounts.length;
-  if (totalAccounts === 0 || (!options.initialDelayMs && otherAccounts.length === 0 && !authorAccount)) {
-    logger.info({ postId: post.id }, 'no accounts available to upvote solution');
-    return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
-  }
-
-  if (otherAccounts.length === 0 && !authorAccount) {
-    logger.info({ postId: post.id }, 'no other accounts available to upvote solution');
-    return { scheduled: false, count: 0, initialDelayMs: initialDelay, accountGapMs: gap };
-  }
-
-  logger.info(
-    { postId: post.id, topicId, totalAccounts, initialDelayMs: initialDelay, gapMs: gap },
-    'enqueued solution article upvote job',
-  );
-
-  upvoteQueue.push({ post, options, authorAccount, otherAccounts });
-  void processUpvoteQueue();
-
-  return { scheduled: true, count: otherAccounts.length || totalAccounts, initialDelayMs: initialDelay, accountGapMs: gap };
 }
 
 /**
@@ -1134,7 +1146,11 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
     });
 
     const todayCandidates = todayPublished.filter(
-      (post) => Boolean(post.publishedUrl) && !activeUpvoteJobs.has(post.id) && !upvoteQueue.some((q) => q.post.id === post.id),
+      (post) =>
+        Boolean(post.publishedUrl) &&
+        !schedulingIds.has(post.id) &&
+        !activeUpvoteJobs.has(post.id) &&
+        !upvoteQueue.some((q) => q.post.id === post.id),
     );
     const upvoteStates = await loadSystemStateMap(
       todayCandidates.map((post) => `solution-post-upvotes:${post.id}`),
@@ -1142,6 +1158,9 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
     );
 
     for (const post of todayCandidates) {
+      if (schedulingIds.has(post.id) || activeUpvoteJobs.has(post.id) || upvoteQueue.some((q) => q.post.id === post.id)) {
+        continue;
+      }
       const existingValue = upvoteStates.get(`solution-post-upvotes:${post.id}`);
       if (existingValue !== undefined) {
         try {
@@ -1158,8 +1177,8 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
         { postId: post.id, problemSlug: post.problemSlug, publishedUrl: post.publishedUrl },
         'recovering today unverified solution article upvote',
       );
-      triggeredAny = true;
-      await scheduleSolutionArticleUpvotes(post, { force: false });
+      const res = await scheduleSolutionArticleUpvotes(post, { force: false });
+      if (res.scheduled) triggeredAny = true;
     }
 
     // Auto-boost views for recent published articles (last 72h) if not yet boosted

@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config';
+import { validateSolutionPostModels } from '../config/solutionPostModels';
 import { prisma } from '../database/prisma';
 import { generateForRun, retryPost, requeueInterruptedGeneration, PostError, resetFailedSolutionPostRetries } from './service';
 import { approvePost } from './store';
@@ -173,9 +174,16 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
         if (!key) return { ok: false, error: 'FIRECRAWL_KEY_REQUIRED' };
         return probeFirecrawlAgent(key, config.solutionPosts.agentMaxCredits);
       }
-      const body = z.object({ apiKey: z.string().min(8).max(512).optional(),
-        model: z.enum(['gpt-5.6-terra', 'gpt-5.6-luna', 'gemini-3.7-flash', 'gemini-3.8-flash',
-          'qwen/qwen3.8-27b', 'qwen/qwen3.7-flash:free']).optional(),
+      const body = z.object({
+        apiKey: z.string().min(8).max(512).optional(),
+        model: z.string().trim().refine(value => {
+          if (!value || value.includes(',')) return false;
+          try {
+            return validateSolutionPostModels(value).length === 1;
+          } catch {
+            return false;
+          }
+        }, 'Unsupported solution post model').optional(),
       }).strict().parse(req.body ?? {});
       return testSolutionApiKey(body.apiKey, body.model);
     });

@@ -394,22 +394,27 @@ function draftNeedsRefresh(context: SubmissionContext): boolean {
     (presentation?.visualVersion === 6 && questionIllustration(context) === 'grid');
 }
 
-async function interruptedLockKey(
+async function interruptedLockKeys(
   post: Pick<SolutionPost, 'accountId' | 'submissionId'> & { intent?: string; context?: string },
   updatedAt: Date,
-): Promise<string | null> {
+): Promise<string[]> {
   let intent = post.intent;
   if (!intent && typeof post.context === 'string') {
     try { intent = contextSchema.safeParse(JSON.parse(post.context)).data?.intent; } catch { /* ignore unreadable context */ }
   }
-  if (intent !== 'contest-solution') return 'solution-post-job:' + post.accountId + ':' + updatedAt.toISOString().slice(0, 10);
-  if (!post.submissionId) return null;
+  if (intent !== 'contest-solution') return ['solution-post-job:' + post.accountId + ':' + updatedAt.toISOString().slice(0, 10)];
+  if (!post.submissionId) return [];
   const run = await prisma.dailyRun?.findFirst?.({
     where: { accountId: post.accountId, submissionId: post.submissionId },
     select: { date: true },
   });
-  const contestSlug = /^contest:([^:]+):[^:]+:\d{4}-\d{2}-\d{2}$/.exec(run?.date ?? '')?.[1];
-  return contestSlug ? 'contest-post-job:' + contestSlug : null;
+  const match = /^contest:([^:]+):([^:]+):\d{4}-\d{2}-\d{2}$/.exec(run?.date ?? '');
+  if (!match) return [];
+  const [, contestSlug, questionSlug] = match;
+  return [
+    `contest-post-job:${contestSlug}`,
+    `contest-question-job:${post.accountId}:${contestSlug}:${questionSlug}`,
+  ];
 }
 
 export async function generateForRun(accountId: string, runId: string, force = false, onStage?: StageCallback,
@@ -459,13 +464,20 @@ export async function requeueInterruptedGeneration(id: string, updatedAt: Date):
       post.updatedAt.getTime() !== updatedAt.getTime() || Date.now() - updatedAt.getTime() < SOLUTION_ARTICLE_WORK_MS) {
     throw new PostError('GENERATION_RECOVERY_CONFLICT');
   }
-  const key = await interruptedLockKey(post, updatedAt);
-  const lock = key ? await prisma.systemState.findUnique({ where: { key }, select: { value: true, updatedAt: true } }) : null;
+  const keys = await interruptedLockKeys(post, updatedAt);
+  const locks = await Promise.all(
+    keys.map(async key => ({
+      key,
+      lock: await prisma.systemState.findUnique({ where: { key }, select: { value: true, updatedAt: true } }),
+    })),
+  );
   const recovered = await move(post as unknown as SolutionPost, 'RETRY_PENDING', isCoarenaPauseCode(post.lastError)
     ? { leaseUntil: new Date(), retryCount: { decrement: 1 } }
     : { leaseUntil: null, lastError: 'GENERATION_INTERRUPTED' });
-  // Remove only the lock observed before this generation made progress.
-  if (key && lock && lock.updatedAt <= updatedAt) await prisma.systemState.deleteMany({ where: { key, value: lock.value } });
+  // Remove only the locks observed before this generation made progress.
+  for (const { key, lock } of locks) {
+    if (lock && lock.updatedAt <= updatedAt) await prisma.systemState.deleteMany({ where: { key, value: lock.value } });
+  }
   return recovered;
 }
 
@@ -497,9 +509,23 @@ export async function retryPost(id: string, force = false, onStage?: StageCallba
     where: { accountId: post.accountId, submissionId: post.submissionId },
     select: { id: true },
   });
-  if (!run) throw new PostError('SUBMISSION_CONTEXT_MISSING');
-  const verified = await loadContext(post.accountId, run.id);
-  if (hash(verified.code) !== post.codeHash || verified.slug !== context.slug) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  if (run) {
+    const verified = await loadContext(post.accountId, run.id);
+    if (hash(verified.code) !== post.codeHash || verified.slug !== context.slug) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  } else {
+    if (!post.submissionId || context.accountId !== post.accountId ||
+      context.submissionId !== post.submissionId || hash(context.code) !== post.codeHash) {
+      throw new PostError('SOURCE_INTEGRITY_FAILED');
+    }
+    const account = await prisma.account.findUniqueOrThrow({
+      where: { id: post.accountId },
+      select: ACCOUNT_SESSION_SELECT,
+    });
+    await withAccount(account, async api => {
+      const verdict = await api.awaitSubmission(post.submissionId, context.slug, 30000, { firstPollDelayMs: 0 });
+      if (verdict.classification !== 'ACCEPTED') throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
+    });
+  }
   if (refreshDraft) {
     await move(post, 'RETRY_PENDING', { approvedHash: null, contentHash: null });
   } else if (post.status === 'FAILED') {

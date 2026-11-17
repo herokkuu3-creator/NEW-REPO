@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { diagramLayouts, visualThemes, visualMotions, accountDiagramLayouts, animatedScenes, sceneDirections, illustrationKinds } from './visualStyles';
+import { diagramLayouts, visualThemes, visualMotions, accountDiagramLayouts, animatedScenes, sceneDirections, illustrationKinds, escapeSvgText } from './visualStyles';
 import { animatedSceneDimensions, renderAnimatedScene } from './animatedScenes';
 import { illustratedDimensions, renderQuestionIllustration } from './questionIllustration';
 import { renderAccountVisualFrame, visualDimensions } from './visualRenderer';
@@ -76,7 +76,7 @@ export type VisualResolver = (plans: VisualPlan[]) => Promise<VisualAsset[]>;
 export const plainMarkdown = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/[\\`*_{}\[\]()#!|]/g, '\\$&').replace(/[\r\n]/g, ' ');
 
-const xml = (s: string) => s.replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[c]!);
+const xml = escapeSvgText;
 const text = (x: number, y: number, value: string, size: number, color: string, weight = 400, anchor = 'start') =>
   `<text x="${x}" y="${y}" font-family="DejaVu Sans,Arial,sans-serif" font-size="${size}" fill="${color}" font-weight="${weight}" text-anchor="${anchor}">${xml(value)}</text>`;
 

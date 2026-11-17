@@ -1,5 +1,5 @@
 import type { VisualPlan } from './visuals';
-import type { IllustrationKind } from './visualStyles';
+import { escapeSvgText, type IllustrationKind } from './visualStyles';
 
 type Point = { x: number; y: number };
 type Frame = VisualPlan['frames'][number];
@@ -15,8 +15,7 @@ export function illustratedDimensions(plan: Pick<VisualPlan, 'id'>): [number, nu
   return plan.id === 'visual-1' ? [780, 465] : [800, 510];
 }
 
-const escape = (value: string) => value.replace(/[&<>"']/g, char =>
-  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[char]!);
+const escape = escapeSvgText;
 const lerp = (from: number, to: number, progress: number) => from + (to - from) * progress;
 
 function wrap(value: string, columns: number): string[] {

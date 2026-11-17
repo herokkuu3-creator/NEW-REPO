@@ -105,16 +105,20 @@ async function publishDailyPostInternal(id: string, now: Date, alreadyQueued: bo
   if (['PUBLISHED', 'PUBLISHING', 'SKIPPED'].includes(post.status)) {
     await prisma.systemState.deleteMany({ where: { key } }); return post;
   }
-  if (post.status !== 'DRAFT_READY') throw Error('DAILY_DRAFT_NOT_READY');
+  if (post.status !== 'DRAFT_READY') {
+    if (alreadyQueued) await prisma.systemState.deleteMany({ where: { key } });
+    throw Error('DAILY_DRAFT_NOT_READY');
+  }
   if (articleNeedsRefresh(contextSchema.parse(JSON.parse(post.context)))) {
     await prisma.systemState.deleteMany({ where: { key } });
     return { ...post, lastError: 'ARTICLE_LAYOUT_REFRESH_REQUIRED' };
   }
   if (!alreadyQueued) {
+    const queuePayload = JSON.stringify({ postId: id, queuedAt: now.toISOString(), failures: 0 });
     await prisma.systemState.upsert({
       where: { key },
-      create: { key, value: JSON.stringify({ postId: id, queuedAt: now.toISOString(), failures: 0 }) },
-      update: {},
+      create: { key, value: queuePayload },
+      update: { value: queuePayload },
       select: { key: true },
     });
   }
@@ -209,9 +213,13 @@ export async function processDailyPublicationQueue(now = new Date()) {
 
     let publishedOne = false;
     let hitCooldown = false;
+    let remainingCount = runnable.length;
     for (const item of runnable) {
       try {
         const post = await publishDailyPostInternal(item.postId, new Date(), true);
+        if (['PUBLISHED', 'PUBLISHING', 'SKIPPED'].includes(post.status) || post.lastError === 'ARTICLE_LAYOUT_REFRESH_REQUIRED') {
+          remainingCount--;
+        }
         if (post.status === 'PUBLISHED') {
           publishedOne = true;
           if (config.telegram.enabled) await sendTelegramMessage(`✅ Queued daily article published\n${post.publishedUrl}`).catch(() => undefined);
@@ -221,7 +229,10 @@ export async function processDailyPublicationQueue(now = new Date()) {
           hitCooldown = true;
           break;
         }
-      } catch {
+      } catch (err) {
+        if (err instanceof Error && err.message === 'DAILY_DRAFT_NOT_READY') {
+          remainingCount--;
+        }
         const data = JSON.parse(item.value);
         await prisma.systemState.updateMany({ where: { key: item.key, value: item.value },
           data: { value: JSON.stringify({ ...data, failures: (data.failures ?? 0) + 1 }) } });
@@ -229,11 +240,19 @@ export async function processDailyPublicationQueue(now = new Date()) {
       }
     }
     if (publishedOne) {
-      nextDailyQueuePollAt = runnable.length > 1
+      if (remainingCount <= 0) {
+        stopQueueKeepAlive?.();
+        stopQueueKeepAlive = undefined;
+      }
+      nextDailyQueuePollAt = remainingCount > 0
         ? Date.now() + Math.min(DAILY_PUBLICATION_GAP_MS, 60 * 60_000)
         : Date.now() + 60 * 60_000;
     } else if (hitCooldown) {
       nextDailyQueuePollAt = Date.now() + Math.min(DAILY_PUBLICATION_GAP_MS, 5 * 60_000);
+    } else if (remainingCount <= 0) {
+      stopQueueKeepAlive?.();
+      stopQueueKeepAlive = undefined;
+      nextDailyQueuePollAt = Date.now() + 60 * 60_000;
     } else {
       nextDailyQueuePollAt = 0;
     }

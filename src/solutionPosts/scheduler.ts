@@ -439,7 +439,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
     const acceptedAccountIds = [...new Set(acceptedRuns.map(r => r.accountId))];
     const posts = acceptedSlugs.length
       ? await prisma.solutionPost.findMany({
-          where: { accountId: { in: acceptedAccountIds }, problemSlug: { in: acceptedSlugs } },
+          where: { accountId: { in: acceptedAccountIds }, problemSlug: { in: acceptedSlugs }, intent: 'community-solution' },
           select: { accountId: true, problemSlug: true, status: true, lastError: true, retryCount: true, updatedAt: true },
         })
       : [];

@@ -219,14 +219,14 @@ export async function removeSolutionApiKey(target: string | number): Promise<{
   let newActiveIndex = current.activeIndex;
   if (index < current.activeIndex) {
     newActiveIndex = Math.max(0, current.activeIndex - 1);
-  } else if (newActiveIndex >= newKeys.length) {
-    newActiveIndex = Math.max(0, newKeys.length - 1);
+  } else {
+    newActiveIndex = Math.min(current.activeIndex, newKeys.length);
   }
   const pool = await persist({
     ...current,
     keys: newKeys,
     activeIndex: newActiveIndex,
-    lastFailure: undefined,
+    lastFailure: newKeys.length && newActiveIndex > 0 ? current.lastFailure : undefined,
     stored: true,
   });
   return { pool, removedKey, removedIndex: index + 1 };

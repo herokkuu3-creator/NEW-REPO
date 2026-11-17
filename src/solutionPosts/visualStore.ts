@@ -97,10 +97,14 @@ export async function verifyHostedVisualAssets(assets: VisualAsset[], baseUrl: s
       let parsed: URL;
       try { parsed = new URL(asset.url); } catch { return false; }
       if (parsed.origin !== origin || !/^\/solution-assets\/[a-f0-9]{64}\.gif$/.test(parsed.pathname)) return false;
-      let response: Response;
-      try { response = await fetcher(asset.url, { redirect: 'error', signal: controller.signal }); } catch { return false; }
-      if (!response.ok || !response.headers.get('content-type')?.toLowerCase().includes('image/gif')) return false;
-      const bytes = Buffer.from(await response.arrayBuffer());
+      let bytes: Buffer;
+      try {
+        const response = await fetcher(asset.url, { redirect: 'error', signal: controller.signal });
+        if (!response.ok || !response.headers.get('content-type')?.toLowerCase().includes('image/gif')) return false;
+        bytes = Buffer.from(await response.arrayBuffer());
+      } catch {
+        return false;
+      }
       if (bytes.length < 32 || !['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString())) return false;
     }
     return true;

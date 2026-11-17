@@ -7,9 +7,11 @@ import { logger } from '../logger';
 import { sendTelegramMessage } from '../notifications/telegram';
 import type { ContestKind, ContestQuestionSummary, ContestSummary } from '../leetcode/contest';
 import type { StageCallback } from './article';
-import { isCoarenaPauseCode, isCoarenaPaused } from './coarenaLimits';
+import { CoarenaPause, isCoarenaPauseCode, isCoarenaPaused } from './coarenaLimits';
 import { publishGeneratedPost, selectedAccountIds } from './scheduler';
+import { notifySolutionPostSchedulerWork } from './schedulerGate';
 import { generateForRun, PostError } from './service';
+import { recoverGeneration } from './store';
 
 export const WEEKLY_CONTEST_CRON = '31 9 * * 0';
 export const BIWEEKLY_CONTEST_CRON = '31 21 * * 6';
@@ -193,7 +195,7 @@ function coarenaPauseDetail(post: Pick<SolutionPost, 'lastError' | 'leaseUntil'>
 }
 
 function extractErrorCode(error: unknown, fallback: string): string {
-  if (error instanceof PostError) return error.code;
+  if (error instanceof PostError || error instanceof CoarenaPause) return error.code;
   if (error instanceof Error && error.message.trim()) return error.message.trim().slice(0, 200);
   return fallback;
 }
@@ -336,6 +338,7 @@ async function processAccountQuestion(params: {
         };
       }
       if (!force && isCoarenaPaused(existing) && existing.leaseUntil && existing.leaseUntil.getTime() > now.getTime()) {
+        notifySolutionPostSchedulerWork();
         await emit('provider_paused', {
           error: existing.lastError ?? undefined,
           detail: coarenaPauseDetail(existing),
@@ -371,7 +374,7 @@ async function processAccountQuestion(params: {
       contestTitle: contest.title,
       question,
       istDate,
-      forceFreshSubmit: force,
+      forceFreshSubmit: force && !existing,
       onStage: (progress: { stage: string; detail: string }) => emit(progress.stage, { detail: progress.detail }),
     });
 
@@ -395,6 +398,7 @@ async function processAccountQuestion(params: {
     currentPostId = post.id;
 
     if (isCoarenaPaused(post)) {
+      notifySolutionPostSchedulerWork();
       await emit('provider_paused', {
         error: post.lastError ?? undefined,
         detail: coarenaPauseDetail(post),
@@ -483,6 +487,9 @@ async function processAccountQuestion(params: {
     }
 
     const fallbackError = post.lastError ?? (post.status === 'PUBLISHING' ? 'PUBLICATION_UNCERTAIN_RECONCILE_FIRST' : 'CONTEST_POST_PENDING');
+    if (post.status === 'RETRY_PENDING') {
+      notifySolutionPostSchedulerWork();
+    }
     await emit(post.status === 'RETRY_PENDING' ? 'provider_paused' : 'failed', { error: fallbackError });
     return {
       accountId,
@@ -495,6 +502,22 @@ async function processAccountQuestion(params: {
     };
   } catch (error) {
     const code = extractErrorCode(error, 'CONTEST_WORKFLOW_FAILED');
+    if (error instanceof CoarenaPause) {
+      notifySolutionPostSchedulerWork();
+      await emit('provider_paused', {
+        error: code,
+        detail: coarenaPauseDetail({ lastError: code, leaseUntil: error.retryAt }),
+      });
+      return {
+        accountId,
+        contestSlug: contest.titleSlug,
+        questionLabel,
+        questionSlug: question.titleSlug,
+        ...(currentPostId ? { postId: currentPostId } : {}),
+        status: 'RETRY_PENDING',
+        error: code,
+      };
+    }
     await emit('failed', { error: code });
     return {
       accountId,
@@ -541,6 +564,7 @@ export async function runContestSolutionWorkflow(params: {
   if (!questions.length) return [];
 
   const now = params.now ?? new Date();
+  await recoverGeneration(now);
   const istDate = params.contest.endTimeSec > 0
     ? getIstParts(new Date(params.contest.endTimeSec * 1000)).istDate
     : getIstParts(now).istDate;
@@ -682,6 +706,7 @@ export async function runScheduledContestPosts(
   const startedAt = now.toISOString();
 
   try {
+    await recoverGeneration(now);
     const { fetchLatestEndedContest, selectStartingContestQuestions } = await import('../leetcode/contest');
     const contest = await fetchLatestEndedContest(kind, now);
     if (!contest) {
@@ -870,6 +895,7 @@ export async function runScheduledContestPosts(
     return { status: 'FINISHED', contestSlug: contest.titleSlug, results };
   } catch (error) {
     const code = extractErrorCode(error, 'CONTEST_SCHEDULE_FAILED');
+    if (error instanceof CoarenaPause) notifySolutionPostSchedulerWork();
     await saveScheduleState({
       kind,
       trigger,

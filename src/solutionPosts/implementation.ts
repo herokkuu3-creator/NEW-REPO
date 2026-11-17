@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { SubmissionContext } from './article';
 import type { LLMMessage } from '../ai/provider';
-import { AIModelRouter, ModelAttempt, OutputValidationError, RoutingError } from './router';
+import { AIModelRouter, ModelAttempt, OutputValidationError, parseJSON, RoutingError } from './router';
 import { CoarenaRouter } from './coarena';
 
 export const implementationSchema = z.object({
@@ -18,15 +18,18 @@ const structureKeywords = new Set(`if else elif switch case default match when f
   return yield try catch except finally defer throw raise new delete class struct impl fn def func function
   lambda let var const static auto in of is not and or true false null nullptr none`.split(/\s+/));
 
+const HASH_COMMENT_LANGUAGES = new Set<SubmissionContext['language']>(['python3', 'python', 'pythondata', 'ruby', 'bash']);
+
 /** A conservative duplicate check. The reviewer assesses changes this token comparison cannot judge. */
 export function implementationFingerprint(code: string, language: SubmissionContext['language']): string {
-  const tokens = language === 'python3'
-    ? /#[^\n]*|"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|[\p{L}_$][\p{L}\p{N}_$]*|\d+(?:\.\d+)?|\S/gu
+  const hashCommentLang = HASH_COMMENT_LANGUAGES.has(language);
+  const tokens = hashCommentLang
+    ? /#[^\n]*|"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`|[\p{L}_$][\p{L}\p{N}_$]*|\d+(?:\.\d+)?|\S/gu
     : /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`|[\p{L}_$][\p{L}\p{N}_$]*|\d+(?:\.\d+)?|\S/gu;
   const hash = createHash('sha256');
   for (const [token] of code.matchAll(tokens)) {
-    if (token.startsWith('//') || token.startsWith('/*') || '{};'.includes(token) ||
-      (language === 'python3' && token.startsWith('#'))) continue;
+    if ((!hashCommentLang && (token.startsWith('//') || token.startsWith('/*'))) || '{};'.includes(token) ||
+      (hashCommentLang && token.startsWith('#'))) continue;
     if (/^[\p{L}_$]/u.test(token)) hash.update(structureKeywords.has(token) ? token : 'name');
     else if (/^[\d"'`]/.test(token)) hash.update('literal');
     else hash.update(token);
@@ -86,7 +89,7 @@ async function writeImplementation(router: AIModelRouter, context: SubmissionCon
         { role: 'user', content: JSON.stringify({ source, readerLayout: context.presentation?.layout, previousApproaches, feedback }) },
       ];
       const generated = await infer(messages, text => {
-        const candidate = implementationSchema.parse(JSON.parse(text));
+        const candidate = implementationSchema.parse(parseJSON(text));
         if (/^\s*(`{3,}|~{3,})/m.test(candidate.code)) throw new OutputValidationError('ARTICLE_CODE_FENCED');
         return candidate;
       }, 4096, true, 'article implementation');
@@ -102,7 +105,7 @@ async function writeImplementation(router: AIModelRouter, context: SubmissionCon
       const review = await infer([
         { role: 'system', content: oneLiner ? ONE_LINER_REVIEWER_PROMPT : STANDARD_REVIEWER_PROMPT },
         { role: 'user', content: JSON.stringify({ source, proposedCode: generated.value.code }) },
-      ], text => z.object({ issues: z.array(z.string().max(500)).max(8) }).parse(JSON.parse(text)),
+      ], text => z.object({ issues: z.array(z.string().max(500)).max(8) }).parse(parseJSON(text)),
       1024, true, 'technical review implementation');
       attempts.push(...review.attempts);
       if (review.value.issues.length) {

@@ -63,6 +63,10 @@ export class OutputValidationError extends Error {
   constructor(public readonly category: string) { super(category); }
 }
 
+export function parseJSON(text: string): unknown {
+  return JSON.parse(text.trim().replace(/^```(?:json)?\s*\r?\n/, '').replace(/\r?\n```$/, ''));
+}
+
 /** Uses the existing OpenAI SDK/protocol, with one bounded retry owner. Never logs provider bodies. */
 export class AIModelRouter {
   private readonly apiKeys: string[];
@@ -151,7 +155,7 @@ export class AIModelRouter {
         if (blockedUntil > Date.now()) {
           const record: ModelAttempt = { model, attempt: 0, keySlot: keyIndex + 1, elapsedMs: 0, stage,
             outcome: 'MODEL_TEMPORARILY_UNAVAILABLE', deferred: true, retryAfterMs: blockedUntil - Date.now() };
-          attempts.push(record); this.onAttempt(record); lastFailureReason = record.outcome; continue;
+          attempts.push(record); this.onAttempt(record); lastFailureReason ??= record.outcome; continue;
         }
         // Sage Inkstone reasoning models (deepseek, qwen3.8) spend a large
         // portion of max_tokens on internal reasoning_content. The visible
@@ -177,15 +181,38 @@ export class AIModelRouter {
               // Intern-AI enforces 50 RPM on generation models (~1200ms per request).
               // Space requests by at least 1500ms across the process to guarantee staying
               // safely within RPM limits and prevent burst concurrency 429s.
+              if (deferRateLimit && sageBlockedUntil > Date.now()) {
+                const deferred: ModelAttempt = {
+                  model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0, stage,
+                  outcome: 'HTTP_429', retryAfterMs: sageBlockedUntil - Date.now(), deferred: true,
+                };
+                attempts.push(deferred); this.onAttempt(deferred);
+                throw new RoutingError(attempts, 'HTTP_429');
+              }
               const interval = this.options.minRequestIntervalMs ?? (process.env.NODE_ENV === 'test' ? 0 : 1500);
               if (interval > 0) {
+                const waitForSageSlot = async (target: number) => {
+                  const waitMs = target - Date.now();
+                  if (waitMs <= 0) return;
+                  const bounded = remainingTime(waitMs);
+                  await this.sleep(bounded);
+                  if (bounded < waitMs) throw new RoutingError(attempts, 'ARTICLE_TIME_BUDGET_EXCEEDED');
+                  if (deferRateLimit && sageBlockedUntil > Date.now()) {
+                    const deferred: ModelAttempt = {
+                      model, attempt: n + 1, keySlot: keyIndex + 1, elapsedMs: 0, stage,
+                      outcome: 'HTTP_429', retryAfterMs: sageBlockedUntil - Date.now(), deferred: true,
+                    };
+                    attempts.push(deferred); this.onAttempt(deferred);
+                    throw new RoutingError(attempts, 'HTTP_429');
+                  }
+                };
                 let start = Math.max(Date.now(), nextSageRequestAt, sageBlockedUntil);
-                nextSageRequestAt = start + interval;
-                if (start > Date.now()) await this.sleep(start - Date.now());
+                if (start <= (this.options.deadlineAt ?? Infinity)) nextSageRequestAt = start + interval;
+                await waitForSageSlot(start);
                 while (start < sageBlockedUntil) {
                   start = Math.max(Date.now(), nextSageRequestAt, sageBlockedUntil);
-                  nextSageRequestAt = start + interval;
-                  if (start > Date.now()) await this.sleep(start - Date.now());
+                  if (start <= (this.options.deadlineAt ?? Infinity)) nextSageRequestAt = start + interval;
+                  await waitForSageSlot(start);
                 }
               }
             } else if (isBazaarLinkProvider(this.options.baseUrl) && model.endsWith(':free')) {

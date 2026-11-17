@@ -125,11 +125,12 @@ export async function startServerTest(runId: string, publicationMode: 'daily' | 
       }
       let post = await generateForRun(control.accountId, runId, true);
       await save({ postId: post.id, postStatus: post.status, lastError: post.lastError });
-      if (post.status === 'AWAITING_APPROVAL') {
+      if (post.status === 'AWAITING_APPROVAL' || (post.status === 'DRAFT_READY' && (!post.approvedHash || post.approvedHash !== post.contentHash))) {
         if (!post.contentHash) throw new PostError('REVIEW_REQUIRED');
         post = await approvePost(post.id, post.contentHash);
       }
       if (post.status === 'DRAFT_READY') {
+        if (post.approvedHash !== post.contentHash) throw new PostError('REVIEW_REQUIRED');
         await save({ stage: 'publication' });
         post = publicationMode === 'daily' ? await publishDailyPost(post.id) : await publishPost(post.id);
       }

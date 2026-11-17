@@ -39,3 +39,11 @@ export function paletteForAccount(theme: VisualTheme): VisualPalette {
   if (theme in accountPalettes) return accountPalettes[theme as keyof typeof accountPalettes];
   return accountPalettes[({ aurora: 'midnight', sunset: 'plum', ocean: 'cyanotype', violet: 'lavender' } as const)[theme as 'aurora' | 'sunset' | 'ocean' | 'violet']];
 }
+
+const XML_ILLEGAL_CHARS_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]/g;
+
+/** Strips XML 1.0 illegal control characters and escapes SVG text entities. */
+export function escapeSvgText(value: string): string {
+  return value.replace(XML_ILLEGAL_CHARS_RE, '').replace(/[<>&"']/g, char =>
+    ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[char]!);
+}

@@ -14,16 +14,22 @@ export async function verifySolutionProviderOnBoot(): Promise<void> {
       maxCreditsPerJob: config.solutionPosts.agentMaxCredits, agentStartIntervalMs: FIRECRAWL_START_INTERVAL_MS,
       agentQueueWaitMs: FIRECRAWL_QUEUE_WAIT_MS }, 'solution article credential configuration');
     if (config.solutionPosts.firecrawlApiKey && process.env.SOLUTION_POST_VERIFY_ON_BOOT !== 'false') {
-      const response = await fetch('https://api.firecrawl.dev/v2/team/credit-usage', {
-        headers: { Authorization: `Bearer ${config.solutionPosts.firecrawlApiKey}` }, redirect: 'error', signal: AbortSignal.timeout(15000) });
-      let remainingCredits: number | null = null;
-      if (response.ok) {
-        const result: any = await response.json();
-        if (typeof result?.data?.remainingCredits === 'number') remainingCredits = result.data.remainingCredits;
+      try {
+        const response = await fetch('https://api.firecrawl.dev/v2/team/credit-usage', {
+          headers: { Authorization: `Bearer ${config.solutionPosts.firecrawlApiKey}` }, redirect: 'error', signal: AbortSignal.timeout(15000) });
+        let remainingCredits: number | null = null;
+        if (response.ok) {
+          const result: any = await response.json();
+          if (typeof result?.data?.remainingCredits === 'number') remainingCredits = result.data.remainingCredits;
+        }
+        logger.info({ provider: 'firecrawl-agent', httpStatus: response.status, remainingCredits,
+          keyFingerprint: createHash('sha256').update(config.solutionPosts.firecrawlApiKey).digest('hex').slice(0, 12) },
+          'Firecrawl server credit check (no Agent job started)');
+      } catch (error) {
+        const rawErr = error instanceof Error ? error.message : String(error);
+        const safeErr = rawErr.split(config.solutionPosts.firecrawlApiKey).join('[REDACTED]');
+        logger.warn({ provider: 'firecrawl-agent', err: safeErr }, 'Firecrawl server credit check failed');
       }
-      logger.info({ provider: 'firecrawl-agent', httpStatus: response.status, remainingCredits,
-        keyFingerprint: createHash('sha256').update(config.solutionPosts.firecrawlApiKey).digest('hex').slice(0, 12) },
-        'Firecrawl server credit check (no Agent job started)');
     }
     return; // Avoid consuming agent credits on every restart.
   }

@@ -1,7 +1,8 @@
 import { CoarenaPause } from './coarenaLimits';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { AIModelRouter, OutputValidationError, RoutingError, ModelAttempt } from './router';
+import { AIModelRouter, OutputValidationError, parseJSON, RoutingError, ModelAttempt } from './router';
+export { parseJSON };
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { sectionKinds, visualFrameSchema, visualPlanSchema, visualTitleSchema, VisualAsset, VisualResolver, renderVisualFallback, plainMarkdown } from './visuals';
 import { logger } from '../logger';
@@ -78,10 +79,6 @@ export function selectStyle(context: SubmissionContext, recent: string[]): strin
     /stack|queue|unordered_set|\bset\b|while/.test(code) ? [5, 0, 4, 2] :
       context.difficulty === 'Easy' ? [2, 7, 5, 4] : [1, 3, 0, 7];
   return suited.map(i => STYLES[i]!).find(s => !recent.slice(0, 2).includes(s)) ?? STYLES[suited[0]!]!;
-}
-
-export function parseJSON(text: string): unknown {
-  return JSON.parse(text.trim().replace(/^```(?:json)?\s*\n/, '').replace(/\n```$/, ''));
 }
 
 export function validateArticle(text: string, context: SubmissionContext, recentTitles: string[] = []): Article {
@@ -163,15 +160,41 @@ export function titleIncludesQuestionName(title: string, context: Pick<Submissio
 }
 
 function sourceTemplates(code: string): string[] {
-  return [...new Set(code.match(/\b(?:std::)?\w+<[^>\n]+>/g) ?? [])];
+  const templates = new Set<string>();
+  const startPattern = /\b(?:std::)?[A-Za-z_]\w*</g;
+  for (let match = startPattern.exec(code); match; match = startPattern.exec(code)) {
+    const start = match.index;
+    const openIdx = startPattern.lastIndex - 1;
+    if (code[openIdx + 1] === '<' || code[openIdx + 1] === '=') continue;
+    let depth = 1;
+    let end = -1;
+    for (let i = openIdx + 1; i < code.length; i++) {
+      const ch = code[i]!;
+      if (ch === '\n' || ch === '\r' || ch === ';' || ch === '{' || ch === '}' || ch === '=' || ch === '?') break;
+      if ((ch === '&' || ch === '|') && code[i + 1] === ch) break;
+      if (ch === '<') depth++;
+      else if (ch === '>') {
+        depth--;
+        if (depth === 0) {
+          end = i + 1;
+          break;
+        }
+      }
+    }
+    if (end > openIdx + 2) {
+      templates.add(code.slice(start, end));
+    }
+  }
+  return [...templates].sort((a, b) => b.length - a.length);
 }
 
 function formatProse(markdown: string, templates: string[]): string {
-  return markdown.split(/(`+[^`\n]*`+)/g).map((part, index) => {
-    if (index % 2) return part;
-    for (const token of templates) part = part.split(token).join('`' + token + '`');
-    return part;
-  }).join('');
+  const sorted = [...templates].filter(Boolean).sort((a, b) => b.length - a.length);
+  if (!sorted.length) return markdown;
+  const pattern = new RegExp(sorted.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g');
+  return markdown.split(/(`+[^`\n]*`+)/g).map((part, index) =>
+    index % 2 ? part : part.replace(pattern, match => '`' + match + '`'),
+  ).join('');
 }
 
 export function renderArticle(article: Article, context: SubmissionContext, assets: VisualAsset[] = []): string {

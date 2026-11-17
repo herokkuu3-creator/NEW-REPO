@@ -6,7 +6,7 @@ import { config } from '../config';
 import { getSystemState, setSystemState } from '../database/models';
 import { decryptText, encryptText } from '../security/credentialStore';
 import { CoarenaPause, coarenaPauseForAttempt, isCoarenaSharedLimit, retryAfterMs } from './coarenaLimits';
-import { AIModelRouter, ModelAttempt, OutputValidationError, RoutingError } from './router';
+import { AIModelRouter, ModelAttempt, OutputValidationError, parseJSON, RoutingError } from './router';
 
 const BASE_URL = 'https://coarena.ai/api/v1';
 const KEY_STATE = 'solution-post-coarena-key:v1';
@@ -190,7 +190,9 @@ export class CoarenaRouter extends AIModelRouter {
           const attempt = [...error.attempts].reverse().find(record => record.attempt > 0);
           const limit = attempt && coarenaPauseForAttempt(attempt, this.resetAt);
           if (limit) pause = new CoarenaPause(limit.code, limit.retryAt, error.attempts);
-          if (!pause && error.lastFailure === 'ARTICLE_TIME_BUDGET_EXCEEDED') pause = capacityPause().withAttempts(error.attempts);
+          if (!pause && error.lastFailure === 'ARTICLE_TIME_BUDGET_EXCEEDED') {
+            throw capacityPause().withAttempts(error.attempts);
+          }
         }
         if (pause) {
           cooldowns.set(this.quotaKey, pause);
@@ -253,7 +255,7 @@ export async function enableCoarena(key: string) {
     undefined, undefined, undefined, order);
   const messages: LLMMessage[] = [{ role: 'system', content: 'Return only {"ready":true}.' }, { role: 'user', content: 'Confirm readiness.' }];
   const validate = (text: string) => {
-    if (JSON.parse(text).ready !== true) throw new OutputValidationError('COARENA_PROBE_INVALID');
+    if ((parseJSON(text) as { ready?: unknown } | null)?.ready !== true) throw new OutputValidationError('COARENA_PROBE_INVALID');
     return true;
   };
   const writer = await router.generatePrimary(messages, validate, 1024, true, 'coarena probe');

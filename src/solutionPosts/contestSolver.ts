@@ -213,7 +213,13 @@ async function openAuthenticatedContestSession(
   }
 
   let session = await openSessionFn(parsedState.state, account);
-  const check = await checkSessionFn(session.api);
+  let check: SessionCheckResult;
+  try {
+    check = await checkSessionFn(session.api);
+  } catch (error) {
+    await session.close?.().catch(() => undefined);
+    throw error;
+  }
   if (!check.authenticated && check.cause === 'signed-out') {
     await session.close?.().catch(() => undefined);
     const refreshed = await refreshAccountFn(account);
@@ -231,7 +237,13 @@ async function openAuthenticatedContestSession(
       }
     }
     session = await openSessionFn(parsedState.state, account);
-    const recheck = await checkSessionFn(session.api);
+    let recheck: SessionCheckResult;
+    try {
+      recheck = await checkSessionFn(session.api);
+    } catch (error) {
+      await session.close?.().catch(() => undefined);
+      throw error;
+    }
     if (!recheck.authenticated && recheck.cause === 'signed-out') {
       await session.close?.().catch(() => undefined);
       throw new Error(`LeetCode session remains signed out for account "${account.label}"`);
