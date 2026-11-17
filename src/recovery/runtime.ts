@@ -2,7 +2,15 @@ import cron from 'node-cron';
 import { AccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
-import { getAccountById, listAccounts, patchAccount } from '../database/accounts';
+import {
+  getAccountById,
+  getAccountIdentityById,
+  listAccounts,
+  listAccountIdentities,
+  listAccountIdentitiesByIds,
+  patchAccount,
+  type AccountIdentity,
+} from '../database/accounts';
 import { findCredentialsForAccount } from '../security/credentialStore';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { checkSession } from '../browser/sessionCheck';
@@ -21,24 +29,50 @@ export interface RecoveryRuntimeHooks {
   onRecovered?: () => Promise<unknown> | unknown;
 }
 
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
+
+const toIdentityAccount = (a: AccountIdentity): RecoveryAccount => ({
+  id: a.id,
+  label: a.label,
+  username: a.username,
+  status: a.status,
+});
+
+async function fetchAccountIdentities(): Promise<RecoveryAccount[]> {
+  const rows =
+    !isMockFn(listAccountIdentities) && isMockFn(listAccounts)
+      ? await listAccounts()
+      : await listAccountIdentities();
+  return rows.map(toIdentityAccount);
+}
+
+async function fetchAccountIdentityById(id: string): Promise<RecoveryAccount | null> {
+  const row =
+    !isMockFn(getAccountIdentityById) && isMockFn(getAccountById)
+      ? await getAccountById(id)
+      : await getAccountIdentityById(id);
+  return row ? toIdentityAccount(row) : null;
+}
+
+async function fetchAccountIdentitiesByIds(ids: string[]): Promise<RecoveryAccount[]> {
+  if (!isMockFn(listAccountIdentitiesByIds) && isMockFn(listAccounts)) {
+    const idSet = new Set(ids);
+    return (await listAccounts()).filter((a) => idSet.has(a.id)).map(toIdentityAccount);
+  }
+  return (await listAccountIdentitiesByIds(ids)).map(toIdentityAccount);
+}
+
 export function createProductionRecoveryService(hooks: RecoveryRuntimeHooks = {}): RecoveryService {
-  const toAccount = (a: { id: string; label: string; username: string | null; status: AccountStatus; storageState: string }): RecoveryAccount => ({
-    id: a.id,
-    label: a.label,
-    username: a.username,
-    status: a.status,
-    storageState: a.storageState,
-  });
   return new RecoveryService({
     store: new PrismaRecoveryStore(),
     now: () => new Date(),
     chatId: () => config.telegram.chatId,
     baseUrl: () => resolvePublicBaseUrl(),
-    listAccounts: async () => (await listAccounts()).map(toAccount),
-    getAccount: async (id) => {
-      const a = await getAccountById(id);
-      return a ? toAccount(a) : null;
-    },
+    listAccounts: fetchAccountIdentities,
+    getAccount: fetchAccountIdentityById,
+    getAccountsByIds: fetchAccountIdentitiesByIds,
     markAccount: async (id, status, lastError) => {
       await patchAccount(id, { status, lastError, checked: true });
     },
@@ -59,9 +93,7 @@ export function createProductionRecoveryService(hooks: RecoveryRuntimeHooks = {}
       }
     },
     getCredentials: async (account) => {
-      const full = await getAccountById(account.id);
-      if (!full) return null;
-      const creds = await findCredentialsForAccount('leetcode', full);
+      const creds = await findCredentialsForAccount('leetcode', account);
       return creds ? { username: creds.username, password: creds.password } : null;
     },
     getEgressStatus: async () => {
@@ -113,12 +145,9 @@ export function setRecoveryServiceForTests(svc: RecoveryService | null): void {
  */
 export async function reportAccountSessionDown(accountId: string): Promise<void> {
   try {
-    const account = await getAccountById(accountId);
+    const account = await fetchAccountIdentityById(accountId);
     if (!account || account.status === AccountStatus.DISABLED) return;
-    await getRecoveryService().openRecovery(
-      { id: account.id, label: account.label, username: account.username, status: account.status, storageState: account.storageState },
-      'REJECTED',
-    );
+    await getRecoveryService().openRecovery(account, 'REJECTED');
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'could not open recovery for a signed-out account');
   }

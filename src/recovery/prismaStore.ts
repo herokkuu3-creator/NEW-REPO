@@ -44,6 +44,15 @@ export class PrismaRecoveryStore implements RecoveryStore {
     });
   }
 
+  /** Minimal projection for per-minute idle/orphan/reminder checks. */
+  listOpenMeta(): Promise<Array<{ id: string; status: RecoveryStatus; nextReminderAt: Date | null }>> {
+    return prisma.accountRecovery.findMany({
+      where: { status: { in: open } },
+      select: { id: true, status: true, nextReminderAt: true },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
   async create(input: {
     accountId: string;
     reason: string;
@@ -185,7 +194,10 @@ export class PrismaRecoveryStore implements RecoveryStore {
 
   commitRecovered(input: CommitRecoveredInput): Promise<RecoveryRecord> {
     return prisma.$transaction(async (tx) => {
-      const recovery = await tx.accountRecovery.findUnique({ where: { id: input.recoveryId } });
+      const recovery = await tx.accountRecovery.findUnique({
+        where: { id: input.recoveryId },
+        select: { accountId: true, status: true },
+      });
       if (
         !recovery ||
         recovery.accountId !== input.accountId ||
@@ -193,7 +205,10 @@ export class PrismaRecoveryStore implements RecoveryStore {
       ) {
         throw new RecoveryCommitError('recovery_not_verifying', 'recovery is no longer awaiting commit');
       }
-      const account = await tx.account.findUnique({ where: { id: input.accountId } });
+      const account = await tx.account.findUnique({
+        where: { id: input.accountId },
+        select: { status: true },
+      });
       if (!account) throw new RecoveryCommitError('account_missing', 'account no longer exists');
       if (account.status === AccountStatus.DISABLED) {
         throw new RecoveryCommitError('account_disabled', 'account is disabled');

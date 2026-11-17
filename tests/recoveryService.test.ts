@@ -778,4 +778,114 @@ describe('RecoveryService', () => {
       });
     });
   });
+
+  describe('Egress & Idle Tick Optimizations', () => {
+    it('idle tick() skips claimDueReminders, listAccounts, and getAccount when no open recoveries exist', async () => {
+      const listOpenSpy = vi.spyOn(store, 'listOpen');
+      const claimDueSpy = vi.spyOn(store, 'claimDueReminders');
+      const listAccountsSpy = vi.fn(async () => []);
+      const getAccountSpy = vi.fn(async () => null);
+      const svc = new RecoveryService({
+        store,
+        now: () => currentTime,
+        chatId: () => '123456789',
+        baseUrl: () => 'https://solver.example.com',
+        listAccounts: listAccountsSpy,
+        getAccount: getAccountSpy,
+        markAccount: async () => undefined,
+        verifyStoredSession: async () => ({ authenticated: true }),
+        verifyCapturedSession: async () => ({ authenticated: true }),
+        getCredentials: async () => null,
+        openBrowser: async () => fakeBrowser,
+        sendTelegram: async () => true,
+        limits,
+      });
+
+      const outcome = await svc.tick();
+      expect(outcome).toEqual({ notified: 0 });
+      expect(listOpenSpy).toHaveBeenCalledTimes(1);
+      expect(claimDueSpy).not.toHaveBeenCalled();
+      expect(listAccountsSpy).not.toHaveBeenCalled();
+      expect(getAccountSpy).not.toHaveBeenCalled();
+    });
+
+    it('tick() skips claimDueReminders when open recoveries are neither orphans nor due yet', async () => {
+      accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
+      const svc = createService();
+      await svc.openRecovery(accountsMap.get('acc-1')!, 'EXPIRED');
+      await svc.tick();
+
+      const claimDueSpy = vi.spyOn(store, 'claimDueReminders');
+      const outcome = await svc.tick();
+      expect(outcome).toEqual({ notified: 0 });
+      expect(claimDueSpy).not.toHaveBeenCalled();
+    });
+
+    it('tick() reaps orphaned in-session recovery and immediately claims its retry reminder', async () => {
+      accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
+      const svc = createService();
+      const { recovery } = await svc.openRecovery(accountsMap.get('acc-1')!, 'EXPIRED');
+      await store.issueToken(recovery.id, hashRecoveryToken(generateRecoveryToken()), new Date(currentTime.getTime() + 60_000));
+      // Simulate server restart during VERIFYING: no live portal session in this RecoveryService instance
+      await store.setStatus(recovery.id, [RecoveryStatus.RECOVERY_PENDING], RecoveryStatus.AWAITING_VERIFICATION);
+      await store.setStatus(recovery.id, [RecoveryStatus.AWAITING_VERIFICATION], RecoveryStatus.VERIFYING);
+
+      const outcome = await svc.tick();
+      expect(outcome).toEqual({ notified: 1 });
+      const updated = await store.getById(recovery.id);
+      expect(updated?.lastErrorCategory).toBe('SESSION_LOST');
+      expect(updated?.status).toBe(RecoveryStatus.RECOVERY_PENDING);
+    });
+
+    it('describeOpen() skips account queries when empty and batches via getAccountsByIds when open rows exist', async () => {
+      const listAccountsSpy = vi.fn(async () => [...accountsMap.values()].map(({ storageState: _s, ...id }) => id));
+      const getAccountsByIdsSpy = vi.fn(async (ids: string[]) =>
+        ids.map((id) => accountsMap.get(id)).filter((a): a is MemoryAccountRow => Boolean(a)).map(({ storageState: _s, ...id }) => id),
+      );
+      const getAccountSpy = vi.fn(async (id: string) => {
+        const a = accountsMap.get(id);
+        return a ? { id: a.id, label: a.label, username: a.username, status: a.status } : null;
+      });
+      const svc = new RecoveryService({
+        store,
+        now: () => currentTime,
+        chatId: () => '123456789',
+        baseUrl: () => 'https://solver.example.com',
+        listAccounts: listAccountsSpy,
+        getAccount: getAccountSpy,
+        getAccountsByIds: getAccountsByIdsSpy,
+        markAccount: async () => undefined,
+        verifyStoredSession: async () => ({ authenticated: true }),
+        verifyCapturedSession: async () => ({ authenticated: true }),
+        getCredentials: async () => null,
+        openBrowser: async () => fakeBrowser,
+        sendTelegram: async (text, markup) => {
+          telegramMessages.push({ text, markup });
+          return true;
+        },
+        limits,
+      });
+
+      expect(await svc.describeOpen()).toEqual([]);
+      expect(listAccountsSpy).not.toHaveBeenCalled();
+      expect(getAccountsByIdsSpy).not.toHaveBeenCalled();
+
+      accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
+      accountsMap.get('acc-2')!.status = AccountStatus.EXPIRED;
+      await svc.openRecovery({ id: 'acc-1', label: 'account_one', username: 'test_user_1', status: AccountStatus.EXPIRED }, 'EXPIRED');
+      await svc.openRecovery({ id: 'acc-2', label: 'account_two', username: 'test_user_2', status: AccountStatus.EXPIRED }, 'EXPIRED');
+
+      const lines = await svc.describeOpen();
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toContain('account_one');
+      expect(lines[1]).toContain('account_two');
+      expect(getAccountsByIdsSpy).toHaveBeenCalledWith(['acc-1', 'acc-2']);
+      expect(listAccountsSpy).not.toHaveBeenCalled();
+
+      const tickRes = await svc.tick();
+      expect(tickRes).toEqual({ notified: 2 });
+      expect(getAccountsByIdsSpy).toHaveBeenCalledTimes(2);
+      expect(getAccountSpy).not.toHaveBeenCalled();
+    });
+  });
 });

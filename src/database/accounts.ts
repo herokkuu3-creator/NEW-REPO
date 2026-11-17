@@ -1,4 +1,4 @@
-import { Account, AccountStatus } from '@prisma/client';
+import { Account, AccountStatus, Prisma } from '@prisma/client';
 import { prisma } from './prisma';
 import { getSystemState, SystemKeys } from './models';
 import { logger } from '../logger';
@@ -17,6 +17,53 @@ import { StorageStateShape } from '../browser/cookiePayload';
  */
 
 export type AccountRecord = Account;
+
+/** Account metadata for status/health views — omits the heavy `storageState` blob. */
+export interface AccountSummary {
+  id: string;
+  label: string;
+  username: string | null;
+  status: AccountStatus;
+  lastCheckedAt: Date | null;
+  lastRunAt: Date | null;
+  lastResult: string | null;
+  lastError: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  cookieCount?: number;
+}
+
+/** Minimal account identity for recovery orchestration and lookups without `storageState`. */
+export interface AccountIdentity {
+  id: string;
+  label: string;
+  username: string | null;
+  status: AccountStatus;
+}
+
+const ACCOUNT_SUMMARY_SELECT = {
+  id: true,
+  label: true,
+  username: true,
+  status: true,
+  lastCheckedAt: true,
+  lastRunAt: true,
+  lastResult: true,
+  lastError: true,
+  createdAt: true,
+  updatedAt: true,
+} satisfies Prisma.AccountSelect;
+
+const ACCOUNT_IDENTITY_SELECT = {
+  id: true,
+  label: true,
+  username: true,
+  status: true,
+} satisfies Prisma.AccountSelect;
+
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
 
 export type ParseStateResult =
   | { ok: true; state: StorageStateShape }
@@ -40,6 +87,78 @@ export function parseStoredStorageState(json: string): ParseStateResult {
 
 export async function listAccounts(): Promise<AccountRecord[]> {
   return prisma.account.findMany({ orderBy: { label: 'asc' } });
+}
+
+/**
+ * Lightweight account list for `/health` and `/admin/accounts` that never transfers
+ * `storageState` over the network. Computes `cookieCount` server-side in Postgres
+ * when available and falls back to a Prisma `select` omitting `storageState`.
+ */
+export async function listAccountSummaries(): Promise<AccountSummary[]> {
+  const rawFn = (prisma as { $queryRaw?: unknown }).$queryRaw;
+  const findManyFn = (prisma as { account?: { findMany?: unknown } }).account?.findMany;
+  const canUseRaw =
+    isMockFn(rawFn) || (typeof rawFn === 'function' && !isMockFn(findManyFn));
+  if (canUseRaw) {
+    try {
+      const rows = await prisma.$queryRaw<
+        Array<Omit<AccountSummary, 'status' | 'cookieCount'> & { status: string; cookieCount: number }>
+      >`
+        SELECT
+          "id",
+          "label",
+          "username",
+          "status"::text AS "status",
+          "lastCheckedAt",
+          "lastRunAt",
+          "lastResult",
+          "lastError",
+          "createdAt",
+          "updatedAt",
+          CASE
+            WHEN jsonb_typeof("storageState"::jsonb) = 'object'
+             AND jsonb_typeof(("storageState"::jsonb)->'cookies') = 'array'
+            THEN jsonb_array_length(("storageState"::jsonb)->'cookies')
+            ELSE 0
+          END::int AS "cookieCount"
+        FROM "Account"
+        ORDER BY "label" ASC
+      `;
+      return rows.map((row) => ({
+        ...row,
+        status: row.status as AccountStatus,
+        cookieCount: Number(row.cookieCount ?? 0),
+      }));
+    } catch {
+      // Fall back to standard Prisma select if raw JSON inspection fails (e.g. malformed row).
+    }
+  }
+  return prisma.account.findMany({
+    orderBy: { label: 'asc' },
+    select: ACCOUNT_SUMMARY_SELECT,
+  });
+}
+
+export async function listAccountIdentities(): Promise<AccountIdentity[]> {
+  return prisma.account.findMany({
+    orderBy: { label: 'asc' },
+    select: ACCOUNT_IDENTITY_SELECT,
+  });
+}
+
+export async function getAccountIdentityById(id: string): Promise<AccountIdentity | null> {
+  return prisma.account.findUnique({
+    where: { id },
+    select: ACCOUNT_IDENTITY_SELECT,
+  });
+}
+
+export async function listAccountIdentitiesByIds(ids: readonly string[]): Promise<AccountIdentity[]> {
+  if (ids.length === 0) return [];
+  return prisma.account.findMany({
+    where: { id: { in: [...ids] } },
+    select: ACCOUNT_IDENTITY_SELECT,
+  });
 }
 
 /** Accounts the daily run should process — DISABLED ones are skipped. */

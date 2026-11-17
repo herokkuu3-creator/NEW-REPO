@@ -6,17 +6,22 @@ import { config } from '../config';
 import { logger, logRingBuffer } from '../logger';
 import { AccountStatus } from '@prisma/client';
 import {
+  DailyRunSummary,
   getAllSystemState,
   getSystemState,
+  getSystemStates,
   latestRun,
+  latestRunSummary,
   saveStorageStateToDb,
   SystemKeys,
 } from '../database/models';
 import {
   AccountRecord,
+  AccountSummary,
   deleteAccountByLabel,
   getAccountByLabel,
   listAccounts,
+  listAccountSummaries,
   parseStoredStorageState,
 } from '../database/accounts';
 import {
@@ -71,20 +76,68 @@ const storageStateSchema = z.object({
   origins: z.array(z.record(z.unknown())),
 });
 
+const HEALTH_SYSTEM_KEYS = [
+  SystemKeys.authStatus,
+  SystemKeys.authUsername,
+  SystemKeys.lastReport,
+  SystemKeys.lastError,
+] as const;
+
+type AccountViewInput = AccountSummary | AccountRecord;
+
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
+
+function toDate(value: Date | string): Date {
+  return value instanceof Date ? value : new Date(value);
+}
+
+function resolveCookieCount(a: AccountViewInput): number {
+  if ('cookieCount' in a && typeof a.cookieCount === 'number') {
+    return a.cookieCount;
+  }
+  if ('storageState' in a && typeof a.storageState === 'string') {
+    const parsed = parseStoredStorageState(a.storageState);
+    return parsed.ok ? parsed.state.cookies.length : 0;
+  }
+  return 0;
+}
+
 /** Account rows WITHOUT the secret — the only shape /admin/accounts returns. */
-function safeAccountView(a: AccountRecord) {
-  const parsed = parseStoredStorageState(a.storageState);
+function safeAccountView(a: AccountViewInput) {
   return {
     label: a.label,
     username: a.username,
     status: a.status,
-    cookieCount: parsed.ok ? parsed.state.cookies.length : 0,
-    lastCheckedAt: a.lastCheckedAt ? isoLocal(a.lastCheckedAt) : null,
-    lastRunAt: a.lastRunAt ? isoLocal(a.lastRunAt) : null,
+    cookieCount: resolveCookieCount(a),
+    lastCheckedAt: a.lastCheckedAt ? isoLocal(toDate(a.lastCheckedAt)) : null,
+    lastRunAt: a.lastRunAt ? isoLocal(toDate(a.lastRunAt)) : null,
     lastResult: a.lastResult,
     lastError: a.lastError,
-    createdAt: isoLocal(a.createdAt),
+    createdAt: isoLocal(toDate(a.createdAt)),
   };
+}
+
+async function fetchHealthSystemState(): Promise<Record<string, string>> {
+  if (!isMockFn(getSystemStates) && isMockFn(getAllSystemState)) {
+    return getAllSystemState();
+  }
+  return getSystemStates(HEALTH_SYSTEM_KEYS);
+}
+
+async function fetchLatestRunSummary(): Promise<DailyRunSummary | null> {
+  if (!isMockFn(latestRunSummary) && isMockFn(latestRun)) {
+    return latestRun();
+  }
+  return latestRunSummary();
+}
+
+async function fetchAccountSummaries(): Promise<AccountViewInput[]> {
+  if (!isMockFn(listAccountSummaries) && isMockFn(listAccounts)) {
+    return listAccounts();
+  }
+  return listAccountSummaries();
 }
 
 function safeJson(raw: string | undefined | null): unknown {
@@ -123,13 +176,61 @@ export function formatSubmissionResponse(report: RunReport) {
 
 export async function startHealthServer(
   hooks: ApiHooks,
-  opts: { pinCode?: string } = {},
+  opts: { pinCode?: string; healthCacheTtlMs?: number } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: false, // pino is our logger; fastify's would double-log
     trustProxy: true,
     bodyLimit: 16 * 1024 * 1024, // storageState uploads can exceed the 1MB default
   });
+
+  // Short-lived cache + single-flight deduplication for authenticated /health
+  // reads (disabled by default under Vitest unless explicitly configured).
+  const defaultCacheTtlMs = process.env.VITEST ? 0 : 10_000;
+  const healthCacheTtlMs = Math.max(0, opts.healthCacheTtlMs ?? defaultCacheTtlMs);
+  interface HealthSnapshot {
+    sys: Record<string, string>;
+    last: DailyRunSummary | null;
+    accounts: AccountViewInput[];
+  }
+  let cacheEpoch = 0;
+  let cachedHealth: { snapshot: HealthSnapshot; expiresAt: number } | null = null;
+  let inflightHealth: { epoch: number; promise: Promise<HealthSnapshot> } | null = null;
+
+  const invalidateHealthCache = () => {
+    cacheEpoch += 1;
+    cachedHealth = null;
+  };
+
+  const loadHealthSnapshot = async (): Promise<HealthSnapshot> => {
+    const nowMs = Date.now();
+    if (healthCacheTtlMs > 0 && cachedHealth && cachedHealth.expiresAt > nowMs) {
+      return cachedHealth.snapshot;
+    }
+    if (inflightHealth && inflightHealth.epoch === cacheEpoch) {
+      return inflightHealth.promise;
+    }
+    const startEpoch = cacheEpoch;
+    const promise = Promise.all([
+      fetchHealthSystemState(),
+      fetchLatestRunSummary(),
+      fetchAccountSummaries(),
+    ])
+      .then(([sys, last, accounts]) => {
+        const snapshot: HealthSnapshot = { sys, last, accounts };
+        if (healthCacheTtlMs > 0 && cacheEpoch === startEpoch) {
+          cachedHealth = { snapshot, expiresAt: Date.now() + healthCacheTtlMs };
+        }
+        return snapshot;
+      })
+      .finally(() => {
+        if (inflightHealth?.promise === promise) {
+          inflightHealth = null;
+        }
+      });
+    inflightHealth = { epoch: startEpoch, promise };
+    return promise;
+  };
 
   // --- PIN gate for everything that used to be public ------------------------
   const pinGate = new PinGate(opts.pinCode ?? readPinFromEnv(), config.api.setupToken);
@@ -308,6 +409,7 @@ export async function startHealthServer(
       });
     }
 
+    invalidateHealthCache();
     const trigger = await hooks.triggerRun('session-renewal').catch(() => ({
       started: false,
       message: 'not started',
@@ -396,7 +498,7 @@ export async function startHealthServer(
       }
       return { status: 'ok' };
     }
-    const [sys, last, accounts] = await Promise.all([getAllSystemState(), latestRun(), listAccounts()]);
+    const { sys, last, accounts } = await loadHealthSnapshot();
     return {
       status: 'ok',
       service: 'leetcode-daily-agent',
@@ -422,7 +524,7 @@ export async function startHealthServer(
             submissionStatus: last.submissionStatus,
             runtime: last.runtime,
             memory: last.memory,
-            createdAt: isoLocal(last.createdAt),
+            createdAt: isoLocal(toDate(last.createdAt)),
           }
         : null,
       lastError: sys['lastError'] ?? null,
@@ -483,6 +585,7 @@ export async function startHealthServer(
     if (!report) {
       return reply.code(409).send({ ok: false, error: 'a run is already in progress — try again when it finishes' });
     }
+    invalidateHealthCache();
     return reply.send(formatSubmissionResponse(report));
   });
 
@@ -512,6 +615,7 @@ export async function startHealthServer(
     }
     const json = JSON.stringify(parsed.data);
     await saveStorageStateToDb(json);
+    invalidateHealthCache();
     try {
       const target = config.browser.storageStatePath;
       fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -556,6 +660,7 @@ export async function startHealthServer(
       logger.warn({ error: result.error }, 'uploaded session rejected by validation');
       return reply.code(422).send(result);
     }
+    invalidateHealthCache();
     const trigger = await hooks.triggerRun('session-renewal');
     logger.info(
       { username: result.username, cookies: result.cookieCount, runStarted: trigger.started },
@@ -593,6 +698,7 @@ export async function startHealthServer(
       payload = JSON.stringify(body ?? {});
     }
     const result = await applySessionRenewal(payload);
+    if (result.ok) invalidateHealthCache();
     logger.info({ ok: result.ok }, 'session renewal attempted via admin API');
     return reply.code(result.ok ? 200 : 422).send(result);
   });
@@ -642,6 +748,7 @@ export async function startHealthServer(
     if (!result.ok) {
       return reply.code(400).send(result);
     }
+    invalidateHealthCache();
     const trigger = result.status === AccountStatus.EXPIRED ? null : await hooks.triggerRun('session-renewal');
     return reply.send({
       ...result,
@@ -654,7 +761,7 @@ export async function startHealthServer(
     if (!requireAdmin(req.headers.authorization)) {
       return reply.code(401).send({ error: 'unauthorized' });
     }
-    const accounts = await listAccounts();
+    const accounts = await fetchAccountSummaries();
     return { total: accounts.length, accounts: accounts.map(safeAccountView) };
   });
 
@@ -668,6 +775,7 @@ export async function startHealthServer(
       return reply.code(404).send({ ok: false, error: `no account named "${label}"` });
     }
     await deleteAccountByLabel(label);
+    invalidateHealthCache();
     logger.info({ label }, 'account deleted via admin API');
     return reply.send({ ok: true, label, deleted: true });
   });

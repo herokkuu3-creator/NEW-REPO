@@ -11,6 +11,7 @@ import {
   RecoveryRecord,
   RecoveryStatus,
   RecoveryStore,
+  REMINDABLE_STATUSES,
 } from './types';
 
 // ---------------------------------------------------------------------------
@@ -62,7 +63,8 @@ export interface RecoveryAccount {
   label: string;
   username: string | null;
   status: AccountStatus;
-  storageState: string;
+  /** Optional on lightweight identity projections; required only when verifying stored cookies directly. */
+  storageState?: string;
 }
 
 export interface RecoveryCredentials {
@@ -94,6 +96,8 @@ export interface RecoveryDeps {
   baseUrl(): string;
   listAccounts(): Promise<RecoveryAccount[]>;
   getAccount(id: string): Promise<RecoveryAccount | null>;
+  /** Optional batch lookup to avoid N+1 or full-table scans when resolving open recoveries. */
+  getAccountsByIds?(ids: string[]): Promise<RecoveryAccount[]>;
   markAccount(id: string, status: AccountStatus, lastError: string | null): Promise<void>;
   /** Live GraphQL userStatus check of the STORED session (never opens a login page). */
   verifyStoredSession(account: RecoveryAccount): Promise<LiveVerification>;
@@ -392,8 +396,27 @@ export class RecoveryService {
     if (this.tickRunning) return { notified: 0 };
     this.tickRunning = true;
     try {
-      await this.reapOrphans();
-      const due = await this.deps.store.claimDueReminders(this.deps.now(), this.deps.limits.reminderIntervalMs, 25);
+      const now = this.deps.now();
+      const storeWithMeta = this.deps.store as RecoveryStore & {
+        listOpenMeta?: () => Promise<Array<{ id: string; status: RecoveryStatus; nextReminderAt: Date | null }>>;
+      };
+      const open = storeWithMeta.listOpenMeta
+        ? await storeWithMeta.listOpenMeta()
+        : await this.deps.store.listOpen();
+      if (open.length === 0) return { notified: 0 };
+
+      const reaped = await this.reapOrphans(open, now);
+      const hasDue =
+        reaped ||
+        open.some(
+          (r) =>
+            REMINDABLE_STATUSES.includes(r.status) &&
+            r.nextReminderAt !== null &&
+            r.nextReminderAt.getTime() <= now.getTime(),
+        );
+      if (!hasDue) return { notified: 0 };
+
+      const due = await this.deps.store.claimDueReminders(now, this.deps.limits.reminderIntervalMs, 25);
       if (due.length === 0) return { notified: 0 };
       return { notified: await this.notify(due) };
     } finally {
@@ -402,13 +425,18 @@ export class RecoveryService {
   }
 
   /** Recoveries stuck "in session" without a live browser (restart/crash) become retryable failures. */
-  private async reapOrphans(): Promise<void> {
-    const open = await this.deps.store.listOpen();
+  private async reapOrphans(
+    open: Array<{ id: string; status: RecoveryStatus }>,
+    now: Date,
+  ): Promise<boolean> {
+    let reaped = false;
     for (const r of open) {
       if (IN_SESSION_STATUSES.includes(r.status) && !this.byRecovery.has(r.id)) {
-        await this.deps.store.markFailed(r.id, 'SESSION_LOST', describeCategory('SESSION_LOST'), this.deps.now());
+        await this.deps.store.markFailed(r.id, 'SESSION_LOST', describeCategory('SESSION_LOST'), now);
+        reaped = true;
       }
     }
+    return reaped;
   }
 
   private linkFor(token: string): string {
@@ -417,9 +445,17 @@ export class RecoveryService {
 
   /** One consolidated Telegram message; one fresh one-time link per account. */
   private async notify(recoveries: RecoveryRecord[]): Promise<number> {
+    let accountsById: Map<string, RecoveryAccount> | null = null;
+    if (recoveries.length > 1 && this.deps.getAccountsByIds) {
+      const ids = Array.from(new Set(recoveries.map((r) => r.accountId)));
+      const found = await this.deps.getAccountsByIds(ids);
+      accountsById = new Map(found.map((a) => [a.id, a]));
+    }
     const entries: { recovery: RecoveryRecord; account: RecoveryAccount; link: string | null }[] = [];
     for (const recovery of recoveries) {
-      const account = await this.deps.getAccount(recovery.accountId);
+      const account = accountsById
+        ? (accountsById.get(recovery.accountId) ?? null)
+        : await this.deps.getAccount(recovery.accountId);
       if (!account || account.status === AccountStatus.DISABLED) {
         await this.deps.store.cancel(recovery.id, 'ACCOUNT_UNAVAILABLE');
         continue;
@@ -1126,7 +1162,17 @@ export class RecoveryService {
 
   async describeOpen(): Promise<string[]> {
     const open = await this.deps.store.listOpen();
-    const accounts = new Map((await this.deps.listAccounts()).map((a) => [a.id, a]));
+    if (open.length === 0) return [];
+    const ids = Array.from(new Set(open.map((r) => r.accountId)));
+    let accounts: Map<string, RecoveryAccount>;
+    if (this.deps.getAccountsByIds) {
+      accounts = new Map((await this.deps.getAccountsByIds(ids)).map((a) => [a.id, a]));
+    } else if (ids.length === 1) {
+      const single = await this.deps.getAccount(ids[0]!);
+      accounts = new Map(single ? [[single.id, single]] : []);
+    } else {
+      accounts = new Map((await this.deps.listAccounts()).map((a) => [a.id, a]));
+    }
     return open.map((r) => {
       const label = accounts.get(r.accountId)?.label ?? r.accountId;
       const next = r.nextReminderAt ? ` · next reminder ${r.nextReminderAt.toISOString()}` : '';

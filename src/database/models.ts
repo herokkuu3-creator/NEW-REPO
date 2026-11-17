@@ -61,8 +61,36 @@ export async function finalizeRun(
   return updateRun(id, { ...extra, state });
 }
 
+export interface DailyRunSummary {
+  date: string;
+  problemSlug: string;
+  title: string;
+  state: RunState;
+  submissionStatus: string | null;
+  runtime: string | null;
+  memory: string | null;
+  createdAt: Date;
+}
+
 export async function latestRun(): Promise<DailyRunRecord | null> {
   return prisma.dailyRun.findFirst({ orderBy: { createdAt: 'desc' } });
+}
+
+/** Lightweight latest-run projection for `/health` — omits `solution` and `error` text blobs. */
+export async function latestRunSummary(): Promise<DailyRunSummary | null> {
+  return prisma.dailyRun.findFirst({
+    orderBy: { createdAt: 'desc' },
+    select: {
+      date: true,
+      problemSlug: true,
+      title: true,
+      state: true,
+      submissionStatus: true,
+      runtime: true,
+      memory: true,
+      createdAt: true,
+    },
+  });
 }
 
 export async function latestAcceptedRun(): Promise<DailyRunRecord | null> {
@@ -132,11 +160,23 @@ export async function deleteSystemState(key: string): Promise<void> {
 }
 
 export async function getSystemState(key: string): Promise<string | null> {
-  const row = await prisma.systemState.findUnique({ where: { key } });
+  const row = await prisma.systemState.findUnique({ where: { key }, select: { value: true } });
   return row?.value ?? null;
 }
 
+export async function getSystemStates(keys: readonly string[]): Promise<Record<string, string>> {
+  if (keys.length === 0) return {};
+  const rows = await prisma.systemState.findMany({
+    where: { key: { in: [...keys] } },
+    select: { key: true, value: true },
+  });
+  return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+}
+
 export async function getAllSystemState(): Promise<Record<string, string>> {
-  const rows = await prisma.systemState.findMany({ where: { NOT: { key: { startsWith: 'solution-visual:' } } } });
+  const rows = await prisma.systemState.findMany({
+    where: { NOT: { key: { startsWith: 'solution-visual:' } } },
+    select: { key: true, value: true },
+  });
   return Object.fromEntries(rows.map((r) => [r.key, r.value]));
 }
