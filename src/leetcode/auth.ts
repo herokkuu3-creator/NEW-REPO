@@ -814,12 +814,12 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
 export async function loginToLeetCode(loginInput: string, password: string,
   options: LeetCodeLoginOptions = {}): Promise<LeetCodeLoginResult> {
   if (!loginInput.trim() || !password) return { ok: false, code: 'CREDENTIALS_REQUIRED', error: 'Username/email and password are required.', state: 'LOGIN_FAILED' };
-  const hasRemoteSolver = !options.proxyUrl && !options.disableRemoteLogin && !options.solver && Boolean(getCPSolverUrl());
+  const initialProxy = options.proxyUrl ? toPlaywrightProxy(options.proxyUrl) : undefined;
+  if (options.proxyUrl && !initialProxy) return { ok: false, code: 'LOGIN_PROXY_INVALID', error: 'Invalid login proxy configuration; direct fallback disabled.', state: 'LOGIN_FAILED' };
+  const hasRemoteSolver = !options.disableRemoteLogin && !options.solver && Boolean(getCPSolverUrl());
   const timeoutMs = options.timeoutMs ?? (options.proxyUrl ? 150_000 : (hasRemoteSolver ? 140_000 : 90_000));
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return { ok: false, code: 'INVALID_TIMEOUT', error: 'Login timeout must be a positive number.', state: 'LOGIN_FAILED' };
   if (options.signal?.aborted) return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.', state: 'LOGIN_FAILED' };
-  const initialProxy = options.proxyUrl ? toPlaywrightProxy(options.proxyUrl) : undefined;
-  if (options.proxyUrl && !initialProxy) return { ok: false, code: 'LOGIN_PROXY_INVALID', error: 'Invalid login proxy configuration; direct fallback disabled.', state: 'LOGIN_FAILED' };
   const deadline = Date.now() + timeoutMs;
 
   if (hasRemoteSolver) {
@@ -828,10 +828,11 @@ export async function loginToLeetCode(loginInput: string, password: string,
       return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.', state: 'LOGIN_FAILED' };
     }
 
-    const remoteBudgetMs = Math.max(15_000, Math.min(90_000, deadline - Date.now()));
+    const remoteBudgetMs = Math.max(15_000, Math.min(115_000, deadline - Date.now()));
     const remoteRes = await loginLeetCodeWithCPSolver({
       username: loginInput.trim(),
       password,
+      ...(options.proxyUrl ? { proxyUrl: options.proxyUrl } : {}),
       timeoutMs: remoteBudgetMs,
       signal: options.signal,
     });

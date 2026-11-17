@@ -729,4 +729,53 @@ describe('auth.ts verification and worker.ts accountId resolution', () => {
     vi.doUnmock('../src/codeforces/captchaSolver');
     vi.doUnmock('../src/notifications/telegram');
   });
+
+  it('delegates proxied LeetCode login to CPSolver /leetcode-login and rejects invalid proxyUrl early', async () => {
+    vi.resetModules();
+    vi.stubEnv('CPSOLVER_URL', 'https://cpsolver.test.com');
+    vi.stubEnv('CPSOLVER_API_TOKEN', 'cp-login-tok-123');
+
+    const seenRequests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const fetchSpy = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      seenRequests.push({
+        url: String(url),
+        body: JSON.parse(String(init?.body || '{}')),
+      });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          username: 'proxied_handle',
+          storageState: {
+            cookies: [{ name: 'LEETCODE_SESSION', value: 'sess_token_123456', domain: '.leetcode.com', path: '/' }],
+            origins: [],
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const { loginToLeetCode } = await import('../src/leetcode/auth');
+
+    const badProxyRes = await loginToLeetCode('proxied_handle', 'pw', { proxyUrl: 'ftp://invalid-scheme:8080' });
+    expect(badProxyRes.ok).toBe(false);
+    expect(badProxyRes.code).toBe('LOGIN_PROXY_INVALID');
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    const okRes = await loginToLeetCode('proxied_handle', 'pw', {
+      proxyUrl: 'http://alice:secret@216.26.245.81:3129',
+      timeoutMs: 40_000,
+    });
+    expect(okRes.ok).toBe(true);
+    expect(okRes.username).toBe('proxied_handle');
+    expect(seenRequests).toHaveLength(1);
+    expect(seenRequests[0]).toMatchObject({
+      url: 'https://cpsolver.test.com/leetcode-login',
+      body: {
+        username: 'proxied_handle',
+        password: 'pw',
+        proxy: 'http://alice:secret@216.26.245.81:3129',
+      },
+    });
+  });
 });
