@@ -1,3 +1,5 @@
+import os from 'node:os';
+import path from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import { renderVisualGif, VisualPlan } from '../src/solutionPosts/visuals';
 
@@ -21,7 +23,13 @@ const plans: VisualPlan[] = [
   },
 ];
 
-void (async () => {
-  await writeFile('C:/Users/Lenovo/AppData/Local/Temp/leetcode-1021-visual-1.gif', await renderVisualGif(plans[0]!));
-  await writeFile('C:/Users/Lenovo/AppData/Local/Temp/leetcode-1021-visual-2.gif', await renderVisualGif(plans[1]!));
-})();
+async function main() {
+  const outDir = os.tmpdir();
+  await writeFile(path.join(outDir, 'leetcode-1021-visual-1.gif'), await renderVisualGif(plans[0]!));
+  await writeFile(path.join(outDir, 'leetcode-1021-visual-2.gif'), await renderVisualGif(plans[1]!));
+}
+
+main().catch((err) => {
+  console.error(err instanceof Error ? err.message : err);
+  process.exitCode = 1;
+});

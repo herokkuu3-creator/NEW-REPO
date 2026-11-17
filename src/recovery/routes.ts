@@ -76,7 +76,14 @@ function cookieOf(req: FastifyRequest, name: string): string | undefined {
   if (!raw) return undefined;
   for (const part of raw.split(';')) {
     const idx = part.indexOf('=');
-    if (idx > 0 && part.slice(0, idx).trim() === name) return decodeURIComponent(part.slice(idx + 1).trim());
+    if (idx > 0 && part.slice(0, idx).trim() === name) {
+      const value = part.slice(idx + 1).trim();
+      try {
+        return decodeURIComponent(value);
+      } catch {
+        return value;
+      }
+    }
   }
   return undefined;
 }
@@ -422,6 +429,14 @@ async function createCdpClient(port) {
   });
   let seq = 0;
   const pending = new Map();
+  const rejectAllPending = (reason) => {
+    for (const p of pending.values()) {
+      p.reject(new Error(reason));
+    }
+    pending.clear();
+  };
+  ws.addEventListener('close', () => rejectAllPending('CDP WebSocket closed'));
+  ws.addEventListener('error', () => rejectAllPending('CDP WebSocket error'));
   ws.addEventListener('message', (ev) => {
     try {
       const msg = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data));
@@ -435,9 +450,18 @@ async function createCdpClient(port) {
   });
   function send(method, params = {}) {
     return new Promise((resolve, reject) => {
+      if (ws.readyState !== 1) {
+        reject(new Error('CDP WebSocket closed'));
+        return;
+      }
       const id = ++seq;
       pending.set(id, { resolve, reject });
-      ws.send(JSON.stringify({ id, method, params }));
+      try {
+        ws.send(JSON.stringify({ id, method, params }));
+      } catch (err) {
+        pending.delete(id);
+        reject(err);
+      }
     });
   }
   async function evalPage(expression) {
@@ -717,7 +741,8 @@ function buildUserscript(): string {
       const hashMatch = /#lc_recover=([A-Za-z0-9_-]+)/.exec(location.hash || '');
       if (hashMatch) {
         try {
-          const b64 = hashMatch[1].replace(/-/g, '+').replace(/_/g, '/');
+          let b64 = hashMatch[1].replace(/-/g, '+').replace(/_/g, '/');
+          b64 += '='.repeat((4 - (b64.length % 4)) % 4);
           cfg = JSON.parse(atob(b64));
           cfg.createdAt = Date.now();
           gmSet(KEY, JSON.stringify(cfg));

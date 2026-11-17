@@ -10,6 +10,9 @@ export interface StoredCredential {
   updatedAt?: string;
 }
 
+let cachedSecret: string | null = null;
+let cachedEncryptionKey: Buffer | null = null;
+
 /**
  * Derives a consistent 256-bit encryption key from environment configuration.
  */
@@ -20,8 +23,14 @@ function getEncryptionKey(): Buffer {
     process.env.DATABASE_URL ||
     process.env.TELEGRAM_BOT_TOKEN ||
     'leetcode-cf-agent-credential-key-salt-2026';
+  if (cachedEncryptionKey && cachedSecret === secret) {
+    return cachedEncryptionKey;
+  }
   const salt = 'antigravity-credential-salt-v1';
-  return crypto.scryptSync(secret, salt, 32);
+  const derived = crypto.scryptSync(secret, salt, 32);
+  cachedSecret = secret;
+  cachedEncryptionKey = derived;
+  return derived;
 }
 
 /**
@@ -45,14 +54,24 @@ export function decryptText(encryptedString: string): string | null {
     const parts = encryptedString.split(':');
     if (parts.length !== 3) return null;
     const [ivHex, authTagHex, encryptedHex] = parts;
-    if (!ivHex || !authTagHex || !encryptedHex) return null;
+    if (
+      typeof ivHex !== 'string' ||
+      typeof authTagHex !== 'string' ||
+      typeof encryptedHex !== 'string' ||
+      !/^[0-9a-f]{24}$/i.test(ivHex) ||
+      !/^[0-9a-f]{32}$/i.test(authTagHex) ||
+      encryptedHex.length % 2 !== 0 ||
+      (encryptedHex.length > 0 && !/^[0-9a-f]+$/i.test(encryptedHex))
+    ) {
+      return null;
+    }
 
     const key = getEncryptionKey();
     const iv = Buffer.from(ivHex, 'hex');
     const authTag = Buffer.from(authTagHex, 'hex');
     const encrypted = Buffer.from(encryptedHex, 'hex');
 
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
     decipher.setAuthTag(authTag);
     const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
     return decrypted.toString('utf8');
@@ -81,16 +100,26 @@ async function getStoredIndex(site: 'leetcode' | 'codeforces'): Promise<string[]
   }
 }
 
+const indexUpdateLocks = new Map<'leetcode' | 'codeforces', Promise<void>>();
+
 async function updateStoredIndex(site: 'leetcode' | 'codeforces', label: string, action: 'add' | 'remove'): Promise<void> {
-  const norm = label.trim().toLowerCase();
-  const current = await getStoredIndex(site);
-  let next: string[];
-  if (action === 'add') {
-    next = Array.from(new Set([...current, norm]));
-  } else {
-    next = current.filter((item) => item !== norm);
+  const prev = indexUpdateLocks.get(site) ?? Promise.resolve();
+  const nextRun = prev.catch(() => undefined).then(async () => {
+    const norm = label.trim().toLowerCase();
+    const current = await getStoredIndex(site);
+    const next = action === 'add'
+      ? Array.from(new Set([...current, norm]))
+      : current.filter((item) => item !== norm);
+    await setSystemState(indexKey(site), JSON.stringify(next));
+  });
+  indexUpdateLocks.set(site, nextRun);
+  try {
+    await nextRun;
+  } finally {
+    if (indexUpdateLocks.get(site) === nextRun) {
+      indexUpdateLocks.delete(site);
+    }
   }
-  await setSystemState(indexKey(site), JSON.stringify(next));
 }
 
 /**

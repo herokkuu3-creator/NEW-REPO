@@ -2,10 +2,14 @@ export const DEFAULT_SOLUTION_POST_BASE_URL = 'https://discovery-api.intern-ai.o
 export const DEFAULT_SOLUTION_POST_MODEL = 'deepseek-v4.1-flash-1017';
 
 export function isBazaarLinkProvider(baseUrl: string): boolean {
-  const url = new URL(baseUrl);
-  return url.protocol === 'https:' &&
-    ((url.hostname === 'api.bazaarlink.ai' && url.pathname.replace(/\/+$/, '') === '/v1') ||
-      (url.hostname === 'bazaarlink.ai' && url.pathname.replace(/\/+$/, '') === '/api/v1'));
+  try {
+    const url = new URL(baseUrl);
+    return url.protocol === 'https:' &&
+      ((url.hostname === 'api.bazaarlink.ai' && url.pathname.replace(/\/+$/, '') === '/v1') ||
+        (url.hostname === 'bazaarlink.ai' && url.pathname.replace(/\/+$/, '') === '/api/v1'));
+  } catch {
+    return false;
+  }
 }
 
 export function isSageProvider(baseUrl: string): boolean {

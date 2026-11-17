@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import Fastify, { FastifyInstance } from 'fastify';
@@ -295,13 +296,23 @@ export async function startHealthServer(
       .send(pinPage({ next, message, disabled: result !== 'wrong' }));
   });
 
-  app.get('/lock', async (_req, reply) => {
-    reply.header('Set-Cookie', `${PIN_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict`);
+  app.get('/lock', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    reply.header(
+      'Set-Cookie',
+      `${PIN_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict${req.protocol === 'https' ? '; Secure' : ''}`,
+    );
     return reply.redirect('/health', 303);
   });
 
-  const requireAdmin = (authorization: string | undefined): boolean =>
-    authorization === `Bearer ${config.api.setupToken}`;
+  const requireAdmin = (authorization: string | undefined): boolean => {
+    const token = config.api.setupToken;
+    if (!token || typeof authorization !== 'string') return false;
+    const expected = `Bearer ${token}`;
+    const ha = crypto.createHash('sha256').update(authorization, 'utf8').digest();
+    const hb = crypto.createHash('sha256').update(expected, 'utf8').digest();
+    return crypto.timingSafeEqual(ha, hb);
+  };
 
   registerSolutionPostRoutes(app, requireAdmin);
   registerVisualAssetRoutes(app);
@@ -439,14 +450,32 @@ export async function startHealthServer(
   });
 
   // Sage Inkstone (Intern-AI) Console and API endpoints
-  app.get('/sage', async (_req, reply) => {
+  app.get('/sage', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
+    const authed = requireAdmin(req.headers.authorization) || pinGate.isUnlocked(req.ip, req.headers);
+    if (!authed) {
+      if (wantsHtml(req.headers.accept)) {
+        const locked = pinGate.isLockedOut(req.ip);
+        return reply
+          .type('text/html; charset=utf-8')
+          .send(
+            pinPage({
+              next: safeNext(req.url.split('?')[0] || '/health'),
+              message: locked ? 'Too many wrong attempts. Try again in 15 minutes.' : undefined,
+              disabled: locked || !pinGate.configured,
+            }),
+          );
+      }
+      return reply.code(401).send({ ok: false, error: 'unauthorized' });
+    }
     const hostLabel = process.env.RENDER_EXTERNAL_URL ? 'Render Web Service' : (process.env.RENDER_INSTANCE_ID ? 'Render Container' : 'Local Host');
     return reply.type('text/html; charset=utf-8').send(sageConsoleHtml(hostLabel));
   });
 
   app.post('/sage/test', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
+    const authed = requireAdmin(req.headers.authorization) || pinGate.isUnlocked(req.ip, req.headers);
+    if (!authed) return reply.code(401).send({ ok: false, error: 'unauthorized' });
     const body = (req.body ?? {}) as { apiKey?: string; model?: string };
     const result = await probeSageApi(body.apiKey, body.model);
     return reply.send(result);
@@ -454,6 +483,7 @@ export async function startHealthServer(
 
   app.get('/admin/sage/test', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
+    if (!requireAdmin(req.headers.authorization)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
     const query = (req.query ?? {}) as { apiKey?: string; model?: string };
     const result = await probeSageApi(query.apiKey, query.model);
     return reply.send(result);
@@ -461,6 +491,7 @@ export async function startHealthServer(
 
   app.post('/admin/sage/test', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
+    if (!requireAdmin(req.headers.authorization)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
     const body = (req.body ?? {}) as { apiKey?: string; model?: string };
     const result = await probeSageApi(body.apiKey, body.model);
     return reply.send(result);
@@ -468,6 +499,8 @@ export async function startHealthServer(
 
   app.post('/sage/ask', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
+    const authed = requireAdmin(req.headers.authorization) || pinGate.isUnlocked(req.ip, req.headers);
+    if (!authed) return reply.code(401).send({ ok: false, error: 'unauthorized' });
     const body = (req.body ?? {}) as { question?: string; apiKey?: string; model?: string; maxTokens?: number };
     const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
     return reply.send(result);
@@ -475,6 +508,7 @@ export async function startHealthServer(
 
   app.post('/admin/sage/ask', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
+    if (!requireAdmin(req.headers.authorization)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
     const body = (req.body ?? {}) as { question?: string; apiKey?: string; model?: string; maxTokens?: number };
     const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
     return reply.send(result);
@@ -482,6 +516,8 @@ export async function startHealthServer(
 
   app.post('/api/sage/ask', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
+    const authed = requireAdmin(req.headers.authorization) || pinGate.isUnlocked(req.ip, req.headers);
+    if (!authed) return reply.code(401).send({ ok: false, error: 'unauthorized' });
     const body = (req.body ?? {}) as { question?: string; apiKey?: string; model?: string; maxTokens?: number };
     const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
     return reply.send(result);
@@ -545,7 +581,10 @@ export async function startHealthServer(
     if (!requireAdmin(req.headers.authorization)) {
       return reply.code(401).send({ error: 'unauthorized' });
     }
-    runNowBodySchema.parse(req.body ?? {});
+    const parsedBody = runNowBodySchema.safeParse(req.body ?? {});
+    if (!parsedBody.success) {
+      return reply.code(400).send({ ok: false, error: 'invalid request body' });
+    }
     const result = await hooks.triggerRun('admin-api');
     return reply.code(result.started ? 202 : 409).send(result);
   });
@@ -694,19 +733,27 @@ export async function startHealthServer(
    * 422 = rejected (the error explains why). After a 200, trigger the run
    * with POST /admin/run-now.
    */
+  const serializeCookieOrStatePayload = (body: unknown): string => {
+    if (typeof body === 'string') return body;
+    if (Array.isArray(body)) return JSON.stringify(body);
+    if (body && typeof body === 'object') {
+      const obj = body as Record<string, unknown>;
+      if (obj.storageState !== undefined) {
+        return typeof obj.storageState === 'string' ? obj.storageState : JSON.stringify(obj.storageState);
+      }
+      if (obj.cookies !== undefined && !Array.isArray(obj.origins)) {
+        return typeof obj.cookies === 'string' ? obj.cookies : JSON.stringify(obj.cookies);
+      }
+      return JSON.stringify(obj);
+    }
+    return '';
+  };
+
   app.post('/admin/renew-session', async (req, reply) => {
     if (!requireAdmin(req.headers.authorization)) {
       return reply.code(401).send({ error: 'unauthorized' });
     }
-    const body = req.body as unknown;
-    let payload: string;
-    if (typeof body === 'string') {
-      payload = body;
-    } else if (body && typeof body === 'object' && typeof (body as { cookies?: unknown }).cookies === 'string') {
-      payload = (body as { cookies: string }).cookies;
-    } else {
-      payload = JSON.stringify(body ?? {});
-    }
+    const payload = serializeCookieOrStatePayload(req.body ?? {});
     const result = await applySessionRenewal(payload);
     if (result.ok) {
       invalidateHealthCache();
@@ -734,7 +781,8 @@ export async function startHealthServer(
     // Optional: without a label the account is keyed by the LeetCode username
     // read from the session token (same user again = override).
     label: accountLabelSchema.optional(),
-    cookies: z.unknown(),
+    cookies: z.unknown().optional(),
+    storageState: z.unknown().optional(),
     validate: z.boolean().optional(), // default false — live check is deferred to the daily run
   });
 
@@ -742,21 +790,31 @@ export async function startHealthServer(
     if (!requireAdmin(req.headers.authorization)) {
       return reply.code(401).send({ error: 'unauthorized' });
     }
-    const body = addAccountSchema.safeParse(req.body ?? {});
-    if (!body.success) {
+    const rawBody = req.body;
+    let label: string | undefined;
+    let validate = false;
+    if (rawBody && typeof rawBody === 'object' && !Array.isArray(rawBody)) {
+      const parsedMeta = addAccountSchema.safeParse(rawBody);
+      if (!parsedMeta.success) {
+        return reply
+          .code(400)
+          .send({ ok: false, error: parsedMeta.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ') });
+      }
+      label = parsedMeta.data.label;
+      validate = parsedMeta.data.validate === true;
+    } else if (typeof rawBody !== 'string' && !Array.isArray(rawBody)) {
       return reply
         .code(400)
-        .send({ ok: false, error: body.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ') });
+        .send({ ok: false, error: 'expected cookie string, Cookie-Editor array, or storageState object' });
     }
 
     // Accept the same formats as Telegram: a cookie header string, a
     // Cookie-Editor JSON array, or a storageState object — or a raw
     // storageState body with no wrapper at all.
-    const raw = body.data.cookies === undefined ? req.body : body.data.cookies;
-    const payload = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
+    const payload = serializeCookieOrStatePayload(rawBody);
     const result = await ingestCookiePayload(payload, {
-      label: body.data.label,
-      validate: body.data.validate === true,
+      label,
+      validate,
     });
     if (!result.ok) {
       return reply.code(400).send(result);
@@ -788,7 +846,14 @@ export async function startHealthServer(
     if (!existing) {
       return reply.code(404).send({ ok: false, error: `no account named "${label}"` });
     }
-    await deleteAccountByLabel(label);
+    try {
+      await deleteAccountByLabel(label);
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code === 'P2025') {
+        return reply.code(404).send({ ok: false, error: `no account named "${label}"` });
+      }
+      throw err;
+    }
     invalidateHealthCache();
     logger.info({ label }, 'account deleted via admin API');
     return reply.send({ ok: true, label, deleted: true });
@@ -803,8 +868,27 @@ export async function startHealthServer(
   });
 
   app.get('/logs', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    reply.header('X-Robots-Tag', 'noindex, nofollow');
+    const authed = requireAdmin(req.headers.authorization) || pinGate.isUnlocked(req.ip, req.headers);
+    if (!authed) {
+      if (wantsHtml(req.headers.accept)) {
+        const locked = pinGate.isLockedOut(req.ip);
+        return reply
+          .type('text/html; charset=utf-8')
+          .send(
+            pinPage({
+              next: safeNext(req.url.split('?')[0] || '/health'),
+              message: locked ? 'Too many wrong attempts. Try again in 15 minutes.' : undefined,
+              disabled: locked || !pinGate.configured,
+            }),
+          );
+      }
+      return reply.code(401).send({ ok: false, error: 'unauthorized' });
+    }
     const query = req.query as { limit?: string; format?: string; level?: string };
-    const limit = Math.min(1000, Math.max(1, parseInt(query?.limit || '200', 10)));
+    const parsedLimit = Number.parseInt(query?.limit || '200', 10);
+    const limit = Math.min(1000, Math.max(1, Number.isFinite(parsedLimit) ? parsedLimit : 200));
     let entries = logRingBuffer.slice(-limit);
     if (query?.level) {
       const minLevel = parseInt(query.level, 10);

@@ -140,10 +140,12 @@ export async function pushSessionToPairingEndpoint(
   return { httpStatus: res.status, body };
 }
 
-function copyToWindowsClipboard(text: string): boolean {
+export function copyToWindowsClipboard(text: string): boolean {
   if (process.platform !== 'win32' || !text) return false;
   try {
     const proc = spawn('clip');
+    proc.on('error', () => {});
+    proc.stdin.on('error', () => {});
     proc.stdin.write(text);
     proc.stdin.end();
     return true;
@@ -375,14 +377,14 @@ async function main(): Promise<void> {
   await context.close().catch(() => undefined);
 }
 
-async function detectSignedInUser(page: import('playwright').Page): Promise<string | null> {
+export async function detectSignedInUser(page: import('playwright').Page): Promise<string | null> {
   try {
     const cookies = await page.context().cookies(['https://leetcode.com']);
     const session = cookies.find((c) => c.name === 'LEETCODE_SESSION' && c.value && c.value.length > 20);
     if (!session) return null;
 
     // Check GraphQL userStatus inside page context (no redirects or reloads!)
-    const username = await page.evaluate(async () => {
+    const status = await page.evaluate(async () => {
       try {
         const res = await fetch('https://leetcode.com/graphql', {
           method: 'POST',
@@ -393,30 +395,35 @@ async function detectSignedInUser(page: import('playwright').Page): Promise<stri
             variables: {},
           }),
         });
+        if (!res.ok) return null;
         const json = (await res.json()) as {
           data?: { userStatus?: { isSignedIn?: boolean; username?: string | null } };
         };
         const u = json.data?.userStatus;
-        return u?.isSignedIn ? (u.username ?? 'unknown') : null;
+        if (!u || u.isSignedIn !== true) return null;
+        return { isSignedIn: true as const, username: u.username?.trim() || null };
       } catch {
         return null;
       }
     });
 
-    if (username) return username;
+    if (!status || status.isSignedIn !== true) return null;
+    if (status.username) return status.username;
 
-    // Fallback: parse JWT payload from session cookie
+    // Only fill missing username from JWT payload after GraphQL confirms isSignedIn === true
     try {
       const parts = session.value.split('.');
       if (parts.length >= 2 && parts[1]) {
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
-        if (payload?.username) return String(payload.username);
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+        if (typeof payload?.username === 'string' && payload.username.trim()) {
+          return payload.username.trim();
+        }
       }
     } catch {
       // ignore
     }
 
-    return null;
+    return 'unknown';
   } catch {
     return null;
   }

@@ -86,7 +86,17 @@ export function createProductionRecoveryService(hooks: RecoveryRuntimeHooks = {}
       return { authenticated: diag.authenticated, username: diag.username, cause: diag.cause, error: diag.error };
     },
     verifyCapturedSession: async (state) => {
-      const session = await openLightweightLeetCodeSession(state);
+      let sessionState = state;
+      if (!state.transport?.proxyUrl) {
+        const tunnelProxy = await getMobileTunnel().ensureProxyListening();
+        if (tunnelProxy) {
+          sessionState = {
+            ...state,
+            transport: { ...(state.transport ?? {}), proxyUrl: tunnelProxy },
+          };
+        }
+      }
+      const session = await openLightweightLeetCodeSession(sessionState);
       try {
         const res = await checkSession(session.api);
         return { authenticated: res.authenticated, username: res.username ?? null, cause: res.cause };
@@ -112,10 +122,15 @@ export function createProductionRecoveryService(hooks: RecoveryRuntimeHooks = {}
       const tunnelProxy = await getMobileTunnel().ensureProxyListening();
       if (tunnelProxy) {
         logger.info('recovery browser routing through connected mobile IP tunnel');
-        return openRemoteBrowser({ headless: true, proxyUrl: tunnelProxy, viewport: opts?.viewport });
+        return openRemoteBrowser({
+          headless: true,
+          proxyUrl: tunnelProxy,
+          persistProxy: Boolean(!tunnelProxy),
+          viewport: opts?.viewport,
+        });
       }
       const lcProxy = await resolveLeetCodeResidentialProxy();
-      return openRemoteBrowser({ headless: true, proxyUrl: lcProxy?.url, viewport: opts?.viewport });
+      return openRemoteBrowser({ headless: true, proxyUrl: lcProxy?.url, persistProxy: true, viewport: opts?.viewport });
     },
     sendTelegram: (text, markup) =>
       sendTelegramMessage(text, { parseMode: 'HTML', disableWebPagePreview: true, replyMarkup: markup }),
@@ -157,16 +172,35 @@ export async function reportAccountSessionDown(accountId: string): Promise<void>
   }
 }
 
+export async function shutdownRecoveryRuntime(): Promise<void> {
+  if (singleton) {
+    await singleton.shutdown();
+  }
+}
+
+function parseMonitorCronField(raw: string | undefined, fallback: number, min: number, max: number, name: string): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) return fallback;
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Invalid ${name}: expected integer ${min}..${max}, got "${raw}"`);
+  }
+  const value = Number(trimmed);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`Invalid ${name}: expected integer ${min}..${max}, got "${raw}"`);
+  }
+  return value;
+}
+
 /**
  * Daily account monitor + per-minute reminder tick.
  * Reminder timing lives in PostgreSQL (nextReminderAt), so a restart neither
  * loses nor duplicates reminders: the first tick after boot claims whatever is due.
  */
-export function startRecoveryScheduler(service: RecoveryService): () => void {
+export function startRecoveryScheduler(service: RecoveryService): () => Promise<void> {
   const timezone = config.schedule.timezone;
-  const monitorHour = Number(process.env.RECOVERY_MONITOR_HOUR ?? 7);
-  const monitorMinute = Number(process.env.RECOVERY_MONITOR_MINUTE ?? 10);
-  const monitorExpr = `${Number.isFinite(monitorMinute) ? monitorMinute : 10} ${Number.isFinite(monitorHour) ? monitorHour : 7} * * *`;
+  const monitorHour = parseMonitorCronField(process.env.RECOVERY_MONITOR_HOUR, 7, 0, 23, 'RECOVERY_MONITOR_HOUR');
+  const monitorMinute = parseMonitorCronField(process.env.RECOVERY_MONITOR_MINUTE, 10, 0, 59, 'RECOVERY_MONITOR_MINUTE');
+  const monitorExpr = `${monitorMinute} ${monitorHour} * * *`;
 
   const monitorTask = cron.schedule(
     monitorExpr,
@@ -190,6 +224,6 @@ export function startRecoveryScheduler(service: RecoveryService): () => void {
     monitorTask.stop();
     tickTask.stop();
     clearTimeout(boot);
-    void service.shutdown();
+    return service.shutdown();
   };
 }

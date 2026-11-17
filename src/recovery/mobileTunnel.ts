@@ -74,6 +74,14 @@ export function decodeWsFrames(buffer: Buffer): {
     let payloadLen = b1 & 0x7f;
     let cursor = offset + 2;
 
+    if (opcode >= 0x08 && (!fin || payloadLen > 125)) {
+      return {
+        frames,
+        remaining: offset > 0 ? Buffer.from(buffer.subarray(offset)) : buffer,
+        protocolError: 'invalid control frame',
+      };
+    }
+
     if (payloadLen === 126) {
       if (cursor + 2 > buffer.length) break;
       payloadLen = buffer.readUInt16BE(cursor);
@@ -145,6 +153,7 @@ export interface MobileTunnelOptions {
 export class MobileTunnelServer {
   private proxyServer: net.Server | null = null;
   private proxyPort: number | null = null;
+  private proxyListenPromise: Promise<string | null> | null = null;
   private activeClient: Duplex | null = null;
   private clientAuthed = false;
   private clientConnectedAt: Date | null = null;
@@ -178,21 +187,41 @@ export class MobileTunnelServer {
     if (this.proxyServer && this.proxyPort) {
       return `http://127.0.0.1:${this.proxyPort}`;
     }
-    await new Promise<void>((resolve, reject) => {
+    if (this.proxyListenPromise) {
+      return this.proxyListenPromise;
+    }
+    const listenPromise = new Promise<string | null>((resolve, reject) => {
       const srv = net.createServer((sock) => this.handleProxySocket(sock));
-      srv.on('error', reject);
+      srv.on('error', (err) => {
+        try {
+          srv.close();
+        } catch {
+          // ignore
+        }
+        reject(err);
+      });
       srv.listen(0, '127.0.0.1', () => {
+        if (this.proxyListenPromise !== listenPromise || !this.isConnected()) {
+          srv.close(() => resolve(null));
+          return;
+        }
         const addr = srv.address();
         if (addr && typeof addr === 'object') {
           this.proxyServer = srv;
           this.proxyPort = addr.port;
-          resolve();
+          resolve(`http://127.0.0.1:${addr.port}`);
         } else {
+          srv.close();
           reject(new Error('Failed to bind local tunnel proxy port'));
         }
       });
+    }).finally(() => {
+      if (this.proxyListenPromise === listenPromise) {
+        this.proxyListenPromise = null;
+      }
     });
-    return this.proxyPort ? `http://127.0.0.1:${this.proxyPort}` : null;
+    this.proxyListenPromise = listenPromise;
+    return listenPromise;
   }
 
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
@@ -224,12 +253,16 @@ export class MobileTunnelServer {
     let rx: Buffer = head && head.length > 0 ? Buffer.from(head) : Buffer.alloc(0);
     let fragOpcode = 0;
     let fragChunks: Buffer[] = [];
+    let fragBytes = 0;
     let closed = false;
     let authedHere = false;
 
     const closeWs = (code = 1000, reason = '') => {
       if (closed) return;
       closed = true;
+      rx = Buffer.alloc(0);
+      fragChunks = [];
+      fragBytes = 0;
       clearTimeout(authTimer);
       try {
         const body = Buffer.alloc(2 + Buffer.byteLength(reason));
@@ -248,6 +281,11 @@ export class MobileTunnelServer {
     const authTimer = setTimeout(() => {
       if (!authedHere) closeWs(4001, 'auth timeout');
     }, AUTH_TIMEOUT_MS);
+
+    if (rx.length > 4096 + 64) {
+      closeWs(1009, 'payload too large');
+      return;
+    }
 
     const sendJson = (msg: Record<string, unknown>) => {
       if (closed || socket.destroyed) return;
@@ -330,6 +368,11 @@ export class MobileTunnelServer {
     };
 
     socket.on('data', (chunk: Buffer) => {
+      const maxBytes = authedHere ? MAX_WS_PAYLOAD : 4096;
+      if (rx.length + chunk.length > maxBytes + 64) {
+        closeWs(1009, 'payload too large');
+        return;
+      }
       rx = rx.length > 0 ? Buffer.concat([rx, chunk]) : chunk;
       const decoded = decodeWsFrames(rx);
       if (decoded.protocolError) {
@@ -339,6 +382,7 @@ export class MobileTunnelServer {
       rx = decoded.remaining;
 
       for (const f of decoded.frames) {
+        const frameMaxBytes = authedHere ? MAX_WS_PAYLOAD : 4096;
         if (f.opcode === 0x08) {
           closeWs(1000, 'client close');
           return;
@@ -350,19 +394,41 @@ export class MobileTunnelServer {
         if (f.opcode === 0x0a) continue;
 
         if (f.opcode === 0x01 || f.opcode === 0x02) {
+          if (fragOpcode !== 0) {
+            closeWs(1002, 'unexpected frame');
+            return;
+          }
+          if (f.payload.length > frameMaxBytes) {
+            closeWs(1009, 'payload too large');
+            return;
+          }
           if (f.fin) {
             void onMessage(f.opcode, f.payload);
           } else {
             fragOpcode = f.opcode;
             fragChunks = [f.payload];
+            fragBytes = f.payload.length;
           }
-        } else if (f.opcode === 0x00 && fragOpcode !== 0) {
+        } else if (f.opcode === 0x00) {
+          if (fragOpcode === 0) {
+            closeWs(1002, 'unexpected continuation');
+            return;
+          }
+          if (fragBytes + f.payload.length > frameMaxBytes) {
+            fragOpcode = 0;
+            fragChunks = [];
+            fragBytes = 0;
+            closeWs(1009, 'payload too large');
+            return;
+          }
           fragChunks.push(f.payload);
+          fragBytes += f.payload.length;
           if (f.fin) {
             const full = Buffer.concat(fragChunks);
             const op = fragOpcode;
             fragOpcode = 0;
             fragChunks = [];
+            fragBytes = 0;
             void onMessage(op, full);
           }
         }
@@ -537,6 +603,7 @@ export class MobileTunnelServer {
   }
 
   async close(): Promise<void> {
+    this.proxyListenPromise = null;
     if (this.activeClient) {
       const sock = this.activeClient;
       this.clearActiveClient();
@@ -614,16 +681,66 @@ if (typeof WebSocket !== 'function') {
 const ALLOWED_RE = /^(?:[a-z0-9-]+\\.)*(?:leetcode\\.com|leetcode\\.cn|cloudflare\\.com|challenges\\.cloudflare\\.com|cloudflareinsights\\.com|gstatic\\.com|google\\.com|hcaptcha\\.com|recaptcha\\.net)$/i;
 
 function isPrivateIp(ip) {
+  ip = String(ip || '').trim().toLowerCase();
   if (!ip) return true;
-  if (ip === '::1' || ip.startsWith('fe80:') || ip.startsWith('fc') || ip.startsWith('fd')) return true;
-  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  const zone = ip.indexOf('%');
+  if (zone !== -1) ip = ip.slice(0, zone);
+  if (ip.startsWith('[') && ip.endsWith(']')) ip = ip.slice(1, -1);
+  if (ip.startsWith('::ffff:')) {
+    const mapped = ip.slice(7);
+    if (net.isIP(mapped) === 4) {
+      ip = mapped;
+    } else {
+      const hex = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(mapped);
+      if (!hex) return true;
+      const hi = parseInt(hex[1], 16);
+      const lo = parseInt(hex[2], 16);
+      ip = ((hi >> 8) & 0xff) + '.' + (hi & 0xff) + '.' + ((lo >> 8) & 0xff) + '.' + (lo & 0xff);
+    }
+  }
+  if (net.isIP(ip) === 6) {
+    if (ip === '::' || ip === '::1') return true;
+    if (/^fe[89ab][0-9a-f]:/.test(ip) || /^f[cd][0-9a-f]{2}:/.test(ip)) return true;
+    if (/^100::/.test(ip) || /^2001:0?db8:/.test(ip)) return true;
+    const halves = ip.split('::');
+    if (halves.length <= 2) {
+      const left = halves[0] ? halves[0].split(':') : [];
+      const right = halves[1] ? halves[1].split(':') : [];
+      const expandTail = (arr) => {
+        const last = arr[arr.length - 1];
+        if (last && last.includes('.') && net.isIP(last) === 4) {
+          const v4 = last.split('.').map(Number);
+          arr.splice(arr.length - 1, 1, ((v4[0] << 8) | v4[1]).toString(16), ((v4[2] << 8) | v4[3]).toString(16));
+        }
+      };
+      expandTail(right.length ? right : left);
+      const missing = 8 - (left.length + right.length);
+      if (missing >= 0) {
+        const groups = [...left, ...Array(missing).fill('0'), ...right].map((g) => parseInt(g || '0', 16));
+        if (groups.length === 8 && groups.every((n) => !Number.isNaN(n))) {
+          if (groups.every((n) => n === 0)) return true;
+          if (groups.slice(0, 7).every((n) => n === 0) && groups[7] === 1) return true;
+          if ((groups[0] & 0xffc0) === 0xfe80 || (groups[0] & 0xfe00) === 0xfc00) return true;
+          if (groups[0] === 0x0100 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0) return true;
+          if (groups[0] === 0x2001 && groups[1] === 0x0db8) return true;
+          if ((groups[0] & 0xff00) === 0xff00) return true;
+          if (groups.slice(0, 5).every((n) => n === 0) && (groups[5] === 0xffff || groups[5] === 0)) {
+            const v4Ip = ((groups[6] >> 8) & 0xff) + '.' + (groups[6] & 0xff) + '.' + ((groups[7] >> 8) & 0xff) + '.' + (groups[7] & 0xff);
+            return isPrivateIp(v4Ip);
+          }
+        }
+      }
+    }
+    return false;
+  }
+  if (net.isIP(ip) !== 4) return true;
   const p = ip.split('.').map(Number);
-  if (p.length !== 4 || p.some(Number.isNaN)) return ip.includes(':');
   if (p[0] === 127 || p[0] === 10 || p[0] === 0) return true;
   if (p[0] === 169 && p[1] === 254) return true;
   if (p[0] === 192 && p[1] === 168) return true;
   if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
   if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true;
+  if (p[0] >= 224) return true;
   return false;
 }
 

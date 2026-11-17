@@ -97,11 +97,27 @@ export class PinGate {
       this.fails.delete(ip);
       return 'ok';
     }
+    const nowMs = this.now();
     const f = this.fails.get(ip);
-    const expired = !f || f.until <= this.now();
+    const expired = !f || f.until <= nowMs;
     const count = (expired ? 0 : f.count) + 1;
-    this.fails.set(ip, { count, until: this.now() + LOCK_MS });
+    this.fails.delete(ip);
+    this.fails.set(ip, { count, until: nowMs + LOCK_MS });
+    if (this.fails.size > 5000) {
+      this.pruneFails(nowMs);
+    }
     return count >= MAX_FAILS ? 'locked' : 'wrong';
+  }
+
+  private pruneFails(nowMs: number): void {
+    for (const [k, v] of this.fails) {
+      if (v.until <= nowMs) this.fails.delete(k);
+    }
+    while (this.fails.size > 5000) {
+      const oldestKey = this.fails.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.fails.delete(oldestKey);
+    }
   }
 
   /** True when the request carries a valid session cookie or a correct X-PIN-Code header. */

@@ -169,6 +169,18 @@ export async function refreshCodeforcesAccount(account: CodeforcesRefreshAccount
     if (val.ok) {
       isValid = true;
       username = val.username;
+    } else if (val.reason !== 'signed-out') {
+      logger.warn(
+        { label: account.label, reason: val.reason },
+        'Codeforces session verification unavailable; preserving account status and skipping re-login',
+      );
+      return {
+        site: 'codeforces',
+        label: account.label,
+        username: account.username,
+        status: 'failed',
+        error: val.error || 'Codeforces session verification unavailable; existing session retained.',
+      };
     }
   }
 
@@ -222,7 +234,7 @@ export async function refreshCodeforcesAccount(account: CodeforcesRefreshAccount
 
   const errDetail = loginRes.error ?? 'Auto-relogin failed';
   await patchCodeforcesAccount(account.id, {
-    status: CodeforcesAccountStatus.REJECTED,
+    status: /^login failed:/i.test(errDetail) ? CodeforcesAccountStatus.REJECTED : CodeforcesAccountStatus.EXPIRED,
     lastError: `Auto-relogin failed: ${errDetail}`,
     checked: true,
   });
@@ -314,6 +326,10 @@ export async function verifyAndRefreshAllSessions(options?: {
   return summary;
 }
 
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+}
+
 async function sendSessionRefreshTelegramNotification(summary: SessionRefreshSummary): Promise<void> {
   const lines: string[] = ['🌅 <b>Morning Session Health Check (7:00 AM)</b>', '<code>━━━━━━━━━━━━━━━━━━━━</code>'];
 
@@ -324,7 +340,7 @@ async function sendSessionRefreshTelegramNotification(summary: SessionRefreshSum
       lines.push(`🔄 <b>Auto-refreshed:</b> ${summary.refreshed} session(s) renewed using stored credentials:`);
       for (const o of summary.outcomes.filter((x) => x.status === 'refreshed')) {
         const siteTag = o.site === 'leetcode' ? 'LeetCode' : 'Codeforces';
-        lines.push(`   • [${siteTag}] <code>${o.label}</code> (${o.username ?? '—'})`);
+        lines.push(`   • [${siteTag}] <code>${escapeHtml(o.label)}</code> (${escapeHtml(o.username ?? '—')})`);
       }
       lines.push('');
     }
@@ -333,7 +349,7 @@ async function sendSessionRefreshTelegramNotification(summary: SessionRefreshSum
       lines.push(`⚠️ <b>Expired (no credentials):</b> ${summary.expiredWithoutCreds} account(s) need renewal:`);
       for (const o of summary.outcomes.filter((x) => x.status === 'missing-credentials')) {
         const cmd = o.site === 'leetcode' ? '/lclogin' : '/cflogin';
-        lines.push(`   • [${o.site.toUpperCase()}] <code>${o.label}</code> — send ${cmd} or renew cookies`);
+        lines.push(`   • [${o.site.toUpperCase()}] <code>${escapeHtml(o.label)}</code> — send ${cmd} or renew cookies`);
       }
       lines.push('');
     }
@@ -341,7 +357,7 @@ async function sendSessionRefreshTelegramNotification(summary: SessionRefreshSum
     if (summary.failed > 0) {
       lines.push(`❌ <b>Failed re-login:</b> ${summary.failed} account(s):`);
       for (const o of summary.outcomes.filter((x) => x.status === 'failed')) {
-        lines.push(`   • [${o.site.toUpperCase()}] <code>${o.label}</code>: <i>${(o.error ?? 'error').slice(0, 100)}</i>`);
+        lines.push(`   • [${o.site.toUpperCase()}] <code>${escapeHtml(o.label)}</code>: <i>${escapeHtml((o.error ?? 'error').slice(0, 100))}</i>`);
       }
       lines.push('');
     }

@@ -46,6 +46,7 @@ export interface RemoteBrowser {
 export interface RemoteBrowserOptions {
   viewport?: { width: number; height: number };
   proxyUrl?: string;
+  persistProxy?: boolean;
   headless?: boolean;
 }
 
@@ -180,7 +181,10 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
       async captureStorageState() {
         const state = await context.storageState();
         return {
-          transport: { proxyUrl: opts.proxyUrl, userAgent: await page.evaluate(() => navigator.userAgent) },
+          transport: {
+            proxyUrl: opts.persistProxy === false ? undefined : opts.proxyUrl,
+            userAgent: await page.evaluate(() => navigator.userAgent),
+          },
           cookies: state.cookies as unknown as StorageStateShape['cookies'],
           origins: (state.origins ?? []) as unknown as StorageStateShape['origins'],
         };

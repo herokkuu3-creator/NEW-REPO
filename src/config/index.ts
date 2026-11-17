@@ -48,7 +48,14 @@ const envSchema = z.object({
 
   DAILY_RUN_HOUR: intFromString(9).pipe(z.number().int().min(0).max(23)),
   DAILY_RUN_MINUTE: intFromString(0).pipe(z.number().int().min(0).max(59)),
-  TIMEZONE: z.string().default('Asia/Kolkata'),
+  TIMEZONE: z.string().default('Asia/Kolkata').refine((timeZone) => {
+    try {
+      Intl.DateTimeFormat(undefined, { timeZone });
+      return true;
+    } catch {
+      return false;
+    }
+  }, 'TIMEZONE must be a valid IANA timezone'),
   RUN_ON_BOOT: boolFromString,
 
   LLM_PROVIDER: z.string().default('gemini'),
@@ -82,7 +89,7 @@ const envSchema = z.object({
 
   // SOLUTION_POST_API_KEYS is a comma-separated failover pool. The singular
   // name remains a backwards-compatible one-key bootstrap option.
-  SOLUTION_POST_API_KEY: z.string().default('sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056'),
+  SOLUTION_POST_API_KEY: z.string().default(''),
   SOLUTION_POST_API_KEYS: z.string().default(''),
   BAZAARLINK_API_KEY: z.string().default(''),
   BAZAARLINK_API_KEYS: z.string().default(''),
@@ -132,7 +139,7 @@ const envSchema = z.object({
   TURNSTILE_SOLVER_URL: z.string().default(''),
 
   // Sage Inkstone (Intern-AI / Shanghai AI Lab) API
-  SAGE_API_KEY: z.string().default('sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056'),
+  SAGE_API_KEY: z.string().default(''),
   SAGE_BASE_URL: z.string().default('https://discovery-api.intern-ai.org.cn/v1'),
   SAGE_MODEL: z.string().default('deepseek-v4.1-flash-1017'),
 

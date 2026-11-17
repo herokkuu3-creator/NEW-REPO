@@ -6,11 +6,24 @@
  * — logs, API responses, Telegram messages — is rendered in local time.
  */
 
-const DEFAULT_TZ = process.env.TIMEZONE || 'Asia/Kolkata';
+const FALLBACK_TZ = 'Asia/Kolkata';
+
+function resolveTimeZone(timeZone: string | undefined): string {
+  const candidate = (timeZone ?? '').trim() || FALLBACK_TZ;
+  try {
+    Intl.DateTimeFormat('en-US', { timeZone: candidate });
+    return candidate;
+  } catch {
+    return FALLBACK_TZ;
+  }
+}
+
+const DEFAULT_TZ = resolveTimeZone(process.env.TIMEZONE);
 
 function parts(date: Date, timeZone: string): Record<string, string> {
+  const tz = resolveTimeZone(timeZone);
   const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone,
+    timeZone: tz,
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -45,19 +58,21 @@ export function isoLocal(date: Date = new Date(), timeZone: string = DEFAULT_TZ)
 /** Short human form, e.g. "27 Sep 2026, 13:05 IST" (stable across Node/ICU versions). */
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 export function humanLocal(date: Date = new Date(), timeZone: string = DEFAULT_TZ): string {
-  const p = parts(date, timeZone);
+  const tz = resolveTimeZone(timeZone);
+  const p = parts(date, tz);
   const month = MONTHS[Number(p.month) - 1] ?? p.month;
-  return `${p.day} ${month} ${p.year}, ${p.hour}:${p.minute} ${tzLabel(timeZone)}`;
+  return `${p.day} ${month} ${p.year}, ${p.hour}:${p.minute} ${tzLabel(tz, date)}`;
 }
 
 /** "IST" for Asia/Kolkata; otherwise the numeric offset label (e.g. "GMT+02:00"). */
-export function tzLabel(timeZone: string = DEFAULT_TZ): string {
-  if (timeZone === 'Asia/Kolkata' || timeZone === 'Asia/Calcutta') return 'IST';
-  const p = parts(new Date(), timeZone);
-  return p.timeZoneName ?? timeZone;
+export function tzLabel(timeZone: string = DEFAULT_TZ, date: Date = new Date()): string {
+  const tz = resolveTimeZone(timeZone);
+  if (tz === 'Asia/Kolkata' || tz === 'Asia/Calcutta') return 'IST';
+  const p = parts(date, tz);
+  return p.timeZoneName ?? tz;
 }
 
 /** Filesystem-safe local stamp, e.g. "2026-09-27T13-05-10-123+0530". */
 export function fileStampLocal(date: Date = new Date(), timeZone: string = DEFAULT_TZ): string {
-  return isoLocal(date, timeZone).replace(/[:.]/g, '-').replace(/\+(\d{2})-(\d{2})$/, '+$1$2');
+  return isoLocal(date, timeZone).replace(/[:.]/g, '-').replace(/([+-])(\d{2})-(\d{2})$/, '$1$2$3');
 }

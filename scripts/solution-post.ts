@@ -75,6 +75,8 @@ async function main() {
   } finally { rl.close(); }
 }
 
-main().catch(error => { console.error('Solution operation failed. Check configuration, account identity, and solution history.');
-  if (error instanceof RoutingError) console.error(JSON.stringify(error.attempts)); process.exitCode = 1; })
-  .finally(() => prisma.$disconnect());
+main().catch(error => {
+  console.error(error instanceof Error ? error.message : 'Solution operation failed');
+  if (error instanceof RoutingError) console.error(JSON.stringify(error.attempts));
+  process.exitCode = 1;
+}).finally(() => prisma.$disconnect());

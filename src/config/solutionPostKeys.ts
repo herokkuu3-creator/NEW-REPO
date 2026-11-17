@@ -13,7 +13,7 @@ export interface ArticleKeyInput {
 export function parseSolutionApiKeys(input: string | string[]): string[] {
   const tokens = (Array.isArray(input) ? input : [input]).flatMap(raw => {
     let value = raw.trim().replace(/^```(?:env|dotenv|text)?\s*\n([\s\S]*?)\n```$/, '$1');
-    value = value.replace(/^(?:export\s+)?(?:BAZAARLINK|SOLUTION_POST)_API_KEYS?\s*=\s*/i, '');
+    value = value.replace(/^(?:export\s+)?(?:BAZAARLINK|SOLUTION_POST|SAGE)_API_KEYS?\s*=\s*/i, '');
     if (value.startsWith('[')) {
       try {
         const decoded: unknown = JSON.parse(value);

@@ -66,8 +66,11 @@ EOF
   return 1
 )
 
-if [ -n "${CODEFORCES_RUNNER_REPOSITORY:-}" ]; then
+runner_mode=$(printf '%s' "${CODEFORCES_RUNNER_MODE:-render}" | tr '[:upper:]' '[:lower:]')
+if [ "$runner_mode" = "github" ] && [ -n "${CODEFORCES_RUNNER_REPOSITORY:-}" ]; then
   log "GitHub browser runner configured; Render will only dispatch and broker jobs"
+elif [ "$runner_mode" = "local" ]; then
+  log "Local browser runner configured; Render will only broker jobs"
 elif [ -n "${CODEFORCES_PROXY:-}" ]; then
   log "using configured CODEFORCES_PROXY"
 elif [ "${WARP_ENABLED:-true}" != "false" ]; then

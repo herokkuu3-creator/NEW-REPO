@@ -42,46 +42,53 @@ jobs:
         run: |
           node <<'NODE'
           const fs = require('node:fs');
-          const base = process.env.CODEFORCES_SUBMITTER_URL;
-          if (!process.env.CODEFORCES_SUBMITTER_TOKEN?.trim()) {
-            console.error('::error::Missing GitHub Actions secret CODEFORCES_SUBMITTER_TOKEN. Configure the same token used by the Render submitter.');
-            process.exit(1);
-          }
-          const fallbackProxy = process.env.FALLBACK_CODEFORCES_PROXY;
-          if (fallbackProxy && base) {
-            fetch(`${base}/proxy/sync`, {
-              method: 'POST',
-              headers: {
-                authorization: `Bearer ${process.env.CODEFORCES_SUBMITTER_TOKEN}`,
-                'content-type': 'application/json',
-              },
-              body: JSON.stringify({ proxies: fallbackProxy }),
-              signal: AbortSignal.timeout(10000),
-            }).catch(() => {});
-          }
-          const requested = process.env.CODEFORCES_INPUT_JOB_ID;
-          const lookupUrl = requested ? `${base}/jobs/${requested}/network` : `${base}/jobs/next`;
-          fetch(lookupUrl, {
-            headers: { authorization: `Bearer ${process.env.CODEFORCES_SUBMITTER_TOKEN}` },
-            signal: AbortSignal.timeout(30000),
-          }).then(async response => {
+          (async () => {
+            const base = process.env.CODEFORCES_SUBMITTER_URL;
+            const token = process.env.CODEFORCES_SUBMITTER_TOKEN?.trim();
+            if (!token) {
+              console.error('::error::Missing GitHub Actions secret CODEFORCES_SUBMITTER_TOKEN. Configure the same token used by the Render submitter.');
+              process.exit(1);
+            }
+            const fallbackProxy = process.env.FALLBACK_CODEFORCES_PROXY;
+            if (fallbackProxy && base) {
+              await fetch(`${base}/proxy/sync`, {
+                method: 'POST',
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  'content-type': 'application/json',
+                },
+                body: JSON.stringify({ proxies: fallbackProxy }),
+                signal: AbortSignal.timeout(10000),
+              }).catch(() => {});
+            }
+            const requested = (process.env.CODEFORCES_INPUT_JOB_ID || '').trim();
+            if (requested && !/^[a-f0-9-]{36}$/.test(requested)) {
+              throw new Error('invalid broker job id');
+            }
+            const lookupUrl = requested ? `${base}/jobs/${requested}/network` : `${base}/jobs/next`;
+            const response = await fetch(lookupUrl, {
+              headers: { authorization: `Bearer ${token}` },
+              signal: AbortSignal.timeout(30000),
+            });
             if (response.status === 401) throw new Error('Render rejected CODEFORCES_SUBMITTER_TOKEN (HTTP 401). Check that the GitHub secret matches the Render submitter token.');
             if (!response.ok) throw new Error(`Render job lookup failed: HTTP ${response.status}`);
             const body = await response.json();
             const jobId = requested || body.jobId;
             if (jobId) {
-              if (!/^[a-f0-9-]{36}$/.test(jobId)) throw new Error('invalid broker job id');
-              fs.appendFileSync(process.env.GITHUB_OUTPUT, `job_id=${jobId}\n`);
+              if (typeof jobId !== 'string' || !/^[a-f0-9-]{36}$/.test(jobId)) throw new Error('invalid broker job id');
+              const clean = (v) => String(v).replace(/[\r\n]+/g, '');
+              const outFile = process.env.GITHUB_OUTPUT;
+              fs.appendFileSync(outFile, `job_id=${clean(jobId)}\n`);
               const networkMode = body.networkMode;
-              fs.appendFileSync(process.env.GITHUB_OUTPUT, `network_mode=${networkMode === 'tailscale' ? 'tailscale' : 'proxy'}\n`);
+              fs.appendFileSync(outFile, `network_mode=${networkMode === 'tailscale' ? 'tailscale' : 'proxy'}\n`);
               if (body.removedProxies && Array.isArray(body.removedProxies)) {
-                fs.appendFileSync(process.env.GITHUB_OUTPUT, `removed_proxies=${JSON.stringify(body.removedProxies)}\n`);
+                fs.appendFileSync(outFile, `removed_proxies=${clean(JSON.stringify(body.removedProxies))}\n`);
               }
               if (body.proxy && typeof body.proxy === 'string') {
-                fs.appendFileSync(process.env.GITHUB_OUTPUT, `preferred_proxy=${body.proxy}\n`);
+                fs.appendFileSync(outFile, `preferred_proxy=${clean(body.proxy)}\n`);
               }
             }
-          }).catch(error => { console.error(error.message); process.exitCode = 1; });
+          })().catch(error => { console.error(error.message); process.exitCode = 1; });
           NODE
       - uses: actions/checkout@v4
         if: inputs.job_id != '' || steps.lookup.outputs.job_id != ''
@@ -139,4 +146,5 @@ jobs:
           CODEFORCES_JOB_ID: ${{ inputs.job_id || steps.lookup.outputs.job_id }}
           STRICT_PROXY: 'true'
           CPSOLVER_URL: ${{ vars.CPSOLVER_URL || secrets.CPSOLVER_URL || 'https://pk-coder.onrender.com' }}
+          CPSOLVER_API_TOKEN: ${{ secrets.CPSOLVER_API_TOKEN }}
         run: xvfb-run -a node --expose-gc dist/src/codeforces/actionRunner.js

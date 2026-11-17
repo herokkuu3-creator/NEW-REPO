@@ -23,10 +23,11 @@ interface ProxyScore {
 async function testSingleProxy(raw: string): Promise<ProxyScore> {
   const normalized = normalizeSingleProxy(raw) ?? `http://${raw}`;
 
-  // Test Codeforces
+  // Note: testProxyDetailed probes https://challenges.cloudflare.com/cdn-cgi/trace:443
+  // (shared Cloudflare egress check; second call acts as stability/latency re-check).
   const cfRes = await testProxyDetailed(normalized, 6);
 
-  // Test LeetCode
+  // Secondary Cloudflare egress probe (represents LeetCode/Cloudflare check path until target-specific probing is supported)
   let lcRes: ProxyTestResult;
   try {
     lcRes = await testProxyDetailed(normalized, 6);
@@ -88,7 +89,13 @@ async function main() {
   const scored = await runPool(RAW_PROXIES, 12, async (raw) => {
     const res = await testSingleProxy(raw);
     completed++;
-    const status = (res.cfOk && res.lcOk) ? `✅ CF: ${res.cfLatency}ms | LC: ${res.lcLatency}ms (${res.cfCountry || '??'})` : (res.cfOk ? `🟡 CF ONLY (${res.cfLatency}ms)` : `❌ FAILED: ${res.error?.slice(0, 40)}`);
+    const status = (res.cfOk && res.lcOk)
+      ? `✅ CF: ${res.cfLatency}ms | LC: ${res.lcLatency}ms (${res.cfCountry || '??'})`
+      : res.cfOk
+        ? `🟡 CF ONLY (${res.cfLatency}ms)`
+        : res.lcOk
+          ? `🟡 LC ONLY (${res.lcLatency}ms)`
+          : `❌ FAILED: ${res.error?.slice(0, 40)}`;
     console.log(`[${completed}/${RAW_PROXIES.length}] ${res.normalized} -> ${status}`);
     return res;
   });
@@ -118,4 +125,7 @@ async function main() {
   console.log('\nSaved masked results to tested-proxies.json');
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error(err instanceof Error ? err.message : err);
+  process.exitCode = 1;
+});

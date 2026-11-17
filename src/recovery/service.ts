@@ -181,6 +181,7 @@ interface PortalSession {
   phase: PortalPhase;
   message: string;
   username?: string;
+  viewport: { width: number; height: number };
   browser: RemoteBrowser | null;
   abort: AbortController;
   stopReason: 'cancelled' | 'crash' | null;
@@ -760,12 +761,36 @@ export class RecoveryService {
       let verifiedUsername: string | null = null;
       let serverVerified = false;
       if (check.authenticated && check.username) {
+        if (localVerifiedUsername && lower(localVerifiedUsername) !== lower(check.username)) {
+          await this.failRecovery(recovery, null, 'USERNAME_MISMATCH', describeCategory('USERNAME_MISMATCH'), {
+            notify: true,
+          });
+          return {
+            ok: false,
+            httpStatus: 422,
+            reason: 'username_mismatch',
+            error: describeCategory('USERNAME_MISMATCH'),
+            label: account.label,
+          };
+        }
         verifiedUsername = check.username;
         serverVerified = true;
       } else if (check.cause === 'query-failed' && !identity.expired && (localVerifiedUsername || identity.username)) {
+        if (identity.username && localVerifiedUsername && lower(identity.username) !== lower(localVerifiedUsername)) {
+          await this.failRecovery(recovery, null, 'USERNAME_MISMATCH', describeCategory('USERNAME_MISMATCH'), {
+            notify: true,
+          });
+          return {
+            ok: false,
+            httpStatus: 422,
+            reason: 'username_mismatch',
+            error: describeCategory('USERNAME_MISMATCH'),
+            label: account.label,
+          };
+        }
         // Server GraphQL check can be transiently challenged by Cloudflare on datacenter IPs
         // immediately after local-IP login; accept the verified local JWT identity when unexpired.
-        verifiedUsername = (localVerifiedUsername || identity.username)!;
+        verifiedUsername = (identity.username ?? localVerifiedUsername)!;
       }
 
       if (!verifiedUsername) {
@@ -896,6 +921,7 @@ export class RecoveryService {
     if (!creds) return abortEarly('NO_CREDENTIALS', describeCategory('NO_CREDENTIALS'));
     if (!expectedUsername(account, creds)) return abortEarly('NO_EXPECTED_USERNAME', describeCategory('NO_EXPECTED_USERNAME'));
 
+    const viewport = opts?.mobile ? { width: 430, height: 760 } : { width: 1024, height: 720 };
     const secret = randomBytes(32).toString('base64url');
     const session: PortalSession = {
       recoveryId: recovery.id,
@@ -904,6 +930,7 @@ export class RecoveryService {
       secretHash: secretHash(secret),
       phase: 'starting',
       message: PHASE_TEXT.starting,
+      viewport,
       browser: null,
       abort: new AbortController(),
       stopReason: null,
@@ -936,7 +963,7 @@ export class RecoveryService {
     const hardStop = setTimeout(() => s.abort.abort(), limits.sessionTimeoutMs + 5000);
     try {
       try {
-        s.browser = await this.deps.openBrowser(opts?.mobile ? { viewport: { width: 430, height: 760 } } : undefined);
+        s.browser = await this.deps.openBrowser(opts?.mobile ? { viewport: s.viewport } : undefined);
       } catch {
         return void (await this.failRecovery(recovery, s, 'BROWSER_LAUNCH_FAILED', describeCategory('BROWSER_LAUNCH_FAILED'), { notify: true }));
       }
@@ -1113,7 +1140,7 @@ export class RecoveryService {
       label: s.label,
       username: s.phase === 'success' ? s.username : undefined,
       final: s.phase === 'success' || s.phase === 'failed' || s.phase === 'cancelled',
-      viewport: s.browser?.viewport ?? { width: 1024, height: 720 },
+      viewport: s.browser?.viewport ?? s.viewport,
     };
   }
 
@@ -1164,11 +1191,12 @@ export class RecoveryService {
   async requestRecovery(
     label: string,
     reason: 'EXPIRED' | 'REJECTED' | 'VERIFICATION_REQUIRED' = 'EXPIRED',
-  ): Promise<'sent' | 'unknown_account' | 'active' | 'in_progress'> {
+  ): Promise<'sent' | 'unknown_account' | 'active' | 'in_progress' | 'disabled'> {
     this.nextIdleDbCheckAt = 0;
     const accounts = await this.deps.listAccounts();
     const account = accounts.find((a) => lower(a.label) === lower(label) || lower(a.username) === lower(label));
     if (!account) return 'unknown_account';
+    if (account.status === AccountStatus.DISABLED) return 'disabled';
     // A manual renewal may target an account whose ACTIVE status is stale.
     // Check it instead of silently cancelling its reminder in notify().
     if (account.status === AccountStatus.ACTIVE) {

@@ -70,16 +70,19 @@ async function main(): Promise<void> {
   const stopContestPosts = startContestPostScheduler();
   void verifySolutionProviderOnBoot().catch(() => logger.warn('solution provider startup probe could not complete'));
 
+  let shuttingDown = false;
   const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info({ signal }, 'shutting down');
     stopScheduler();
     stopTelegramBot();
     stopCodeforcesScheduler();
     stopCodeChefScheduler();
     stopMorningSessionCheck();
-    stopRecovery();
     stopSolutionPosts();
     stopContestPosts();
+    await Promise.resolve(stopRecovery()).catch(() => undefined);
     await app.close().catch(() => undefined);
     await disconnectDatabase().catch(() => undefined);
     process.exit(0);

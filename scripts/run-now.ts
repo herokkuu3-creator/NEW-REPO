@@ -14,17 +14,25 @@ import { logger } from '../src/logger';
 
 async function main(): Promise<void> {
   await connectDatabase();
-  const report = await executeDailyRun('manual-cli');
-  logger.info(
-    {
-      summary: `${report.totals.accounts} account(s)`,
-      totals: report.totals,
-      accounts: report.accounts,
-    },
-    'manual run finished',
-  );
-  await disconnectDatabase();
-  const ok = report.totals.accounts > 0 && report.totals.failed === 0 && report.totals.expired === 0;
+  let ok = false;
+  try {
+    const report = await executeDailyRun('manual-cli');
+    logger.info(
+      {
+        summary: `${report.totals.accounts} account(s)`,
+        totals: report.totals,
+        accounts: report.accounts,
+      },
+      'manual run finished',
+    );
+    ok =
+      report.totals.accounts > 0 &&
+      report.totals.failed === 0 &&
+      report.totals.expired === 0 &&
+      report.totals.rejected === 0;
+  } finally {
+    await disconnectDatabase().catch(() => undefined);
+  }
   process.exit(ok ? 0 : 1);
 }
 
