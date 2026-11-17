@@ -3,6 +3,7 @@ import { prisma } from './prisma';
 import { getSystemState, SystemKeys } from './models';
 import { logger } from '../logger';
 import { StorageStateShape } from '../browser/cookiePayload';
+import { invalidateHealthCache } from '../api/healthCache';
 
 /**
  * Account store — one row per cookie-set ("account") the agent manages.
@@ -187,26 +188,31 @@ export async function saveAccount(
   meta: { username?: string; status?: AccountStatus } = {},
 ): Promise<AccountRecord> {
   const status = meta.status ?? AccountStatus.UNKNOWN;
-  return prisma.account.upsert({
+  const saved = await prisma.account.upsert({
     where: { label },
     create: { label, storageState, username: meta.username, status },
     update: { storageState, username: meta.username, status, lastError: null },
   });
+  invalidateHealthCache();
+  return saved;
 }
 
 export async function deleteAccountByLabel(label: string): Promise<void> {
   await prisma.account.delete({ where: { label } });
+  invalidateHealthCache();
 }
 
 /** Removes one account (and, by cascade, its run history). Returns false if it no longer exists. */
 export async function deleteAccountById(id: string): Promise<boolean> {
   const res = await prisma.account.deleteMany({ where: { id } });
+  if (res.count > 0) invalidateHealthCache();
   return res.count > 0;
 }
 
 /** Removes EVERY account (cascade: run history). Returns how many were removed. */
 export async function deleteAllAccounts(): Promise<number> {
   const res = await prisma.account.deleteMany({});
+  if (res.count > 0) invalidateHealthCache();
   return res.count;
 }
 
@@ -235,6 +241,7 @@ export async function patchAccount(id: string, patch: AccountPatch): Promise<voi
   if (patch.checked) data.lastCheckedAt = new Date();
   if (patch.ran) data.lastRunAt = new Date();
   await prisma.account.update({ where: { id }, data });
+  invalidateHealthCache();
 }
 
 /**

@@ -25,6 +25,7 @@ import { startArticleWorkKeepAlive } from './keepAlive';
 import { generateImplementation, IMPLEMENTATION_STAGE_BUDGET } from './implementation';
 import { CoarenaRouter, loadCoarenaKey, loadCoarenaModelOrder, maskCoarenaKey, type CoarenaReply } from './coarena';
 import { CoarenaPause, isCoarenaPauseCode, isCoarenaPaused } from './coarenaLimits';
+import { notifySolutionPostSchedulerWork } from './schedulerGate';
 
 type PublicationMode = SubmissionContext['resumePublication'];
 const checkpointPrefix = (postId: string) => 'solution-post-coarena-reply:' + postId + ':';
@@ -533,6 +534,7 @@ export async function resetFailedSolutionPostRetries(): Promise<number> {
   // matching scheduler budget too; resetting only posts leaves the schedule stuck.
   await prisma.systemState.deleteMany({ where: { key: { startsWith: 'solution-post-schedule-budget:' } } });
   await prisma.systemState.deleteMany({ where: { key: { startsWith: 'solution-post-schedule-attempt-at:' } } });
+  notifySolutionPostSchedulerWork();
   return updated.count;
 }
 

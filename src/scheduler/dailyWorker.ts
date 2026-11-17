@@ -59,6 +59,14 @@ import { notifyMultiRunReport } from '../notifications/notifier';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { isoLocal } from '../time';
 import { shouldRetryWithOriginal, stripCppComments } from '../codeforces/codeSanitizer';
+import {
+  getDailyRetryPollGate,
+  resetDailyRetryPollGate,
+  setDailyRetryCompletedDate,
+  setDailyRetryNextPollAt,
+} from './dailyRetryGate';
+
+export { resetDailyRetryPollGate };
 
 /**
  * The daily pipeline — MULTI-ACCOUNT.
@@ -1098,14 +1106,6 @@ export function startScheduler(): () => void {
 export const DAILY_RETRY_LIMIT = 5;
 export const DAILY_RETRY_GAP_MS = 60 * 60 * 1000; // 1 hour gap between retry attempts
 
-let dailyRetryNextPollAt = 0;
-let dailyRetryCompletedDate: string | null = null;
-
-export function resetDailyRetryPollGate(): void {
-  dailyRetryNextPollAt = 0;
-  dailyRetryCompletedDate = null;
-}
-
 export async function triggerDailyRetry(): Promise<void> {
   if (runInProgress) return;
   const { isRangeJobActive } = await import('./rangeSubmission').catch(() => ({ isRangeJobActive: () => false }));
@@ -1113,7 +1113,8 @@ export async function triggerDailyRetry(): Promise<void> {
   if (!isPastScheduledDailyTime()) return;
   const today = leetcodeDayKey();
   const nowMs = Date.now();
-  if (process.env.NODE_ENV !== 'test' && (dailyRetryCompletedDate === today || nowMs < dailyRetryNextPollAt)) {
+  const gate = getDailyRetryPollGate();
+  if (process.env.NODE_ENV !== 'test' && (gate.completedDate === today || nowMs < gate.nextPollAt)) {
     return;
   }
   const accountRows = await prisma.account
@@ -1123,8 +1124,8 @@ export async function triggerDailyRetry(): Promise<void> {
     })
     .catch(() => []);
   if (accountRows.length === 0) {
-    dailyRetryCompletedDate = today;
-    dailyRetryNextPollAt = nowMs + 60 * 60_000;
+    // Cool down for 60m on empty DB without latching the whole day so new accounts wake retries.
+    setDailyRetryNextPollAt(nowMs + 60 * 60_000);
     return;
   }
 
@@ -1141,8 +1142,8 @@ export async function triggerDailyRetry(): Promise<void> {
     return !row || row.state !== RunState.SUCCESS || /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(row.submissionStatus ?? '');
   });
   if (!hasIncomplete) {
-    dailyRetryCompletedDate = today;
-    dailyRetryNextPollAt = nowMs + 60 * 60_000;
+    setDailyRetryCompletedDate(today);
+    setDailyRetryNextPollAt(nowMs + 60 * 60_000);
     return;
   }
 
@@ -1162,14 +1163,14 @@ export async function triggerDailyRetry(): Promise<void> {
     // A malformed retry marker is safe to reset for today's recovery window.
   }
   if (retry.count >= DAILY_RETRY_LIMIT) {
-    dailyRetryCompletedDate = today;
-    dailyRetryNextPollAt = nowMs + 60 * 60_000;
+    setDailyRetryCompletedDate(today);
+    setDailyRetryNextPollAt(nowMs + 60 * 60_000);
     return;
   }
 
   const now = Date.now();
   if (retry.lastAttemptAt > 0 && now - retry.lastAttemptAt < DAILY_RETRY_GAP_MS) {
-    dailyRetryNextPollAt = retry.lastAttemptAt + DAILY_RETRY_GAP_MS;
+    setDailyRetryNextPollAt(retry.lastAttemptAt + DAILY_RETRY_GAP_MS);
     const remainingMin = Math.ceil((DAILY_RETRY_GAP_MS - (now - retry.lastAttemptAt)) / 60000);
     logger.debug({ today, count: retry.count, remainingMin }, 'waiting for 1 hour gap before daily retry');
     return;

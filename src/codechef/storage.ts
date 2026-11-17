@@ -1,5 +1,6 @@
 import { CodeChefAccount, CodeChefAccountStatus, CodeChefProgress } from '@prisma/client';
 import { prisma } from '../database/prisma';
+import { resetCodeChefRetryPollGate } from './retryGate';
 
 export type CodeChefAccountSummary = Pick<
   CodeChefAccount,
@@ -166,6 +167,7 @@ export async function ensureCodeChefAccountsSeeded(): Promise<void> {
         },
         select: { id: true },
       });
+      resetCodeChefRetryPollGate();
     } else {
       let storedPassword: string | undefined;
       try {
@@ -175,6 +177,7 @@ export async function ensureCodeChefAccountsSeeded(): Promise<void> {
       }
       if (storedPassword !== password) {
         await patchCodeChefAccount(existing.id, { storageState: JSON.stringify({ username, password, cookies: [], origins: [] }) });
+        resetCodeChefRetryPollGate();
       }
     }
   }

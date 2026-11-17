@@ -10,6 +10,7 @@ import { checkSession } from './sessionCheck';
 import { parseCookiePayload, StorageStateShape } from './cookiePayload';
 import * as sessionManager from '../leetcode/sessionManager';
 import type { LightweightLeetCodeSession } from '../leetcode/sessionManager';
+import { resetDailyRetryPollGate } from '../scheduler/dailyRetryGate';
 
 /**
  * Session renewal — the apply half of the /renew flow.
@@ -120,6 +121,7 @@ async function validateAndSaveAccount(
     username: validation.username,
     status: AccountStatus.ACTIVE,
   });
+  resetDailyRetryPollGate();
   logger.info(
     { label, username: validation.username, cookies: storageState.cookies.length, format },
     'account session renewed from user-supplied cookies',
@@ -159,6 +161,7 @@ async function validateAndSave(
   await setSystemState(SystemKeys.authUsername, validation.username);
   // A fresh session re-arms the once-a-day expiry alert.
   await setSystemState(SystemKeys.authNotifiedAt, '');
+  resetDailyRetryPollGate();
 
   try {
     const accounts = await listAccounts();

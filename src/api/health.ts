@@ -46,6 +46,10 @@ import {
   renderLeetCodePairingPortalHtml,
   resolvePublicBaseUrl,
 } from '../leetcode/loginHandoff';
+import { invalidateHealthCache, registerHealthCacheInvalidator } from './healthCache';
+import { resetDailyRetryPollGate } from '../scheduler/dailyRetryGate';
+
+export { invalidateHealthCache };
 
 /**
  * Health + minimal admin API.
@@ -197,10 +201,13 @@ export async function startHealthServer(
   let cachedHealth: { snapshot: HealthSnapshot; expiresAt: number } | null = null;
   let inflightHealth: { epoch: number; promise: Promise<HealthSnapshot> } | null = null;
 
-  const invalidateHealthCache = () => {
+  const unregisterHealthCache = registerHealthCacheInvalidator(() => {
     cacheEpoch += 1;
     cachedHealth = null;
-  };
+  });
+  app.addHook('onClose', async () => {
+    unregisterHealthCache();
+  });
 
   const loadHealthSnapshot = async (): Promise<HealthSnapshot> => {
     const nowMs = Date.now();
@@ -410,6 +417,7 @@ export async function startHealthServer(
     }
 
     invalidateHealthCache();
+    resetDailyRetryPollGate();
     const trigger = await hooks.triggerRun('session-renewal').catch(() => ({
       started: false,
       message: 'not started',
@@ -616,6 +624,7 @@ export async function startHealthServer(
     const json = JSON.stringify(parsed.data);
     await saveStorageStateToDb(json);
     invalidateHealthCache();
+    resetDailyRetryPollGate();
     try {
       const target = config.browser.storageStatePath;
       fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -661,6 +670,7 @@ export async function startHealthServer(
       return reply.code(422).send(result);
     }
     invalidateHealthCache();
+    resetDailyRetryPollGate();
     const trigger = await hooks.triggerRun('session-renewal');
     logger.info(
       { username: result.username, cookies: result.cookieCount, runStarted: trigger.started },
@@ -698,7 +708,10 @@ export async function startHealthServer(
       payload = JSON.stringify(body ?? {});
     }
     const result = await applySessionRenewal(payload);
-    if (result.ok) invalidateHealthCache();
+    if (result.ok) {
+      invalidateHealthCache();
+      resetDailyRetryPollGate();
+    }
     logger.info({ ok: result.ok }, 'session renewal attempted via admin API');
     return reply.code(result.ok ? 200 : 422).send(result);
   });
@@ -749,6 +762,7 @@ export async function startHealthServer(
       return reply.code(400).send(result);
     }
     invalidateHealthCache();
+    resetDailyRetryPollGate();
     const trigger = result.status === AccountStatus.EXPIRED ? null : await hooks.triggerRun('session-renewal');
     return reply.send({
       ...result,

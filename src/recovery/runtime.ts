@@ -21,6 +21,8 @@ import { PrismaRecoveryStore } from './prismaStore';
 import { getMobileTunnel } from './mobileTunnel';
 import { openRemoteBrowser } from './remoteBrowser';
 import { loadRecoveryLimits, RecoveryService, type RecoveryAccount } from './service';
+import { invalidateHealthCache } from '../api/healthCache';
+import { resetDailyRetryPollGate } from '../scheduler/dailyRetryGate';
 
 let singleton: RecoveryService | null = null;
 
@@ -119,6 +121,8 @@ export function createProductionRecoveryService(hooks: RecoveryRuntimeHooks = {}
       sendTelegramMessage(text, { parseMode: 'HTML', disableWebPagePreview: true, replyMarkup: markup }),
     onRecovered: async (account) => {
       await clearLeetCodeLoginCooldown(account.label).catch(() => undefined);
+      invalidateHealthCache();
+      resetDailyRetryPollGate();
       await hooks.onRecovered?.();
     },
     limits: loadRecoveryLimits(),

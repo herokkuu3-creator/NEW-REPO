@@ -62,6 +62,7 @@ import {
   runCodeforcesNow,
   type CodeforcesNetworkMode,
 } from '../codeforces/worker';
+import { resetCodeforcesRetryPollGate } from '../codeforces/retryGate';
 import {
   isCodeChefRunInProgress,
   runCodeChefNow,
@@ -131,6 +132,8 @@ import {
   triggerRun,
   TRIGGER_SUBMISSION_REASON,
 } from '../scheduler/dailyWorker';
+import { resetDailyRetryPollGate } from '../scheduler/dailyRetryGate';
+import { invalidateHealthCache } from '../api/healthCache';
 import { formatAccountMessage, summarizeReport } from '../scheduler/report';
 import { claimContestRewardForAccount, ContestRewardResult } from '../leetcode/contestReward';
 import type {
@@ -1414,6 +1417,7 @@ export async function processCookieMessage(
         text: `${opts.fileName ? `${opts.fileName}: ` : ''}${describeCodeforcesIngest(result)}`,
       };
     }
+    resetCodeforcesRetryPollGate();
     const total = (await listCodeforcesAccounts(true)).length;
     return {
       stored: true,
@@ -1444,6 +1448,9 @@ export async function processCookieMessage(
   if (!result.ok) {
     return { stored: false, site: 'leetcode', text: `${opts.fileName ? `${opts.fileName}: ` : ''}${describeIngest(result)}` };
   }
+
+  invalidateHealthCache();
+  resetDailyRetryPollGate();
 
   if (result.status === AccountStatus.ACTIVE) {
     clearLeetCodeLoginCooldownsForTests();
@@ -5680,6 +5687,7 @@ export async function handleCallbackQuery(
     }
     const removed = await deps.deleteAllAccounts();
     await deps.clearLegacySession().catch(() => undefined);
+    invalidateHealthCache();
     logger.info({ removed }, 'all account sessions removed via Telegram');
     await deps.answer(q.id, `Removed ${removed}`);
     await deps.edit(
@@ -5703,6 +5711,7 @@ export async function handleCallbackQuery(
     if (!target || !(await deps.deleteAccountById(id))) {
       text = '🤷 That account was already removed.';
     } else {
+      invalidateHealthCache();
       logger.info({ label: target.label }, 'account session removed via Telegram');
       text = `✅ Removed ${accountName(target)}`;
     }
@@ -7914,11 +7923,13 @@ export async function handleExecuteLogin(
                     lastError: 'Cloudflare verification required',
                   }).catch(() => undefined);
                 }
+                invalidateHealthCache();
               } else if (account.status === AccountStatus.ACTIVE && !existingAccountTransientQueryFailure) {
                 await patchAccount(account.id, {
                   status: AccountStatus.UNKNOWN,
                   lastError: 'Cloudflare verification required',
                 }).catch(() => undefined);
+                invalidateHealthCache();
               }
 
               // 3. Trigger server-hosted remote interactive recovery portal with explicit VERIFICATION_REQUIRED reason
@@ -8031,6 +8042,8 @@ export async function handleExecuteLogin(
           username,
           status: AccountStatus.ACTIVE,
         });
+        invalidateHealthCache();
+        resetDailyRetryPollGate();
         logger.info({ operationId, label, username }, '[DATABASE] Encrypted session persisted');
 
         // Read-back verification from PostgreSQL (Part 8 & Part 11)
@@ -8102,6 +8115,7 @@ export async function handleExecuteLogin(
         username: handle,
         status: CodeforcesAccountStatus.ACTIVE,
       });
+      resetCodeforcesRetryPollGate();
 
       await replyFunc(
         `✅ <b>Codeforces Login Successful!</b>\n` +
@@ -8126,6 +8140,11 @@ async function handleCheckSessionsCommand(): Promise<void> {
   );
   try {
     const summary = await verifyAndRefreshAllSessions({ notifyTelegram: false });
+    invalidateHealthCache();
+    if (summary.refreshed > 0) {
+      resetDailyRetryPollGate();
+      resetCodeforcesRetryPollGate();
+    }
     const lines: string[] = [
       '<b>📋 Session Verification Summary</b>',
       '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',

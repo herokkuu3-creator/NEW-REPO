@@ -36,6 +36,14 @@ import {
 } from './report';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { refreshCodeforcesAccount } from '../security/sessionAutoRefresh';
+import {
+  getCodeforcesRetryPollGate,
+  resetCodeforcesRetryPollGate,
+  setCodeforcesRetryCompletedDate,
+  setCodeforcesRetryNextPollAt,
+} from './retryGate';
+
+export { resetCodeforcesRetryPollGate };
 
 const CODEFORCES_LAST_REPORT_KEY = 'codeforcesLastReport';
 let runInProgress = false;
@@ -232,22 +240,19 @@ export const CODEFORCES_MANUAL_REASON = 'codeforces-manual';
 
 export async function triggerCodeforcesRun(reason: string): Promise<CodeforcesTriggerResult> {
   if (runInProgress) return { started: false, message: 'a Codeforces run is already in progress' };
+  resetCodeforcesRetryPollGate();
   void executeCodeforcesRun(reason).catch((err) =>
     logger.error({ err: err instanceof Error ? err.message : String(err) }, 'unhandled Codeforces run error'),
   );
   return { started: true, message: `Codeforces run triggered (${reason})` };
 }
 
-let cfRetryNextPollAt = 0;
-let cfRetryCompletedDate: string | null = null;
-
 export async function runCodeforcesNow(
   reason: string,
   options: CodeforcesRunOptions = {},
 ): Promise<CodeforcesRunReport | null> {
   if (runInProgress) return null;
-  cfRetryNextPollAt = 0;
-  cfRetryCompletedDate = null;
+  resetCodeforcesRetryPollGate();
   return executeCodeforcesRun(reason, options);
 }
 
@@ -302,6 +307,7 @@ export async function executeCodeforcesRun(
     return buildCodeforcesReport({ date: todayInTimezone(), reason, startedAt: new Date().toISOString(), outcomes: [] });
   }
   runInProgress = true;
+  resetCodeforcesRetryPollGate();
   activeCodeforcesRangeAbortController = new AbortController();
   const signal = activeCodeforcesRangeAbortController.signal;
   const startedAt = new Date().toISOString();
@@ -1256,7 +1262,7 @@ export function isAfterCodeforcesSchedule(
   return currentHour * 60 + currentMinute > hour * 60 + minute;
 }
 
-async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minute: number, timezone: string): Promise<void> {
+export async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minute: number, timezone: string): Promise<void> {
   if (runInProgress) return;
   if (isLeetCodeBusy() || isCodeChefRunInProgress()) {
     logger.info('LeetCode or CodeChef is currently running; deferring Codeforces execution to protect memory');
@@ -1265,17 +1271,23 @@ async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minut
   if (isRetry && !isAfterCodeforcesSchedule(new Date(), hour, minute, timezone)) return;
 
   const date = todayInTimezone();
-  if (isRetry && process.env.NODE_ENV !== 'test' && (cfRetryCompletedDate === date || Date.now() < cfRetryNextPollAt)) {
+  const gate = getCodeforcesRetryPollGate();
+  if (isRetry && process.env.NODE_ENV !== 'test' && (gate.completedDate === date || Date.now() < gate.nextPollAt)) {
     return;
   }
   const state = await readCodeforcesDailyState(date);
   if (isRetry && state.retryCount >= CODEFORCES_DAILY_RETRY_LIMIT) {
-    cfRetryCompletedDate = date;
-    cfRetryNextPollAt = Date.now() + 60 * 60_000;
+    setCodeforcesRetryCompletedDate(date);
+    setCodeforcesRetryNextPollAt(Date.now() + 60 * 60_000);
     return;
   }
 
   const accountIds = await loadEnabledAccountIds();
+  if (accountIds.length === 0) {
+    // Cool down for 60m on empty DB without latching the whole day so new accounts wake retries.
+    setCodeforcesRetryNextPollAt(Date.now() + 60 * 60_000);
+    return;
+  }
   const completed = new Set(state.completedAccountIds);
   const browserAttempted = new Set(state.browserAttemptedAccountIds);
   // A normal daily submission gets one browser delivery. The browser path
@@ -1283,8 +1295,8 @@ async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minut
   // only retry failures that occurred before any proxy browser was opened.
   const pendingIds = accountIds.filter((id) => !completed.has(id) && !browserAttempted.has(id));
   if (pendingIds.length === 0) {
-    cfRetryCompletedDate = date;
-    cfRetryNextPollAt = Date.now() + 60 * 60_000;
+    setCodeforcesRetryCompletedDate(date);
+    setCodeforcesRetryNextPollAt(Date.now() + 60 * 60_000);
     return;
   }
 

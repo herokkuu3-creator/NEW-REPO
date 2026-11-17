@@ -24,6 +24,9 @@ import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { config } from '../config';
 import { logger } from '../logger';
+import { invalidateHealthCache } from '../api/healthCache';
+import { resetDailyRetryPollGate } from '../scheduler/dailyRetryGate';
+import { resetCodeforcesRetryPollGate } from '../codeforces/retryGate';
 
 export interface AccountRefreshOutcome {
   site: 'leetcode' | 'codeforces';
@@ -121,6 +124,8 @@ export async function refreshLeetCodeAccount(account: LeetCodeRefreshAccount): P
       username: loginRes.username ?? creds.username,
       status: AccountStatus.ACTIVE,
     });
+    invalidateHealthCache();
+    resetDailyRetryPollGate();
     logger.info({ label: account.label }, 'LeetCode auto-relogin succeeded; storageState updated in DB');
     return {
       site: 'leetcode',
@@ -205,6 +210,7 @@ export async function refreshCodeforcesAccount(account: CodeforcesRefreshAccount
       username: loginRes.handle ?? creds.username,
       status: CodeforcesAccountStatus.ACTIVE,
     });
+    resetCodeforcesRetryPollGate();
     logger.info({ label: account.label }, 'Codeforces auto-relogin succeeded; storageState updated in DB');
     return {
       site: 'codeforces',

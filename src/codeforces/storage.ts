@@ -1,5 +1,6 @@
 import { CodeforcesAccount, CodeforcesAccountStatus, CodeforcesProgress } from '@prisma/client';
 import { prisma } from '../database/prisma';
+import { resetCodeforcesRetryPollGate } from './retryGate';
 
 export type CodeforcesAccountRecord = CodeforcesAccount;
 export type CodeforcesAccountSummary = Pick<
@@ -234,6 +235,7 @@ export async function saveCodeforcesAccount(
     }
   }
 
+  resetCodeforcesRetryPollGate();
   return account;
 }
 

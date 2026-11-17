@@ -11,6 +11,7 @@ import {
   listCodeforcesAccounts,
   saveCodeforcesAccount,
 } from './storage';
+import { resetCodeforcesRetryPollGate } from './retryGate';
 
 export type SessionSite = 'leetcode' | 'codeforces' | 'unknown';
 
@@ -179,6 +180,7 @@ export async function ingestCodeforcesSession(
     username: validation.username,
     status: CodeforcesAccountStatus.ACTIVE,
   });
+  resetCodeforcesRetryPollGate();
 
   logger.info(
     { label, username: validation.username, cookies: parsed.storageState.cookies.length, format: parsed.format },

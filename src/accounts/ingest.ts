@@ -8,6 +8,7 @@ import {
   resolveAccountLabel,
 } from '../browser/sessionIdentity';
 import type { ValidationOutcome } from '../browser/sessionRenewal';
+import { resetDailyRetryPollGate } from '../scheduler/dailyRetryGate';
 
 /**
  * Cookie ingestion — the ONE path every cookie upload takes (Telegram file,
@@ -76,6 +77,11 @@ export async function ingestStorageState(
   );
 
   const previous = existing.find((a) => a.label === label);
+  const persistAccount = async (username: string | undefined, status: AccountStatus) => {
+    const saved = await saveAccount(label, JSON.stringify(state), { username, status });
+    resetDailyRetryPollGate();
+    return saved;
+  };
 
   // If validating live (or replacing an existing account during a validated renewal), verify
   // before overwriting any stored session so a bad upload never clobbers an existing session.
@@ -84,10 +90,7 @@ export async function ingestStorageState(
       if (!isNew) {
         return { ok: false, error: 'Session token is expired; stored session retained.' };
       }
-      const account = await saveAccount(label, JSON.stringify(state), {
-        username: identity.username,
-        status: AccountStatus.UNKNOWN,
-      });
+      const account = await persistAccount(identity.username, AccountStatus.UNKNOWN);
       const detail = 'the session token is past its expiry date — capture fresh cookies';
       await patchAccount(account.id, { status: AccountStatus.EXPIRED, lastError: detail, checked: true });
       return {
@@ -112,10 +115,7 @@ export async function ingestStorageState(
       if (!isNew) {
         return { ok: false, error: `${validation.error}; stored session retained.` };
       }
-      const account = await saveAccount(label, JSON.stringify(state), {
-        username: identity.username,
-        status: AccountStatus.UNKNOWN,
-      });
+      const account = await persistAccount(identity.username, AccountStatus.UNKNOWN);
       if (validation.reason === 'signed-out') {
         const detail =
           'LeetCode rejected this transferred session from the agent server — this does not by itself prove that the token has expired';
@@ -151,10 +151,7 @@ export async function ingestStorageState(
     ) {
       return { ok: false, error: 'Authenticated username does not match the target account; stored session retained.' };
     }
-    const account = await saveAccount(label, JSON.stringify(state), {
-      username: validation.username,
-      status: AccountStatus.ACTIVE,
-    });
+    const account = await persistAccount(validation.username, AccountStatus.ACTIVE);
     if (account?.id) {
       await patchAccount(account.id, {
         username: validation.username,
@@ -178,10 +175,7 @@ export async function ingestStorageState(
   // 1) STORE first — new label = add, existing label = override the cookies.
   // Normal capture uploads do NOT perform a Render-side live check. This keeps
   // a cross-network session rejection from being misreported as token expiry.
-  const account = await saveAccount(label, JSON.stringify(state), {
-    username: identity.username,
-    status: AccountStatus.UNKNOWN,
-  });
+  const account = await persistAccount(identity.username, AccountStatus.UNKNOWN);
   logger.info(
     { label, created: isNew, username: identity.username ?? null, cookies: state.cookies.length, format },
     isNew ? 'account added from cookies' : 'account cookies overridden',

@@ -7,6 +7,7 @@ import { approvePost } from './store';
 import { publishPost, reconcilePost, reserveBrowserPublication, inspectPublication } from './publisher';
 import { runCombined, setSelectedAccounts, POST_CRON, POST_TIMEZONE, runScheduledSolutionPosts,
   isScheduledSolutionRunInProgress, SCHEDULE_STATE_KEY } from './scheduler';
+import { notifySolutionPostSchedulerWork } from './schedulerGate';
 import {
   BIWEEKLY_CONTEST_CRON,
   CONTEST_TIMEZONE,
@@ -114,6 +115,7 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     scoped.post('/admin/solutions/scheduled', async (req, reply) => {
       z.object({}).strict().parse(req.body ?? {});
       if (isScheduledSolutionRunInProgress()) return reply.code(202).send({ status: 'ALREADY_RUNNING' });
+      notifySolutionPostSchedulerWork();
       // Return before a cold-start proxy timeout. Durable diagnostics record completion.
       void runScheduledSolutionPosts();
       return reply.code(202).send({ status: 'ACCEPTED', cron: POST_CRON, timezone: POST_TIMEZONE });
