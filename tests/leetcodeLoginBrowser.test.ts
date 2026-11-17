@@ -6,12 +6,18 @@ import {
   detectVerificationDetail,
   type LoginState,
 } from '../src/leetcode/auth';
+import { initCapzyKeys } from '../src/codeforces/capzyKeyManager';
 
 let browser: Browser;
 let page: Page;
 beforeAll(async () => { browser = await chromium.launch({ headless: true }); });
 beforeEach(async () => { page = await browser.newPage(); });
-afterEach(async () => { vi.restoreAllMocks(); await page.context().close(); });
+afterEach(async () => {
+  initCapzyKeys([], 0);
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  await page.context().close();
+});
 afterAll(async () => { await browser.close(); });
 
 describe('LeetCode login using an owned browser fixture', () => {
@@ -353,44 +359,46 @@ describe('LeetCode login using an owned browser fixture', () => {
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
 
-    const { initCapzyKeys } = await import('../src/codeforces/capzyKeyManager');
-    initCapzyKeys(['capzy_test_fixture_00000000000000000000000000000000'], 0);
+    try {
+      initCapzyKeys(['capzy_test_fixture_00000000000000000000000000000000'], 0);
 
-    await page.route('https://leetcode.com/**', route => {
-      route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        body: `
-          <html>
-            <body>
-              <div>
-                <input type="hidden" name="cf-turnstile-response" id="cf-chl-widget-nositekey_response">
-              </div>
-              <form id="login">
-                <input id="id_login">
-                <input id="id_password" type="password">
-                <button type="submit">Sign In</button>
-              </form>
-            </body>
-          </html>
-        `,
+      await page.route('https://leetcode.com/**', route => {
+        route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: `
+            <html>
+              <body>
+                <div>
+                  <input type="hidden" name="cf-turnstile-response" id="cf-chl-widget-nositekey_response">
+                </div>
+                <form id="login">
+                  <input id="id_login">
+                  <input id="id_password" type="password">
+                  <button type="submit">Sign In</button>
+                </form>
+              </body>
+            </html>
+          `,
+        });
       });
-    });
 
-    const result = await loginOnLeetCodePage(page, 'black_sheep_7', 'test-password', {
-      timeoutMs: 3000,
-    });
+      const result = await loginOnLeetCodePage(page, 'black_sheep_7', 'test-password', {
+        timeoutMs: 3000,
+      });
 
-    expect(result.ok).toBe(false);
-    expect(result.code).toBe('VERIFICATION_REQUIRED');
-    expect(result.diagnostic?.providerErrorCode).toBe('MISSING_TURNSTILE_SITEKEY');
-    expect(result.diagnostic?.providerErrorCategory).toBe('INVALID_REQUEST_CONFIGURATION');
-    expect(fetchSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining('api.capzy.ai'),
-      expect.anything(),
-    );
-    initCapzyKeys([], 0);
-    vi.unstubAllGlobals();
+      expect(result.ok).toBe(false);
+      expect(result.code).toBe('VERIFICATION_REQUIRED');
+      expect(result.diagnostic?.providerErrorCode).toBe('MISSING_TURNSTILE_SITEKEY');
+      expect(result.diagnostic?.providerErrorCategory).toBe('INVALID_REQUEST_CONFIGURATION');
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('api.capzy.ai'),
+        expect.anything(),
+      );
+    } finally {
+      initCapzyKeys([], 0);
+      vi.unstubAllGlobals();
+    }
   });
 
   it('extracts LeetCode Turnstile sitekey from challenges.cloudflare.com resource entries instead of universal fallback', async () => {

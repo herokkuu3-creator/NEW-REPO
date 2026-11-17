@@ -60,6 +60,8 @@ export function createLLMProvider(): LLMProvider {
         model: config.llm.model,
         baseUrl: config.llm.baseUrl || undefined,
         timeoutMs: config.llm.timeoutMs,
+        maxTokens: config.llm.maxTokens,
+        temperature: config.llm.temperature,
       });
     default:
       throw new LLMError(

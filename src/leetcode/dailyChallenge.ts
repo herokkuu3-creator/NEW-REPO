@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { LeetCodeApi } from './apiClient';
+import { LeetCodeApi, LeetCodeHttpError } from './apiClient';
 import { logger } from '../logger';
 
 /**
@@ -26,24 +26,26 @@ const dailySchema = z.object({
 });
 
 const questionSchema = z.object({
-  question: z.object({
-    questionId: z.string(),
-    questionFrontendId: z.string(),
-    title: z.string(),
-    titleSlug: z.string(),
-    difficulty: z.string(),
-    content: z.string().nullable(),
-    exampleTestcases: z.string().nullable(),
-    metaData: z.string().nullable(),
-    codeSnippets: z
-      .array(z.object({ lang: z.string(), langSlug: z.string(), code: z.string() }))
-      .nullable(),
-    topicTags: z
-      .array(z.object({ name: z.string(), slug: z.string() }))
-      .nullable()
-      .optional(),
-    isPaidOnly: z.boolean(),
-  }),
+  question: z
+    .object({
+      questionId: z.string().nullable(),
+      questionFrontendId: z.string(),
+      title: z.string(),
+      titleSlug: z.string(),
+      difficulty: z.string(),
+      content: z.string().nullable(),
+      exampleTestcases: z.string().nullable(),
+      metaData: z.string().nullable(),
+      codeSnippets: z
+        .array(z.object({ lang: z.string(), langSlug: z.string(), code: z.string() }))
+        .nullable(),
+      topicTags: z
+        .array(z.object({ name: z.string(), slug: z.string() }))
+        .nullable()
+        .optional(),
+      isPaidOnly: z.boolean(),
+    })
+    .nullable(),
 });
 
 const DAILY_QUERY = `
@@ -145,6 +147,9 @@ export async function fetchQuestionData(
 ): Promise<RawQuestionData> {
   const data = await api.graphql(QUESTION_QUERY, { titleSlug: slug }, questionSchema);
   const q = data.question;
+  if (!q) {
+    throw new LeetCodeHttpError(`Question not found: ${slug}`, 404);
+  }
 
   let metaData: Record<string, unknown> | null = null;
   if (q.metaData) {

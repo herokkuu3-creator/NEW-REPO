@@ -100,27 +100,29 @@ export async function launchWithPersistentProfile(): Promise<BrowserSession | nu
     logger.warn({ profilePath }, 'persistent browser profile not found');
     return null;
   }
+  let context: BrowserContext | null = null;
   try {
     const isHeadless = config.browser.headless;
-    const context = await chromium.launchPersistentContext(profilePath, {
+    const activeContext = (context = await chromium.launchPersistentContext(profilePath, {
       headless: isHeadless,
       args: buildLaunchArgs(isHeadless),
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
       serviceWorkers: 'allow',
-    });
-    await applyStealthScripts(context, 'chromium');
+    }));
+    await applyStealthScripts(activeContext, 'chromium');
     const browserLogs: string[] = [];
-    const page = await openPageWithCapture(context, browserLogs);
+    const page = await openPageWithCapture(activeContext, browserLogs);
     logger.info({ profilePath }, 'launched persistent Chromium profile');
     return {
-      context,
+      context: activeContext,
       page,
       mode: 'profile',
       browserLogs,
-      close: () => context.close(),
+      close: () => activeContext.close().catch(() => undefined),
     };
   } catch (err) {
+    await context?.close().catch(() => undefined);
     logger.error(
       { err: err instanceof Error ? err.message : String(err) },
       'failed to launch persistent profile — will try storageState fallback',
@@ -141,35 +143,39 @@ export async function launchWithStorageState(): Promise<BrowserSession | null> {
     logger.warn('no storageState available (neither file nor database copy)');
     return null;
   }
+  let browser: Browser | null = null;
+  let context: BrowserContext | null = null;
   try {
     const isHeadless = config.browser.headless;
-    const browser = await chromium.launch({
+    const activeBrowser = (browser = await chromium.launch({
       headless: isHeadless,
       args: buildLaunchArgs(isHeadless),
-    });
-    const context = await browser.newContext({
+    }));
+    const activeContext = (context = await activeBrowser.newContext({
       storageState: statePath,
       userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
       serviceWorkers: 'allow',
-    });
-    await applyStealthScripts(context, 'chromium');
+    }));
+    await applyStealthScripts(activeContext, 'chromium');
     const browserLogs: string[] = [];
-    const page = await openPageWithCapture(context, browserLogs);
+    const page = await openPageWithCapture(activeContext, browserLogs);
     logger.info({ statePath }, 'launched context from storageState');
     return {
-      context,
+      context: activeContext,
       page,
       mode: 'storage-state',
       browserLogs,
 
       close: async () => {
-        await context.close();
-        await browser.close();
+        await activeContext.close().catch(() => undefined);
+        await activeBrowser.close().catch(() => undefined);
       },
     };
   } catch (err) {
+    await context?.close().catch(() => undefined);
+    await browser?.close().catch(() => undefined);
     logger.error(
       { err: err instanceof Error ? err.message : String(err) },
       'failed to launch from storageState',
@@ -188,13 +194,15 @@ export async function launchWithStorageStateObject(
   state: StorageStateShape,
   label: string,
 ): Promise<BrowserSession | null> {
+  let browser: Browser | null = null;
+  let context: BrowserContext | null = null;
   try {
     const isHeadless = config.browser.headless;
-    const browser = await chromium.launch({
+    const activeBrowser = (browser = await chromium.launch({
       headless: isHeadless,
       args: buildLaunchArgs(isHeadless),
-    });
-    const context = await browser.newContext({
+    }));
+    const activeContext = (context = await activeBrowser.newContext({
       storageState: {
         cookies: state.cookies,
         origins: state.origins,
@@ -203,22 +211,24 @@ export async function launchWithStorageStateObject(
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
       serviceWorkers: 'allow',
-    });
-    await applyStealthScripts(context, 'chromium');
+    }));
+    await applyStealthScripts(activeContext, 'chromium');
     const browserLogs: string[] = [];
-    const page = await openPageWithCapture(context, browserLogs);
+    const page = await openPageWithCapture(activeContext, browserLogs);
     logger.info({ label }, 'launched context from account storageState');
     return {
-      context,
+      context: activeContext,
       page,
       mode: 'storage-state',
       browserLogs,
       close: async () => {
-        await context.close();
-        await browser.close();
+        await activeContext.close().catch(() => undefined);
+        await activeBrowser.close().catch(() => undefined);
       },
     };
   } catch (err) {
+    await context?.close().catch(() => undefined);
+    await browser?.close().catch(() => undefined);
     logger.error(
       { label, err: err instanceof Error ? err.message : String(err) },
       'failed to launch context from account storageState',
@@ -241,6 +251,7 @@ export async function launchFirefoxWithStorageStateObject(
   proxyUrl?: string,
 ): Promise<BrowserSession | null> {
   let browser: Browser | null = null;
+  let context: BrowserContext | null = null;
   const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
   try {
     const activeBrowser = (browser = await firefox.launch({
@@ -264,7 +275,7 @@ export async function launchFirefoxWithStorageStateObject(
         'dom.ipc.keepProcessesAlive.web': 0,
       },
     }));
-    const context = await activeBrowser.newContext({
+    const activeContext = (context = await activeBrowser.newContext({
       storageState: {
         cookies: state.cookies,
         origins: state.origins,
@@ -273,11 +284,11 @@ export async function launchFirefoxWithStorageStateObject(
       viewport: { width: 1366, height: 768 },
       locale: 'en-US',
       serviceWorkers: 'allow',
-    });
-    await applyStealthScripts(context, 'firefox');
+    }));
+    await applyStealthScripts(activeContext, 'firefox');
 
     // Omit decorative assets while preserving CSS and verification resources.
-    await context.route('**/*', async (route) => {
+    await activeContext.route('**/*', async (route) => {
       const type = route.request().resourceType();
       if (blockCodeforcesResource(route.request().url(), type)) {
         await route.abort();
@@ -287,20 +298,21 @@ export async function launchFirefoxWithStorageStateObject(
     });
 
     const browserLogs: string[] = [];
-    const page = await openPageWithCapture(context, browserLogs);
+    const page = await openPageWithCapture(activeContext, browserLogs);
     logger.info({ label }, 'launched Firefox context from account storageState');
     return {
-      context,
+      context: activeContext,
       page,
       mode: 'storage-state',
       browserLogs,
       close: async () => {
-        await context.close().catch(() => undefined);
+        await activeContext.close().catch(() => undefined);
         await activeBrowser.close().catch(() => undefined);
       },
     };
   } catch (err) {
-    // Without this, a context failure left the browser process running.
+    // Without this, a context/page failure left the browser process running.
+    await context?.close().catch(() => undefined);
     await browser?.close().catch(() => undefined);
     logger.error(
       { label, err: err instanceof Error ? err.message : String(err) },

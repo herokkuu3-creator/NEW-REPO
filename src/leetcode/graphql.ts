@@ -28,9 +28,20 @@ export async function leetcodeGraphQL<T>(
 ): Promise<T> {
   const result = await page.evaluate(
     async ({ query, variables }) => {
+      const csrfMatch = /(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie || '');
+      let csrf = '';
+      if (csrfMatch?.[1]) {
+        try {
+          csrf = decodeURIComponent(csrfMatch[1].trim());
+        } catch {
+          csrf = csrfMatch[1].trim();
+        }
+      }
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (csrf) headers['x-csrftoken'] = csrf;
       const res = await fetch('https://leetcode.com/graphql', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         credentials: 'include',
         body: JSON.stringify({ query, variables }),
       });

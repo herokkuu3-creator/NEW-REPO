@@ -102,14 +102,25 @@ const ENTITY_MAP: Record<string, string> = {
 };
 
 export function decodeEntities(text: string): string {
-  let out = text;
-  for (const [entity, char] of Object.entries(ENTITY_MAP)) {
-    out = out.split(entity).join(char);
-  }
-  out = out.replace(/&#(\d+);/g, (_, code: string) =>
-    String.fromCodePoint(Number.parseInt(code, 10)),
+  return text.replace(
+    /&(?:nbsp|amp|lt|gt|quot|apos|times|le|ge|ne|minus|hellip|#\d+|#[xX][0-9a-fA-F]+);/g,
+    (entity) => {
+      if (entity in ENTITY_MAP) return ENTITY_MAP[entity]!;
+      if (entity.startsWith('&#x') || entity.startsWith('&#X')) {
+        const cp = Number.parseInt(entity.slice(3, -1), 16);
+        return Number.isFinite(cp) && cp >= 0 && cp <= 0x10ffff
+          ? String.fromCodePoint(cp)
+          : entity;
+      }
+      if (entity.startsWith('&#')) {
+        const cp = Number.parseInt(entity.slice(2, -1), 10);
+        return Number.isFinite(cp) && cp >= 0 && cp <= 0x10ffff
+          ? String.fromCodePoint(cp)
+          : entity;
+      }
+      return entity;
+    },
   );
-  return out;
 }
 
 export function extractExamples(text: string): ParsedExample[] {

@@ -37,14 +37,22 @@ type TryResult = AuthenticatedSession | 'cf' | null;
 async function trySession(session: BrowserSession | null): Promise<TryResult> {
   if (!session) return null;
 
-  const api = new LeetCodeApi(session.context);
-  const check = await checkSession(api);
-  if (!check.authenticated || !check.username) {
-    await session.close().catch(() => undefined);
-    return null;
-  }
+  try {
+    const api = new LeetCodeApi(session.context);
+    const check = await checkSession(api);
+    if (!check.authenticated || !check.username) {
+      await session.close().catch(() => undefined);
+      if (check.challenged) {
+        return await reportChallenge(new Error('LeetCode session check challenged'));
+      }
+      return null;
+    }
 
-  return { session, api, username: check.username };
+    return { session, api, username: check.username };
+  } catch (err) {
+    await session.close().catch(() => undefined);
+    throw err;
+  }
 }
 
 async function reportChallenge(err: unknown): Promise<'cf'> {
@@ -82,7 +90,16 @@ export async function establishAuthenticatedSession(): Promise<AuthOutcome> {
   logger.warn('persistent profile authentication failed — trying storageState fallback');
 
   // 2) storageState fallback (the normal path on Render's free tier)
-  const fallback = await trySession(await launchWithStorageState());
+  let fallback: TryResult;
+  try {
+    fallback = await trySession(await launchWithStorageState());
+  } catch (err) {
+    if (looksLikeChallenge(err)) {
+      await reportChallenge(err);
+      return { ok: false, reason: 'CLOUDFLARE_VERIFICATION_REQUIRED' };
+    }
+    throw err;
+  }
   if (fallback === 'cf') {
     return { ok: false, reason: 'CLOUDFLARE_VERIFICATION_REQUIRED' };
   }

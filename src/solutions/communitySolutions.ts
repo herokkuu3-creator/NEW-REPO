@@ -127,9 +127,20 @@ export async function executeLeetCodeGraphQL<T>(
     try {
       const evalResult = await options.page.evaluate(
         async ({ query, variables }) => {
+          const csrfMatch = /(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie || '');
+          let csrf = '';
+          if (csrfMatch?.[1]) {
+            try {
+              csrf = decodeURIComponent(csrfMatch[1].trim());
+            } catch {
+              csrf = csrfMatch[1].trim();
+            }
+          }
+          const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+          if (csrf) headers['x-csrftoken'] = csrf;
           const res = await fetch('https://leetcode.com/graphql', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers,
             credentials: 'include',
             body: JSON.stringify({ query, variables }),
           });
@@ -235,7 +246,10 @@ function isValidSqlCandidate(code: string): boolean {
 function starterIdentifierForLanguage(starterCode: string, language: string): string | null {
   if (!starterCode) return null;
   if (language === 'cpp') {
-    const m = /\b(?:[\w:<>,\[\]&*]+\s+)+([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(starterCode);
+    const cleaned = starterCode
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/\/\/[^\n]*/g, ' ');
+    const m = /\b(?:(?:[\w<>\[\],]|::)+(?:\s+|[\s*&]+))+[\s*&]*([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(cleaned);
     return m?.[1] ?? null;
   }
   if (language === 'python3' || language === 'python' || language === 'pythondata') {
@@ -545,6 +559,27 @@ const articleContentCache = new Map<string, CachedArticleContent>();
 
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 const EMPTY_LIST_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_ARTICLE_CONTENT_CACHE = 250;
+const MAX_ARTICLE_LIST_CACHE = 500;
+const MAX_SLUG_BY_NUMBER_CACHE = 2000;
+
+function evictTimedCache<T extends { timestamp: number }>(
+  cache: Map<string, T>,
+  maxSize: number,
+  ttlOf: (entry: T) => number,
+  now = Date.now(),
+): void {
+  for (const [key, entry] of cache.entries()) {
+    if (now - entry.timestamp >= ttlOf(entry)) {
+      cache.delete(key);
+    }
+  }
+  while (cache.size >= maxSize) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) break;
+    cache.delete(oldestKey);
+  }
+}
 
 export function clearCommunitySolutionsCache(): void {
   articleListCache.clear();
@@ -574,9 +609,17 @@ export async function fetchCommunityArticleList(
   const langTag = language === 'cpp' ? 'cpp' : language === 'python3' ? 'python3' : language;
   const cacheKey = `${questionSlug}:${langTag}:${maxArticles}`;
 
+  const now = Date.now();
+  const listTtl = (entry: CachedArticleList) =>
+    entry.edges.length ? CACHE_TTL_MS : EMPTY_LIST_CACHE_TTL_MS;
   const cached = articleListCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < (cached.edges.length ? CACHE_TTL_MS : EMPTY_LIST_CACHE_TTL_MS)) {
-    return cached.edges;
+  if (cached) {
+    if (now - cached.timestamp < listTtl(cached)) {
+      articleListCache.delete(cacheKey);
+      articleListCache.set(cacheKey, cached);
+      return cached.edges;
+    }
+    articleListCache.delete(cacheKey);
   }
 
   // 1. Fetch solution articles tagged with the target language (and close tag aliases like sql/pandas)
@@ -628,6 +671,8 @@ export async function fetchCommunityArticleList(
   }
 
   if (edges.length > 0 || confirmedEmpty) {
+    articleListCache.delete(cacheKey);
+    evictTimedCache(articleListCache, MAX_ARTICLE_LIST_CACHE, listTtl);
     articleListCache.set(cacheKey, { timestamp: Date.now(), edges });
   }
 
@@ -641,9 +686,15 @@ export async function fetchArticleContent(
   uuid: string,
   options?: FetchCommunitySolutionOptions,
 ): Promise<string | null> {
+  const now = Date.now();
   const cached = articleContentCache.get(uuid);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    return cached.content;
+  if (cached) {
+    if (now - cached.timestamp < CACHE_TTL_MS) {
+      articleContentCache.delete(uuid);
+      articleContentCache.set(uuid, cached);
+      return cached.content;
+    }
+    articleContentCache.delete(uuid);
   }
 
   const artData = await executeLeetCodeGraphQL<UgcArticleResponse>(
@@ -653,6 +704,8 @@ export async function fetchArticleContent(
   );
   const content = artData.ugcArticleSolutionArticle?.content ?? null;
   if (content) {
+    articleContentCache.delete(uuid);
+    evictTimedCache(articleContentCache, MAX_ARTICLE_CONTENT_CACHE, () => CACHE_TTL_MS);
     articleContentCache.set(uuid, { timestamp: Date.now(), content });
   }
   return content;
@@ -817,7 +870,11 @@ export async function resolveLeetCodeSlugByNumber(
   options?: FetchCommunitySolutionOptions,
 ): Promise<string | null> {
   const cached = slugByNumberCache.get(questionNumber);
-  if (cached) return cached;
+  if (cached) {
+    slugByNumberCache.delete(questionNumber);
+    slugByNumberCache.set(questionNumber, cached);
+    return cached;
+  }
 
   const targetStr = String(questionNumber);
   try {
@@ -845,6 +902,12 @@ export async function resolveLeetCodeSlugByNumber(
     const questions = data.problemsetQuestionList?.questions ?? [];
     const matched = questions.find((q) => q.frontendQuestionId === targetStr);
     if (matched?.titleSlug) {
+      slugByNumberCache.delete(questionNumber);
+      while (slugByNumberCache.size >= MAX_SLUG_BY_NUMBER_CACHE) {
+        const oldestKey = slugByNumberCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        slugByNumberCache.delete(oldestKey);
+      }
       slugByNumberCache.set(questionNumber, matched.titleSlug);
       logger.info(
         { questionNumber, slug: matched.titleSlug, title: matched.title },

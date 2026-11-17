@@ -446,9 +446,9 @@ export async function submitViaPageFetch(
     );
   }
 
-  let parsed: { submission_id?: number; error?: string };
+  let parsed: { submission_id?: number | string; error?: string };
   try {
-    parsed = JSON.parse(response.text) as { submission_id?: number; error?: string };
+    parsed = JSON.parse(response.text) as { submission_id?: number | string; error?: string };
   } catch {
     const detail = summarizeHttpErrorBody(response.text);
     throw new LeetCodeHttpError(
@@ -462,11 +462,15 @@ export async function submitViaPageFetch(
     if (isSubmissionLimitError(err)) throw err;
     throw err;
   }
-  if (typeof parsed.submission_id !== 'number') {
+  const rawId = parsed.submission_id;
+  const isValidId =
+    (typeof rawId === 'number' && Number.isSafeInteger(rawId) && rawId > 0) ||
+    (typeof rawId === 'string' && /^[1-9]\d*$/.test(rawId));
+  if (!isValidId) {
     throw new LeetCodeHttpError('submit response contained no submission_id', 200);
   }
 
-  return String(parsed.submission_id);
+  return String(rawId);
 }
 
 async function waitForPassiveChallengeSettle(
@@ -583,48 +587,53 @@ export async function openGhostBrowserSession(
 
           if (!browser || !browser.isConnected() || !context || !page || pageCrashed || page.isClosed()) {
             await closeResources();
-            const headless = config.browser.headless;
-            browser = await chromium.launch({
-              headless,
-              args: buildLaunchArgs(headless),
-              proxy,
-            });
-            const cleanedCookies = pruneExpiredCookies(currentState.cookies ?? []);
-            context = await browser.newContext({
-              userAgent,
-              viewport: getRandomDesktopViewport(),
-              locale: 'en-US',
-              storageState: {
-                cookies: cleanedCookies as never,
-                origins: (currentState.origins ?? []) as never,
-              },
-            });
-            await applyStealthScripts(context, 'chromium');
-            await context.route('**/*', async (route) => {
-              if (
-                blockNonEssentialProblemAssets(route.request().url(), route.request().resourceType())
-              ) {
-                return route.abort().catch(() => undefined);
-              }
-              return route.continue().catch(() => undefined);
-            });
-            page = await context.newPage();
-            await installTurnstileMetadataHook(page);
-            const ghostPage = page;
-            page.on('response', (response) => {
-              try {
-                const match = TURNSTILE_URL_SITEKEY_RE.exec(response.url());
-                if (match?.[1]) {
-                  observedGhostTurnstileSitekey.set(ghostPage, match[1]);
+            try {
+              const headless = config.browser.headless;
+              browser = await chromium.launch({
+                headless,
+                args: buildLaunchArgs(headless),
+                proxy,
+              });
+              const cleanedCookies = pruneExpiredCookies(currentState.cookies ?? []);
+              context = await browser.newContext({
+                userAgent,
+                viewport: getRandomDesktopViewport(),
+                locale: 'en-US',
+                storageState: {
+                  cookies: cleanedCookies as never,
+                  origins: (currentState.origins ?? []) as never,
+                },
+              });
+              await applyStealthScripts(context, 'chromium');
+              await context.route('**/*', async (route) => {
+                if (
+                  blockNonEssentialProblemAssets(route.request().url(), route.request().resourceType())
+                ) {
+                  return route.abort().catch(() => undefined);
                 }
-              } catch {}
-            });
-            pageCrashed = false;
-            page.on('crash', () => {
-              pageCrashed = true;
+                return route.continue().catch(() => undefined);
+              });
+              page = await context.newPage();
+              await installTurnstileMetadataHook(page);
+              const ghostPage = page;
+              page.on('response', (response) => {
+                try {
+                  const match = TURNSTILE_URL_SITEKEY_RE.exec(response.url());
+                  if (match?.[1]) {
+                    observedGhostTurnstileSitekey.set(ghostPage, match[1]);
+                  }
+                } catch {}
+              });
+              pageCrashed = false;
+              page.on('crash', () => {
+                pageCrashed = true;
+                hasSettledProblemPage = false;
+              });
               hasSettledProblemPage = false;
-            });
-            hasSettledProblemPage = false;
+            } catch (launchErr) {
+              await closeResources();
+              throw launchErr;
+            }
           }
 
           const activePage = page;

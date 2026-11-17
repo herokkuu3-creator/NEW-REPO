@@ -111,14 +111,18 @@ function pruneStaleSessions(now = Date.now()): void {
   for (const [token, session] of pairingSessions.entries()) {
     if (session.status === 'pending' && now >= session.expiresAt) {
       session.status = 'expired';
+      session.password = undefined;
     }
     if (now - session.createdAt > 60 * 60 * 1000) {
+      session.password = undefined;
       pairingSessions.delete(token);
     }
   }
   while (pairingSessions.size > MAX_ACTIVE_PAIRING_SESSIONS) {
     const oldestKey = pairingSessions.keys().next().value;
     if (!oldestKey) break;
+    const oldestSession = pairingSessions.get(oldestKey);
+    if (oldestSession) oldestSession.password = undefined;
     pairingSessions.delete(oldestKey);
   }
 }
@@ -434,12 +438,23 @@ export async function completeLeetCodePairingSession(
 
   if (ingestResult.status === AccountStatus.ACTIVE) {
     const verifiedUsername = ingestResult.username || localVerifiedUsername || pendingIdentifier || ingestResult.label;
+    const localVsServerMismatch = Boolean(
+      localVerifiedUsername &&
+        ingestResult.username &&
+        localVerifiedUsername.trim().toLowerCase() !== ingestResult.username.trim().toLowerCase(),
+    );
+    const normalizedPendingId = pendingIdentifier?.trim();
+    const pendingIdentifierMatches =
+      !normalizedPendingId ||
+      normalizedPendingId.includes('@') ||
+      (Boolean(ingestResult.username) &&
+        normalizedPendingId.toLowerCase() === ingestResult.username!.trim().toLowerCase());
     await clearLeetCodeLoginCooldown(ingestResult.label).catch(() => undefined);
     if (hasRecoveryService()) {
       await getRecoveryService().cancelByLabel(ingestResult.label).catch(() => undefined);
     }
     let savedCreds = false;
-    if (pendingPassword) {
+    if (pendingPassword && !localVsServerMismatch && pendingIdentifierMatches) {
       await saveEncryptedCredentials('leetcode', ingestResult.label, {
         username: verifiedUsername,
         password: pendingPassword,
@@ -455,7 +470,11 @@ export async function completeLeetCodePairingSession(
       `• Account label: <code>${escapeHtml(ingestResult.label)}</code>`,
       `• Account status: <b>ACTIVE</b> (verified live on Render via LeetCode GraphQL <code>userStatus</code>)`,
       ...(localVerifiedUsername
-        ? [`• Local companion check: <code>${escapeHtml(localVerifiedUsername)}</code> (matched server)`]
+        ? [
+            localVsServerMismatch
+              ? `• Local companion check: <code>${escapeHtml(localVerifiedUsername)}</code> (differs from server-verified <code>${escapeHtml(verifiedUsername)}</code>)`
+              : `• Local companion check: <code>${escapeHtml(localVerifiedUsername)}</code> (matched server)`,
+          ]
         : []),
       ...(savedCreds
         ? ['• Encrypted credentials saved (AES-256-GCM) for automated session refresh.']
@@ -487,7 +506,7 @@ export async function completeLeetCodePairingSession(
       localVerifiedUsername,
       accountStatus: AccountStatus.ACTIVE,
       serverVerified: true,
-      localVsServerMismatch: false,
+      localVsServerMismatch,
       cookieCount: ingestResult.cookieCount,
       detail: ingestResult.detail,
       telegramMessage,

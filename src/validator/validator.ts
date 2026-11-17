@@ -45,12 +45,12 @@ export function extractCode(raw: string, language?: string): string | null {
   let text = raw.trim();
 
   // Full fenced block(s): take the first complete fence body.
-  const fence = /```(?:[a-zA-Z0-9_+-]*)\s*\n([\s\S]*?)```/.exec(text);
+  const fence = /```[^\r\n]*\r?\n([\s\S]*?)```/.exec(text);
   if (fence && fence[1]) {
     text = fence[1].trim();
   } else {
     // Stray fence markers without a pair — strip them.
-    text = text.replace(/```[a-zA-Z0-9_+-]*/g, '').trim();
+    text = text.replace(/```(?:[^\r\n]*?(?=\r?\n)|[a-zA-Z0-9_+-]*)/g, '').trim();
   }
 
   const lang = language?.trim().toLowerCase();

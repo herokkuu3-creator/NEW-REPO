@@ -41,16 +41,16 @@ export class GeminiProvider implements LLMProvider {
   private readonly temperature?: number;
 
   constructor(opts: GeminiProviderOptions) {
-    if (!opts.apiKey) {
+    if (!opts.apiKey || !opts.apiKey.trim()) {
       throw new LLMError(
         'GEMINI_API_KEY (or LLM_API_KEY) is required for the gemini provider',
         'gemini',
       );
     }
-    if (!opts.model) {
+    if (!opts.model || !opts.model.trim()) {
       throw new LLMError('LLM_MODEL is required for the gemini provider', 'gemini');
     }
-    this.model = opts.model;
+    this.model = opts.model.trim();
     this.reasoningEffort = opts.reasoningEffort;
     this.maxTokens = opts.maxTokens ?? 8192;
     this.temperature = opts.temperature;
@@ -83,9 +83,12 @@ export class GeminiProvider implements LLMProvider {
       (params as unknown as Record<string, unknown>).reasoning_effort = this.reasoningEffort;
     }
 
+    const requestOptions =
+      options.timeoutMs !== undefined ? { timeout: options.timeoutMs } : undefined;
+
     for (let attempt = 0; ; attempt++) {
       try {
-        const completion = await this.client.chat.completions.create(params);
+        const completion = await this.client.chat.completions.create(params, requestOptions);
         const text = completion.choices[0]?.message?.content;
         if (!text || !text.trim()) {
           throw new LLMError(

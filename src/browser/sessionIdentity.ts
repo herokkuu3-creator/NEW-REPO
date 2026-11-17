@@ -35,13 +35,10 @@ function decodeBase64Url(part: string): string | null {
   }
 }
 
-export function extractSessionIdentity(
-  state: StorageStateShape,
-  nowSeconds: number = Date.now() / 1000,
+function parseSessionCookie(
+  cookie: StorageStateShape['cookies'][number],
+  nowSeconds: number,
 ): SessionIdentity {
-  const cookie = state.cookies.find((c) => c.name === 'LEETCODE_SESSION');
-  if (!cookie) return { expired: false };
-
   const expiries: number[] = [];
   // Cookie-level expiry (-1 / 0 = session cookie, no information).
   if (typeof cookie.expires === 'number' && cookie.expires > 0) expiries.push(cookie.expires);
@@ -74,6 +71,44 @@ export function extractSessionIdentity(
     expiresAt,
     expired: expiresAt !== undefined && expiresAt < nowSeconds,
   };
+}
+
+export function extractSessionIdentity(
+  state: StorageStateShape,
+  nowSeconds: number = Date.now() / 1000,
+): SessionIdentity {
+  const candidates: Array<{ identity: SessionIdentity; index: number }> = [];
+  for (let i = 0; i < state.cookies.length; i++) {
+    const cookie = state.cookies[i];
+    if (cookie?.name === 'LEETCODE_SESSION') {
+      candidates.push({ identity: parseSessionCookie(cookie, nowSeconds), index: i });
+    }
+  }
+  if (candidates.length === 0) return { expired: false };
+
+  candidates.sort((a, b) => {
+    if (a.identity.expired !== b.identity.expired) return a.identity.expired ? 1 : -1;
+    if (
+      a.identity.expiresAt !== undefined &&
+      b.identity.expiresAt !== undefined &&
+      a.identity.expiresAt !== b.identity.expiresAt
+    ) {
+      return b.identity.expiresAt - a.identity.expiresAt;
+    }
+    if (
+      a.identity.refreshedAt !== undefined &&
+      b.identity.refreshedAt !== undefined &&
+      a.identity.refreshedAt !== b.identity.refreshedAt
+    ) {
+      return b.identity.refreshedAt - a.identity.refreshedAt;
+    }
+    const aHasExpiry = a.identity.expiresAt !== undefined || a.identity.refreshedAt !== undefined;
+    const bHasExpiry = b.identity.expiresAt !== undefined || b.identity.refreshedAt !== undefined;
+    if (aHasExpiry !== bHasExpiry) return aHasExpiry ? -1 : 1;
+    return b.index - a.index;
+  });
+
+  return candidates[0]!.identity;
 }
 
 /** Account-label rules shared by the API and the Telegram bot. */

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { logger } from '../logger';
-import { LeetCodeApi } from '../leetcode/apiClient';
+import { LeetCodeApi, looksLikeChallenge } from '../leetcode/apiClient';
 
 /**
  * Session verification — API-only.
@@ -39,6 +39,7 @@ export interface SessionCheckResult {
    *                    403): NOT proof of expiry, must not mark a cookie expired.
    */
   cause?: 'signed-out' | 'query-failed';
+  challenged?: boolean;
 }
 
 export async function checkSession(api: LeetCodeApi): Promise<SessionCheckResult> {
@@ -51,10 +52,13 @@ export async function checkSession(api: LeetCodeApi): Promise<SessionCheckResult
     logger.info('session check: not signed in');
     return { authenticated: false, cause: 'signed-out' };
   } catch (err) {
+    const challenged = looksLikeChallenge(err);
     logger.warn(
-      { err: err instanceof Error ? err.message : String(err) },
+      { err: err instanceof Error ? err.message : String(err), challenged },
       'session check query failed — treating as unauthenticated',
     );
-    return { authenticated: false, cause: 'query-failed' };
+    return challenged
+      ? { authenticated: false, cause: 'query-failed', challenged: true }
+      : { authenticated: false, cause: 'query-failed' };
   }
 }

@@ -336,6 +336,15 @@ export async function askSage(
   }
 }
 
+function escapeHtml(text: string): string {
+  return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 /** HTML Console for testing and interacting with Sage Inkstone (Intern-AI) directly on Render. */
 export function sageConsoleHtml(hostLabel: string): string {
   return `<!DOCTYPE html>
@@ -450,7 +459,7 @@ export function sageConsoleHtml(hostLabel: string): string {
   <div class="container">
     <header>
       <h1>🪶 Sage Inkstone (Intern-AI)</h1>
-      <span class="badge">Host: ${hostLabel}</span>
+      <span class="badge">Host: ${escapeHtml(hostLabel)}</span>
     </header>
 
     <!-- SECTION 1: TEST API -->
@@ -530,25 +539,25 @@ export function sageConsoleHtml(hostLabel: string): string {
           body: JSON.stringify({ apiKey, model })
         });
         const data = await res.json();
-        const ok = data.ok;
+        const ok = Boolean(data.ok);
         let html = (ok ? '🟢 <span class="status-ok">ALL CHECKS PASSED</span>' : '🔴 <span class="status-err">DIAGNOSTIC FAILED</span>') + '\\n\\n';
-        html += '• Host: ' + data.executionHost + '\\n';
-        html += '• Duration: ' + data.elapsedMs + ' ms\\n';
-        html += '• Masked Key: ' + data.keyMasked + '\\n';
-        html += '• GET /v1/models: HTTP ' + data.modelsStatus + ' (' + data.modelsCount + ' models available)\\n';
-        if (data.models && data.models.length) {
-          html += '  Active: ' + data.models.slice(0, 8).join(', ') + (data.models.length > 8 ? '...' : '') + '\\n';
+        html += '• Host: ' + escapeHtml(String(data.executionHost ?? '')) + '\\n';
+        html += '• Duration: ' + escapeHtml(String(data.elapsedMs ?? '')) + ' ms\\n';
+        html += '• Masked Key: ' + escapeHtml(String(data.keyMasked ?? '')) + '\\n';
+        html += '• GET /v1/models: HTTP ' + escapeHtml(String(data.modelsStatus ?? '')) + ' (' + escapeHtml(String(data.modelsCount ?? '')) + ' models available)\\n';
+        if (Array.isArray(data.models) && data.models.length) {
+          html += '  Active: ' + escapeHtml(data.models.slice(0, 8).map((m) => String(m)).join(', ')) + (data.models.length > 8 ? '...' : '') + '\\n';
         }
-        html += '• POST /v1/chat/completions: HTTP ' + data.chatStatus + ' (model: ' + data.chatModel + ')\\n';
+        html += '• POST /v1/chat/completions: HTTP ' + escapeHtml(String(data.chatStatus ?? '')) + ' (model: ' + escapeHtml(String(data.chatModel ?? '')) + ')\\n';
         if (data.chatReply) {
-          html += '  Reply: ' + data.chatReply.slice(0, 120) + '\\n';
+          html += '  Reply: ' + escapeHtml(String(data.chatReply).slice(0, 120)) + '\\n';
         }
         if (data.error) {
-          html += '  Error: ' + data.error + '\\n';
+          html += '  Error: ' + escapeHtml(String(data.error)) + '\\n';
         }
         out.innerHTML = html;
       } catch (e) {
-        out.innerHTML = '🔴 <span class="status-err">Request Failed:</span> ' + e.message;
+        out.innerHTML = '🔴 <span class="status-err">Request Failed:</span> ' + escapeHtml(e && e.message ? e.message : String(e));
       } finally {
         btn.disabled = false;
         btn.textContent = '🚀 Run API Diagnostics';
@@ -570,7 +579,7 @@ export function sageConsoleHtml(hostLabel: string): string {
       btn.disabled = true;
       btn.textContent = '🤔 Thinking...';
       out.style.display = 'block';
-      out.innerHTML = 'Querying Sage AI (' + model + ') from server...';
+      out.textContent = 'Querying Sage AI (' + model + ') from server...';
 
       try {
         const res = await fetch('/sage/ask', {
@@ -580,13 +589,13 @@ export function sageConsoleHtml(hostLabel: string): string {
         });
         const data = await res.json();
         if (data.ok) {
-          let header = '🤖 <b>Answer</b> (' + data.model + ' · ' + data.elapsedMs + 'ms)\\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\n';
-          out.innerHTML = header + escapeHtml(data.answer);
+          let header = '🤖 <b>Answer</b> (' + escapeHtml(String(data.model ?? '')) + ' · ' + escapeHtml(String(data.elapsedMs ?? '')) + 'ms)\\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\n';
+          out.innerHTML = header + escapeHtml(String(data.answer ?? ''));
         } else {
-          out.innerHTML = '❌ <span class="status-err">Error:</span> ' + escapeHtml(data.error || data.answer || 'Failed to get answer');
+          out.innerHTML = '❌ <span class="status-err">Error:</span> ' + escapeHtml(String(data.error || data.answer || 'Failed to get answer'));
         }
       } catch (e) {
-        out.innerHTML = '❌ <span class="status-err">Network error:</span> ' + e.message;
+        out.innerHTML = '❌ <span class="status-err">Network error:</span> ' + escapeHtml(e && e.message ? e.message : String(e));
       } finally {
         btn.disabled = false;
         btn.textContent = '💡 Ask Sage AI';
@@ -594,9 +603,12 @@ export function sageConsoleHtml(hostLabel: string): string {
     }
 
     function escapeHtml(str) {
-      const div = document.createElement('div');
-      div.innerText = str || '';
-      return div.innerHTML;
+      return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
   </script>
 </body>

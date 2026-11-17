@@ -16,6 +16,10 @@ export default defineConfig({
       SOLUTION_POST_API_KEY: '',
       SOLUTION_POST_API_KEYS: '',
       SOLUTION_AI_PROVIDER: 'bazaarlink',
+      CAPZY_API_KEY: '',
+      CAPZY_API_KEYS: '',
+      CPSOLVER_URL: '',
+      TURNSTILE_SOLVER_URL: '',
     },
   },
 });

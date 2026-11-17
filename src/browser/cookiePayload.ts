@@ -41,6 +41,24 @@ export type ParseResult =
   | { ok: false; error: string };
 
 const LEETCODE_DOMAIN = '.leetcode.com';
+const LEETCODE_DOMAIN_RE = /(?:^|\.)leetcode\.com$/i;
+
+function buildImportedCookie(
+  c: Record<string, unknown>,
+  expires: number,
+): StorageCookie {
+  const sameSite = normalizeSameSite(c.sameSite);
+  return {
+    name: c.name as string,
+    value: c.value as string,
+    domain: stringOr(c.domain, LEETCODE_DOMAIN),
+    path: stringOr(c.path, '/'),
+    expires,
+    httpOnly: c.httpOnly === true,
+    secure: sameSite === 'None' ? true : c.secure !== false,
+    sameSite,
+  };
+}
 
 const FORMAT_HINT =
   'send `LEETCODE_SESSION=...; csrftoken=...`, a Cookie-Editor JSON export, or a Playwright storageState JSON';
@@ -97,16 +115,7 @@ function parseCookieEditorJson(text: string): ParseResult {
     const c = item as Record<string, unknown> | null;
     if (!c || typeof c.name !== 'string' || typeof c.value !== 'string') continue;
     if (!c.name || !c.value) continue;
-    cookies.push({
-      name: c.name,
-      value: c.value,
-      domain: stringOr(c.domain, LEETCODE_DOMAIN),
-      path: stringOr(c.path, '/'),
-      expires: numberOr(c.expirationDate) ?? numberOr(c.expires) ?? -1,
-      httpOnly: c.httpOnly === true,
-      secure: c.secure !== false,
-      sameSite: normalizeSameSite(c.sameSite),
-    });
+    cookies.push(buildImportedCookie(c, numberOr(c.expirationDate) ?? numberOr(c.expires) ?? -1));
   }
   return finalize(cookies, [], 'Cookie-Editor export');
 }
@@ -127,16 +136,7 @@ function parseStorageStateJson(text: string): ParseResult {
     const c = item as Record<string, unknown> | null;
     if (!c || typeof c.name !== 'string' || typeof c.value !== 'string') continue;
     if (!c.name || !c.value) continue;
-    cookies.push({
-      name: c.name,
-      value: c.value,
-      domain: stringOr(c.domain, LEETCODE_DOMAIN),
-      path: stringOr(c.path, '/'),
-      expires: numberOr(c.expires) ?? -1,
-      httpOnly: c.httpOnly === true,
-      secure: c.secure !== false,
-      sameSite: normalizeSameSite(c.sameSite),
-    });
+    cookies.push(buildImportedCookie(c, numberOr(c.expires) ?? -1));
   }
   const origins: StorageOrigin[] = [];
   if (Array.isArray(obj.origins)) {
@@ -179,7 +179,7 @@ function finalize(
   format: string,
   transport?: { userAgent?: string },
 ): ParseResult {
-  const leetcodeOnly = cookies.filter((c) => c.domain.includes('leetcode.com'));
+  const leetcodeOnly = cookies.filter((c) => LEETCODE_DOMAIN_RE.test(c.domain.trim()));
   const deduped = [...new Map(leetcodeOnly.map((c) => [`${c.name}@${c.domain}`, c])).values()];
 
   if (deduped.length === 0) {

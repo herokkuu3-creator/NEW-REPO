@@ -6,6 +6,8 @@ export interface OpenAIProviderOptions {
   model: string;
   baseUrl?: string;
   timeoutMs: number;
+  maxTokens?: number;
+  temperature?: number;
 }
 
 /** OpenAI (or any OpenAI-compatible endpoint via baseUrl). */
@@ -13,12 +15,19 @@ export class OpenAIProvider implements LLMProvider {
   readonly name = 'openai';
   readonly model: string;
   private readonly client: OpenAI;
+  private readonly maxTokens: number;
+  private readonly temperature: number;
 
   constructor(opts: OpenAIProviderOptions) {
-    if (!opts.apiKey) {
+    if (!opts.apiKey || !opts.apiKey.trim()) {
       throw new LLMError('LLM_API_KEY is required for the openai provider', 'openai');
     }
-    this.model = opts.model;
+    if (!opts.model || !opts.model.trim()) {
+      throw new LLMError('LLM_MODEL is required for the openai provider', 'openai');
+    }
+    this.model = opts.model.trim();
+    this.maxTokens = opts.maxTokens ?? 4096;
+    this.temperature = opts.temperature ?? 0.2;
     this.client = new OpenAI({
       apiKey: opts.apiKey,
       baseURL: opts.baseUrl,
@@ -29,12 +38,17 @@ export class OpenAIProvider implements LLMProvider {
 
   async generate(messages: LLMMessage[], options: LLMGenerateOptions = {}): Promise<string> {
     try {
-      const completion = await this.client.chat.completions.create({
-        model: this.model,
-        messages,
-        temperature: options.temperature ?? 0.2,
-        max_tokens: options.maxTokens ?? 4096,
-      });
+      const requestOptions =
+        options.timeoutMs !== undefined ? { timeout: options.timeoutMs } : undefined;
+      const completion = await this.client.chat.completions.create(
+        {
+          model: this.model,
+          messages,
+          temperature: options.temperature ?? this.temperature,
+          max_tokens: options.maxTokens ?? this.maxTokens,
+        },
+        requestOptions,
+      );
       const text = completion.choices[0]?.message?.content;
       if (!text || !text.trim()) {
         throw new LLMError('model returned an empty completion', this.name);

@@ -2,6 +2,7 @@
 import { z } from 'zod';
 import { SELECTORS } from './selectors';
 import { leetcodeGraphQL } from './graphql';
+import { parseJudgeCheck, type JudgeCheckResult } from './apiClient';
 import { logger } from '../logger';
 
 /**
@@ -84,12 +85,22 @@ export async function submitCurrentEditor(
   questionFrontendId: string,
 ): Promise<SubmissionResult> {
   // Arm the network listener BEFORE clicking.
-  const submissionIdPromise = waitForSubmissionId(page, questionFrontendId, 30_000);
+  const pendingSubmissionId = waitForSubmissionId(page, questionFrontendId, 30_000);
+  pendingSubmissionId.promise.catch(() => undefined);
 
-  const clicked = await clickSubmit(page);
-  if (!clicked) throw new SubmissionError('submit button not found');
+  let clicked = false;
+  try {
+    clicked = await clickSubmit(page);
+  } catch (err) {
+    pendingSubmissionId.cancel();
+    throw err;
+  }
+  if (!clicked) {
+    pendingSubmissionId.cancel();
+    throw new SubmissionError('submit button not found');
+  }
 
-  const submissionId = await submissionIdPromise.catch((err) => {
+  const submissionId = await pendingSubmissionId.promise.catch((err) => {
     logger.warn(
       { err: err instanceof Error ? err.message : String(err) },
       'could not capture submission ID from the network - will try the result panel',
@@ -127,14 +138,35 @@ function waitForSubmissionId(
   page: Page,
   _questionFrontendId: string,
   timeoutMs: number,
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+): { promise: Promise<string>; cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  let rejectFn: ((err: Error) => void) | undefined;
+  let handler:
+    | ((response: { url(): string; request(): { method(): string }; json(): Promise<unknown> }) => void)
+    | undefined;
+
+  const cleanup = () => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    if (handler) {
       page.off('response', handler);
+      handler = undefined;
+    }
+  };
+
+  const promise = new Promise<string>((resolve, reject) => {
+    rejectFn = reject;
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       reject(new Error('timed out waiting for submission id'));
     }, timeoutMs);
 
-    const handler = (response: { url(): string; request(): { method(): string }; json(): Promise<unknown> }) => {
+    handler = (response) => {
       try {
         const url = response.url();
         if (!/\/problems\/[^/]+\/submit\/?$/.test(new URL(url).pathname)) return;
@@ -142,10 +174,14 @@ function waitForSubmissionId(
         response
           .json()
           .then((body) => {
-            const id = (body as { submission_id?: number })?.submission_id;
-            if (typeof id === 'number') {
-              clearTimeout(timer);
-              page.off('response', handler);
+            if (settled) return;
+            const id = (body as { submission_id?: unknown })?.submission_id;
+            const validId =
+              (typeof id === 'number' && Number.isSafeInteger(id) && id > 0) ||
+              (typeof id === 'string' && /^[1-9]\d*$/.test(id));
+            if (validId) {
+              settled = true;
+              cleanup();
               resolve(String(id));
             }
           })
@@ -157,45 +193,136 @@ function waitForSubmissionId(
 
     page.on('response', handler);
   });
+
+  const cancel = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    rejectFn?.(new Error('cancelled waiting for submission id'));
+  };
+
+  return { promise, cancel };
 }
 
 async function pollSubmissionResult(page: Page, submissionId: string): Promise<SubmissionResult> {
   const deadline = Date.now() + 60_000;
   let lastStatus = 'PENDING';
+  const numericId = Number(submissionId);
+  // submissionDetails accepts GraphQL Int! (signed 32-bit); newer IDs overflow it.
+  const canQueryDetails =
+    Number.isSafeInteger(numericId) && numericId > 0 && numericId <= 2_147_483_647;
+  let lastCheckFinal: Extract<JudgeCheckResult, { kind: 'final' }> | null = null;
 
   while (Date.now() < deadline) {
-    await page.waitForTimeout(2_000);
-    try {
-      const data = await leetcodeGraphQL(
-        page,
-        SUBMISSION_DETAILS_QUERY,
-        { submissionId: Number(submissionId) },
-        submissionDetailsSchema,
-      );
-      const d = data.submissionDetails;
-      if (!d) continue;
-      if (JUDGE_PENDING_CODES.has(d.statusCode)) continue;
+    await page.waitForTimeout(Math.min(2_000, Math.max(1, deadline - Date.now())));
 
-      const classification = STATUS_CODE_MAP[d.statusCode] ?? 'UNKNOWN';
-      const result: SubmissionResult = {
-        submissionId,
-        classification,
-        statusDisplay: d.statusDisplay ?? lastStatus,
-        runtime: d.runtimeDisplay ?? (d.runtime != null ? `${d.runtime} ms` : null),
-        memory: d.memoryDisplay ?? (d.memory != null ? `${d.memory} MB` : null),
-        rawStatusMsg: d.statusDisplay ?? `statusCode=${d.statusCode}`,
-      };
-      logger.info(
-        { submissionId, classification: result.classification, runtime: result.runtime, memory: result.memory },
-        'judge finished',
-      );
-      return result;
+    // Primary source: LeetCode's own /v2/check/ polling endpoint via in-page fetch.
+    try {
+      const checkBody = await page
+        .evaluate(async (id) => {
+          const res = await fetch(
+            `https://leetcode.com/submissions/detail/${encodeURIComponent(id)}/v2/check/`,
+            {
+              method: 'GET',
+              credentials: 'include',
+              headers: { Accept: 'application/json' },
+            },
+          );
+          if (!res.ok) return null;
+          return await res.json().catch(() => null);
+        }, submissionId)
+        .catch(() => null);
+
+      const check = parseJudgeCheck(checkBody);
+      if (check?.kind === 'pending') {
+        lastStatus = check.state;
+        continue;
+      }
+      if (check?.kind === 'final') {
+        lastCheckFinal = check;
+        if (check.classification !== 'UNKNOWN') {
+          const result: SubmissionResult = {
+            submissionId,
+            classification: check.classification,
+            statusDisplay: check.statusDisplay,
+            runtime: check.runtime,
+            memory: check.memory,
+            rawStatusMsg: check.statusDisplay,
+          };
+          logger.info(
+            {
+              submissionId,
+              classification: result.classification,
+              runtime: result.runtime,
+              memory: result.memory,
+              source: 'check',
+            },
+            'judge finished',
+          );
+          return result;
+        }
+      }
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
-        'submission polling failed - retrying',
+        'in-page judge check polling failed - falling back',
       );
     }
+
+    if (canQueryDetails) {
+      try {
+        const data = await leetcodeGraphQL(
+          page,
+          SUBMISSION_DETAILS_QUERY,
+          { submissionId: numericId },
+          submissionDetailsSchema,
+        );
+        const d = data.submissionDetails;
+        if (d) {
+          if (JUDGE_PENDING_CODES.has(d.statusCode)) {
+            lastStatus = d.statusDisplay ?? lastStatus;
+            continue;
+          }
+
+          const classification = STATUS_CODE_MAP[d.statusCode] ?? 'UNKNOWN';
+          const result: SubmissionResult = {
+            submissionId,
+            classification,
+            statusDisplay: d.statusDisplay ?? lastStatus,
+            runtime: d.runtimeDisplay ?? (d.runtime != null ? `${d.runtime} ms` : null),
+            memory: d.memoryDisplay ?? (d.memory != null ? `${d.memory} MB` : null),
+            rawStatusMsg: d.statusDisplay ?? `statusCode=${d.statusCode}`,
+          };
+          logger.info(
+            { submissionId, classification: result.classification, runtime: result.runtime, memory: result.memory },
+            'judge finished',
+          );
+          return result;
+        }
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'submission polling failed - retrying',
+        );
+      }
+    }
+
+    const panelResult = await tryReadResultPanelOnce(page, submissionId);
+    if (panelResult) return panelResult;
+  }
+
+  const finalPanel = await tryReadResultPanelOnce(page, submissionId);
+  if (finalPanel) return finalPanel;
+
+  if (lastCheckFinal) {
+    return {
+      submissionId,
+      classification: lastCheckFinal.classification,
+      statusDisplay: lastCheckFinal.statusDisplay,
+      runtime: lastCheckFinal.runtime,
+      memory: lastCheckFinal.memory,
+      rawStatusMsg: lastCheckFinal.statusDisplay,
+    };
   }
 
   return {
@@ -208,26 +335,35 @@ async function pollSubmissionResult(page: Page, submissionId: string): Promise<S
   };
 }
 
+async function tryReadResultPanelOnce(
+  page: Page,
+  submissionId: string | null,
+): Promise<SubmissionResult | null> {
+  for (const sel of SELECTORS.resultStatus) {
+    const loc = page.locator(sel).first();
+    if ((await loc.count().catch(() => 0)) === 0) continue;
+    const text = ((await loc.innerText().catch(() => '')) ?? '').trim();
+    if (!text || /pending|judging/i.test(text)) continue;
+
+    return {
+      submissionId,
+      classification: classifyStatusText(text),
+      statusDisplay: text,
+      runtime: await scrapeNear(page, SELECTORS.resultRuntime),
+      memory: await scrapeNear(page, SELECTORS.resultMemory),
+      rawStatusMsg: text,
+    };
+  }
+  return null;
+}
+
 /** DOM fallback when the submission id could not be captured. */
 async function readResultPanel(page: Page): Promise<SubmissionResult> {
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
-    for (const sel of SELECTORS.resultStatus) {
-      const loc = page.locator(sel).first();
-      if ((await loc.count().catch(() => 0)) === 0) continue;
-      const text = ((await loc.innerText().catch(() => '')) ?? '').trim();
-      if (!text || /pending|judging/i.test(text)) continue;
-
-      return {
-        submissionId: null,
-        classification: classifyStatusText(text),
-        statusDisplay: text,
-        runtime: await scrapeNear(page, SELECTORS.resultRuntime),
-        memory: await scrapeNear(page, SELECTORS.resultMemory),
-        rawStatusMsg: text,
-      };
-    }
-    await page.waitForTimeout(2_000);
+    const res = await tryReadResultPanelOnce(page, null);
+    if (res) return res;
+    await page.waitForTimeout(Math.min(2_000, Math.max(1, deadline - Date.now())));
   }
   return {
     submissionId: null,

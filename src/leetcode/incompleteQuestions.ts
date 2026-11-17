@@ -64,6 +64,7 @@ export async function fetchIncompleteQuestions(
 ): Promise<IncompleteQuestion[]> {
   const result: IncompleteQuestion[] = [];
   const targetCount = Math.max(1, count);
+  const safePageSize = Number.isFinite(pageSize) ? Math.max(1, Math.floor(pageSize)) : 50;
   let skip = 0;
 
   while (result.length < targetCount) {
@@ -72,7 +73,7 @@ export async function fetchIncompleteQuestions(
       {
         categorySlug,
         skip,
-        limit: pageSize,
+        limit: safePageSize,
         filters: {
           orderBy: 'FRONTEND_ID',
           sortOrder: 'ASCENDING',
@@ -90,13 +91,16 @@ export async function fetchIncompleteQuestions(
       const num = Number(q.frontendQuestionId);
       if (!Number.isFinite(num) || num < 1) continue;
 
+      const slug = q.titleSlug?.trim();
+      if (!slug) continue;
+
       const st = (q.status ?? '').toLowerCase().trim();
       // Skip accepted / solved questions
       if (st === 'ac' || st === 'solved') continue;
 
       result.push({
         number: num,
-        slug: q.titleSlug || '',
+        slug,
         title: q.title || `Question #${num}`,
         status: q.status ?? null,
       });
@@ -104,7 +108,8 @@ export async function fetchIncompleteQuestions(
       if (result.length >= targetCount) break;
     }
 
-    skip += pageSize;
+    if (questions.length < safePageSize) break;
+    skip += safePageSize;
     const total = data?.problemsetQuestionList?.total ?? 0;
     if (total > 0 && skip >= total) break;
     if (skip >= 10000) break;

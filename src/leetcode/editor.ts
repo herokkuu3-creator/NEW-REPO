@@ -37,18 +37,24 @@ export async function ensureLanguage(page: Page, language: string): Promise<bool
   const label = LANGUAGE_LABELS[language];
   if (!label) throw new EditorError(`unsupported language slug: ${language}`);
 
-  // Strategy 1 (preferred): ask Monaco/LeetCode app state what is active.
+  // Strategy 1 (preferred): ask Monaco's active model what language is active.
   const activeSlug = await page
-    .evaluate(() => {
-      // LeetCode keeps editor state on window in many builds; tolerate absence.
-      const w = window as unknown as Record<string, unknown>;
-      const state = w['__NEXT_DATA__'] ?? w['__APP_STATE__'];
-      return state ? JSON.stringify(state).includes(language) : null;
-    })
+    .evaluate((lang: string) => {
+      const w = window as unknown as {
+        monaco?: { editor?: { getModels?: () => { getLanguageId?: () => string }[] } };
+      };
+      const rawId = w.monaco?.editor?.getModels?.()?.[0]?.getLanguageId?.();
+      if (typeof rawId !== 'string' || !rawId.trim()) return null;
+      const normalize = (slug: string) => {
+        const lower = slug.trim().toLowerCase();
+        return lower === 'python3' ? 'python' : lower;
+      };
+      return normalize(rawId) === normalize(lang);
+    }, language)
     .catch(() => null);
 
   if (activeSlug === true) {
-    logger.info({ language }, 'language already active (app state)');
+    logger.info({ language }, 'language already active (Monaco model)');
     return true;
   }
 

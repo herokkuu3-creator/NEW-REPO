@@ -19,7 +19,11 @@ export function parseExampleInput(input: string): string[] | null {
     if (!m || !m[1]) return null;
     const value = m[1].trim();
     if (!isJsonLike(value)) return null;
-    args.push(toJson(value));
+    try {
+      args.push(toJson(value));
+    } catch {
+      return null;
+    }
   }
   return args.length > 0 ? args : null;
 }
@@ -29,7 +33,11 @@ export function parseExampleOutput(output: string): string | null {
   const firstLine = output.split('\n')[0]?.trim() ?? '';
   if (!firstLine) return null;
   if (!isJsonLike(firstLine)) return null;
-  return toJson(firstLine);
+  try {
+    return toJson(firstLine);
+  } catch {
+    return null;
+  }
 }
 
 function isJsonLike(v: string): boolean {
@@ -114,15 +122,37 @@ function generateEdgeCases(exampleTests: TestCase[]): TestCase[] {
  *   PY: `def twoSum(` → twoSum
  */
 export function extractFunctionName(starterCode: string, language: string): string | null {
-  if (language === 'python3') {
-    const m = /def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(starterCode);
-    return m?.[1] ?? null;
+  if (language === 'python3' || language === 'python') {
+    const cleaned = starterCode.replace(/#[^\n]*/g, '');
+    for (const m of cleaned.matchAll(/\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) {
+      const name = m[1];
+      if (name && name !== '__init__') return name;
+    }
+    return null;
   }
-  const varMatch = /(?:var|let|const)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*function/.exec(starterCode);
-  if (varMatch?.[1]) return varMatch[1];
-  const fnMatch = /function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(starterCode);
+
+  const cleaned = starterCode
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '');
+
+  const varFnMatch = /(?:var|let|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s+)?function\b/.exec(cleaned);
+  if (varFnMatch?.[1]) return varFnMatch[1];
+
+  const arrowPattern = /(?:export\s+)?(?:var|let|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s+)?(?:<[^>\n]*>\s*)?(?:\((?:[^;\n()]|\([^;\n()]*\))*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*(?::[^\n={;]+)?=>/;
+  const topArrowMatch = new RegExp(`^${arrowPattern.source}`, 'm').exec(cleaned);
+  if (topArrowMatch?.[1]) return topArrowMatch[1];
+
+  const fnMatch = /\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^>\n]*>\s*)?\(/.exec(cleaned);
   if (fnMatch?.[1]) return fnMatch[1];
+
+  const anyArrowMatch = arrowPattern.exec(cleaned);
+  if (anyArrowMatch?.[1]) return anyArrowMatch[1];
+
   // class Solution { methodName(...) { ... } }
-  const methodMatch = /^\s{2,}([A-Za-z_][A-Za-z0-9_]*)\s*\(/m.exec(starterCode);
-  return methodMatch?.[1] ?? null;
+  const ignored = new Set(['constructor', 'if', 'for', 'while', 'switch', 'catch']);
+  for (const m of cleaned.matchAll(/^\s{2,}(?:(?:public|private|protected|static|async)\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^>\n]*>\s*)?\(/gm)) {
+    const name = m[1];
+    if (name && !ignored.has(name)) return name;
+  }
+  return null;
 }

@@ -234,17 +234,25 @@ const ENTITY_MAP: Record<string, string> = {
 };
 
 export function decodeEntities(text: string): string {
-  let out = text;
-  for (const [entity, char] of Object.entries(ENTITY_MAP)) {
-    out = out.split(entity).join(char);
-  }
-  out = out.replace(/&#(\d+);/g, (_, code: string) =>
-    String.fromCodePoint(Number.parseInt(code, 10)),
+  return text.replace(
+    /&(?:amp|lt|gt|quot|apos|nbsp|#\d+|#[xX][0-9a-fA-F]+);/g,
+    (entity) => {
+      if (entity in ENTITY_MAP) return ENTITY_MAP[entity]!;
+      if (entity.startsWith('&#x') || entity.startsWith('&#X')) {
+        const cp = Number.parseInt(entity.slice(3, -1), 16);
+        return Number.isFinite(cp) && cp >= 0 && cp <= 0x10ffff
+          ? String.fromCodePoint(cp)
+          : entity;
+      }
+      if (entity.startsWith('&#')) {
+        const cp = Number.parseInt(entity.slice(2, -1), 10);
+        return Number.isFinite(cp) && cp >= 0 && cp <= 0x10ffff
+          ? String.fromCodePoint(cp)
+          : entity;
+      }
+      return entity;
+    },
   );
-  out = out.replace(/&#x([0-9a-fA-F]+);/g, (_, code: string) =>
-    String.fromCodePoint(Number.parseInt(code, 16)),
-  );
-  return out;
 }
 
 /**
@@ -279,6 +287,9 @@ export function signatureMatchesStarter(walkcccCode: string, problem: ParsedProb
 }
 
 function extractMethodName(starterCode: string): string | null {
-  const m = /\b(?:[\w:<>,\[\]&*]+\s+)+([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(starterCode);
+  const cleaned = starterCode
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n]*/g, ' ');
+  const m = /\b(?:(?:[\w<>\[\],]|::)+(?:\s+|[\s*&]+))+[\s*&]*([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(cleaned);
   return m?.[1] ?? null;
 }

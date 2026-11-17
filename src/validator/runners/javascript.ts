@@ -29,7 +29,11 @@ export class JavaScriptRunner implements CodeRunner {
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message.slice(0, 2000) : String(err) };
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Best-effort temp directory cleanup
+      }
     }
   }
 
@@ -64,7 +68,11 @@ export class JavaScriptRunner implements CodeRunner {
         stderr: err instanceof Error ? err.message.slice(0, 2000) : String(err),
       };
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Best-effort temp directory cleanup
+      }
     }
   }
 }

@@ -464,7 +464,11 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
     }
 
     const hasCPSolver = Boolean(getCPSolverUrl());
-    const capzyKeys = await getCandidateCapzyKeys().catch(() => []);
+    const hasMockedFetch = Boolean((globalThis.fetch as unknown as { mock?: unknown })?.mock);
+    const rawCapzyKeys = await getCandidateCapzyKeys().catch(() => []);
+    const capzyKeys = hasMockedFetch
+      ? rawCapzyKeys
+      : rawCapzyKeys.filter((key) => key !== 'test-capzy-key');
     const hasCapzy = capzyKeys.length > 0;
     const diagnostic: VerificationDiagnostic = {
       challengeType: detail.type,
@@ -729,6 +733,10 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
         await usernameInput.waitFor({ state: 'visible', timeout: Math.min(15_000, remaining()) });
         await usernameInput.fill(username, { timeout: remaining() });
         await scope.locator(PASSWORD).first().fill(password, { timeout: remaining() });
+        const postRefillDetail = await detectVerificationDetail(page);
+        if (postRefillDetail.required) {
+          await attemptSolverVerification(postRefillDetail, codeStatus);
+        }
       }
       await submit.click({ timeout: remaining() });
     };
@@ -782,9 +790,13 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
       combinedSignal,
     );
   } catch (error) {
-    const failure = options.signal?.aborted ? new LoginFailure('LOGIN_CANCELLED', 'Login cancelled.', undefined, 'LOGIN_FAILED') :
-      Date.now() >= deadline ? new LoginFailure('LOGIN_TIMEOUT', 'Login timed out before the session could be verified.', undefined, 'LOGIN_FAILED') :
-      error instanceof LoginFailure ? error : new LoginFailure('LOGIN_BROWSER_ERROR', 'Login browser or navigation failed. Use /renew after signing in in your browser.', undefined, 'LOGIN_FAILED');
+    const failure = options.signal?.aborted
+      ? new LoginFailure('LOGIN_CANCELLED', 'Login cancelled.', undefined, 'LOGIN_FAILED')
+      : error instanceof LoginFailure
+        ? error
+        : Date.now() >= deadline
+          ? new LoginFailure('LOGIN_TIMEOUT', 'Login timed out before the session could be verified.', undefined, 'LOGIN_FAILED')
+          : new LoginFailure('LOGIN_BROWSER_ERROR', 'Login browser or navigation failed. Use /renew after signing in in your browser.', undefined, 'LOGIN_FAILED');
     logger.warn({ attemptId, state: failure.state, code: failure.code, elapsedMs: Date.now() - started }, 'LeetCode login failed');
     return {
       ok: false,
