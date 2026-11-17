@@ -143,6 +143,10 @@ import {
   completeCurrentProblem,
   recordAttempt,
   getCodeforcesProgress,
+  listCodeforcesAccountSummaries,
+  listCodeforcesAccountIds,
+  getCodeforcesAccountStorageState,
+  patchCodeforcesAccount,
 } from '../src/codeforces/storage';
 import { resolveCurrentEntry, matchQueueEntry } from '../src/codeforces/worker';
 import { SourceIndexEntry } from '../src/codeforces/sourceRepo';
@@ -385,5 +389,42 @@ describe('resolveCurrentEntry with shorthand contest/index matching', () => {
     expect(matchQueueEntry(target, '628b')).toBe(true);
     expect(matchQueueEntry(target, '628/B')).toBe(true);
     expect(matchQueueEntry(target, '628A')).toBe(false);
+  });
+});
+
+describe('Codeforces storage egress projections', () => {
+  it('uses explicit select projections omitting storageState on summary/id queries and reads storageState by id only', async () => {
+    const { prisma } = await import('../src/database/prisma');
+    const acc = await saveCodeforcesAccount('cf-proj', '{"cookies":[{"name":"a","value":"b"}]}', { username: 'cf_u' });
+
+    const summaries = await listCodeforcesAccountSummaries(false);
+    expect(summaries).toHaveLength(1);
+    expect(vi.mocked(prisma.codeforcesAccount.findMany)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: { id: true, label: true, username: true, status: true },
+      }),
+    );
+
+    const ids = await listCodeforcesAccountIds(false);
+    expect(ids).toEqual([acc.id]);
+    expect(vi.mocked(prisma.codeforcesAccount.findMany)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: { id: true },
+      }),
+    );
+
+    const storageState = await getCodeforcesAccountStorageState(acc.id);
+    expect(storageState).toBe('{"cookies":[{"name":"a","value":"b"}]}');
+    expect(vi.mocked(prisma.codeforcesAccount.findUnique)).toHaveBeenCalledWith({
+      where: { id: acc.id },
+      select: { storageState: true },
+    });
+
+    await patchCodeforcesAccount(acc.id, { lastError: null, checked: true });
+    expect(vi.mocked(prisma.codeforcesAccount.update)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: { id: true },
+      }),
+    );
   });
 });

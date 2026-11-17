@@ -6,11 +6,11 @@ import { logger } from '../logger';
 import { getSystemState, setSystemState, SystemKeys } from '../database/models';
 import { isRunInProgress as isLeetCodeBusy, todayInTimezone } from '../scheduler/dailyWorker';
 import { isCodeChefRunInProgress } from '../codechef/worker';
+import * as cfStorage from './storage';
 import {
   claimDailyAttempt,
   completeCurrentProblem,
   getCodeforcesProgress,
-  listCodeforcesAccounts,
   parseStoredCodeforcesState,
   patchCodeforcesAccount,
   recordAttempt,
@@ -246,6 +246,49 @@ export async function runCodeforcesNow(
   return executeCodeforcesRun(reason, options);
 }
 
+type CodeforcesWorkerAccount = Pick<
+  cfStorage.CodeforcesAccountRecord,
+  'id' | 'label' | 'username' | 'status' | 'storageState'
+>;
+
+async function loadEnabledAccountSummaries(): Promise<
+  Array<cfStorage.CodeforcesAccountSummary & { storageState?: string }>
+> {
+  if (typeof cfStorage.listCodeforcesAccountSummaries === 'function') {
+    return cfStorage.listCodeforcesAccountSummaries(false);
+  }
+  return cfStorage.listCodeforcesAccounts(false);
+}
+
+async function loadEnabledAccountIds(): Promise<string[]> {
+  if (typeof cfStorage.listCodeforcesAccountIds === 'function') {
+    return cfStorage.listCodeforcesAccountIds(false);
+  }
+  return (await loadEnabledAccountSummaries()).map((account) => account.id);
+}
+
+async function loadSingleCodeforcesAccount(
+  id: string,
+  fallback?: cfStorage.CodeforcesAccountSummary & { storageState?: string },
+): Promise<CodeforcesWorkerAccount | null> {
+  if (typeof cfStorage.getCodeforcesAccountById === 'function') {
+    return cfStorage.getCodeforcesAccountById(id);
+  }
+  if (fallback && typeof fallback.storageState === 'string') {
+    return fallback as CodeforcesWorkerAccount;
+  }
+  if (typeof cfStorage.getCodeforcesAccountStorageState === 'function' && fallback) {
+    const storageState = await cfStorage.getCodeforcesAccountStorageState(id);
+    if (storageState !== null) {
+      return { ...fallback, storageState };
+    }
+  }
+  if (typeof cfStorage.listCodeforcesAccounts === 'function') {
+    return (await cfStorage.listCodeforcesAccounts()).find((a) => a.id === id) ?? null;
+  }
+  return null;
+}
+
 export async function executeCodeforcesRun(
   reason: string,
   options: CodeforcesRunOptions = {},
@@ -266,13 +309,13 @@ export async function executeCodeforcesRun(
     const source = await loadRuntimeSourceIndex();
     const requestedAccountIds = options.accountIds ? new Set(options.accountIds) : null;
     const networkMode = options.networkMode ?? await configuredNetworkMode();
-    const accounts = (await listCodeforcesAccounts(false)).filter(
+    const accountSummaries = (await loadEnabledAccountSummaries()).filter(
       (account) => !requestedAccountIds || requestedAccountIds.has(account.id),
     );
     const outcomes: CodeforcesAccountOutcome[] = [];
 
     activeCodeforcesRangeJob = {
-      totalRequested: accounts.length * batchCount,
+      totalRequested: accountSummaries.length * batchCount,
       completed: 0,
       skipped: 0,
       failed: 0,
@@ -283,7 +326,7 @@ export async function executeCodeforcesRun(
       state: 'running',
     };
 
-    if (accounts.length === 0) {
+    if (accountSummaries.length === 0) {
       const report = buildCodeforcesReport({ date: today, reason, startedAt, outcomes });
       await setSystemState(CODEFORCES_LAST_REPORT_KEY, JSON.stringify(report));
       return report;
@@ -293,24 +336,36 @@ export async function executeCodeforcesRun(
       await sendTelegramMessage('🚀 <b>Starting daily submission for Codeforces…</b>', { parseMode: 'HTML' }).catch(() => undefined);
     }
 
+    const loadedAccountsById = new Map<string, CodeforcesWorkerAccount>();
+
     // Auto-refresh any expired or rejected sessions if credentials exist in DB
-    for (let i = 0; i < accounts.length; i++) {
-      const acc = accounts[i];
+    for (let i = 0; i < accountSummaries.length; i++) {
+      const acc = accountSummaries[i];
       if (!acc) continue;
       if (acc.status === CodeforcesAccountStatus.EXPIRED || acc.status === CodeforcesAccountStatus.REJECTED) {
         try {
-          const outcome = await refreshCodeforcesAccount(acc);
+          const fullAcc = await loadSingleCodeforcesAccount(acc.id, acc);
+          if (!fullAcc) continue;
+          const outcome = await refreshCodeforcesAccount(fullAcc);
           if (outcome.status === 'refreshed') {
-            const updatedList = await listCodeforcesAccounts();
-            const updated = updatedList.find((a) => a.id === acc.id);
-            if (updated) accounts[i] = updated;
+            const updated = await loadSingleCodeforcesAccount(acc.id);
+            if (updated) {
+              accountSummaries[i] = updated;
+              loadedAccountsById.set(acc.id, updated);
+            }
+          } else {
+            loadedAccountsById.set(acc.id, fullAcc);
           }
         } catch {}
       }
     }
 
-    for (const [accIndex, account] of accounts.entries()) {
+    for (const [accIndex, summary] of accountSummaries.entries()) {
       if (signal.aborted) break;
+
+      let account = loadedAccountsById.get(summary.id) ?? await loadSingleCodeforcesAccount(summary.id, summary);
+      loadedAccountsById.delete(summary.id);
+      if (!account) continue;
 
       const cursor = await getCodeforcesProgress(account.id);
       const current = resolveCurrentEntry(source.queue, cursor.nextKey, cursor.lastCompletedKey);
@@ -322,12 +377,12 @@ export async function executeCodeforcesRun(
       for (let step = 0; step < batchCount; step++) {
         if (signal.aborted) break;
 
-        const progressIndex = accounts.length > 1 && batchCount === 1
+        const progressIndex = accountSummaries.length > 1 && batchCount === 1
           ? accIndex + 1
-          : (accounts.length > 1 ? accIndex * batchCount + step + 1 : step + 1);
-        const progressTotal = accounts.length > 1 && batchCount === 1
-          ? accounts.length
-          : (accounts.length > 1 ? accounts.length * batchCount : batchCount);
+          : (accountSummaries.length > 1 ? accIndex * batchCount + step + 1 : step + 1);
+        const progressTotal = accountSummaries.length > 1 && batchCount === 1
+          ? accountSummaries.length
+          : (accountSummaries.length > 1 ? accountSummaries.length * batchCount : batchCount);
 
         if (activeCodeforcesRangeJob) {
           activeCodeforcesRangeJob.currentStep = progressIndex;
@@ -343,7 +398,7 @@ export async function executeCodeforcesRun(
           index: progressIndex,
           total: progressTotal,
           accIndex,
-          accTotal: accounts.length,
+          accTotal: accountSummaries.length,
           stepIndex: step + 1,
           stepTotal: batchCount,
         }));
@@ -364,7 +419,7 @@ export async function executeCodeforcesRun(
               networkMode,
               attempt,
               accIndex,
-              accTotal: accounts.length,
+              accTotal: accountSummaries.length,
               stepIndex: step + 1,
               stepTotal: batchCount,
             }),
@@ -395,7 +450,7 @@ export async function executeCodeforcesRun(
             index: progressIndex,
             total: progressTotal,
             accIndex,
-            accTotal: accounts.length,
+            accTotal: accountSummaries.length,
             stepIndex: step + 1,
             stepTotal: batchCount,
           });
@@ -409,7 +464,7 @@ export async function executeCodeforcesRun(
             index: progressIndex,
             total: progressTotal,
             accIndex,
-            accTotal: accounts.length,
+            accTotal: accountSummaries.length,
             stepIndex: step + 1,
             stepTotal: batchCount,
           });
@@ -423,7 +478,7 @@ export async function executeCodeforcesRun(
             index: progressIndex,
             total: progressTotal,
             accIndex,
-            accTotal: accounts.length,
+            accTotal: accountSummaries.length,
             stepIndex: step + 1,
             stepTotal: batchCount,
           });
@@ -459,7 +514,7 @@ export async function executeCodeforcesRun(
             index: progressIndex,
             total: progressTotal,
             accIndex,
-            accTotal: accounts.length,
+            accTotal: accountSummaries.length,
             stepIndex: step + 1,
             stepTotal: batchCount,
             waitSeconds: Math.round(pacingGapMs / 1000),
@@ -483,9 +538,9 @@ export async function executeCodeforcesRun(
           label: account.label,
           username: account.username,
           index: outcomes.length,
-          total: accounts.length * batchCount,
+          total: accountSummaries.length * batchCount,
           accIndex,
-          accTotal: accounts.length,
+          accTotal: accountSummaries.length,
         });
         break;
       }
@@ -506,7 +561,7 @@ export async function executeCodeforcesRun(
 }
 
 async function runForAccount(
-  account: Awaited<ReturnType<typeof listCodeforcesAccounts>>[number],
+  account: CodeforcesWorkerAccount,
   today: string,
   source: Awaited<ReturnType<typeof loadRuntimeSourceIndex>>,
   forceDailyAttempt = false,
@@ -519,8 +574,7 @@ async function runForAccount(
   if (!stored.ok) {
     const refreshed = await refreshCodeforcesAccount(account).catch(() => null);
     if (refreshed?.status === 'refreshed') {
-      const updatedList = await listCodeforcesAccounts();
-      const updated = updatedList.find((a) => a.id === account.id);
+      const updated = await loadSingleCodeforcesAccount(account.id);
       if (updated) {
         account = updated;
         stored = parseStoredCodeforcesState(account.storageState);
@@ -574,6 +628,7 @@ async function runForAccount(
   // which reached the proxied browser may be safe to retry in principle,
   // but repeatedly reopening it every five minutes is very expensive.
   let browserAttempted = false;
+  let stateDirty = false;
   await Promise.resolve(onProgress?.('verified', username));
   try {
     const originalCode = await fetchSourceCode(entry);
@@ -633,6 +688,7 @@ async function runForAccount(
       if (!attempt.ok && attempt.kind === 'blocked') {
         logger.warn({ label, problem: problemLabel(entry), error: attempt.error }, 'Codeforces HTTP submission blocked; falling back to browser transport');
         browserAttempted = true;
+        const cookiesBeforeBrowser = stored.state.cookies;
         const viaBrowser = await runSubmissionAttempts((deadline, attemptNumber) => submitViaBrowser(
           stored.state,
           label,
@@ -643,6 +699,7 @@ async function runForAccount(
           deadline,
           (phase) => onProgress?.(phase, attemptUsername, attemptNumber),
         ), (phase, attemptNumber) => onProgress?.(phase, attemptUsername, attemptNumber));
+        if (stored.state.cookies !== cookiesBeforeBrowser) stateDirty = true;
         if (viaBrowser) {
           attempt = viaBrowser;
           attemptUsername = viaBrowser.handle ?? attemptUsername;
@@ -662,7 +719,9 @@ async function runForAccount(
                 existing.set(name, { name, value: String(value), domain: '.codeforces.com', path: '/' });
               }
               stored.state.cookies = Array.from(existing.values());
+              stateDirty = true;
               logger.info({ label, cookieCount: Object.keys(capzyResult.cookies).length }, 'Injected Capzy clearance cookies into stored state; retrying browser submission');
+              const cookiesBeforeRetry = stored.state.cookies;
               const retryViaBrowser = await submitViaBrowser(
                 stored.state,
                 label,
@@ -673,6 +732,7 @@ async function runForAccount(
                 Date.now() + 60_000,
                 (phase) => onProgress?.(phase, attemptUsername),
               );
+              if (stored.state.cookies !== cookiesBeforeRetry) stateDirty = true;
               if (retryViaBrowser) {
                 attempt = retryViaBrowser;
                 attemptUsername = retryViaBrowser.handle ?? attemptUsername;
@@ -764,9 +824,9 @@ async function runForAccount(
         lastSubmissionDate: today,
         lastSubmissionId: result.submissionId,
         lastVerdict: result.verdict,
-        state: stored.state,
+        ...(stateDirty ? { state: stored.state } : {}),
       });
-      account.storageState = JSON.stringify(stored.state);
+      if (stateDirty) account.storageState = JSON.stringify(stored.state);
       return {
         label,
         username,
@@ -817,9 +877,9 @@ async function runForAccount(
       lastSubmissionDate: today,
       lastSubmissionId: result.submissionId ?? null,
       lastVerdict: verdictCode,
-      state: stored.state,
+      ...(stateDirty ? { state: stored.state } : {}),
     });
-    account.storageState = JSON.stringify(stored.state);
+    if (stateDirty) account.storageState = JSON.stringify(stored.state);
     return {
       label,
       username,
@@ -843,9 +903,9 @@ async function runForAccount(
       checked: true,
       lastSubmissionDate: today,
       lastVerdict: 'SUBMISSION_ERROR',
-      state: stored.state,
+      ...(stateDirty ? { state: stored.state } : {}),
     }).catch(() => undefined);
-    account.storageState = JSON.stringify(stored.state);
+    if (stateDirty) account.storageState = JSON.stringify(stored.state);
     return {
       label,
       username: handle,
@@ -1203,35 +1263,35 @@ async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minut
   const state = await readCodeforcesDailyState(date);
   if (isRetry && state.retryCount >= CODEFORCES_DAILY_RETRY_LIMIT) return;
 
-  const accounts = await listCodeforcesAccounts(false);
+  const accountIds = await loadEnabledAccountIds();
   const completed = new Set(state.completedAccountIds);
   const browserAttempted = new Set(state.browserAttemptedAccountIds);
   // A normal daily submission gets one browser delivery. The browser path
   // itself still has its bounded three-attempt recovery; subsequent cron ticks
   // only retry failures that occurred before any proxy browser was opened.
-  const pending = accounts.filter((account) => !completed.has(account.id) && !browserAttempted.has(account.id));
-  if (pending.length === 0) return;
+  const pendingIds = accountIds.filter((id) => !completed.has(id) && !browserAttempted.has(id));
+  if (pendingIds.length === 0) return;
 
   if (isRetry) state.retryCount += 1;
   await writeCodeforcesDailyState(state);
   logger.info(
-    { date, retry: isRetry, retryAttempt: state.retryCount, retryLimit: CODEFORCES_DAILY_RETRY_LIMIT, accounts: pending.length, browserAttempted: browserAttempted.size },
+    { date, retry: isRetry, retryAttempt: state.retryCount, retryLimit: CODEFORCES_DAILY_RETRY_LIMIT, accounts: pendingIds.length, browserAttempted: browserAttempted.size },
     'automatic Codeforces daily run starting',
   );
 
   await runCodeforcesNow('cron', {
     forceDailyAttempt: true,
-    accountIds: pending.map((account) => account.id),
+    accountIds: pendingIds,
     onAccountOutcome: async (outcome, index) => {
-      const account = pending[index - 1];
-      if (!account) return;
+      const accountId = pendingIds[index - 1];
+      if (!accountId) return;
       const terminalWithoutSource = outcome.kind === 'skipped' && /queue is exhausted/i.test(outcome.error ?? '');
       if (outcome.performed || terminalWithoutSource) {
-        completed.add(account.id);
+        completed.add(accountId);
         state.completedAccountIds = [...completed];
         await writeCodeforcesDailyState(state);
       } else if (outcome.browserAttempted) {
-        browserAttempted.add(account.id);
+        browserAttempted.add(accountId);
         state.browserAttemptedAccountIds = [...browserAttempted];
         await writeCodeforcesDailyState(state);
       }

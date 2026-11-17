@@ -2,6 +2,10 @@ import { CodeforcesAccount, CodeforcesAccountStatus, CodeforcesProgress } from '
 import { prisma } from '../database/prisma';
 
 export type CodeforcesAccountRecord = CodeforcesAccount;
+export type CodeforcesAccountSummary = Pick<
+  CodeforcesAccountRecord,
+  'id' | 'label' | 'username' | 'status'
+>;
 
 export type StoredCodeforcesState = {
   cookies: Array<{
@@ -40,8 +44,38 @@ export async function listCodeforcesAccounts(includeDisabled = true): Promise<Co
   });
 }
 
+export async function listCodeforcesAccountSummaries(includeDisabled = true): Promise<CodeforcesAccountSummary[]> {
+  return prisma.codeforcesAccount.findMany({
+    ...(includeDisabled ? {} : { where: { status: { not: CodeforcesAccountStatus.DISABLED } } }),
+    select: {
+      id: true,
+      label: true,
+      username: true,
+      status: true,
+    },
+    orderBy: { label: 'asc' },
+  });
+}
+
+export async function listCodeforcesAccountIds(includeDisabled = true): Promise<string[]> {
+  const rows = await prisma.codeforcesAccount.findMany({
+    ...(includeDisabled ? {} : { where: { status: { not: CodeforcesAccountStatus.DISABLED } } }),
+    select: { id: true },
+    orderBy: { label: 'asc' },
+  });
+  return rows.map((row) => row.id);
+}
+
 export async function getCodeforcesAccountById(id: string): Promise<CodeforcesAccountRecord | null> {
   return prisma.codeforcesAccount.findUnique({ where: { id } });
+}
+
+export async function getCodeforcesAccountStorageState(id: string): Promise<string | null> {
+  const row = await prisma.codeforcesAccount.findUnique({
+    where: { id },
+    select: { storageState: true },
+  });
+  return row?.storageState ?? null;
 }
 
 export interface CodeforcesUsernameProgress {
@@ -62,7 +96,9 @@ export async function getUsernameProgress(username: string): Promise<CodeforcesU
   const clean = username.trim();
   if (!clean) return null;
   const key = getCodeforcesUsernameProgressKey(clean);
-  const raw = await prisma.systemState.findUnique({ where: { key } }).then((r) => r?.value ?? null);
+  const raw = await prisma.systemState
+    .findUnique({ where: { key }, select: { value: true } })
+    .then((r) => r?.value ?? null);
   if (!raw) {
     if (clean.toLowerCase() === 'pts003') {
       return {
@@ -108,10 +144,12 @@ export async function saveUsernameProgress(
     updatedAt: now,
   };
   const key = getCodeforcesUsernameProgressKey(clean);
+  const serialized = JSON.stringify(updated);
   await prisma.systemState.upsert({
     where: { key },
-    create: { key, value: JSON.stringify(updated) },
-    update: { value: JSON.stringify(updated) },
+    create: { key, value: serialized },
+    update: { value: serialized },
+    select: { key: true },
   });
   return updated;
 }
@@ -119,6 +157,7 @@ export async function saveUsernameProgress(
 export async function listAllUsernameProgress(): Promise<CodeforcesUsernameProgress[]> {
   const rows = await prisma.systemState.findMany({
     where: { key: { startsWith: 'cf_user_progress:' } },
+    select: { value: true },
   });
   const list: CodeforcesUsernameProgress[] = [];
   for (const row of rows) {
@@ -190,6 +229,7 @@ export async function saveCodeforcesAccount(
           lastSubmissionId: userProgress.lastSubmissionId ?? null,
           lastVerdict: userProgress.lastVerdict ?? null,
         },
+        select: { accountId: true },
       });
     }
   }
@@ -222,6 +262,7 @@ export async function patchCodeforcesAccount(
       ...(patch.lastVerdict !== undefined ? { lastVerdict: patch.lastVerdict } : {}),
       ...(patch.state !== undefined ? { storageState: JSON.stringify(patch.state) } : {}),
     },
+    select: { id: true },
   });
 }
 
@@ -292,6 +333,7 @@ export async function recordAttempt(
       lastSubmissionId: data.submissionId ?? null,
       lastVerdict: data.verdict,
     },
+    select: { accountId: true },
   });
 
   const account = await prisma.codeforcesAccount.findUnique({
@@ -325,6 +367,7 @@ export async function completeCurrentProblem(
       lastSubmissionId: data.submissionId,
       lastVerdict: data.verdict,
     },
+    select: { accountId: true },
   });
 
   const account = await prisma.codeforcesAccount.findUnique({

@@ -24,7 +24,11 @@ vi.mock('../src/database/models', () => ({
 }));
 
 vi.mock('../src/codechef/storage', () => ({
-  ensureCodeChefAccountsSeeded: vi.fn(), listCodeChefAccounts: vi.fn(), patchCodeChefAccount: vi.fn(),
+  ensureCodeChefAccountsSeeded: vi.fn(),
+  listCodeChefAccounts: vi.fn(),
+  listCodeChefAccountSummaries: vi.fn(),
+  getCodeChefAccountStorageState: vi.fn(),
+  patchCodeChefAccount: vi.fn(),
   getCodeChefProgress: vi.fn(), completeCurrentProblem: vi.fn(), claimDailyAttempt: vi.fn(), releaseDailyAttempt: vi.fn(), recordAttempt: vi.fn(),
 }));
 vi.mock('../src/codechef/sourceRepo', () => ({
@@ -51,6 +55,12 @@ beforeEach(() => {
   vi.mocked(isRunInProgress).mockReturnValue(false);
   vi.mocked(storage.patchCodeChefAccount).mockResolvedValue({} as never);
   vi.mocked(storage.releaseDailyAttempt).mockResolvedValue(undefined);
+  vi.mocked(storage.listCodeChefAccountSummaries).mockResolvedValue([
+    { id: 'account', label: 'tester', username: 'tester', status: 'ACTIVE', lastSubmissionDate: null },
+  ] as never);
+  vi.mocked(storage.getCodeChefAccountStorageState).mockResolvedValue(
+    JSON.stringify({ cookies: [{ name: 'session' }], origins: [] }),
+  );
   vi.mocked(storage.listCodeChefAccounts).mockResolvedValue([{ id: 'account', label: 'tester', username: 'tester', storageState: JSON.stringify({ cookies: [{ name: 'session' }], origins: [] }) }] as never);
   vi.mocked(storage.getCodeChefProgress).mockResolvedValue({ nextKey: 'AAA', lastCompletedKey: null, lastAttemptDate: null } as never);
   vi.mocked(storage.claimDailyAttempt).mockResolvedValue(true);
@@ -115,7 +125,8 @@ describe('CodeChef daily progress', () => {
     expect(storage.completeCurrentProblem).not.toHaveBeenCalled();
   });
   it('releases failed login claims and reports failure instead of saving false success', async () => {
-    vi.mocked(storage.listCodeChefAccounts).mockResolvedValue([{ id: 'account', label: 'tester', storageState: JSON.stringify({ username: 'tester', password: 'fixture', cookies: [] }) }] as never);
+    vi.mocked(storage.listCodeChefAccountSummaries).mockResolvedValue([{ id: 'account', label: 'tester', username: null, status: 'ACTIVE', lastSubmissionDate: null }] as never);
+    vi.mocked(storage.getCodeChefAccountStorageState).mockResolvedValue(JSON.stringify({ username: 'tester', password: 'fixture', cookies: [] }));
     vi.mocked(loginToCodeChef).mockRejectedValue(new Error('Login not verified'));
     const report = await runCodeChefNow();
     expect(report?.outcomes[0]?.error).toBe('Login not verified');
@@ -242,9 +253,12 @@ describe('CodeChef daily scheduler and retries', () => {
   it('runAutomaticCodeChefDaily ensures accounts are seeded and triggers run with forceDailyAttempt=true', async () => {
     const today = todayInTimezone();
     vi.mocked(getSystemState).mockImplementation(async key => key.startsWith('question-order:') ? null : JSON.stringify({ date: today, retryCount: 0 }));
-    vi.mocked(storage.listCodeChefAccounts).mockResolvedValue([
-      { id: 'acc1', label: 'tester', username: 'tester', lastSubmissionDate: null, storageState: JSON.stringify({ cookies: [{ name: 'session' }], origins: [] }) },
+    vi.mocked(storage.listCodeChefAccountSummaries).mockResolvedValue([
+      { id: 'acc1', label: 'tester', username: 'tester', status: 'ACTIVE', lastSubmissionDate: null },
     ] as never);
+    vi.mocked(storage.getCodeChefAccountStorageState).mockResolvedValue(
+      JSON.stringify({ cookies: [{ name: 'session' }], origins: [] }),
+    );
     vi.mocked(submitDirectlyViaCodeChefApi).mockResolvedValue({ ok: true, performed: true, clicked: true, submissionId: '555', verdict: 'Accepted' });
 
     // Simulate calling after schedule (e.g. 10:00 AM)
@@ -255,5 +269,22 @@ describe('CodeChef daily scheduler and retries', () => {
     expect(storage.ensureCodeChefAccountsSeeded).toHaveBeenCalled();
     expect(submitDirectlyViaCodeChefApi).toHaveBeenCalled();
     expect(sendTelegramMessage).toHaveBeenCalled();
+  });
+
+  it('skips storageState fetch when attempt is skipped/claimed and skips re-seeding on retry ticks', async () => {
+    const today = todayInTimezone();
+    vi.mocked(storage.listCodeChefAccountSummaries).mockResolvedValue([
+      { id: 'acc1', label: 'tester', username: 'tester', status: 'ACTIVE', lastSubmissionDate: today },
+    ] as never);
+
+    await runAutomaticCodeChefDaily(true, 0, 0, 'Asia/Kolkata');
+    expect(storage.ensureCodeChefAccountsSeeded).not.toHaveBeenCalled();
+    expect(storage.listCodeChefAccountSummaries).toHaveBeenCalledWith(true);
+    expect(storage.listCodeChefAccounts).not.toHaveBeenCalled();
+    expect(storage.getCodeChefAccountStorageState).not.toHaveBeenCalled();
+
+    vi.mocked(storage.claimDailyAttempt).mockResolvedValue(false);
+    await runCodeChefNow();
+    expect(storage.getCodeChefAccountStorageState).not.toHaveBeenCalled();
   });
 });

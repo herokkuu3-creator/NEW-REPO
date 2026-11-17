@@ -6,8 +6,8 @@ import { prepareShuffledBatch, plannedProgress } from '../scheduler/questionOrde
 import { getSystemState, setSystemState, SystemKeys } from '../database/models';
 import { isRunInProgress as isLeetCodeBusy } from '../scheduler/dailyWorker';
 import { sendTelegramMessage } from '../notifications/telegram';
+import * as ccStorage from './storage';
 import {
-  listCodeChefAccounts,
   ensureCodeChefAccountsSeeded,
   patchCodeChefAccount,
   getCodeChefProgress,
@@ -305,6 +305,27 @@ export function formatCodeChefReport(report: CodeChefReport): string {
   ].join('\n');
 }
 
+async function loadActiveCodeChefAccountSummaries(): Promise<
+  Array<ccStorage.CodeChefAccountSummary & { storageState?: string }>
+> {
+  if (typeof ccStorage.listCodeChefAccountSummaries === 'function') {
+    return ccStorage.listCodeChefAccountSummaries(true);
+  }
+  return ccStorage.listCodeChefAccounts(true);
+}
+
+async function loadCodeChefStorageState(
+  account: ccStorage.CodeChefAccountSummary & { storageState?: string },
+): Promise<string | null> {
+  if (typeof account.storageState === 'string') {
+    return account.storageState;
+  }
+  if (typeof ccStorage.getCodeChefAccountStorageState === 'function') {
+    return ccStorage.getCodeChefAccountStorageState(account.id);
+  }
+  return null;
+}
+
 export async function runCodeChefNow(
   reason: 'manual' | 'cron' = 'manual',
   options: CodeChefRunOptions = {},
@@ -317,7 +338,7 @@ export async function runCodeChefNow(
     const report: CodeChefReport = { date: todayInTimezone(), outcomes: [] };
     await ensureCodeChefAccountsSeeded();
     const requestedAccountIds = options.accountIds ? new Set(options.accountIds) : null;
-    const accounts = (await listCodeChefAccounts(true)).filter(
+    const accounts = (await loadActiveCodeChefAccountSummaries()).filter(
       (account) => !requestedAccountIds || requestedAccountIds.has(account.id)
     );
     const sourceQueue = accounts.length ? await loadCodeChefSourceIndex() : [];
@@ -423,7 +444,15 @@ export async function runCodeChefNow(
       }
 
       let mayHaveSubmitted = false;
-      const credentials = JSON.parse(account.storageState) as Partial<CodeChefState> & { username?: string; password?: string };
+      const rawStorageState = await loadCodeChefStorageState(account);
+      let credentials: Partial<CodeChefState> & { username?: string; password?: string } = {};
+      if (rawStorageState) {
+        try {
+          credentials = JSON.parse(rawStorageState) as Partial<CodeChefState> & { username?: string; password?: string };
+        } catch {
+          credentials = {};
+        }
+      }
       let state: CodeChefState | undefined = credentials.cookies?.length ? { cookies: credentials.cookies, origins: [] } : undefined;
 
       const login = async (): Promise<void> => {
@@ -812,8 +841,10 @@ export async function runAutomaticCodeChefDaily(
   const state = await readCodeChefDailyState(today);
   if (isRetry && state.retryCount >= CODECHEF_DAILY_RETRY_LIMIT) return;
 
-  await Promise.resolve(ensureCodeChefAccountsSeeded()).catch(() => {});
-  const accounts = await listCodeChefAccounts(true).catch(() => []);
+  if (!isRetry) {
+    await Promise.resolve(ensureCodeChefAccountsSeeded()).catch(() => {});
+  }
+  const accounts = await loadActiveCodeChefAccountSummaries().catch(() => []);
   const pending = accounts.filter((a) => a.lastSubmissionDate !== today);
   if (pending.length === 0) return;
 

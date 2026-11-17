@@ -100,8 +100,26 @@ vi.mock('../src/solutions/communitySolutions', async (orig) => ({
 vi.mock('../src/database/accounts', () => ({
   ensureAccountsSeeded: vi.fn(async () => undefined),
   listEnabledAccounts: vi.fn(async () => h.accounts),
+  getAccountById: vi.fn(async (id: string) => h.accounts.find((a) => a.id === id) ?? null),
   parseStoredStorageState: () => ({ ok: true, state: { cookies: [], origins: [] } }),
   patchAccount: vi.fn(async () => undefined),
+}));
+
+vi.mock('../src/database/prisma', () => ({
+  prisma: {
+    account: {
+      findMany: vi.fn(async () => h.accounts.map((a) => ({ id: a.id }))),
+    },
+    dailyRun: {
+      findMany: vi.fn(async () =>
+        [...h.runs.values()].map((r) => ({
+          accountId: r.accountId,
+          state: r.state,
+          submissionStatus: r.submissionStatus ?? null,
+        })),
+      ),
+    },
+  },
 }));
 
 vi.mock('../src/database/models', async () => {
@@ -317,12 +335,50 @@ describe('multi-account run shares one solution', () => {
     expect(h.submit).toHaveBeenCalledTimes(3);
   });
 
-  it('restricts a combined workflow to explicitly selected accounts', async () => {
+  it('restricts a combined workflow to explicitly selected accounts without listing all accounts', async () => {
+    const accountsDb = await import('../src/database/accounts');
+    vi.mocked(accountsDb.listEnabledAccounts).mockClear();
+    vi.mocked(accountsDb.getAccountById).mockClear();
     h.fetchWalkccc.mockResolvedValue({ code: 'class Solution {};', sourceUrl: 'u' });
     const { executeDailyRun } = await import('../src/scheduler/dailyWorker');
     const report = await executeDailyRun('solution-post-combined', { accountIds: ['id-a2'] });
     expect(report.accounts.map(a => a.label)).toEqual(['a2']);
     expect(h.submit).toHaveBeenCalledTimes(1);
+    expect(accountsDb.getAccountById).toHaveBeenCalledWith('id-a2');
+    expect(accountsDb.listEnabledAccounts).not.toHaveBeenCalled();
+  });
+
+  it('triggerDailyRetry uses lightweight select projections without fetching storageState or solution text', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-06T04:00:00.000Z')); // 09:30 IST (past 09:00 IST schedule)
+    try {
+      const { prisma } = await import('../src/database/prisma');
+      const accountsDb = await import('../src/database/accounts');
+      vi.mocked(accountsDb.listEnabledAccounts).mockClear();
+      vi.mocked(prisma.account.findMany).mockClear();
+      vi.mocked(prisma.dailyRun.findMany).mockClear();
+      for (const a of h.accounts) {
+        h.runs.set(String(a.id), {
+          accountId: a.id,
+          state: 'SUCCESS',
+          submissionStatus: 'Accepted',
+        });
+      }
+      const { triggerDailyRetry } = await import('../src/scheduler/dailyWorker');
+      await triggerDailyRetry();
+      expect(accountsDb.listEnabledAccounts).not.toHaveBeenCalled();
+      expect(prisma.account.findMany).toHaveBeenCalledWith({
+        where: { status: { not: 'DISABLED' } },
+        select: { id: true },
+      });
+      expect(prisma.dailyRun.findMany).toHaveBeenCalledWith({
+        where: { accountId: { in: ['id-a1', 'id-a2', 'id-a3'] }, date: '2026-10-06' },
+        select: { accountId: true, state: true, submissionStatus: true },
+      });
+      expect(h.submit).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('refuses a stale daily pointer before combined-mode code submission', async () => {

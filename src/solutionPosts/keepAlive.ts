@@ -8,16 +8,28 @@ export function startArticleWorkKeepAlive(): () => void {
   let url: URL;
   try { url = new URL('/health', config.api.publicUrl); } catch { return () => undefined; }
   if (!process.env.RENDER_INSTANCE_ID || url.protocol !== 'https:' || url.username || url.password) return () => undefined;
-  if (owners++ === 0) {
-    const ping = () => { void fetch(url, { signal: AbortSignal.timeout(20000) }).catch(() => undefined); };
+  if (owners === 0) {
+    if (timer) {
+      clearInterval(timer);
+      timer = undefined;
+    }
+    const ping = () => {
+      try {
+        void Promise.resolve(fetch(url, { signal: AbortSignal.timeout(20000) })).catch(() => undefined);
+      } catch {
+        // Ignore synchronous fetch/AbortSignal errors in keep-alive timer
+      }
+    };
     ping();
     timer = setInterval(ping, 8 * 60 * 1000);
     timer.unref();
   }
+  owners += 1;
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    if (--owners === 0 && timer) { clearInterval(timer); timer = undefined; }
+    if (owners > 0) owners -= 1;
+    if (owners === 0 && timer) { clearInterval(timer); timer = undefined; }
   };
 }

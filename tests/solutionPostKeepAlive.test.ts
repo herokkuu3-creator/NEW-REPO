@@ -24,3 +24,17 @@ it('does not make requests during local article tests', () => {
   vi.stubEnv('RENDER_INSTANCE_ID', ''); const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
   startArticleWorkKeepAlive()(); expect(fetch).not.toHaveBeenCalled();
 });
+it('can re-acquire after full release and tolerates synchronous fetch failures', async () => {
+  vi.useFakeTimers(); vi.stubEnv('RENDER_INSTANCE_ID', 'render');
+  const previous = config.api.publicUrl; config.api.publicUrl = 'https://bot.example.test';
+  const fetch = vi.fn(() => { throw new Error('network init failed'); });
+  vi.stubGlobal('fetch', fetch);
+  const stopOne = startArticleWorkKeepAlive();
+  stopOne();
+  const stopTwo = startArticleWorkKeepAlive();
+  try {
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(8 * 60 * 1000);
+    expect(fetch).toHaveBeenCalledTimes(3);
+  } finally { stopTwo(); config.api.publicUrl = previous; }
+});

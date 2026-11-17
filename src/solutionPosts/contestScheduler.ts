@@ -160,10 +160,10 @@ function contestQuestionLeaseKey(accountId: string, contestSlug: string, questio
 async function acquireCasLease(key: string, durationMs = CONTEST_JOB_LEASE_MS): Promise<(() => Promise<void>) | null> {
   const value = JSON.stringify({ owner: randomUUID(), until: Date.now() + durationMs });
   try {
-    await prisma.systemState.create({ data: { key, value } });
+    await prisma.systemState.create({ data: { key, value }, select: { key: true } });
   } catch (error) {
     if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') throw error;
-    const existing = await prisma.systemState.findUnique({ where: { key } });
+    const existing = await prisma.systemState.findUnique({ where: { key }, select: { value: true } });
     if (!existing) return null;
     let until = Infinity;
     try { until = Number(JSON.parse(existing.value).until); } catch { /* corrupt lock stays held */ }
@@ -225,7 +225,15 @@ async function emitContestProgress(
   }
 }
 
-async function findExistingContestPost(accountId: string, problemSlug: string): Promise<SolutionPost | null> {
+type ExistingContestPostSummary = Pick<
+  SolutionPost,
+  'id' | 'status' | 'publishedUrl' | 'lastError' | 'leaseUntil' | 'retryCount'
+>;
+
+async function findExistingContestPost(
+  accountId: string,
+  problemSlug: string,
+): Promise<ExistingContestPostSummary | null> {
   return prisma.solutionPost.findUnique({
     where: {
       accountId_problemSlug_intent: {
@@ -233,6 +241,14 @@ async function findExistingContestPost(accountId: string, problemSlug: string): 
         problemSlug,
         intent: 'contest-solution',
       },
+    },
+    select: {
+      id: true,
+      status: true,
+      publishedUrl: true,
+      lastError: true,
+      leaseUntil: true,
+      retryCount: true,
     },
   });
 }
@@ -511,6 +527,7 @@ export async function runContestSolutionWorkflow(params: {
   }
   const accounts = await prisma.account.findMany({
     where: { id: { in: params.accountIds }, status: { not: 'DISABLED' } },
+    select: { id: true },
   });
   if (accounts.length !== params.accountIds.length) {
     throw new PostError('ACCOUNT_UNAVAILABLE');
@@ -547,11 +564,10 @@ export async function runContestSolutionWorkflow(params: {
   return results;
 }
 
-async function readBudget(key: string): Promise<BudgetRecord> {
-  const row = await prisma.systemState.findUnique({ where: { key } });
-  if (!row) return { attempts: 0, lastAttemptAt: 0 };
+function parseBudgetValue(raw: string | null | undefined): BudgetRecord {
+  if (!raw) return { attempts: 0, lastAttemptAt: 0 };
   try {
-    const parsed = JSON.parse(row.value) as Partial<BudgetRecord>;
+    const parsed = JSON.parse(raw) as Partial<BudgetRecord>;
     return {
       attempts: Number.isFinite(parsed.attempts) ? Number(parsed.attempts) : 0,
       lastAttemptAt: Number.isFinite(parsed.lastAttemptAt) ? Number(parsed.lastAttemptAt) : 0,
@@ -562,9 +578,15 @@ async function readBudget(key: string): Promise<BudgetRecord> {
   }
 }
 
-async function reserveBudgetAttempt(key: string, now: Date): Promise<boolean> {
-  const existing = await prisma.systemState.findUnique({ where: { key } });
-  const current = await readBudget(key);
+async function reserveBudgetAttempt(
+  key: string,
+  now: Date,
+  prefetched?: { value: string } | null,
+): Promise<boolean> {
+  const existing = prefetched !== undefined
+    ? prefetched
+    : await prisma.systemState.findUnique({ where: { key }, select: { value: true } });
+  const current = parseBudgetValue(existing?.value);
   if (current.attempts < 0 || current.attempts >= CONTEST_RETRY_LIMIT) return false;
   const nextValue = JSON.stringify({
     attempts: current.attempts + 1,
@@ -575,7 +597,7 @@ async function reserveBudgetAttempt(key: string, now: Date): Promise<boolean> {
     return updated.count === 1;
   }
   try {
-    await prisma.systemState.create({ data: { key, value: nextValue } });
+    await prisma.systemState.create({ data: { key, value: nextValue }, select: { key: true } });
     return true;
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return false;
@@ -584,9 +606,9 @@ async function reserveBudgetAttempt(key: string, now: Date): Promise<boolean> {
 }
 
 async function releaseBudgetAttempt(key: string, errorCode?: string): Promise<void> {
-  const existing = await prisma.systemState.findUnique({ where: { key } });
+  const existing = await prisma.systemState.findUnique({ where: { key }, select: { value: true } });
   if (!existing) return;
-  const current = await readBudget(key);
+  const current = parseBudgetValue(existing.value);
   const nextValue = JSON.stringify({
     attempts: Math.max(0, current.attempts - 1),
     lastAttemptAt: current.lastAttemptAt,
@@ -601,36 +623,44 @@ async function saveScheduleState(value: Record<string, unknown>): Promise<void> 
     where: { key: CONTEST_SCHEDULE_STATE_KEY },
     create: { key: CONTEST_SCHEDULE_STATE_KEY, value: serialized },
     update: { value: serialized },
+    select: { key: true },
   });
 }
 
-async function isPairPending(
+async function inspectPendingPair(
   contestSlug: string,
   accountId: string,
   questionSlug: string,
   now: Date,
-): Promise<boolean> {
-  const done = await prisma.systemState.findUnique({ where: { key: contestDoneKey(contestSlug, accountId, questionSlug) } });
-  if (done) return false;
+): Promise<{ pending: false } | { pending: true; budgetRow: { value: string } | null }> {
+  const done = await prisma.systemState.findUnique({
+    where: { key: contestDoneKey(contestSlug, accountId, questionSlug) },
+    select: { key: true },
+  });
+  if (done) return { pending: false };
 
   const existingPost = await findExistingContestPost(accountId, questionSlug);
   if (existingPost) {
-    if (['PUBLISHED', 'PUBLISHING', 'SKIPPED'].includes(existingPost.status)) return false;
-    if (isCoarenaPaused(existingPost)) return false;
+    if (['PUBLISHED', 'PUBLISHING', 'SKIPPED'].includes(existingPost.status)) return { pending: false };
+    if (isCoarenaPaused(existingPost)) return { pending: false };
     if (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(existingPost.status) && !config.solutionPosts.autoPublish) {
-      return false;
+      return { pending: false };
     }
     if (existingPost.status === 'FAILED' && existingPost.retryCount >= CONTEST_RETRY_LIMIT && existingPost.lastError !== 'AI_KEYS_EXHAUSTED') {
-      return false;
+      return { pending: false };
     }
   }
 
-  const budget = await readBudget(contestBudgetKey(contestSlug, accountId, questionSlug));
+  const budgetRow = await prisma.systemState.findUnique({
+    where: { key: contestBudgetKey(contestSlug, accountId, questionSlug) },
+    select: { value: true },
+  });
+  const budget = parseBudgetValue(budgetRow?.value);
   if (budget.attempts >= CONTEST_RETRY_LIMIT && existingPost?.lastError !== 'AI_KEYS_EXHAUSTED') {
-    return false;
+    return { pending: false };
   }
   void now;
-  return true;
+  return { pending: true, budgetRow: budgetRow ? { value: budgetRow.value } : null };
 }
 
 /**
@@ -691,7 +721,11 @@ export async function runScheduledContestPosts(
 
     const prefIds = await selectedAccountIds();
     const accounts = prefIds.length
-      ? await prisma.account.findMany({ where: { id: { in: prefIds }, status: { not: 'DISABLED' } }, orderBy: { label: 'asc' } })
+      ? await prisma.account.findMany({
+          where: { id: { in: prefIds }, status: { not: 'DISABLED' } },
+          select: { id: true },
+          orderBy: { label: 'asc' },
+        })
       : [];
     const questions = selectStartingContestQuestions(contest, [0, 1]);
     if (!accounts.length || !questions.length) {
@@ -710,8 +744,9 @@ export async function runScheduledContestPosts(
     for (const account of accounts) {
       const pendingQuestions: ContestQuestionSummary[] = [];
       for (const q of questions) {
-        if (!await isPairPending(contest.titleSlug, account.id, q.titleSlug, now)) continue;
-        if (await reserveBudgetAttempt(contestBudgetKey(contest.titleSlug, account.id, q.titleSlug), now)) {
+        const pair = await inspectPendingPair(contest.titleSlug, account.id, q.titleSlug, now);
+        if (!pair.pending) continue;
+        if (await reserveBudgetAttempt(contestBudgetKey(contest.titleSlug, account.id, q.titleSlug), now, pair.budgetRow)) {
           pendingQuestions.push(q);
         }
       }
@@ -780,25 +815,22 @@ export async function runScheduledContestPosts(
         (!config.solutionPosts.autoPublish && (result.status === 'DRAFT_READY' || result.status === 'AWAITING_APPROVAL'));
 
       if (completedForAuto) {
+        const donePayload = JSON.stringify({
+          status: result.status,
+          postId: result.postId ?? null,
+          publishedUrl: result.publishedUrl ?? null,
+          at: new Date().toISOString(),
+        });
         await prisma.systemState.upsert({
           where: { key: doneKey },
           create: {
             key: doneKey,
-            value: JSON.stringify({
-              status: result.status,
-              postId: result.postId ?? null,
-              publishedUrl: result.publishedUrl ?? null,
-              at: new Date().toISOString(),
-            }),
+            value: donePayload,
           },
           update: {
-            value: JSON.stringify({
-              status: result.status,
-              postId: result.postId ?? null,
-              publishedUrl: result.publishedUrl ?? null,
-              at: new Date().toISOString(),
-            }),
+            value: donePayload,
           },
+          select: { key: true },
         });
       } else if (isContentionError(result.error)) {
         await releaseBudgetAttempt(budgetKey, result.error);
@@ -859,7 +891,10 @@ export async function getContestSchedulerDiagnostics(): Promise<unknown> {
   const ist = getIstParts(now);
   let stateRow: { value: string; updatedAt?: Date } | null = null;
   try {
-    stateRow = await prisma.systemState.findUnique({ where: { key: CONTEST_SCHEDULE_STATE_KEY } });
+    stateRow = await prisma.systemState.findUnique({
+      where: { key: CONTEST_SCHEDULE_STATE_KEY },
+      select: { value: true, updatedAt: true },
+    });
   } catch {
     stateRow = null;
   }

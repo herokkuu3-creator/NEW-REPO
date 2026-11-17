@@ -9,10 +9,20 @@ import * as credentialStore from '../src/security/credentialStore';
 import * as leetcodeAuth from '../src/leetcode/auth';
 import * as codeforcesAuth from '../src/codeforces/auth';
 import * as accountsDb from '../src/database/accounts';
+import { prisma } from '../src/database/prisma';
 import * as codeforcesStorage from '../src/codeforces/storage';
 import * as sessionCheck from '../src/browser/sessionCheck';
 import * as codeforcesSession from '../src/codeforces/session';
 import * as playwright from '../src/browser/playwright';
+
+vi.mock('../src/database/prisma', () => ({
+  prisma: {
+    account: {
+      findMany: vi.fn(),
+      findUnique: vi.fn(),
+    },
+  },
+}));
 
 vi.mock('../src/browser/playwright', () => ({
   launchWithStorageStateObject: vi.fn(),
@@ -49,6 +59,8 @@ vi.mock('../src/database/accounts', () => ({
 
 vi.mock('../src/codeforces/storage', () => ({
   listCodeforcesAccounts: vi.fn(),
+  listCodeforcesAccountSummaries: vi.fn(),
+  getCodeforcesAccountStorageState: vi.fn(),
   patchCodeforcesAccount: vi.fn(),
   saveCodeforcesAccount: vi.fn(),
 }));
@@ -276,38 +288,29 @@ describe('Session Auto-Refresh & Verification Engine', () => {
 
   describe('Full Verification Summary', () => {
     it('aggregates outcomes across both platforms', async () => {
-      vi.mocked(accountsDb.listAccounts).mockResolvedValue([
+      vi.mocked(prisma.account.findMany).mockResolvedValue([
         {
           id: 'acc-1',
           label: 'lc1',
           username: 'lc_user1',
-          storageState: JSON.stringify({ cookies: [], origins: [] }),
           status: AccountStatus.ACTIVE,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-          lastError: null,
-          lastCheckedAt: null,
-          lastRunAt: null,
-          lastResult: null,
-        },
+        } as any,
       ]);
+      vi.mocked(prisma.account.findUnique).mockResolvedValue({
+        storageState: JSON.stringify({ cookies: [], origins: [] }),
+      } as any);
 
-      vi.mocked(codeforcesStorage.listCodeforcesAccounts).mockResolvedValue([
+      vi.mocked(codeforcesStorage.listCodeforcesAccountSummaries).mockResolvedValue([
         {
           id: 'cf-1',
           label: 'cf1',
           username: 'cf_user1',
-          storageState: JSON.stringify({ cookies: [], origins: [] }),
           status: CodeforcesAccountStatus.ACTIVE,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-          lastError: null,
-          lastCheckedAt: null,
-          lastSubmissionDate: null,
-          lastSubmissionId: null,
-          lastVerdict: null,
         },
       ]);
+      vi.mocked(codeforcesStorage.getCodeforcesAccountStorageState).mockResolvedValue(
+        JSON.stringify({ cookies: [], origins: [] }),
+      );
 
       vi.mocked(playwright.launchWithStorageStateObject).mockResolvedValue({
         context: {} as any,
@@ -332,6 +335,32 @@ describe('Session Auto-Refresh & Verification Engine', () => {
       expect(summary.refreshed).toBe(0);
       expect(summary.failed).toBe(0);
       expect(summary.expiredWithoutCreds).toBe(0);
+      expect(prisma.account.findMany).toHaveBeenCalledWith({
+        select: { id: true, label: true, username: true, status: true },
+        orderBy: { label: 'asc' },
+      });
+      expect(prisma.account.findUnique).toHaveBeenCalledWith({
+        where: { id: 'acc-1' },
+        select: { storageState: true },
+      });
+      expect(codeforcesStorage.listCodeforcesAccountSummaries).toHaveBeenCalledWith(true);
+      expect(codeforcesStorage.getCodeforcesAccountStorageState).toHaveBeenCalledWith('cf-1');
+    });
+
+    it('never fetches storageState for DISABLED accounts during full verification', async () => {
+      vi.mocked(prisma.account.findMany).mockResolvedValue([
+        { id: 'acc-disabled', label: 'lc_dis', username: 'u1', status: AccountStatus.DISABLED } as any,
+      ]);
+      vi.mocked(codeforcesStorage.listCodeforcesAccountSummaries).mockResolvedValue([
+        { id: 'cf-disabled', label: 'cf_dis', username: 'u2', status: CodeforcesAccountStatus.DISABLED },
+      ]);
+
+      const summary = await verifyAndRefreshAllSessions({ notifyTelegram: false });
+      expect(summary.totalLeetCode).toBe(1);
+      expect(summary.totalCodeforces).toBe(1);
+      expect(summary.outcomes).toEqual([]);
+      expect(prisma.account.findUnique).not.toHaveBeenCalled();
+      expect(codeforcesStorage.getCodeforcesAccountStorageState).not.toHaveBeenCalled();
     });
   });
 });

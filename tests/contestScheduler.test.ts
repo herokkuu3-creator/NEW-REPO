@@ -659,4 +659,36 @@ describe('runScheduledContestPosts & recovery', () => {
       await app.close();
     }
   });
+
+  it('uses explicit select projections omitting heavy text blobs and avoids duplicate budget reads', async () => {
+    const { prisma } = await import('../src/database/prisma');
+    h.accounts = [h.accounts[0]!];
+    h.preferences = [{ accountId: 'acc-1', enabled: true }];
+    const contest = makeContest('weekly', 'weekly-contest-528', '2026-11-15T04:00:00Z');
+    h.fetchLatestEndedContest.mockResolvedValue(contest);
+
+    await runScheduledContestPosts('weekly', new Date('2026-11-15T04:01:00Z'), 'cron');
+
+    expect(vi.mocked(prisma.account.findMany)).toHaveBeenCalledWith(
+      expect.objectContaining({ select: { id: true } }),
+    );
+    expect(vi.mocked(prisma.solutionPost.findUnique)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: {
+          id: true,
+          status: true,
+          publishedUrl: true,
+          lastError: true,
+          leaseUntil: true,
+          retryCount: true,
+        },
+      }),
+    );
+
+    const q1BudgetReads = vi.mocked(prisma.systemState.findUnique).mock.calls.filter(
+      ([args]) => args?.where?.key === 'contest-post-budget:weekly-contest-528:acc-1:smallest-pair',
+    );
+    expect(q1BudgetReads).toHaveLength(1);
+    expect(q1BudgetReads[0]?.[0]?.select).toEqual({ value: true });
+  });
 });

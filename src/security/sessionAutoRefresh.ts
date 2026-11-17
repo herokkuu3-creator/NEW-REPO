@@ -1,7 +1,14 @@
 import cron from 'node-cron';
 import { AccountStatus, CodeforcesAccountStatus } from '@prisma/client';
-import { listAccounts, patchAccount, saveAccount, AccountRecord, parseStoredStorageState } from '../database/accounts';
-import { listCodeforcesAccounts, patchCodeforcesAccount, saveCodeforcesAccount, CodeforcesAccountRecord } from '../codeforces/storage';
+import { prisma } from '../database/prisma';
+import { patchAccount, saveAccount, AccountRecord, parseStoredStorageState } from '../database/accounts';
+import {
+  getCodeforcesAccountStorageState,
+  listCodeforcesAccountSummaries,
+  patchCodeforcesAccount,
+  saveCodeforcesAccount,
+  CodeforcesAccountRecord,
+} from '../codeforces/storage';
 import { validateCodeforcesStorageState } from '../codeforces/session';
 import { checkSession } from '../browser/sessionCheck';
 import { LeetCodeApi } from '../leetcode/apiClient';
@@ -36,7 +43,10 @@ export interface SessionRefreshSummary {
   outcomes: AccountRefreshOutcome[];
 }
 
-async function checkLeetCodeSessionLive(account: AccountRecord): Promise<{ authenticated: boolean; username?: string | null; cause?: string }> {
+type LeetCodeRefreshAccount = Pick<AccountRecord, 'id' | 'label' | 'username' | 'status' | 'storageState'>;
+type CodeforcesRefreshAccount = Pick<CodeforcesAccountRecord, 'id' | 'label' | 'username' | 'status' | 'storageState'>;
+
+async function checkLeetCodeSessionLive(account: LeetCodeRefreshAccount): Promise<{ authenticated: boolean; username?: string | null; cause?: string }> {
   const parsed = parseStoredStorageState(account.storageState);
   if (!parsed.ok) return { authenticated: false, cause: 'invalid-storage-state' };
   let session = null;
@@ -62,7 +72,7 @@ async function checkLeetCodeSessionLive(account: AccountRecord): Promise<{ authe
  * Checks a LeetCode account session; if expired/signed out and encrypted credentials exist,
  * automatically re-authenticates and updates storageState in DB.
  */
-export async function refreshLeetCodeAccount(account: AccountRecord): Promise<AccountRefreshOutcome> {
+export async function refreshLeetCodeAccount(account: LeetCodeRefreshAccount): Promise<AccountRefreshOutcome> {
   const check = await checkLeetCodeSessionLive(account);
   if (check.authenticated) {
     if (account.status !== AccountStatus.ACTIVE) {
@@ -140,7 +150,7 @@ export async function refreshLeetCodeAccount(account: AccountRecord): Promise<Ac
  * Checks a Codeforces account session; if expired/signed out and encrypted credentials exist,
  * automatically re-authenticates and updates storageState in DB.
  */
-export async function refreshCodeforcesAccount(account: CodeforcesAccountRecord): Promise<AccountRefreshOutcome> {
+export async function refreshCodeforcesAccount(account: CodeforcesRefreshAccount): Promise<AccountRefreshOutcome> {
   const parsed = parseStoredStorageState(account.storageState);
   let isValid = false;
   let username = account.username;
@@ -227,15 +237,25 @@ export async function verifyAndRefreshAllSessions(options?: {
   notifyTelegram?: boolean;
 }): Promise<SessionRefreshSummary> {
   logger.info('Starting full pre-run session verification and auto-refresh');
-  const lcAccounts = await listAccounts().catch(() => []);
-  const cfAccounts = await listCodeforcesAccounts().catch(() => []);
+  const lcAccounts = await prisma.account
+    .findMany({
+      select: { id: true, label: true, username: true, status: true },
+      orderBy: { label: 'asc' },
+    })
+    .catch(() => []);
+  const cfAccounts = await listCodeforcesAccountSummaries(true).catch(() => []);
 
   const outcomes: AccountRefreshOutcome[] = [];
 
   for (const acc of lcAccounts) {
     if (acc.status === AccountStatus.DISABLED) continue;
     try {
-      const outcome = await refreshLeetCodeAccount(acc);
+      const row = await prisma.account.findUnique({
+        where: { id: acc.id },
+        select: { storageState: true },
+      });
+      if (!row) continue;
+      const outcome = await refreshLeetCodeAccount({ ...acc, storageState: row.storageState });
       outcomes.push(outcome);
     } catch (err) {
       outcomes.push({
@@ -251,7 +271,9 @@ export async function verifyAndRefreshAllSessions(options?: {
   for (const acc of cfAccounts) {
     if (acc.status === CodeforcesAccountStatus.DISABLED) continue;
     try {
-      const outcome = await refreshCodeforcesAccount(acc);
+      const storageState = await getCodeforcesAccountStorageState(acc.id);
+      if (storageState === null) continue;
+      const outcome = await refreshCodeforcesAccount({ ...acc, storageState });
       outcomes.push(outcome);
     } catch (err) {
       outcomes.push({

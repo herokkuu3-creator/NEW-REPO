@@ -1,12 +1,40 @@
 import { CodeChefAccount, CodeChefAccountStatus, CodeChefProgress } from '@prisma/client';
 import { prisma } from '../database/prisma';
 
+export type CodeChefAccountSummary = Pick<
+  CodeChefAccount,
+  'id' | 'label' | 'username' | 'status' | 'lastSubmissionDate'
+>;
+
 export async function listCodeChefAccounts(onlyActive = true): Promise<CodeChefAccount[]> {
   const where = onlyActive ? { status: CodeChefAccountStatus.ACTIVE } : {};
   return prisma.codeChefAccount.findMany({
     where,
     orderBy: { createdAt: 'asc' },
   });
+}
+
+export async function listCodeChefAccountSummaries(onlyActive = true): Promise<CodeChefAccountSummary[]> {
+  const where = onlyActive ? { status: CodeChefAccountStatus.ACTIVE } : {};
+  return prisma.codeChefAccount.findMany({
+    where,
+    select: {
+      id: true,
+      label: true,
+      username: true,
+      status: true,
+      lastSubmissionDate: true,
+    },
+    orderBy: { createdAt: 'asc' },
+  });
+}
+
+export async function getCodeChefAccountStorageState(id: string): Promise<string | null> {
+  const row = await prisma.codeChefAccount.findUnique({
+    where: { id },
+    select: { storageState: true },
+  });
+  return row?.storageState ?? null;
 }
 
 export async function patchCodeChefAccount(
@@ -104,6 +132,7 @@ export async function recordAttempt(
       lastSubmissionId: data.submissionId,
       lastVerdict: data.verdict,
     },
+    select: { accountId: true },
   });
 }
 
@@ -119,7 +148,10 @@ export async function ensureCodeChefAccountsSeeded(): Promise<void> {
     const password = value.slice(separator + 2);
     if (!username) continue;
     // Note: We use username as label
-    const existing = await prisma.codeChefAccount.findUnique({ where: { label: username } });
+    const existing = await prisma.codeChefAccount.findUnique({
+      where: { label: username },
+      select: { id: true, storageState: true },
+    });
     if (!existing) {
       await prisma.codeChefAccount.create({
         data: {
@@ -132,10 +164,16 @@ export async function ensureCodeChefAccountsSeeded(): Promise<void> {
           }),
           status: CodeChefAccountStatus.ACTIVE,
         },
+        select: { id: true },
       });
     } else {
-      const stored = JSON.parse(existing.storageState) as { password?: string };
-      if (stored.password !== password) {
+      let storedPassword: string | undefined;
+      try {
+        storedPassword = (JSON.parse(existing.storageState) as { password?: string }).password;
+      } catch {
+        storedPassword = undefined;
+      }
+      if (storedPassword !== password) {
         await patchCodeChefAccount(existing.id, { storageState: JSON.stringify({ username, password, cookies: [], origins: [] }) });
       }
     }

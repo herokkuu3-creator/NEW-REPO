@@ -5,16 +5,23 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../src/database/models', () => ({
   getSystemState: vi.fn(async (key: string) => key.startsWith('question-order:') ? null : 'proxy'), setSystemState: vi.fn(async () => {}), SystemKeys: { codeforcesNetworkMode: 'route' },
 }));
-vi.mock('../src/codeforces/storage', () => ({
-  listCodeforcesAccounts: vi.fn(async () => [
-    { id: 'a1', label: 'first', username: 'first', storageState: '{}' },
-    { id: 'a2', label: 'second', username: 'second', storageState: '{}' },
-  ]),
-  parseStoredCodeforcesState: vi.fn(() => ({ ok: true, state: { cookies: [], origins: [] } })),
-  getCodeforcesProgress: vi.fn(async () => ({ nextKey: '8B', lastCompletedKey: null })),
-  claimDailyAttempt: vi.fn(async () => true), releaseDailyAttempt: vi.fn(async () => {}), recordAttempt: vi.fn(async () => {}),
-  completeCurrentProblem: mocks.complete, patchCodeforcesAccount: mocks.patch,
-}));
+vi.mock('../src/codeforces/storage', () => {
+  const rows = [
+    { id: 'a1', label: 'first', username: 'first', status: 'ACTIVE', storageState: '{}' },
+    { id: 'a2', label: 'second', username: 'second', status: 'ACTIVE', storageState: '{}' },
+  ];
+  return {
+    listCodeforcesAccounts: vi.fn(async () => rows),
+    listCodeforcesAccountSummaries: vi.fn(async () => rows.map(({ storageState: _s, ...rest }) => rest)),
+    listCodeforcesAccountIds: vi.fn(async () => rows.map((r) => r.id)),
+    getCodeforcesAccountById: vi.fn(async (id: string) => rows.find((r) => r.id === id) ?? null),
+    getCodeforcesAccountStorageState: vi.fn(async (id: string) => rows.find((r) => r.id === id)?.storageState ?? null),
+    parseStoredCodeforcesState: vi.fn(() => ({ ok: true, state: { cookies: [], origins: [] } })),
+    getCodeforcesProgress: vi.fn(async () => ({ nextKey: '8B', lastCompletedKey: null })),
+    claimDailyAttempt: vi.fn(async () => true), releaseDailyAttempt: vi.fn(async () => {}), recordAttempt: vi.fn(async () => {}),
+    completeCurrentProblem: mocks.complete, patchCodeforcesAccount: mocks.patch,
+  };
+});
 vi.mock('../src/codeforces/sourceRepo', () => ({
   loadRuntimeSourceIndex: vi.fn(async () => ({ queue: [
     { key: '8B', contestId: 8, problemIndex: 'B', language: 'cpp', problemUrl: 'https://codeforces.com/contest/8/problem/B' },
@@ -158,4 +165,15 @@ it('sends starting notification and final verdict report when reason is cron', a
   expect(sendTelegramMessage).toHaveBeenCalledTimes(2);
   expect(vi.mocked(sendTelegramMessage).mock.calls[0]?.[0]).toContain('Starting daily submission for Codeforces');
   expect(vi.mocked(sendTelegramMessage).mock.calls[1]?.[0]).toContain('Codeforces Daily');
+});
+
+it('uses lightweight account summaries + per-account loads and skips rewriting unchanged state', async () => {
+  const storage = await import('../src/codeforces/storage');
+  mocks.post.mockResolvedValue(posted);
+  mocks.poll.mockResolvedValue({ id: 101, verdict: 'OK' });
+  await runCodeforcesNow('manual', { forceDailyAttempt: true });
+  expect(storage.listCodeforcesAccountSummaries).toHaveBeenCalledWith(false);
+  expect(storage.listCodeforcesAccounts).not.toHaveBeenCalled();
+  expect(storage.getCodeforcesAccountById).toHaveBeenCalledTimes(2);
+  expect(mocks.patch).toHaveBeenCalledWith('a1', expect.not.objectContaining({ state: expect.anything() }));
 });

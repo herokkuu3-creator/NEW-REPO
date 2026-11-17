@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { AccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
+import { prisma } from '../database/prisma';
 import {
   DailyRunRecord,
   RunState,
@@ -251,7 +252,19 @@ export async function executeDailyRun(
     await ensureAccountsSeeded();
 
     const today = leetcodeDayKey();
-    const accounts = (await listEnabledAccounts()).filter(a => !options.accountIds || options.accountIds.includes(a.id));
+    let accounts: AccountRecord[];
+    if (options.accountIds) {
+      if (options.accountIds.length === 0) {
+        accounts = [];
+      } else if (options.accountIds.length === 1 && typeof getAccountById === 'function') {
+        const one = await getAccountById(options.accountIds[0]!);
+        accounts = one && one.status !== AccountStatus.DISABLED ? [one] : [];
+      } else {
+        accounts = (await listEnabledAccounts()).filter((a) => options.accountIds!.includes(a.id));
+      }
+    } else {
+      accounts = await listEnabledAccounts();
+    }
 
     // Auto-refresh any expired or rejected sessions if credentials exist in DB
     for (let i = 0; i < accounts.length; i++) {
@@ -1079,20 +1092,33 @@ export function startScheduler(): () => void {
 export const DAILY_RETRY_LIMIT = 5;
 export const DAILY_RETRY_GAP_MS = 60 * 60 * 1000; // 1 hour gap between retry attempts
 
-async function triggerDailyRetry(): Promise<void> {
+export async function triggerDailyRetry(): Promise<void> {
   if (runInProgress) return;
   const { isRangeJobActive } = await import('./rangeSubmission').catch(() => ({ isRangeJobActive: () => false }));
   if (isRangeJobActive()) return;
   if (!isPastScheduledDailyTime()) return;
   const today = leetcodeDayKey();
-  const accounts = await listEnabledAccounts().catch(() => []);
-  if (accounts.length === 0) return;
+  const accountRows = await prisma.account
+    .findMany({
+      where: { status: { not: AccountStatus.DISABLED } },
+      select: { id: true },
+    })
+    .catch(() => []);
+  if (accountRows.length === 0) return;
 
-  const incomplete = await Promise.all(accounts.map(async (account) => {
-    const row = await findRunByDate(account.id, today);
+  const accountIds = accountRows.map((account) => account.id);
+  const runRows = await prisma.dailyRun
+    .findMany({
+      where: { accountId: { in: accountIds }, date: today },
+      select: { accountId: true, state: true, submissionStatus: true },
+    })
+    .catch(() => []);
+  const runByAccount = new Map(runRows.map((row) => [row.accountId, row]));
+  const hasIncomplete = accountIds.some((id) => {
+    const row = runByAccount.get(id);
     return !row || row.state !== RunState.SUCCESS || /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(row.submissionStatus ?? '');
-  }));
-  if (!incomplete.some(Boolean)) return;
+  });
+  if (!hasIncomplete) return;
 
   let retry = { date: today, count: 0, lastAttemptAt: 0 };
   try {
