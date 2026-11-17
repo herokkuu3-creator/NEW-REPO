@@ -48,7 +48,11 @@ export async function publishGeneratedPost(post: SolutionPost, mode: 'daily' | '
 
 /** The durable list shared by the 06:00 scheduler and the Telegram picker. */
 export async function selectedAccountIds(): Promise<string[]> {
-  const selected = await prisma.solutionPostPreference.findMany({ where: { enabled: true }, orderBy: { accountId: 'asc' } });
+  const selected = await prisma.solutionPostPreference.findMany({
+    where: { enabled: true },
+    select: { accountId: true },
+    orderBy: { accountId: 'asc' },
+  });
   return selected.map(item => item.accountId);
 }
 
@@ -141,11 +145,13 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
           language: capture.language, solution: capture.code, submissionId, submissionStatus: 'Accepted', state: 'SUCCESS' },
         update: { problemSlug: capture.slug, title: capture.title, difficulty: capture.difficulty, language: capture.language,
           solution: capture.code, submissionId, submissionStatus: 'Accepted', state: 'SUCCESS', error: null },
+        select: { id: true },
       });
       await reportProgress(onProgress, { accountId: account.id, stage: 'generating_article', questionNumber, submissionId, detail: 'Starting article generation & visual planning…' });
-      const existing = await prisma.solutionPost.findUnique({ where: {
-        accountId_problemSlug_intent: { accountId: account.id, problemSlug: capture.slug, intent: 'community-solution' },
-      } });
+      const existing = await prisma.solutionPost.findUnique({
+        where: { accountId_problemSlug_intent: { accountId: account.id, problemSlug: capture.slug, intent: 'community-solution' } },
+        select: { id: true, status: true },
+      });
       const onStage = onProgress ? (stage: string, detail?: string) => {
         void reportProgress(onProgress, { accountId: account.id, stage: stage as any, questionNumber, submissionId, detail });
       } : undefined;
@@ -188,10 +194,10 @@ export async function acquireDailyLease(accountId: string, date: string) {
   const workMs = config.solutionPosts.aiProvider === 'firecrawl' ? (6 + IMPLEMENTATION_STAGE_BUDGET) * FIRECRAWL_STAGE_BUDGET_MS : SOLUTION_ARTICLE_WORK_MS;
   const duration = workMs + 15 * 60_000;
   const value = JSON.stringify({ owner: randomUUID(), until: Date.now() + duration });
-  try { await prisma.systemState.create({ data: { key, value } }); }
+  try { await prisma.systemState.create({ data: { key, value }, select: { key: true } }); }
   catch (error) {
     if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') throw error;
-    const old = await prisma.systemState.findUnique({ where: { key } });
+    const old = await prisma.systemState.findUnique({ where: { key }, select: { value: true } });
     if (!old) return null;
     let until = Infinity;
     try { until = Number(JSON.parse(old.value).until); } catch { /* corrupt lock requires operator review */ }
@@ -207,8 +213,8 @@ async function reserveScheduledAttempt(accountId: string, date: string, now = ne
   const timeKey = `solution-post-schedule-attempt-at:${accountId}:${date}`;
 
   const [oldBudget, oldTime] = await Promise.all([
-    prisma.systemState.findUnique({ where: { key: budgetKey } }),
-    prisma.systemState.findUnique({ where: { key: timeKey } }),
+    prisma.systemState.findUnique({ where: { key: budgetKey }, select: { value: true } }),
+    prisma.systemState.findUnique({ where: { key: timeKey }, select: { value: true } }),
   ]);
 
   const count = oldBudget ? Number(oldBudget.value) : 0;
@@ -228,7 +234,7 @@ async function reserveScheduledAttempt(accountId: string, date: string, now = ne
     claimed = (await prisma.systemState.updateMany({ where: { key: budgetKey, value: oldBudget.value }, data: { value: nextCount } })).count === 1;
   } else {
     try {
-      await prisma.systemState.create({ data: { key: budgetKey, value: nextCount } });
+      await prisma.systemState.create({ data: { key: budgetKey, value: nextCount }, select: { key: true } });
       claimed = true;
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return false;
@@ -242,6 +248,7 @@ async function reserveScheduledAttempt(accountId: string, date: string, now = ne
       where: { key: timeKey },
       create: { key: timeKey, value: timeVal },
       update: { value: timeVal },
+      select: { key: true },
     }).catch(() => undefined);
   }
 
@@ -270,14 +277,21 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
       }
       await reportProgress(onProgress, { accountId: account.id, stage: 'resolving_daily' });
       const daily = await resolveCurrentDaily(account, now);
-      let run = await prisma.dailyRun.findUnique({ where: { accountId_date: { accountId: account.id, date: daily.date } } });
+      const runSelect = { id: true, problemSlug: true, state: true, submissionId: true, submissionStatus: true } satisfies Prisma.DailyRunSelect;
+      let run = await prisma.dailyRun.findUnique({
+        where: { accountId_date: { accountId: account.id, date: daily.date } },
+        select: runSelect,
+      });
       if (!acceptedDailyRun(run, daily.slug)) {
         // Lazy import avoids loading the submission stack for draft-only commands.
         const { runSubmissionNow } = await import('../scheduler/dailyWorker');
         await reportProgress(onProgress, { accountId: account.id, stage: 'submitting' });
         const report = await runSubmissionNow('solution-post-combined', { accountIds: [account.id], expectedChallengeDate: daily.date });
         if (!report) throw new PostError('SUBMISSION_WORKER_BUSY');
-        run = await prisma.dailyRun.findUnique({ where: { accountId_date: { accountId: account.id, date: daily.date } } });
+        run = await prisma.dailyRun.findUnique({
+          where: { accountId_date: { accountId: account.id, date: daily.date } },
+          select: runSelect,
+        });
       }
       if (!acceptedDailyRun(run, daily.slug) || !run) throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
       await reportProgress(onProgress, { accountId: account.id, stage: 'accepted', submissionId: run.submissionId! });
@@ -298,9 +312,10 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
         await reportProgress(onProgress, { accountId, stage: 'skipped', error: 'ACCOUNT_JOB_IN_PROGRESS' });
         continue;
       }
-      const existing = await prisma.solutionPost.findUnique({ where: {
-        accountId_problemSlug_intent: { accountId, problemSlug: run.slug, intent: 'community-solution' },
-      } });
+      const existing = await prisma.solutionPost.findUnique({
+        where: { accountId_problemSlug_intent: { accountId, problemSlug: run.slug, intent: 'community-solution' } },
+        select: { id: true, status: true, lastError: true },
+      });
       // Never resubmit accepted code for generation retries. Uncertain publications are left for reconciliation.
       await reportProgress(onProgress, { accountId, stage: 'generating_article', submissionId: run.submissionId, detail: 'Starting article generation & visual planning…' });
       const onStage = onProgress ? (stage: string, detail?: string) => {
@@ -356,7 +371,7 @@ export async function setSelectedAccounts(accountIds: string[]) {
   await prisma.$transaction(async tx => {
     await tx.solutionPostPreference.updateMany({ data: { enabled: false } });
     for (const accountId of unique) await tx.solutionPostPreference.upsert({ where: { accountId },
-      create: { accountId, enabled: true }, update: { enabled: true } });
+      create: { accountId, enabled: true }, update: { enabled: true }, select: { accountId: true } });
   });
   return { accountIds: unique, cron: POST_CRON, timezone: POST_TIMEZONE,
     publishing: config.solutionPosts.autoPublish ? 'automatic' : 'review-required' };
@@ -372,19 +387,46 @@ export async function runScheduledSolutionPosts(now = new Date()) {
   const startedAt = now.toISOString();
   const saveState = async (value: object) => {
     const state = JSON.stringify({ startedAt, date: now.toISOString().slice(0, 10), ...value });
-    await prisma.systemState.upsert({ where: { key: SCHEDULE_STATE_KEY },
-      create: { key: SCHEDULE_STATE_KEY, value: state }, update: { value: state } });
+    await prisma.systemState.upsert({
+      where: { key: SCHEDULE_STATE_KEY },
+      create: { key: SCHEDULE_STATE_KEY, value: state },
+      update: { value: state },
+      select: { key: true },
+    });
   };
   try {
     await recoverGeneration(now);
-    const preferences = await prisma.solutionPostPreference.findMany({ where: { enabled: true } });
-    const selected = await prisma.account.findMany({ where: { id: { in: preferences.map(p => p.accountId) }, status: { not: 'DISABLED' } } });
+    const preferences = await prisma.solutionPostPreference.findMany({
+      where: { enabled: true },
+      select: { accountId: true },
+    });
+    if (!preferences.length) {
+      await saveState({ status: 'IDLE', selected: 0, eligible: 0, reason: 'NO_SELECTED_ACCOUNTS' });
+      return { status: 'IDLE' as const };
+    }
+    const selected = await prisma.account.findMany({
+      where: { id: { in: preferences.map(p => p.accountId) }, status: { not: 'DISABLED' } },
+      select: { id: true },
+    });
+    if (!selected.length) {
+      await saveState({ status: 'IDLE', selected: 0, eligible: 0, reason: 'NO_SELECTED_ACCOUNTS' });
+      return { status: 'IDLE' as const };
+    }
     const today = now.toISOString().slice(0, 10);
     const ids = selected.map(a => a.id);
-    const [runs, posts] = await Promise.all([
-      prisma.dailyRun.findMany({ where: { accountId: { in: ids }, date: today } }),
-      prisma.solutionPost.findMany({ where: { accountId: { in: ids } } }),
-    ]);
+    const runs = await prisma.dailyRun.findMany({
+      where: { accountId: { in: ids }, date: today },
+      select: { accountId: true, problemSlug: true, state: true, submissionId: true, submissionStatus: true },
+    });
+    const acceptedRuns = runs.filter(r => acceptedDailyRun(r, r.problemSlug));
+    const acceptedSlugs = [...new Set(acceptedRuns.map(r => r.problemSlug))];
+    const acceptedAccountIds = [...new Set(acceptedRuns.map(r => r.accountId))];
+    const posts = acceptedSlugs.length
+      ? await prisma.solutionPost.findMany({
+          where: { accountId: { in: acceptedAccountIds }, problemSlug: { in: acceptedSlugs } },
+          select: { accountId: true, problemSlug: true, status: true, lastError: true, retryCount: true, updatedAt: true },
+        })
+      : [];
     const keysExhaustedIds = new Set<string>();
     const eligibleIds = ids.filter(id => {
       const run = runs.find(r => r.accountId === id);
@@ -421,7 +463,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
       // Contention is not an execution failure and must not use up the day's retries.
       if (isCoarenaPauseCode(result.error) || ['SUBMISSION_WORKER_BUSY', 'ACCOUNT_JOB_IN_PROGRESS', 'DAILY_PUBLICATION_COOLDOWN', 'AI_KEYS_EXHAUSTED'].includes(result.error ?? '')) {
         const key = `solution-post-schedule-budget:${result.accountId}:${today}`;
-        const old = await prisma.systemState.findUnique({ where: { key } });
+        const old = await prisma.systemState.findUnique({ where: { key }, select: { value: true } });
         if (old) await prisma.systemState.updateMany({ where: { key, value: old.value },
           data: { value: String(Math.max(0, Number(old.value) - 1)) } });
       }
@@ -456,6 +498,7 @@ export async function resumePausedCoarenaArticles(now = new Date()): Promise<voi
     const posts = await prisma.solutionPost.findMany({
       where: { status: 'RETRY_PENDING', lastError: { in: [...COARENA_PAUSE_CODES] },
         leaseUntil: { not: null }, account: { status: { not: 'DISABLED' } } },
+      select: { id: true, leaseUntil: true },
       orderBy: [{ leaseUntil: 'asc' }, { createdAt: 'asc' }], take: 2,
     });
     if (posts.length) {

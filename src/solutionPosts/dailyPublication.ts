@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { SolutionPost } from '@prisma/client';
+import { Prisma, SolutionPost } from '@prisma/client';
 import { prisma } from '../database/prisma';
 import { publishPost } from './publisher';
 import { logger } from '../logger';
@@ -10,44 +10,92 @@ import { articleNeedsRefresh, contextSchema } from './article';
 
 export const DAILY_PUBLICATION_GAP_MS = 20 * 60 * 1000;
 export const DAILY_PUBLICATION_STATE_KEY = 'solution-post-daily-publication:gate';
+const queueDomainPrefix = 'solution-post-daily-publication:';
 const queuePrefix = 'solution-post-daily-publication:queue:';
 type Gate = { nextAt: number; owner?: string; leaseUntil?: number; lastPostId?: string; lastPublishedAt?: string };
 let draining = false;
 let stopQueueKeepAlive: (() => void) | undefined;
 
-export async function dailyPublicationStatus() {
-  const row = await prisma.systemState.findUnique({ where: { key: DAILY_PUBLICATION_STATE_KEY } });
-  const gate: Gate = row ? JSON.parse(row.value) : { nextAt: 0 };
-  return { minimumGapMs: DAILY_PUBLICATION_GAP_MS,
+const DAILY_POST_SELECT = {
+  id: true,
+  accountId: true,
+  problemSlug: true,
+  submissionId: true,
+  intent: true,
+  context: true,
+  codeHash: true,
+  status: true,
+  title: true,
+  style: true,
+  model: true,
+  reviewModel: true,
+  contentHash: true,
+  approvedHash: true,
+  publishedUrl: true,
+  lastError: true,
+  retryCount: true,
+  leaseUntil: true,
+  createdAt: true,
+  updatedAt: true,
+  publishedAt: true,
+} satisfies Prisma.SolutionPostSelect;
+
+function formatGateStatus(gate: Gate) {
+  return {
+    minimumGapMs: DAILY_PUBLICATION_GAP_MS,
     nextEligibleAt: gate.nextAt ? new Date(gate.nextAt).toISOString() : null,
-    lastPostId: gate.lastPostId, lastPublishedAt: gate.lastPublishedAt };
+    lastPostId: gate.lastPostId,
+    lastPublishedAt: gate.lastPublishedAt,
+  };
 }
 
-async function claimSlot(now: number) {
+function isGateBlocked(gate: Gate, now: number): boolean {
+  return gate.nextAt > now || (Boolean(gate.owner) && (gate.leaseUntil ?? Infinity) > now);
+}
+
+export async function dailyPublicationStatus() {
+  const row = await prisma.systemState.findUnique({
+    where: { key: DAILY_PUBLICATION_STATE_KEY },
+    select: { value: true },
+  });
+  const gate: Gate = row ? JSON.parse(row.value) : { nextAt: 0 };
+  return formatGateStatus(gate);
+}
+
+async function claimSlot(now: number): Promise<{ claimed: true; value: string; gate: Gate } | { claimed: false; gate: Gate }> {
+  let latestGate: Gate = { nextAt: 0 };
   for (let attempt = 0; attempt < 8; attempt++) {
-    const row = await prisma.systemState.findUnique({ where: { key: DAILY_PUBLICATION_STATE_KEY } });
+    const row = await prisma.systemState.findUnique({
+      where: { key: DAILY_PUBLICATION_STATE_KEY },
+      select: { value: true },
+    });
     const gate: Gate = row ? JSON.parse(row.value) : { nextAt: 0 };
+    latestGate = gate;
     if (!Number.isFinite(gate.nextAt)) throw Error('INVALID_DAILY_PUBLICATION_GATE');
-    if (gate.nextAt > now || (gate.owner && (gate.leaseUntil ?? Infinity) > now)) return null;
+    if (isGateBlocked(gate, now)) return { claimed: false, gate };
     // Reserve the worst-case publication window before the request. A crash
     // after the request but before saving its result must still preserve the gap.
     const value = JSON.stringify({ ...gate, nextAt: now + 10 * 60 * 1000 + DAILY_PUBLICATION_GAP_MS,
       owner: randomUUID(), leaseUntil: now + 10 * 60 * 1000 });
     if (row) {
       if ((await prisma.systemState.updateMany({ where: { key: DAILY_PUBLICATION_STATE_KEY, value: row.value }, data: { value } })).count) {
-        return { value, gate };
+        return { claimed: true, value, gate };
       }
     } else {
-      try { await prisma.systemState.create({ data: { key: DAILY_PUBLICATION_STATE_KEY, value } }); return { value, gate }; }
-      catch (error) { if ((error as { code?: string }).code !== 'P2002') throw error; }
+      try {
+        await prisma.systemState.create({ data: { key: DAILY_PUBLICATION_STATE_KEY, value }, select: { key: true } });
+        return { claimed: true, value, gate };
+      } catch (error) { if ((error as { code?: string }).code !== 'P2002') throw error; }
     }
   }
-  return null;
+  return { claimed: false, gate: latestGate };
 }
 
-/** Durable daily-only queue; manual publishing never enters this gate. */
-export async function publishDailyPost(id: string, now = new Date()): Promise<SolutionPost> {
-  let post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
+async function publishDailyPostInternal(id: string, now: Date, alreadyQueued: boolean): Promise<SolutionPost> {
+  let post = await prisma.solutionPost.findUniqueOrThrow({
+    where: { id },
+    select: DAILY_POST_SELECT,
+  }) as unknown as SolutionPost;
   const key = queuePrefix + id;
   if (['PUBLISHED', 'PUBLISHING', 'SKIPPED'].includes(post.status)) {
     await prisma.systemState.deleteMany({ where: { key } }); return post;
@@ -57,11 +105,17 @@ export async function publishDailyPost(id: string, now = new Date()): Promise<So
     await prisma.systemState.deleteMany({ where: { key } });
     return { ...post, lastError: 'ARTICLE_LAYOUT_REFRESH_REQUIRED' };
   }
-  await prisma.systemState.upsert({ where: { key }, create: { key,
-    value: JSON.stringify({ postId: id, queuedAt: now.toISOString(), failures: 0 }) }, update: {} });
+  if (!alreadyQueued) {
+    await prisma.systemState.upsert({
+      where: { key },
+      create: { key, value: JSON.stringify({ postId: id, queuedAt: now.toISOString(), failures: 0 }) },
+      update: {},
+      select: { key: true },
+    });
+  }
   const claim = await claimSlot(now.getTime());
-  if (!claim) {
-    logger.info({ postId: id, ...await dailyPublicationStatus() }, 'daily article queued for publication spacing');
+  if (!claim.claimed) {
+    logger.info({ postId: id, ...formatGateStatus(claim.gate) }, 'daily article queued for publication spacing');
     return { ...post, lastError: 'DAILY_PUBLICATION_COOLDOWN' };
   }
   // Keep the conservative reservation if publication throws. A database error
@@ -87,28 +141,70 @@ export async function publishDailyPost(id: string, now = new Date()): Promise<So
   }
 }
 
+/** Durable daily-only queue; manual publishing never enters this gate. */
+export async function publishDailyPost(id: string, now = new Date()): Promise<SolutionPost> {
+  return publishDailyPostInternal(id, now, false);
+}
+
 /** Runs every minute and on boot; cooldowns consume no generation retries. */
 export async function processDailyPublicationQueue() {
   if (draining) return;
   draining = true;
   try {
-    const pending = await prisma.systemState.findMany({ where: { key: { startsWith: queuePrefix } }, orderBy: { updatedAt: 'asc' }, take: 100 });
-    const hasWork = pending.some(row => { try { return (JSON.parse(row.value).failures ?? 0) < 4; } catch { return false; } });
-    if (hasWork && !stopQueueKeepAlive) stopQueueKeepAlive = startArticleWorkKeepAlive();
-    else if (!hasWork && stopQueueKeepAlive) { stopQueueKeepAlive(); stopQueueKeepAlive = undefined; }
+    const rows = await prisma.systemState.findMany({
+      where: { key: { startsWith: queueDomainPrefix } },
+      select: { key: true, value: true },
+      orderBy: { updatedAt: 'asc' },
+      take: 101,
+    });
+    const pending = rows.filter(row => row.key.startsWith(queuePrefix));
+    const runnable: Array<{ key: string; value: string; postId: string; failures: number }> = [];
     for (const row of pending) {
       try {
-        const { postId, failures = 0 } = JSON.parse(row.value);
-        if (failures >= 4) continue;
-        const post = await publishDailyPost(postId);
+        const parsed = JSON.parse(row.value) as { postId?: string; failures?: number };
+        const failures = parsed.failures ?? 0;
+        if (parsed.postId && failures < 4) {
+          runnable.push({ key: row.key, value: row.value, postId: parsed.postId, failures });
+        }
+      } catch {
+        // Ignore unreadable queue payload.
+      }
+    }
+    const hasWork = runnable.length > 0;
+    if (hasWork && !stopQueueKeepAlive) stopQueueKeepAlive = startArticleWorkKeepAlive();
+    else if (!hasWork && stopQueueKeepAlive) { stopQueueKeepAlive(); stopQueueKeepAlive = undefined; }
+    if (!hasWork) return;
+
+    // Avoid fetching SolutionPost rows or context blobs on every minute tick while the gate is in cooldown.
+    let gateRow: { value: string } | null | undefined = rows.find(row => row.key === DAILY_PUBLICATION_STATE_KEY);
+    if (!gateRow && rows.length >= 101) {
+      gateRow = await prisma.systemState.findUnique({
+        where: { key: DAILY_PUBLICATION_STATE_KEY },
+        select: { value: true },
+      });
+    }
+    if (gateRow) {
+      try {
+        const gate: Gate = JSON.parse(gateRow.value);
+        if (Number.isFinite(gate.nextAt) && isGateBlocked(gate, Date.now())) {
+          return;
+        }
+      } catch {
+        // Let claimSlot surface invalid gate state if corrupt.
+      }
+    }
+
+    for (const item of runnable) {
+      try {
+        const post = await publishDailyPostInternal(item.postId, new Date(), true);
         if (post.status === 'PUBLISHED') {
           if (config.telegram.enabled) await sendTelegramMessage(`✅ Queued daily article published\n${post.publishedUrl}`).catch(() => undefined);
           break;
         }
         if (post.lastError === 'DAILY_PUBLICATION_COOLDOWN') break;
       } catch {
-        const data = JSON.parse(row.value);
-        await prisma.systemState.updateMany({ where: { key: row.key, value: row.value },
+        const data = JSON.parse(item.value);
+        await prisma.systemState.updateMany({ where: { key: item.key, value: item.value },
           data: { value: JSON.stringify({ ...data, failures: (data.failures ?? 0) + 1 }) } });
         logger.warn({ postId: data.postId }, 'queued daily publication failed; draft retained');
       }

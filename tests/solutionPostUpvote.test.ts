@@ -14,6 +14,7 @@ vi.mock('../src/database/prisma', () => ({
     },
     systemState: {
       findUnique: vi.fn(),
+      findMany: vi.fn(async () => []),
       upsert: vi.fn(async () => ({})),
       updateMany: vi.fn(),
     },
@@ -46,6 +47,7 @@ import {
   UGC_ARTICLE_ADD_REACTION_MUTATION,
   boostSolutionArticleViews,
   fetchLiveSolutionMetrics,
+  recoverUnverifiedArticleUpvotes,
 } from '../src/solutionPosts/upvote';
 
 describe('extractTopicIdFromUrl', () => {
@@ -285,5 +287,74 @@ describe('fetchLiveSolutionMetrics', () => {
       title: 'Clean Two Pointers',
       slug: 'clean-two-pointers',
     });
+  });
+});
+
+describe('recoverUnverifiedArticleUpvotes', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(prisma.solutionPost.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.systemState.findMany).mockResolvedValue([]);
+  });
+
+  it('uses explicit metadata select projections and batches systemState lookups without fetching heavy text columns', async () => {
+    vi.mocked(prisma.solutionPost.findMany)
+      .mockResolvedValueOnce([
+        { id: 'post-today', publishedUrl: 'https://leetcode.com/problems/two-sum/solutions/101/a/', accountId: 'acc-1', problemSlug: 'two-sum' } as any,
+      ])
+      .mockResolvedValueOnce([
+        { id: 'post-today', publishedUrl: 'https://leetcode.com/problems/two-sum/solutions/101/a/', problemSlug: 'two-sum' } as any,
+      ]);
+    vi.mocked(prisma.systemState.findMany)
+      .mockResolvedValueOnce([{ key: 'solution-post-upvotes:post-today', value: JSON.stringify({ status: 'COMPLETED', attempts: 1 }) }] as any)
+      .mockResolvedValueOnce([{ key: 'solution-post-views:post-today' }] as any);
+
+    await recoverUnverifiedArticleUpvotes();
+
+    expect(prisma.solutionPost.findMany).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        select: { id: true, publishedUrl: true, accountId: true, problemSlug: true },
+      }),
+    );
+    expect(prisma.solutionPost.findMany).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        select: { id: true, publishedUrl: true, problemSlug: true },
+      }),
+    );
+    expect(prisma.systemState.findMany).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        where: { key: { in: ['solution-post-upvotes:post-today'] } },
+        select: { key: true, value: true },
+      }),
+    );
+    expect(prisma.systemState.findMany).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        where: { key: { in: ['solution-post-views:post-today'] } },
+        select: { key: true },
+      }),
+    );
+    expect(prisma.systemState.findUnique).not.toHaveBeenCalled();
+    expect(prisma.account.findMany).not.toHaveBeenCalled();
+  });
+
+  it('projects only required account credential fields when scheduling upvotes and boosting views', async () => {
+    vi.mocked(prisma.account.findFirst).mockResolvedValueOnce(null);
+    vi.mocked(prisma.account.findMany).mockResolvedValueOnce([]);
+    await scheduleSolutionArticleUpvotes({
+      id: 'post-select-check',
+      publishedUrl: 'https://leetcode.com/problems/two-sum/solutions/123456/my-post/',
+      accountId: 'acc-1',
+      problemSlug: 'two-sum',
+    });
+    expect(prisma.account.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      select: { id: true, label: true, username: true, status: true, storageState: true },
+    }));
+    expect(prisma.account.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      select: { id: true, label: true, username: true, status: true, storageState: true },
+    }));
   });
 });

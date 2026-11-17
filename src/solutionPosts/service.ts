@@ -1,5 +1,5 @@
 import { chromium, Page } from 'playwright';
-import { Account, SolutionPost } from '@prisma/client';
+import { Account, Prisma, SolutionPost } from '@prisma/client';
 import { z } from 'zod';
 import { config } from '../config';
 import { logger } from '../logger';
@@ -54,8 +54,42 @@ export function activeSolutionApiKeys(pool: Pick<SolutionKeyPool, 'keys' | 'acti
   return pool.keys.slice(Math.max(0, pool.activeIndex));
 }
 
+export type AccountSessionRecord = Pick<Account, 'id' | 'label' | 'username' | 'status' | 'storageState'>;
+
+const ACCOUNT_SESSION_SELECT = {
+  id: true,
+  label: true,
+  username: true,
+  status: true,
+  storageState: true,
+} satisfies Prisma.AccountSelect;
+
+const SOLUTION_POST_METADATA_WITH_CONTEXT_SELECT = {
+  id: true,
+  accountId: true,
+  problemSlug: true,
+  submissionId: true,
+  intent: true,
+  context: true,
+  codeHash: true,
+  status: true,
+  title: true,
+  style: true,
+  model: true,
+  reviewModel: true,
+  contentHash: true,
+  approvedHash: true,
+  publishedUrl: true,
+  lastError: true,
+  retryCount: true,
+  leaseUntil: true,
+  createdAt: true,
+  updatedAt: true,
+  publishedAt: true,
+} satisfies Prisma.SolutionPostSelect;
+
 /** A normal isolated browser context. No shared profile, solver, credential forwarding, or challenge bypass. */
-export async function withAccount<T>(account: Account,
+export async function withAccount<T>(account: AccountSessionRecord,
   action: (api: LeetCodeApi, page: Page, username: string) => Promise<T>): Promise<T> {
   const parsed = parseStoredStorageState(account.storageState);
   if (!parsed.ok || account.status === 'DISABLED') throw new PostError('ACCOUNT_UNAVAILABLE');
@@ -74,10 +108,27 @@ export async function withAccount<T>(account: Account,
 }
 
 export async function loadContext(accountId: string, runId: string): Promise<SubmissionContext> {
-  const run = await prisma.dailyRun.findUniqueOrThrow({ where: { id: runId } });
+  const run = await prisma.dailyRun.findUniqueOrThrow({
+    where: { id: runId },
+    select: {
+      accountId: true,
+      state: true,
+      solution: true,
+      submissionId: true,
+      submissionStatus: true,
+      date: true,
+      problemSlug: true,
+      title: true,
+      difficulty: true,
+      language: true,
+    },
+  });
   if (run.accountId !== accountId || run.state !== 'SUCCESS' || !run.solution || !run.submissionId ||
     run.submissionStatus !== 'Accepted') throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
-  const account = await prisma.account.findUniqueOrThrow({ where: { id: accountId } });
+  const account = await prisma.account.findUniqueOrThrow({
+    where: { id: accountId },
+    select: ACCOUNT_SESSION_SELECT,
+  });
   // Manual and contest question submissions use namespaced DailyRun keys so they
   // never collide with the real calendar-day run. The article context still needs a
   // normal ISO challenge date for validation and presentation.
@@ -188,11 +239,11 @@ async function createDiscoveryRouter(correlation: { postId?: string; accountId?:
 async function reserveImplementation(post: SolutionPost, context: SubmissionContext, fingerprint: string): Promise<boolean> {
   const key = `solution-implementation:${context.slug}:${context.language}:${fingerprint}`;
   try {
-    await prisma.systemState.create({ data: { key, value: post.id } });
+    await prisma.systemState.create({ data: { key, value: post.id }, select: { key: true } });
     return true;
   } catch (error) {
     if ((error as { code?: string }).code !== 'P2002') throw error;
-    const reservation = await prisma.systemState.findUnique({ where: { key } });
+    const reservation = await prisma.systemState.findUnique({ where: { key }, select: { value: true } });
     return reservation?.value === post.id;
   }
 }
@@ -342,14 +393,20 @@ function draftNeedsRefresh(context: SubmissionContext): boolean {
     (presentation?.visualVersion === 6 && questionIllustration(context) === 'grid');
 }
 
-async function interruptedLockKey(post: SolutionPost, updatedAt: Date): Promise<string | null> {
-  let intent = (post as { intent?: string }).intent;
+async function interruptedLockKey(
+  post: Pick<SolutionPost, 'accountId' | 'submissionId'> & { intent?: string; context?: string },
+  updatedAt: Date,
+): Promise<string | null> {
+  let intent = post.intent;
   if (!intent && typeof post.context === 'string') {
     try { intent = contextSchema.safeParse(JSON.parse(post.context)).data?.intent; } catch { /* ignore unreadable context */ }
   }
   if (intent !== 'contest-solution') return 'solution-post-job:' + post.accountId + ':' + updatedAt.toISOString().slice(0, 10);
   if (!post.submissionId) return null;
-  const run = await prisma.dailyRun?.findFirst?.({ where: { accountId: post.accountId, submissionId: post.submissionId } });
+  const run = await prisma.dailyRun?.findFirst?.({
+    where: { accountId: post.accountId, submissionId: post.submissionId },
+    select: { date: true },
+  });
   const contestSlug = /^contest:([^:]+):[^:]+:\d{4}-\d{2}-\d{2}$/.exec(run?.date ?? '')?.[1];
   return contestSlug ? 'contest-post-job:' + contestSlug : null;
 }
@@ -357,19 +414,23 @@ async function interruptedLockKey(post: SolutionPost, updatedAt: Date): Promise<
 export async function generateForRun(accountId: string, runId: string, force = false, onStage?: StageCallback,
   publicationMode?: PublicationMode,
   options?: { intent?: SubmissionContext['intent']; articleStyle?: SubmissionContext['articleStyle'] }): Promise<SolutionPost> {
-  const run = await prisma.dailyRun.findUniqueOrThrow({ where: { id: runId } });
+  const run = await prisma.dailyRun.findUniqueOrThrow({
+    where: { id: runId },
+    select: { accountId: true, problemSlug: true },
+  });
   if (run.accountId !== accountId) throw new PostError('ACCOUNT_IDENTITY_MISMATCH');
   const intent = options?.intent ?? 'community-solution';
-  const existing = await prisma.solutionPost.findUnique({ where: { accountId_problemSlug_intent: {
-    accountId, problemSlug: run.problemSlug, intent,
-  } } });
-  if (existing && awaitingCoarena(existing)) return existing;
+  const existing = await prisma.solutionPost.findUnique({
+    where: { accountId_problemSlug_intent: { accountId, problemSlug: run.problemSlug, intent } },
+    select: SOLUTION_POST_METADATA_WITH_CONTEXT_SELECT,
+  });
+  if (existing && awaitingCoarena(existing as unknown as SolutionPost)) return existing as unknown as SolutionPost;
   if (existing && !['PENDING', 'RETRY_PENDING'].includes(existing.status)) {
     if ((force && existing.status === 'FAILED') || (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(existing.status) && !existing.approvedHash &&
       draftNeedsRefresh(contextSchema.parse(JSON.parse(existing.context))))) {
       return retryPost(existing.id, true, onStage, publicationMode);
     }
-    return existing;
+    return existing as unknown as SolutionPost;
   }
   const loaded = await loadContext(accountId, runId);
   const context = options ? {
@@ -381,14 +442,25 @@ export async function generateForRun(accountId: string, runId: string, force = f
 }
 
 export async function requeueInterruptedGeneration(id: string, updatedAt: Date): Promise<SolutionPost> {
-  const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
+  const post = await prisma.solutionPost.findUniqueOrThrow({
+    where: { id },
+    select: {
+      id: true,
+      accountId: true,
+      submissionId: true,
+      intent: true,
+      status: true,
+      lastError: true,
+      updatedAt: true,
+    },
+  });
   if (!['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING'].includes(post.status) ||
       post.updatedAt.getTime() !== updatedAt.getTime() || Date.now() - updatedAt.getTime() < SOLUTION_ARTICLE_WORK_MS) {
     throw new PostError('GENERATION_RECOVERY_CONFLICT');
   }
   const key = await interruptedLockKey(post, updatedAt);
-  const lock = key ? await prisma.systemState.findUnique({ where: { key } }) : null;
-  const recovered = await move(post, 'RETRY_PENDING', isCoarenaPauseCode(post.lastError)
+  const lock = key ? await prisma.systemState.findUnique({ where: { key }, select: { value: true, updatedAt: true } }) : null;
+  const recovered = await move(post as unknown as SolutionPost, 'RETRY_PENDING', isCoarenaPauseCode(post.lastError)
     ? { leaseUntil: new Date(), retryCount: { decrement: 1 } }
     : { leaseUntil: null, lastError: 'GENERATION_INTERRUPTED' });
   // Remove only the lock observed before this generation made progress.
@@ -398,7 +470,21 @@ export async function requeueInterruptedGeneration(id: string, updatedAt: Date):
 
 export async function retryPost(id: string, force = false, onStage?: StageCallback,
   publicationMode?: PublicationMode): Promise<SolutionPost> {
-  const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
+  const post = await prisma.solutionPost.findUniqueOrThrow({
+    where: { id },
+    select: {
+      id: true,
+      accountId: true,
+      submissionId: true,
+      status: true,
+      lastError: true,
+      leaseUntil: true,
+      retryCount: true,
+      codeHash: true,
+      context: true,
+      updatedAt: true,
+    },
+  }) as unknown as SolutionPost;
   if (awaitingCoarena(post)) return post;
   const refreshDraft = force && ['DRAFT_READY', 'AWAITING_APPROVAL'].includes(post.status);
   if (!refreshDraft && !['FAILED', 'RETRY_PENDING'].includes(post.status)) throw new PostError('NOT_RETRYABLE');
@@ -406,7 +492,10 @@ export async function retryPost(id: string, force = false, onStage?: StageCallba
   if (refreshDraft && !draftNeedsRefresh(context)) throw new PostError('NOT_RETRYABLE');
   if (isCoarenaPaused(post)) return generatePost(context, undefined, force, onStage, publicationMode);
   checkGenerationBudget(post, force);
-  const run = await prisma.dailyRun.findFirst({ where: { accountId: post.accountId, submissionId: post.submissionId } });
+  const run = await prisma.dailyRun.findFirst({
+    where: { accountId: post.accountId, submissionId: post.submissionId },
+    select: { id: true },
+  });
   if (!run) throw new PostError('SUBMISSION_CONTEXT_MISSING');
   const verified = await loadContext(post.accountId, run.id);
   if (hash(verified.code) !== post.codeHash || verified.slug !== context.slug) throw new PostError('SOURCE_INTEGRITY_FAILED');
@@ -448,7 +537,7 @@ export async function resetFailedSolutionPostRetries(): Promise<number> {
 }
 
 export async function resolveCurrentDaily(account: Account, now = new Date()) {
-  const resolve = (candidate: Account) => withAccount(candidate, async api => {
+  const resolve = (candidate: AccountSessionRecord) => withAccount(candidate, async api => {
     for (let n = 0; n < 3; n++) {
       const daily = await fetchDailyChallenge(api);
       if (daily.date === now.toISOString().slice(0, 10)) return daily;
@@ -464,6 +553,9 @@ export async function resolveCurrentDaily(account: Account, now = new Date()) {
     const { refreshLeetCodeAccount } = await import('../security/sessionAutoRefresh');
     const refreshed = await refreshLeetCodeAccount(account);
     if (!['valid', 'refreshed'].includes(refreshed.status)) throw new PostError('AUTHENTICATION_REQUIRED');
-    return resolve(await prisma.account.findUniqueOrThrow({ where: { id: account.id } }));
+    return resolve(await prisma.account.findUniqueOrThrow({
+      where: { id: account.id },
+      select: ACCOUNT_SESSION_SELECT,
+    }));
   }
 }

@@ -1,24 +1,25 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ states: new Map<string, string>(), posts: new Map<string, any>(), publish: vi.fn() }));
 vi.mock('../src/database/prisma', () => ({ prisma: {
-  solutionPost: { findUniqueOrThrow: async ({ where }: any) => ({ ...h.posts.get(where.id) }) },
+  solutionPost: { findUniqueOrThrow: vi.fn(async ({ where }: any) => ({ ...h.posts.get(where.id) })) },
   systemState: {
-    findUnique: async ({ where }: any) => h.states.has(where.key) ? { key: where.key, value: h.states.get(where.key) } : null,
-    findMany: async ({ where }: any) => [...h.states].filter(([key]) => key.startsWith(where.key.startsWith)).map(([key, value]) => ({ key, value })),
-    create: async ({ data }: any) => { if (h.states.has(data.key)) throw Object.assign(Error(), { code: 'P2002' }); h.states.set(data.key, data.value); },
-    updateMany: async ({ where, data }: any) => {
+    findUnique: vi.fn(async ({ where }: any) => h.states.has(where.key) ? { key: where.key, value: h.states.get(where.key) } : null),
+    findMany: vi.fn(async ({ where }: any) => [...h.states].filter(([key]) => key.startsWith(where.key.startsWith)).map(([key, value]) => ({ key, value }))),
+    create: vi.fn(async ({ data }: any) => { if (h.states.has(data.key)) throw Object.assign(Error(), { code: 'P2002' }); h.states.set(data.key, data.value); }),
+    updateMany: vi.fn(async ({ where, data }: any) => {
       if (h.states.get(where.key) !== where.value) return { count: 0 };
       h.states.set(where.key, data.value); return { count: 1 };
-    },
-    upsert: async ({ where, create, update }: any) => {
+    }),
+    upsert: vi.fn(async ({ where, create, update }: any) => {
       if (!h.states.has(where.key)) h.states.set(where.key, create.value);
       else if (update.value) h.states.set(where.key, update.value);
-    },
-    deleteMany: async ({ where }: any) => { h.states.delete(where.key); },
+    }),
+    deleteMany: vi.fn(async ({ where }: any) => { h.states.delete(where.key); }),
   },
 } }));
 vi.mock('../src/solutionPosts/publisher', () => ({ publishPost: h.publish }));
-import { publishDailyPost, processDailyPublicationQueue, dailyPublicationStatus, DAILY_PUBLICATION_GAP_MS } from '../src/solutionPosts/dailyPublication';
+import { prisma } from '../src/database/prisma';
+import { publishDailyPost, processDailyPublicationQueue, dailyPublicationStatus, DAILY_PUBLICATION_GAP_MS, DAILY_PUBLICATION_STATE_KEY } from '../src/solutionPosts/dailyPublication';
 import { postPresentationVariant } from '../src/solutionPosts/presentationStyles';
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-06T00:00:00Z'));
@@ -76,4 +77,31 @@ it('preserves the reservation when a post-request database failure prevents savi
   vi.setSystemTime(Date.now() + DAILY_PUBLICATION_GAP_MS);
   expect((await publishDailyPost('b')).lastError).toBe('DAILY_PUBLICATION_COOLDOWN');
   expect(h.publish).toHaveBeenCalledTimes(1);
+});
+
+it('does zero SolutionPost queries when idle or in cooldown and picks up external DB queue inserts once due', async () => {
+  await processDailyPublicationQueue();
+  expect(prisma.solutionPost.findUniqueOrThrow).not.toHaveBeenCalled();
+  expect(prisma.systemState.findMany).toHaveBeenCalledWith(expect.objectContaining({
+    select: { key: true, value: true },
+  }));
+
+  // Simulate an external/manual DB queue insert + active cooldown gate directly in SystemState.
+  vi.clearAllMocks();
+  const nextAt = Date.now() + DAILY_PUBLICATION_GAP_MS;
+  h.states.set(DAILY_PUBLICATION_STATE_KEY, JSON.stringify({ nextAt, lastPostId: 'a' }));
+  h.states.set('solution-post-daily-publication:queue:b', JSON.stringify({ postId: 'b', queuedAt: new Date().toISOString(), failures: 0 }));
+  await processDailyPublicationQueue();
+  expect(prisma.solutionPost.findUniqueOrThrow).not.toHaveBeenCalled();
+  expect(prisma.systemState.upsert).not.toHaveBeenCalled();
+  expect(h.publish).not.toHaveBeenCalled();
+
+  // Advance past the cooldown: the queued post is picked up without fetching markdown/attempts.
+  vi.setSystemTime(nextAt);
+  await processDailyPublicationQueue();
+  expect(h.publish).toHaveBeenCalledWith('b');
+  expect(prisma.solutionPost.findUniqueOrThrow).toHaveBeenCalledWith(expect.objectContaining({
+    where: { id: 'b' },
+    select: expect.not.objectContaining({ markdown: true, attempts: true }),
+  }));
 });

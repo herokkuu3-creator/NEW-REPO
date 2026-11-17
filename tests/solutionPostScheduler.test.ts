@@ -46,6 +46,7 @@ vi.mock('../src/scheduler/rangeSubmission', () => ({ submitSingleQuestionDirectl
 import { afterPostSchedule, POST_CRON, POST_TIMEZONE, runCombined, runManualQuestion, runScheduledSolutionPosts,
   resumePausedCoarenaArticles, SCHEDULE_STATE_KEY, setSelectedAccounts, startSolutionPostScheduler } from '../src/solutionPosts/scheduler';
 import { PostError } from '../src/solutionPosts/service';
+import { prisma } from '../src/database/prisma';
 beforeEach(() => {
   vi.clearAllMocks(); h.locks.clear(); h.preferences = []; h.runs.clear(); h.calls = []; h.timers = []; h.posts = [];
   h.accounts = ['a', 'b', 'c', 'd', 'e'].map(id => ({ id, status: 'ACTIVE' }));
@@ -266,5 +267,55 @@ describe('daily AI drafts', () => {
     h.posts = h.accounts.map((a, index) => ({ accountId: a.id, problemSlug: 'today', status: index ? 'PUBLISHING' : 'PUBLISHED' }));
     expect((await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'))).status).toBe('IDLE');
     expect(h.publish).not.toHaveBeenCalled(); expect(h.generate).not.toHaveBeenCalled();
+  });
+  it('uses explicit minimal select projections on scheduled polling and skips unnecessary queries when idle', async () => {
+    h.preferences = [];
+    const idleResult = await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'));
+    expect(idleResult.status).toBe('IDLE');
+    expect(prisma.solutionPostPreference.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      select: { accountId: true },
+    }));
+    expect(prisma.account.findMany).not.toHaveBeenCalled();
+    expect(prisma.dailyRun.findMany).not.toHaveBeenCalled();
+    expect(prisma.solutionPost.findMany).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    h.preferences = [{ accountId: 'a', enabled: true }];
+    h.posts = [{ accountId: 'a', problemSlug: 'today', status: 'PUBLISHED' }];
+    await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'));
+    expect(prisma.account.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      select: { id: true },
+    }));
+    expect(prisma.dailyRun.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      select: { accountId: true, problemSlug: true, state: true, submissionId: true, submissionStatus: true },
+    }));
+    expect(prisma.solutionPost.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { accountId: { in: ['a'] }, problemSlug: { in: ['today'] } },
+      select: { accountId: true, problemSlug: true, status: true, lastError: true, retryCount: true, updatedAt: true },
+    }));
+
+    vi.clearAllMocks();
+    h.runs.clear();
+    await runScheduledSolutionPosts(new Date('2026-10-15T00:30:00Z'));
+    expect(prisma.solutionPost.findMany).not.toHaveBeenCalled();
+  });
+  it('projects only id and leaseUntil in resumePausedCoarenaArticles and projects light fields in runCombined', async () => {
+    const future = new Date('2026-10-16T00:00:00Z');
+    h.posts = [{ id: 'post-paused', accountId: 'a', problemSlug: 'today', status: 'RETRY_PENDING', lastError: 'COARENA_DAILY_LIMIT', leaseUntil: future }];
+    await resumePausedCoarenaArticles(new Date(future.getTime() - 10_000));
+    expect(h.retry).not.toHaveBeenCalled();
+    expect(prisma.solutionPost.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      select: { id: true, leaseUntil: true },
+    }));
+
+    vi.clearAllMocks();
+    h.posts = [];
+    await runCombined(['a'], new Date('2026-10-15T00:30:00Z'));
+    expect(prisma.dailyRun.findUnique).toHaveBeenCalledWith(expect.objectContaining({
+      select: { id: true, problemSlug: true, state: true, submissionId: true, submissionStatus: true },
+    }));
+    expect(prisma.solutionPost.findUnique).toHaveBeenCalledWith(expect.objectContaining({
+      select: { id: true, status: true, lastError: true },
+    }));
   });
 });

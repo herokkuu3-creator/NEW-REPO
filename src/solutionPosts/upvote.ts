@@ -1,4 +1,4 @@
-import { Account } from '@prisma/client';
+import { Account, Prisma } from '@prisma/client';
 import { Page } from 'playwright';
 import { z } from 'zod';
 import { prisma } from '../database/prisma';
@@ -89,12 +89,24 @@ export interface AccountUpvoteResult {
   latestHitCount?: number;
 }
 
+export type AccountCredentialRecord = Pick<Account, 'id' | 'label' | 'username' | 'status' | 'storageState'>;
+
+const ACCOUNT_CREDENTIAL_SELECT = {
+  id: true,
+  label: true,
+  username: true,
+  status: true,
+  storageState: true,
+} satisfies Prisma.AccountSelect;
+
 const activeUpvoteJobs = new Set<string>();
+const activeViewBoosts = new Set<string>();
+let upvoteRecoveryInProgress = false;
 interface UpvoteQueueItem {
   post: UpvoteTarget;
   options: { initialDelayMs?: number; accountGapMs?: number; force?: boolean };
-  authorAccount?: Account | null;
-  otherAccounts?: Account[];
+  authorAccount?: AccountCredentialRecord | null;
+  otherAccounts?: AccountCredentialRecord[];
 }
 const upvoteQueue: UpvoteQueueItem[] = [];
 let isProcessingQueue = false;
@@ -247,7 +259,7 @@ export async function upvoteArticleWithSession(
 const PER_ACCOUNT_TIMEOUT_MS = 90_000;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-export function cookieGraphqlClient(account: Account): { graphql: LeetCodeApi['graphql'] } | null {
+export function cookieGraphqlClient(account: AccountCredentialRecord): { graphql: LeetCodeApi['graphql'] } | null {
   let cookies: Array<{ name: string; value: string; domain?: string }> = [];
   try { cookies = (JSON.parse(account.storageState) as { cookies?: typeof cookies }).cookies ?? []; } catch { return null; }
   const lc = cookies.filter(c => !c.domain || /leetcode\.com$/i.test(c.domain.replace(/^\./, '')));
@@ -357,7 +369,7 @@ export async function fetchLiveSolutionMetrics(topicId: number | string): Promis
  * 5. Returns both the attempt count and the verified LeetCode hitCount.
  */
 export async function generateArticleViewsWithAccount(
-  account: Account,
+  account: AccountCredentialRecord,
   topicId: number,
   publishedUrl: string,
   problemSlug?: string,
@@ -501,7 +513,7 @@ export async function generateArticleViewsWithAccount(
 }
 
 export async function upvoteSolutionArticleWithAccount(
-  account: Account,
+  account: AccountCredentialRecord,
   topicId: number,
   publishedUrl?: string | null,
   options?: { generateViews?: boolean; viewsCount?: number; delayMs?: number; problemSlug?: string },
@@ -544,14 +556,14 @@ export async function upvoteSolutionArticleWithAccount(
 }
 
 async function upvoteWithBrowser(
-  account: Account,
+  account: AccountCredentialRecord,
   topicId: number,
   publishedUrl?: string | null,
 ): Promise<AccountUpvoteResult> {
-  const execute = (target: Account) =>
+  const execute = (target: AccountCredentialRecord) =>
     withAccount(target, async (api, page, username) => {
       if (!target.username && username && typeof prisma.account?.update === 'function') {
-        await prisma.account.update({ where: { id: target.id }, data: { username } }).catch(() => undefined);
+        await prisma.account.update({ where: { id: target.id }, data: { username }, select: { id: true } }).catch(() => undefined);
       }
       return upvoteArticleWithSession(api, page, topicId, publishedUrl, username);
     });
@@ -566,9 +578,13 @@ async function upvoteWithBrowser(
     ) {
       try {
         const { refreshLeetCodeAccount } = await import('../security/sessionAutoRefresh');
-        const refreshed = await refreshLeetCodeAccount(account);
+        // refreshLeetCodeAccount reads only { id, label, username, status, storageState }.
+        const refreshed = await refreshLeetCodeAccount(account as Account);
         if (['valid', 'refreshed'].includes(refreshed.status) && typeof prisma.account?.findUniqueOrThrow === 'function') {
-          const updated = await prisma.account.findUniqueOrThrow({ where: { id: account.id } });
+          const updated = await prisma.account.findUniqueOrThrow({
+            where: { id: account.id },
+            select: ACCOUNT_CREDENTIAL_SELECT,
+          });
           return await execute(updated);
         }
       } catch {
@@ -620,8 +636,8 @@ function renderUpvoteProgressBoard(params: {
 async function executeUpvoteWorkflow(
   post: UpvoteTarget,
   options: { initialDelayMs?: number; accountGapMs?: number; force?: boolean } = {},
-  passedAuthorAccount?: Account | null,
-  passedOtherAccounts?: Account[],
+  passedAuthorAccount?: AccountCredentialRecord | null,
+  passedOtherAccounts?: AccountCredentialRecord[],
 ): Promise<void> {
   const initialDelay = options.initialDelayMs ?? UPVOTE_INITIAL_DELAY_MS;
   const gap = options.accountGapMs ?? UPVOTE_ACCOUNT_GAP_MS;
@@ -631,23 +647,26 @@ async function executeUpvoteWorkflow(
   const stateKey = `solution-post-upvotes:${post.id}`;
 
   // Fetch author account and other accounts
-  let authorAccount: Account | null = passedAuthorAccount !== undefined ? passedAuthorAccount : null;
+  let authorAccount: AccountCredentialRecord | null = passedAuthorAccount !== undefined ? passedAuthorAccount : null;
   if (passedAuthorAccount === undefined) {
     if (typeof prisma.account?.findFirst === 'function') {
       authorAccount = await prisma.account
         .findFirst({
           where: { id: post.accountId, status: { not: 'DISABLED' } },
+          select: ACCOUNT_CREDENTIAL_SELECT,
         })
         .catch(() => null);
     } else if (typeof prisma.account?.findUniqueOrThrow === 'function') {
-      authorAccount = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } }).catch(() => null);
+      authorAccount = await prisma.account
+        .findUniqueOrThrow({ where: { id: post.accountId }, select: ACCOUNT_CREDENTIAL_SELECT })
+        .catch(() => null);
       if (authorAccount && (authorAccount.id !== post.accountId || authorAccount.status === 'DISABLED')) {
         authorAccount = null;
       }
     }
   }
 
-  let otherAccounts: Account[] = passedOtherAccounts ?? [];
+  let otherAccounts: AccountCredentialRecord[] = passedOtherAccounts ?? [];
   if (passedOtherAccounts === undefined) {
     const fetched = await prisma.account
       .findMany({
@@ -655,6 +674,7 @@ async function executeUpvoteWorkflow(
           id: { not: post.accountId },
           status: { not: 'DISABLED' },
         },
+        select: ACCOUNT_CREDENTIAL_SELECT,
         orderBy: { createdAt: 'asc' },
       })
       .catch(() => []);
@@ -683,6 +703,7 @@ async function executeUpvoteWorkflow(
     where: { key: stateKey },
     create: { key: stateKey, value: JSON.stringify(jobState) },
     update: { value: JSON.stringify(jobState) },
+    select: { key: true },
   });
 
   const stopKeepAlive = startArticleWorkKeepAlive();
@@ -913,7 +934,9 @@ export async function scheduleSolutionArticleUpvotes(
 
   const stateKey = `solution-post-upvotes:${post.id}`;
   if (typeof prisma.systemState?.findUnique === 'function') {
-    const existingState = await Promise.resolve(prisma.systemState.findUnique({ where: { key: stateKey } })).catch(() => null);
+    const existingState = await Promise.resolve(
+      prisma.systemState.findUnique({ where: { key: stateKey }, select: { value: true } }),
+    ).catch(() => null);
     if (existingState) {
       try {
         const parsed = JSON.parse(existingState.value) as { status?: string; verified?: boolean; attempts?: number };
@@ -928,11 +951,15 @@ export async function scheduleSolutionArticleUpvotes(
     }
   }
 
-  let authorAccount: Account | null = null;
+  let authorAccount: AccountCredentialRecord | null = null;
   if (typeof prisma.account?.findFirst === 'function') {
-    authorAccount = await prisma.account.findFirst({ where: { id: post.accountId, status: { not: 'DISABLED' } } }).catch(() => null);
+    authorAccount = await prisma.account
+      .findFirst({ where: { id: post.accountId, status: { not: 'DISABLED' } }, select: ACCOUNT_CREDENTIAL_SELECT })
+      .catch(() => null);
   } else if (typeof prisma.account?.findUniqueOrThrow === 'function') {
-    authorAccount = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } }).catch(() => null);
+    authorAccount = await prisma.account
+      .findUniqueOrThrow({ where: { id: post.accountId }, select: ACCOUNT_CREDENTIAL_SELECT })
+      .catch(() => null);
     if (authorAccount && (authorAccount.id !== post.accountId || authorAccount.status === 'DISABLED')) {
       authorAccount = null;
     }
@@ -940,6 +967,7 @@ export async function scheduleSolutionArticleUpvotes(
 
   const otherAccounts = await prisma.account.findMany({
     where: { id: { not: post.accountId }, status: { not: 'DISABLED' } },
+    select: ACCOUNT_CREDENTIAL_SELECT,
     orderBy: { createdAt: 'asc' },
   });
 
@@ -981,6 +1009,7 @@ export async function boostSolutionArticleViews(
   const accounts = (await Promise.resolve(
     prisma.account?.findMany?.({
       where: { status: { not: 'DISABLED' } },
+      select: ACCOUNT_CREDENTIAL_SELECT,
       orderBy: { createdAt: 'asc' },
     }),
   ).catch(() => [])) || [];
@@ -1030,11 +1059,40 @@ export async function boostSolutionArticleViews(
             liveUpvotes: liveMetrics?.upvotes,
           }),
         },
+        select: { key: true },
       }),
     ).catch(() => undefined);
   }
 
   return { totalViews, accountsProcessed, liveHitCount: finalHitCount };
+}
+
+async function loadSystemStateMap(keys: string[], includeValue: boolean): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  if (!keys.length) return result;
+  if (typeof prisma.systemState?.findMany === 'function') {
+    const rows = await Promise.resolve(
+      prisma.systemState.findMany({
+        where: { key: { in: keys } },
+        select: includeValue ? { key: true, value: true } : { key: true },
+      }),
+    ).catch(() => null);
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        if (row?.key) result.set(row.key, (row as { value?: string }).value ?? '');
+      }
+      return result;
+    }
+  }
+  if (typeof prisma.systemState?.findUnique === 'function') {
+    await Promise.all(keys.map(async key => {
+      const row = await Promise.resolve(
+        prisma.systemState.findUnique({ where: { key }, select: includeValue ? { value: true } : { key: true } }),
+      ).catch(() => null);
+      if (row) result.set(key, (row as { value?: string }).value ?? '');
+    }));
+  }
+  return result;
 }
 
 /**
@@ -1046,7 +1104,8 @@ export async function boostSolutionArticleViews(
  * - Ensures all recent published solution articles have their 300+ views boosted.
  */
 export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
-  if (typeof prisma.solutionPost?.findMany !== 'function') return;
+  if (typeof prisma.solutionPost?.findMany !== 'function' || upvoteRecoveryInProgress) return;
+  upvoteRecoveryInProgress = true;
   try {
     const now = new Date();
     const parts = new Intl.DateTimeFormat('en-US', {
@@ -1066,16 +1125,23 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
         publishedUrl: { not: null },
         publishedAt: { gte: todayStart },
       },
+      select: { id: true, publishedUrl: true, accountId: true, problemSlug: true },
       orderBy: { publishedAt: 'asc' },
     });
 
-    for (const post of todayPublished) {
-      if (!post.publishedUrl) continue;
-      const stateKey = `solution-post-upvotes:${post.id}`;
-      const existing = await Promise.resolve(prisma.systemState.findUnique({ where: { key: stateKey } })).catch(() => null);
-      if (existing) {
+    const todayCandidates = todayPublished.filter(
+      (post) => Boolean(post.publishedUrl) && !activeUpvoteJobs.has(post.id) && !upvoteQueue.some((q) => q.post.id === post.id),
+    );
+    const upvoteStates = await loadSystemStateMap(
+      todayCandidates.map((post) => `solution-post-upvotes:${post.id}`),
+      true,
+    );
+
+    for (const post of todayCandidates) {
+      const existingValue = upvoteStates.get(`solution-post-upvotes:${post.id}`);
+      if (existingValue !== undefined) {
         try {
-          const parsed = JSON.parse(existing.value) as { status?: string; verified?: boolean; attempts?: number };
+          const parsed = JSON.parse(existingValue) as { status?: string; verified?: boolean; attempts?: number };
           // Single time rule: if already completed or attempted, never repeat
           if (parsed.status === 'COMPLETED' || (parsed.attempts ?? 0) >= 1) {
             continue;
@@ -1099,19 +1165,25 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
         publishedUrl: { not: null },
         publishedAt: { gte: cutoff72h },
       },
+      select: { id: true, publishedUrl: true, problemSlug: true },
       orderBy: { publishedAt: 'desc' },
       take: 6,
     });
 
-    for (const post of recentPublished) {
+    const boostCandidates = recentPublished.filter((post) => Boolean(post.publishedUrl) && !activeViewBoosts.has(post.id));
+    const existingViewStates = await loadSystemStateMap(
+      boostCandidates.map((post) => `solution-post-views:${post.id}`),
+      false,
+    );
+
+    for (const post of boostCandidates) {
       if (!post.publishedUrl) continue;
-      const viewsKey = `solution-post-views:${post.id}`;
-      const existingViews = await Promise.resolve(prisma.systemState.findUnique({ where: { key: viewsKey } })).catch(() => null);
-      if (!existingViews) {
+      if (!existingViewStates.has(`solution-post-views:${post.id}`)) {
         logger.info({ postId: post.id, publishedUrl: post.publishedUrl }, 'auto-boosting article views for recent published post');
-        void boostSolutionArticleViews({ id: post.id, publishedUrl: post.publishedUrl, problemSlug: post.problemSlug }).catch((err) =>
-          logger.warn({ postId: post.id, err: err instanceof Error ? err.message : String(err) }, 'view boost error'),
-        );
+        activeViewBoosts.add(post.id);
+        void boostSolutionArticleViews({ id: post.id, publishedUrl: post.publishedUrl, problemSlug: post.problemSlug })
+          .catch((err) => logger.warn({ postId: post.id, err: err instanceof Error ? err.message : String(err) }, 'view boost error'))
+          .finally(() => activeViewBoosts.delete(post.id));
       }
     }
   } catch (err) {
@@ -1119,5 +1191,7 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
       { err: err instanceof Error ? err.message : String(err) },
       'failed to inspect today published articles for upvote recovery',
     );
+  } finally {
+    upvoteRecoveryInProgress = false;
   }
 }

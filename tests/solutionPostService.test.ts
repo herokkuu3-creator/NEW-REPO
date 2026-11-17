@@ -297,4 +297,50 @@ describe('solution workflow and persistence', () => {
     await expect(withAccount(h.account, action)).rejects.toThrow('ACCOUNT_IDENTITY_MISMATCH');
     expect(action).not.toHaveBeenCalled(); expect(h.browser.close).toHaveBeenCalledTimes(2);
   });
+  it('uses explicit Prisma select projections to avoid fetching heavy unused columns', async () => {
+    await loadContext('a', 'run1');
+    const runLoadCall = vi.mocked(prisma.dailyRun.findUniqueOrThrow).mock.calls.at(-1)?.[0] as any;
+    expect(runLoadCall?.select).toBeDefined();
+    expect(runLoadCall?.select?.error).toBeUndefined();
+    const acctCall = vi.mocked(prisma.account.findUniqueOrThrow).mock.calls.at(-1)?.[0] as any;
+    expect(acctCall?.select).toEqual({ id: true, label: true, username: true, status: true, storageState: true });
+
+    await generatePost(context, {} as never);
+    h.row.status = 'AWAITING_APPROVAL';
+    vi.clearAllMocks();
+    await generateForRun('a', 'run1');
+    const runForGenCall = vi.mocked(prisma.dailyRun.findUniqueOrThrow).mock.calls.at(-1)?.[0] as any;
+    expect(runForGenCall?.select).toEqual({ accountId: true, problemSlug: true });
+    const postForGenCall = vi.mocked(prisma.solutionPost.findUnique).mock.calls.at(-1)?.[0] as any;
+    expect(postForGenCall?.select).toBeDefined();
+    expect(postForGenCall?.select?.markdown).toBeUndefined();
+    expect(postForGenCall?.select?.attempts).toBeUndefined();
+
+    vi.clearAllMocks();
+    h.row.status = 'FAILED';
+    h.row.retryCount = 1;
+    await retryPost('post1');
+    const retryPostCall = vi.mocked(prisma.solutionPost.findUniqueOrThrow).mock.calls[0]?.[0] as any;
+    expect(retryPostCall?.select).toBeDefined();
+    expect(retryPostCall?.select?.markdown).toBeUndefined();
+    expect(retryPostCall?.select?.attempts).toBeUndefined();
+    const retryRunCall = vi.mocked(prisma.dailyRun.findFirst).mock.calls[0]?.[0] as any;
+    expect(retryRunCall?.select).toEqual({ id: true });
+
+    vi.clearAllMocks();
+    const stale = new Date(Date.now() - (SOLUTION_ARTICLE_WORK_MS + 60_000));
+    h.row.status = 'GENERATING';
+    h.row.updatedAt = stale;
+    await requeueInterruptedGeneration('post1', stale);
+    const recoverPostCall = vi.mocked(prisma.solutionPost.findUniqueOrThrow).mock.calls[0]?.[0] as any;
+    expect(recoverPostCall?.select).toEqual({
+      id: true,
+      accountId: true,
+      submissionId: true,
+      intent: true,
+      status: true,
+      lastError: true,
+      updatedAt: true,
+    });
+  });
 });

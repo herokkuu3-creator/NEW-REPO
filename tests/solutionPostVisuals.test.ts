@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 const db = vi.hoisted(() => ({ findUnique: vi.fn(), upsert: vi.fn() }));
 vi.mock('../src/database/prisma', () => ({ prisma: { systemState: db } }));
 import { visualPlanSchema, renderVisualFallback, renderVisualFrame, renderVisualGif } from '../src/solutionPosts/visuals';
-import { publicVisualOrigin, registerVisualAssetRoutes, storeVisualAssets, verifyHostedVisualAssets } from '../src/solutionPosts/visualStore';
+import { clearVisualAssetCache, MAX_VISUAL_CACHE_ENTRIES, publicVisualOrigin, registerVisualAssetRoutes, storeVisualAssets, verifyHostedVisualAssets } from '../src/solutionPosts/visualStore';
 import { articleSchema, contextSchema, renderArticle } from '../src/solutionPosts/article';
 
 const context = contextSchema.parse({ accountId: 'a', username: 'alice', problemId: '1', slug: 'example',
@@ -110,5 +110,65 @@ describe('original solution animations', () => {
     await expect(verifyHostedVisualAssets(assets, 'https://app.example.test', fetcher)).resolves.toBe(true);
     await expect(verifyHostedVisualAssets([assets[0]!], 'https://app.example.test', fetcher)).resolves.toBe(false);
     await expect(verifyHostedVisualAssets([{ ...assets[0]!, url: 'https://other.example.test/a.gif' }, assets[1]!], 'https://app.example.test', fetcher)).resolves.toBe(false);
+  });
+  it('uses minimal select projections, serves cached GIFs with ETag/304, and bounds cache growth via LRU eviction', async () => {
+    clearVisualAssetCache();
+    db.upsert.mockResolvedValue({ key: 'k' });
+    db.findUnique.mockReset();
+
+    const bytes = await renderVisualGif(plan);
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    const encoded = bytes.toString('base64');
+
+    await storeVisualAssets([plan], 'https://app.example.test');
+    expect(db.upsert).toHaveBeenLastCalledWith(expect.objectContaining({
+      select: { key: true },
+    }));
+
+    db.findUnique.mockResolvedValue({ value: encoded });
+    const app = Fastify();
+    registerVisualAssetRoutes(app, { enableCache: true });
+
+    const first = await app.inject(`/solution-assets/${digest}.gif`);
+    expect(first.statusCode).toBe(200);
+    expect(first.headers.etag).toBe(`"${digest}"`);
+    expect(db.findUnique).toHaveBeenCalledTimes(1);
+    expect(db.findUnique).toHaveBeenCalledWith({
+      where: { key: `solution-visual:${digest}` },
+      select: { value: true },
+    });
+
+    // Second GET hits the bounded in-memory LRU cache without touching Postgres.
+    const second = await app.inject(`/solution-assets/${digest}.gif`);
+    expect(second.statusCode).toBe(200);
+    expect(second.rawPayload.equals(bytes)).toBe(true);
+    expect(db.findUnique).toHaveBeenCalledTimes(1);
+
+    // Matching If-None-Match returns 304 without hitting Postgres.
+    const notModified = await app.inject({
+      method: 'GET',
+      url: `/solution-assets/${digest}.gif`,
+      headers: { 'if-none-match': `"${digest}"` },
+    });
+    expect(notModified.statusCode).toBe(304);
+    expect(db.findUnique).toHaveBeenCalledTimes(1);
+
+    // Populate beyond MAX_VISUAL_CACHE_ENTRIES to verify oldest entries are evicted.
+    for (let i = 0; i < MAX_VISUAL_CACHE_ENTRIES + 2; i++) {
+      const vBytes = Buffer.from(`GIF89a-cache-entry-${i}`);
+      const vDigest = createHash('sha256').update(vBytes).digest('hex');
+      db.findUnique.mockResolvedValueOnce({ value: vBytes.toString('base64') });
+      const res = await app.inject(`/solution-assets/${vDigest}.gif`);
+      expect(res.statusCode).toBe(200);
+    }
+
+    const callsBeforeEvictedLookup = db.findUnique.mock.calls.length;
+    db.findUnique.mockResolvedValueOnce({ value: encoded });
+    const evictedRetry = await app.inject(`/solution-assets/${digest}.gif`);
+    expect(evictedRetry.statusCode).toBe(200);
+    expect(db.findUnique).toHaveBeenCalledTimes(callsBeforeEvictedLookup + 1);
+
+    clearVisualAssetCache();
+    await app.close();
   });
 });
