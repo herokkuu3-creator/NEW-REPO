@@ -5,11 +5,11 @@ interface LogEntry { level: number; time: string; service: string; msg: string; 
 export const logRingBuffer: LogEntry[] = [];
 
 function safeValue(value: unknown, key = ''): unknown {
-  if (/^(authorization|password|proxyPassword|proxyLogin|cookies|updatedCookies|token|cfClearance|clientKey|apiKey|capzyApiKeys|telegramBotToken)$/i.test(key)) return '[redacted]';
+  if (/^(authorization|password|proxyPassword|proxyLogin|cookies|updatedCookies|token|cfClearance|clientKey|apiKey|capzyApiKeys|telegramBotToken|cpsolverApiToken|apiToken)$/i.test(key)) return '[redacted]';
   if (Array.isArray(value)) return value.map(item => safeValue(item));
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, safeValue(item, name)]));
   if (typeof value === 'string') {
-    const urlRedacted = value.replace(/(?:https?|socks[45]):\/\/[^\s"'<>]+/g, raw => {
+    const urlRedacted = value.replace(/(?:https?|socks[45]h?):\/\/[^\s"'<>]+/gi, raw => {
       try {
         const url = new URL(raw);
         if (url.username || url.password) { url.username = 'redacted'; url.password = 'redacted'; }

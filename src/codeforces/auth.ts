@@ -88,23 +88,45 @@ export async function loginToCodeforces(
     await applyStealthScripts(context, 'chromium');
 
     // Route blocking to save memory on 512MB RAM instances
-    await context.route('**/*', (route) => {
-      const request = route.request();
-      const parsed = new URL(request.url());
-      if (
-        parsed.hostname === 'challenges.cloudflare.com' ||
-        parsed.hostname.includes('codeforces.com') ||
-        parsed.hostname.includes('codeforces.net') ||
-        parsed.hostname.includes('codeforces.org') ||
-        parsed.pathname.startsWith('/cdn-cgi/')
-      ) {
-        return route.continue();
+    await context.route('**/*', async (route) => {
+      try {
+        const request = route.request();
+        let parsed: URL;
+        try {
+          parsed = new URL(request.url());
+        } catch {
+          await route.continue().catch(() => {});
+          return;
+        }
+        const host = parsed.hostname.toLowerCase();
+        if (
+          host === 'challenges.cloudflare.com' ||
+          host.endsWith('.challenges.cloudflare.com') ||
+          host === 'codeforces.com' ||
+          host.endsWith('.codeforces.com') ||
+          host === 'codeforces.net' ||
+          host.endsWith('.codeforces.net') ||
+          host === 'codeforces.org' ||
+          host.endsWith('.codeforces.org') ||
+          parsed.pathname.startsWith('/cdn-cgi/')
+        ) {
+          await route.continue().catch(() => {});
+          return;
+        }
+        const blockedTypes = ['image', 'font', 'media'];
+        if (blockedTypes.includes(request.resourceType())) {
+          await route.abort().catch(() => {});
+          return;
+        }
+        const blockedHosts = ['google-analytics.com', 'googletagmanager.com', 'clarity.ms', 'doubleclick.net'];
+        if (blockedHosts.some((h) => host === h || host.endsWith(`.${h}`))) {
+          await route.abort().catch(() => {});
+          return;
+        }
+        await route.continue().catch(() => {});
+      } catch {
+        await route.continue().catch(() => {});
       }
-      const blockedTypes = ['image', 'font', 'media'];
-      if (blockedTypes.includes(request.resourceType())) return route.abort();
-      const blockedHosts = ['google-analytics.com', 'googletagmanager.com', 'clarity.ms', 'doubleclick.net'];
-      if (blockedHosts.some((h) => parsed.hostname.includes(h))) return route.abort();
-      return route.continue();
     });
 
     let page: Page = await context.newPage();
@@ -212,13 +234,13 @@ export async function loginToCodeforces(
 
     const handleVisible = await handleInput.waitFor({ state: 'visible', timeout: 25_000 }).then(() => true).catch(() => false);
     if (!handleVisible) {
-      // Check if already signed in
-      const cookies = await context.cookies('https://codeforces.com');
-      const hasSession = cookies.some((c) => (c.name === 'JSESSIONID' || c.name === '39ce7') && c.value.length > 5);
+      // Check if already signed in via verified DOM/meta state (never anonymous JSESSIONID/39ce7 alone)
+      const cookies = await context.cookies('https://codeforces.com').catch(() => []);
       const detected = await detectCodeforcesHandle(page);
-      if (hasSession && detected) {
+      const verifiedCookie = hasVerifiedAuthCookie(cookies);
+      if (detected || verifiedCookie) {
         const storageState = (await context.storageState()) as StorageStateShape;
-        return { ok: true, handle: detected, storageState };
+        return { ok: true, handle: detected ?? verifiedCookie?.handle ?? handleOrEmail, storageState };
       }
       return { ok: false, error: 'Codeforces login form elements could not be found' };
     }
@@ -238,9 +260,10 @@ export async function loginToCodeforces(
     const submitBtn = page.locator('input[type="submit"].submit, input.submit, button[type="submit"], input[type="submit"]').first();
     await notify('🚀 Submitting login form…');
     await submitBtn.click({ timeout: 4000, force: true }).catch(async () => {
-      await page.keyboard.press('Enter').catch(() => null);
+      await passwordInputEl.press('Enter').catch(async () => {
+        await page.keyboard.press('Enter').catch(() => null);
+      });
     });
-    await passwordInputEl.press('Enter').catch(() => null);
 
     await notify('⏳ Waiting for authentication…');
     const deadline = Date.now() + Math.min(timeoutMs, 40_000);
@@ -250,7 +273,7 @@ export async function loginToCodeforces(
       await new Promise((r) => setTimeout(r, 2000));
 
       const cookies = await context.cookies('https://codeforces.com').catch(() => []);
-      const hasSession = cookies.some((c) => (c.name === 'JSESSIONID' || c.name === '39ce7') && c.value.length > 5);
+      const verifiedCookie = hasVerifiedAuthCookie(cookies);
 
       if (!page.isClosed()) {
         const detected = await detectCodeforcesHandle(page);
@@ -276,28 +299,29 @@ export async function loginToCodeforces(
         }
 
         if (!/\/enter(?:[/?#]|$)/i.test(curUrl) && (curUrl.includes('codeforces.com') || curUrl.endsWith('/'))) {
-          if (hasSession) {
-            authenticatedHandle = detected || handleOrEmail;
+          if (verifiedCookie) {
+            authenticatedHandle = verifiedCookie.handle ?? handleOrEmail;
             break;
           }
         }
-      } else {
-        if (hasSession) {
-          authenticatedHandle = handleOrEmail;
-          break;
-        }
+      } else if (verifiedCookie) {
+        authenticatedHandle = verifiedCookie.handle ?? handleOrEmail;
+        break;
       }
     }
 
     if (!authenticatedHandle) {
       const cookies = await context.cookies('https://codeforces.com').catch(() => []);
-      const hasSession = cookies.some((c) => (c.name === 'JSESSIONID' || c.name === '39ce7') && c.value.length > 5);
-      if (hasSession) {
-        authenticatedHandle = handleOrEmail;
+      const verifiedCookie = hasVerifiedAuthCookie(cookies);
+      const detected = !page.isClosed() ? await detectCodeforcesHandle(page) : null;
+      if (detected) {
+        authenticatedHandle = detected;
+      } else if (verifiedCookie) {
+        authenticatedHandle = verifiedCookie.handle ?? handleOrEmail;
       } else {
         return {
           ok: false,
-          error: 'Login timed out. No active session cookie received from Codeforces.',
+          error: 'Login timed out. Codeforces session could not be verified as authenticated.',
         };
       }
     }
@@ -322,26 +346,45 @@ export async function loginToCodeforces(
   }
 }
 
-async function detectCodeforcesHandle(page: Page): Promise<string | null> {
+function hasVerifiedAuthCookie(cookies: Array<{ name: string; value: string }>): { handle?: string } | null {
+  const xUser = cookies.find((c) => c.name === 'X-User' && c.value.trim().length > 0 && c.value.trim().toLowerCase() !== 'anonymous');
+  if (xUser) return { handle: xUser.value.trim() };
+  const xUserSha1 = cookies.find((c) => c.name === 'X-User-Sha1' && c.value.trim().length > 5);
+  if (xUserSha1) return {};
+  return null;
+}
+
+export async function detectCodeforcesHandle(page: Page): Promise<string | null> {
   if (!page || page.isClosed()) return null;
   return page.evaluate(() => {
     try {
-      const anchors = Array.from(document.querySelectorAll('a[href*="/profile/"]')) as HTMLAnchorElement[];
-      for (const a of anchors) {
-        const match = /\/profile\/([^/?#]+)/i.exec(a.href);
-        if (match && match[1]) {
-          const text = (a.textContent || '').trim();
-          if (text && text.toLowerCase() === match[1].toLowerCase()) {
-            return decodeURIComponent(match[1]);
-          }
+      const langChooser = document.querySelector('.lang-chooser');
+      const hasLogout = Boolean(
+        langChooser?.querySelector('a[href*="/logout"]') ?? document.querySelector('a[href*="/logout"]'),
+      );
+      if (hasLogout && langChooser) {
+        const headerUser = langChooser.querySelector('a[href*="/profile/"]') as HTMLAnchorElement | null;
+        if (headerUser) {
+          const match = /\/profile\/([^/?#]+)/i.exec(headerUser.getAttribute('href') || headerUser.href);
+          if (match && match[1]) return decodeURIComponent(match[1]);
         }
       }
-      // Lang chooser header area
-      const headerUser = document.querySelector('.lang-chooser a[href*="/profile/"]');
-      if (headerUser) {
-        const match = /\/profile\/([^/?#]+)/i.exec((headerUser as HTMLAnchorElement).href);
-        if (match && match[1]) return decodeURIComponent(match[1]);
+
+      const xUserMeta = document.querySelector('meta[name="X-User"]') as HTMLMetaElement | null;
+      const xUser = xUserMeta?.getAttribute('content')?.trim() || '';
+      if (xUser && xUser.toLowerCase() !== 'anonymous') return xUser;
+
+      const xUserSha1Meta = document.querySelector('meta[name="X-User-Sha1"]') as HTMLMetaElement | null;
+      const xUserSha1 = xUserSha1Meta?.getAttribute('content')?.trim() || '';
+      if (xUserSha1 && xUserSha1.length > 5) {
+        const headerUser = (langChooser ?? document).querySelector('a[href*="/profile/"]') as HTMLAnchorElement | null;
+        if (headerUser) {
+          const match = /\/profile\/([^/?#]+)/i.exec(headerUser.getAttribute('href') || headerUser.href);
+          if (match && match[1]) return decodeURIComponent(match[1]);
+        }
+        return xUserSha1;
       }
+
       return null;
     } catch {
       return null;

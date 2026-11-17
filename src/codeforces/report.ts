@@ -3,6 +3,7 @@ import { isoLocal } from '../time';
 export type CodeforcesOutcomeKind = 'solved' | 'failed' | 'expired' | 'rejected' | 'skipped' | 'pending';
 
 export interface CodeforcesAccountOutcome {
+  accountId?: string;
   label: string;
   username?: string | null;
   kind: CodeforcesOutcomeKind;

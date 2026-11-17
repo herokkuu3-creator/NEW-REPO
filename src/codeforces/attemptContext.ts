@@ -13,6 +13,8 @@ const attempts = new AsyncLocalStorage<AttemptContext>();
 export const getAttemptContext = () => attempts.getStore();
 export function throwIfAttemptAborted(): void { attempts.getStore()?.signal.throwIfAborted(); }
 
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
 /** All nested requests and delays share the lifetime of their submission. */
 export async function withAttemptContext<T>(
   requestId: string, deadline: number, task: () => Promise<T>, parentSignal?: AbortSignal,
@@ -21,7 +23,9 @@ export async function withAttemptContext<T>(
   const signal = parentSignal ? AbortSignal.any([controller.signal, parentSignal]) : controller.signal;
   const remaining = deadline - Date.now();
   if (remaining <= 0) controller.abort(new AttemptCancelledError('deadline'));
-  const timer = remaining > 0 ? setTimeout(() => controller.abort(new AttemptCancelledError('deadline')), remaining) : undefined;
+  const timer = Number.isFinite(remaining) && remaining > 0
+    ? setTimeout(() => controller.abort(new AttemptCancelledError('deadline')), Math.min(remaining, MAX_TIMEOUT_MS))
+    : undefined;
   try {
     return await attempts.run({ requestId, deadline, signal }, async () => {
       signal.throwIfAborted();

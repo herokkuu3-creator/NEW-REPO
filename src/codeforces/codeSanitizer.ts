@@ -54,6 +54,36 @@ export function stripCppComments(source: string): string {
       continue;
     }
 
+    // Numeric literals (including C++14 digit separators like 100'000 or 0xFF'FF)
+    // must be scanned before char-literal matching so `digit'digit` does not open a char literal.
+    if (
+      (ch >= '0' && ch <= '9' && (i === 0 || !isIdentifierChar(source[i - 1]!))) ||
+      (ch === '.' && i + 1 < source.length && source[i + 1]! >= '0' && source[i + 1]! <= '9' && (i === 0 || !isIdentifierChar(source[i - 1]!)))
+    ) {
+      out += ch;
+      i++;
+      while (i < source.length) {
+        const cur = source[i]!;
+        if (/[0-9a-zA-Z_.]/.test(cur)) {
+          out += cur;
+          i++;
+          continue;
+        }
+        if (cur === "'" && i + 1 < source.length && /[0-9a-fA-F]/.test(source[i + 1]!)) {
+          out += cur;
+          i++;
+          continue;
+        }
+        if ((cur === '+' || cur === '-') && i > 0 && /[eEpP]/.test(source[i - 1]!)) {
+          out += cur;
+          i++;
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
+
     // String / character literals: comment markers inside them are code.
     if (ch === '"' || ch === "'") {
       const quote = ch;
@@ -102,11 +132,11 @@ function isIdentifierChar(ch: string): boolean {
 
 function isRawStringPrefixAt(source: string, index: number): boolean {
   const rest = source.slice(index);
-  return /^(?:u8|u|U|L)?R"[^\\()\\s]{0,16}\(/.test(rest);
+  return /^(?:u8|u|U|L)?R"[^\\()\s]{0,16}\(/.test(rest);
 }
 
 function readRawStringEnd(source: string, index: number): { end: number } | null {
-  const match = /^(?:u8|u|U|L)?R"([^\\()\\s]{0,16})\(/.exec(source.slice(index));
+  const match = /^(?:u8|u|U|L)?R"([^\\()\s]{0,16})\(/.exec(source.slice(index));
   if (!match) return null;
 
   const prefixLength = match[0].length;

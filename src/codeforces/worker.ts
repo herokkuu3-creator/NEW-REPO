@@ -24,6 +24,7 @@ import { solveCloudflareWithCapzy } from './captchaSolver';
 import type { HttpSubmitResult } from './httpSubmit';
 import { captureBefore, pollForVerdict, postSubmitForm, type BrowserPostOutcome } from './submission';
 import { isRemoteSubmitterConfigured, notifyProxyInUse, submitViaRemoteSubmitter } from './remoteSubmitter';
+import * as proxyManager from './proxyManager';
 import { shouldRetryWithOriginal, stripCppComments } from './codeSanitizer';
 import { runSubmissionAttempts, readBeforeDeadline, CODEFORCES_ATTEMPT_MS, isCodeforcesVerificationRequired } from './attempts';
 import { launchFirefoxWithStorageStateObject } from '../browser/playwright';
@@ -593,7 +594,7 @@ async function runForAccount(
     }
     if (!stored.ok) {
       await patchCodeforcesAccount(account.id, { status: CodeforcesAccountStatus.UNKNOWN, lastError: stored.error, checked: true });
-      return { label, username: account.username, kind: 'failed', error: stored.error };
+      return { accountId: account.id, label, username: account.username, kind: 'failed', error: stored.error };
     }
   }
 
@@ -625,6 +626,7 @@ async function runForAccount(
   }
   if (!current) {
     return {
+      accountId: account.id,
       label,
       username: account.username,
       kind: 'skipped',
@@ -662,6 +664,7 @@ async function runForAccount(
     if (!claimed) {
       const latest = await getCodeforcesProgress(account.id);
       return {
+        accountId: account.id,
         label,
         username: handle,
         kind: 'skipped',
@@ -718,20 +721,35 @@ async function runForAccount(
         if (!attempt.ok && isCodeforcesVerificationRequired(attempt.error)) {
           logger.info({ label, problem: problemLabel(entry) }, 'Codeforces verification required; attempting automated Capzy solver clearance');
           try {
+            const activeProxy = networkMode !== 'tailscale'
+              ? await (async () => {
+                  try {
+                    return typeof proxyManager.resolveActiveProxy === 'function'
+                      ? await proxyManager.resolveActiveProxy().catch(() => null)
+                      : null;
+                  } catch {
+                    return null;
+                  }
+                })()
+              : null;
             const capzyResult = await solveCloudflareWithCapzy(
               entry.problemUrl ?? `https://codeforces.com/contest/${entry.contestId}/problem/${entry.problemIndex}`,
-              undefined,
+              activeProxy?.url,
               undefined,
               60_000,
             );
-            if (capzyResult?.cookies && Object.keys(capzyResult.cookies).length > 0) {
+            const clearanceCookies: Record<string, string> = { ...(capzyResult?.cookies ?? {}) };
+            if (capzyResult?.cfClearance && !clearanceCookies.cf_clearance) {
+              clearanceCookies.cf_clearance = capzyResult.cfClearance;
+            }
+            if (Object.keys(clearanceCookies).length > 0) {
               const existing = new Map(((stored.state.cookies as any[]) ?? []).map((c: any) => [c.name, c]));
-              for (const [name, value] of Object.entries(capzyResult.cookies)) {
+              for (const [name, value] of Object.entries(clearanceCookies)) {
                 existing.set(name, { name, value: String(value), domain: '.codeforces.com', path: '/' });
               }
               stored.state.cookies = Array.from(existing.values());
               stateDirty = true;
-              logger.info({ label, cookieCount: Object.keys(capzyResult.cookies).length }, 'Injected Capzy clearance cookies into stored state; retrying browser submission');
+              logger.info({ label, cookieCount: Object.keys(clearanceCookies).length }, 'Injected Capzy clearance cookies into stored state; retrying browser submission');
               const cookiesBeforeRetry = stored.state.cookies;
               const retryViaBrowser = await submitViaBrowser(
                 stored.state,
@@ -740,7 +758,7 @@ async function runForAccount(
                 entry,
                 submissionCode,
                 networkMode,
-                Date.now() + 60_000,
+                Date.now() + CODEFORCES_ATTEMPT_MS,
                 (phase) => onProgress?.(phase, attemptUsername),
               );
               if (stored.state.cookies !== cookiesBeforeRetry) stateDirty = true;
@@ -839,6 +857,7 @@ async function runForAccount(
       });
       if (stateDirty) account.storageState = JSON.stringify(stored.state);
       return {
+        accountId: account.id,
         label,
         username,
         kind: 'solved',
@@ -892,6 +911,7 @@ async function runForAccount(
     });
     if (stateDirty) account.storageState = JSON.stringify(stored.state);
     return {
+      accountId: account.id,
       label,
       username,
       kind: result.kind === 'signed-out' ? 'rejected' : 'failed',
@@ -918,6 +938,7 @@ async function runForAccount(
     }).catch(() => undefined);
     if (stateDirty) account.storageState = JSON.stringify(stored.state);
     return {
+      accountId: account.id,
       label,
       username: handle,
       kind: 'failed',
@@ -1311,7 +1332,7 @@ export async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number
     forceDailyAttempt: true,
     accountIds: pendingIds,
     onAccountOutcome: async (outcome, index) => {
-      const accountId = pendingIds[index - 1];
+      const accountId = outcome.accountId ?? pendingIds[index - 1];
       if (!accountId) return;
       const terminalWithoutSource = outcome.kind === 'skipped' && /queue is exhausted/i.test(outcome.error ?? '');
       if (outcome.performed || terminalWithoutSource) {

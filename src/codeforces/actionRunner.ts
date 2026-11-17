@@ -1,5 +1,6 @@
 /** GitHub Actions entry point. Job inputs contain only an opaque id. */
 import { BrowserFormError } from './browserForm';
+import { getActiveCapzyKeyIndex } from './capzyKeyManager';
 import { submit } from './submitterService';
 
 async function main(): Promise<void> {
@@ -28,6 +29,7 @@ async function main(): Promise<void> {
       clicked: formError?.clicked ?? false,
       turnstile: formError?.flags.turnstile ?? false,
       interactive: formError?.flags.interactive ?? false,
+      activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
     };
   }
   // The POST to Codeforces is never retried. Only delivery of its result may

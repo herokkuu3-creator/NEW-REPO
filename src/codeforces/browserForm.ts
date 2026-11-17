@@ -1,5 +1,5 @@
 import type { Page, Request, Response } from 'playwright';
-import { attemptSleep, throwIfAttemptAborted } from './attemptContext';
+import { attemptSleep, getAttemptContext, throwIfAttemptAborted, withAttemptContext } from './attemptContext';
 import { diagnosticLog } from './diagnosticLog';
 import { logVerificationInventory } from './verificationDiagnostics';
 import { interactWithTurnstileCheckbox, simulateHumanMouseMove } from '../browser/stealth';
@@ -312,7 +312,10 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   };
 
   let solverStarted = false;
+  let orchestratedCapzyRan = false;
   let solverPromise: Promise<void> | null = null;
+  const outerCtx = getAttemptContext();
+  const solverAbort = new AbortController();
   const awaitSolver = async () => {
     if (solverPromise) await solverPromise.catch(() => {});
     throwIfAttemptAborted();
@@ -321,12 +324,17 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   const triggerSolver = (info: { sitekey: string | null; action: string | null; cdata: string | null; callback: string | null }) => {
     if (solverStarted) return;
     solverStarted = true;
-    solverPromise = (async () => {
+    const childSignal = outerCtx?.signal
+      ? AbortSignal.any([outerCtx.signal, solverAbort.signal])
+      : solverAbort.signal;
+    const childDeadline = outerCtx?.deadline ?? Infinity;
+    solverPromise = withAttemptContext(outerCtx?.requestId ?? 'browser-form', childDeadline, async () => {
       await logVerificationInventory(page, 'helper-start', info.sitekey);
       const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => undefined);
       const currentCookies = await page.context().cookies().catch(() => []);
 
       if (info.sitekey) {
+        orchestratedCapzyRan = true;
         const solution = await solveTurnstileOrchestrated({
           siteurl: sanitizeChallengeUrl(page.url()),
           sitekey: info.sitekey,
@@ -340,8 +348,6 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
         });
 
         const hasToken = typeof solution?.token === 'string' && solution.token.trim().length > 10;
-        const hasClearance = (typeof solution?.cfClearance === 'string' && solution.cfClearance.trim().length > 0) ||
-          (solution?.cookies && Object.keys(solution.cookies).some(k => k.toLowerCase().startsWith('cf_')));
 
         if (solution?.cookies) {
           const cookieList = Object.entries(solution.cookies)
@@ -363,39 +369,8 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
           await injectTurnstileToken(form, solution.token!, info.callback);
           return;
         }
-
-        // Direct Capzy fallback if orchestrated solver didn't yield a token
-        log({}, 'ensureFormTurnstile: orchestrated solver did not yield a token; invoking direct Capzy fallback');
-        const capzySolution = await solveTurnstileWithCapzy(
-          sanitizeChallengeUrl(page.url()),
-          info.sitekey,
-          proxyUrl,
-          userAgent,
-          timeoutMs,
-          info.action ?? undefined,
-          info.cdata ?? undefined,
-          overrideKeys,
-        );
-        if (capzySolution?.cookies) {
-          const cookieList = Object.entries(capzySolution.cookies)
-            .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
-            .map(([name, value]) => ({
-              name,
-              value,
-              domain: '.codeforces.com',
-              path: '/',
-            }));
-          if (cookieList.length > 0) {
-            log({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'ensureFormTurnstile: injecting direct Capzy clearance cookies');
-            await page.context().addCookies(cookieList).catch(() => {});
-          }
-        }
-        if (capzySolution?.token) {
-          log({ tokenLength: capzySolution.token.length }, 'ensureFormTurnstile: direct Capzy solved Turnstile, injecting token');
-          await injectTurnstileToken(form, capzySolution.token, info.callback);
-          return;
-        }
       } else {
+        orchestratedCapzyRan = true;
         const cloudflareSol = await solveCloudflareOrchestrated({
           websiteURL: sanitizeChallengeUrl(page.url()),
           proxyUrl,
@@ -427,40 +402,8 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
           await injectTurnstileToken(form, cloudflareSol.token!, info.callback);
           return;
         }
-
-        // Direct Capzy fallback
-        log({}, 'ensureFormTurnstile: orchestrated Cloudflare solver did not yield a token; invoking direct Capzy fallback');
-        const capzySol = await solveCloudflareWithCapzy(
-          sanitizeChallengeUrl(page.url()),
-          proxyUrl,
-          userAgent,
-          timeoutMs,
-          undefined,
-          undefined,
-          undefined,
-          overrideKeys,
-        );
-        if (capzySol?.cookies) {
-          const cookieList = Object.entries(capzySol.cookies)
-            .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
-            .map(([name, value]) => ({
-              name,
-              value,
-              domain: '.codeforces.com',
-              path: '/',
-            }));
-          if (cookieList.length > 0) {
-            log({ count: cookieList.length, names: cookieList.map(c => c.name) }, 'ensureFormTurnstile: injecting direct Capzy clearance cookies');
-            await page.context().addCookies(cookieList).catch(() => {});
-          }
-        }
-        if (capzySol?.token) {
-          log({ tokenLength: capzySol.token.length }, 'ensureFormTurnstile: direct Capzy solved Cloudflare, injecting token');
-          await injectTurnstileToken(form, capzySol.token, info.callback);
-          return;
-        }
       }
-    })();
+    }, childSignal);
     // The page can fail while this helper is still running. Its rejection must
     // be observed even when the caller exits before reaching awaitSolver().
     void solverPromise.catch(() => {});
@@ -484,139 +427,155 @@ export async function ensureFormTurnstile(page: Page, timeoutMs: number, proxyUr
   let executeAttempt = '';
   let clickAttemptedAt = 0;
 
-  while (Date.now() < deadline) {
-    throwIfAttemptAborted();
+  try {
+    while (Date.now() < deadline) {
+      throwIfAttemptAborted();
+      if (await hasToken()) {
+        solverAbort.abort(new Error('Native Turnstile succeeded'));
+        await awaitSolver();
+        return { turnstile: true, interactive: false };
+      }
+
+      if (!solverStarted) {
+        widgetInfo = await extractWidgetInfo();
+        if (widgetInfo.sitekey || Date.now() - startedAt >= 2_000) {
+          triggerSolver(widgetInfo);
+        }
+      }
+
+      if (!apiScriptInjected && Date.now() - startedAt >= 1_000) {
+        const hasApi = await page.evaluate(() => typeof (window as any).turnstile !== 'undefined').catch(() => false);
+        if (hasApi) {
+          apiScriptInjection = 'already-present';
+        } else {
+          try {
+            await page.addScriptTag({ url: 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit' });
+            const hasTurnstile = await page.waitForFunction(
+              () => typeof (window as any).turnstile !== 'undefined',
+              { timeout: 3500 }
+            ).then(() => true).catch(() => false);
+            apiScriptInjection = hasTurnstile ? 'loaded' : 'loaded-without-api';
+          } catch (err) {
+            // Keep the page untouched and log only the error category, never a
+            // URL, response body, cookie, or verification token.
+            apiScriptInjection = `failed:${err instanceof Error ? err.name : 'unknown'}`;
+            logWarn({ apiScriptInjection }, 'Turnstile API script failed to load on the submit form');
+          }
+        }
+        apiScriptInjected = true;
+      }
+
+      if (!widgetRendered && Date.now() - startedAt >= 1_500) {
+        const renderRes = await form.evaluate((element) => {
+          const widgetEl = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
+          const api = (window as unknown as { turnstile?: { render?: (container: HTMLElement, options: Record<string, unknown>) => string; execute?: (container: HTMLElement | string) => void; } }).turnstile;
+          if (!widgetEl || !api?.render) return null;
+          const pageIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+          if (pageIframe) return 'iframe-exists';
+          const sitekey = widgetEl.dataset.sitekey;
+          if (!sitekey) return 'no-sitekey';
+          try {
+            const widgetId = api.render(widgetEl, {
+              sitekey,
+              callback: (token: string) => {
+                const callbackName = widgetEl.getAttribute('data-callback');
+                if (callbackName) {
+                  const fn = callbackName.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
+                  if (typeof fn === 'function') (fn as (value: string) => void)(token);
+                }
+                const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
+                if (input) { input.value = token; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); }
+                const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+                if (cfInput) { cfInput.value = token; cfInput.dispatchEvent(new Event('input', { bubbles: true })); cfInput.dispatchEvent(new Event('change', { bubbles: true })); }
+              },
+              'expired-callback': () => {
+                const expiredName = widgetEl.getAttribute('data-expired-callback');
+                if (expiredName) {
+                  const fn = expiredName.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
+                  if (typeof fn === 'function') (fn as () => void)();
+                }
+                const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
+                if (input) { input.value = ''; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); }
+                const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+                if (cfInput) { cfInput.value = ''; cfInput.dispatchEvent(new Event('input', { bubbles: true })); cfInput.dispatchEvent(new Event('change', { bubbles: true })); }
+              },
+              'error-callback': () => {},
+            });
+            if (widgetId && widgetEl) widgetEl.dataset.widgetId = String(widgetId);
+            return `rendered:${widgetId ?? 'no-id'}`;
+          } catch { return 'render-error'; }
+        }).catch(() => 'page-error');
+        if (renderRes) {
+          renderAttempt = renderRes;
+          if (renderRes !== 'render-error' && renderRes !== 'page-error') {
+            widgetRendered = true;
+          }
+        }
+      }
+
+      if (executeCount < MAX_EXECUTE_RETRIES && Date.now() >= nextExecuteAt) {
+        executeCount += 1;
+        executeAttempt = await form.evaluate((element) => {
+          const widgetEl = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
+          const api = (window as unknown as { turnstile?: { execute?: (container: HTMLElement | string) => void; getResponse?: (id?: string) => string; } }).turnstile;
+          if (!widgetEl || !api?.execute) return 'unavailable';
+          const storedId = widgetEl.dataset.widgetId;
+          try { if (storedId) { api.execute(storedId); } else { api.execute(widgetEl); } return 'executed'; } catch { return 'execute-error'; }
+        }).catch(() => 'page-error');
+        const backoffMs = [5_000, 8_000, 12_000, 17_000][executeCount - 1] ?? 17_000;
+        nextExecuteAt = Date.now() + backoffMs;
+      }
+
+      if (Date.now() > clickAttemptedAt + 3_000) {
+        clickAttemptedAt = Date.now();
+        await interactWithTurnstileCheckbox(page).catch(() => {});
+      }
+
+      await attemptSleep(Math.min(250, Math.max(0, deadline - Date.now())));
+    }
+
+    await awaitSolver();
     if (await hasToken()) {
-      await awaitSolver();
       return { turnstile: true, interactive: false };
     }
 
-    if (!solverStarted) {
-      widgetInfo = await extractWidgetInfo();
-      if (widgetInfo.sitekey || Date.now() - startedAt >= 2_000) {
-        triggerSolver(widgetInfo);
-      }
-    }
+    // Emergency final Capzy solve attempt only when orchestrated solver never ran Capzy
+    if (!await hasToken() && widgetInfo.sitekey && !orchestratedCapzyRan) {
+      log({}, 'ensureFormTurnstile: final emergency Capzy Turnstile solve attempt');
+      const emergencySol = await solveTurnstileWithCapzy(
+        sanitizeChallengeUrl(page.url()),
+        widgetInfo.sitekey,
+        proxyUrl,
+        await page.evaluate(() => navigator.userAgent).catch(() => undefined),
+        35_000,
+        widgetInfo.action ?? undefined,
+        widgetInfo.cdata ?? undefined,
+        overrideKeys,
+      ).catch(() => null);
 
-    if (!apiScriptInjected && Date.now() - startedAt >= 1_000) {
-      const hasApi = await page.evaluate(() => typeof (window as any).turnstile !== 'undefined').catch(() => false);
-      if (hasApi) {
-        apiScriptInjection = 'already-present';
-      } else {
-        try {
-          await page.addScriptTag({ url: 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit' });
-          const hasTurnstile = await page.waitForFunction(
-            () => typeof (window as any).turnstile !== 'undefined',
-            { timeout: 3500 }
-          ).then(() => true).catch(() => false);
-          apiScriptInjection = hasTurnstile ? 'loaded' : 'loaded-without-api';
-        } catch (err) {
-          // Keep the page untouched and log only the error category, never a
-          // URL, response body, cookie, or verification token.
-          apiScriptInjection = `failed:${err instanceof Error ? err.name : 'unknown'}`;
-          logWarn({ apiScriptInjection }, 'Turnstile API script failed to load on the submit form');
+      if (emergencySol?.cookies) {
+        const cookieList = Object.entries(emergencySol.cookies)
+          .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
+          .map(([name, value]) => ({
+            name,
+            value,
+            domain: '.codeforces.com',
+            path: '/',
+          }));
+        if (cookieList.length > 0) {
+          await page.context().addCookies(cookieList).catch(() => {});
         }
       }
-      apiScriptInjected = true;
-    }
-
-    if (!widgetRendered && Date.now() - startedAt >= 1_500) {
-      const renderRes = await form.evaluate((element) => {
-        const widgetEl = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
-        const api = (window as unknown as { turnstile?: { render?: (container: HTMLElement, options: Record<string, unknown>) => string; execute?: (container: HTMLElement | string) => void; } }).turnstile;
-        if (!widgetEl || !api?.render) return null;
-        const pageIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-        if (pageIframe) return 'iframe-exists';
-        const sitekey = widgetEl.dataset.sitekey;
-        if (!sitekey) return 'no-sitekey';
-        try {
-          const widgetId = api.render(widgetEl, {
-            sitekey,
-            callback: (token: string) => {
-              const callbackName = widgetEl.getAttribute('data-callback');
-              if (callbackName) {
-                const fn = callbackName.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, window);
-                if (typeof fn === 'function') (fn as (value: string) => void)(token);
-              }
-              const input = element.querySelector('input[name="turnstileToken"]') as HTMLInputElement | null;
-              if (input && !input.value) { input.value = token; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); }
-              const cfInput = element.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
-              if (cfInput && !cfInput.value) { cfInput.value = token; cfInput.dispatchEvent(new Event('input', { bubbles: true })); cfInput.dispatchEvent(new Event('change', { bubbles: true })); }
-            },
-            'error-callback': () => {},
-          });
-          if (widgetId && widgetEl) widgetEl.dataset.widgetId = String(widgetId);
-          return `rendered:${widgetId ?? 'no-id'}`;
-        } catch { return 'render-error'; }
-      }).catch(() => 'page-error');
-      if (renderRes) {
-        renderAttempt = renderRes;
-        if (renderRes !== 'render-error' && renderRes !== 'page-error') {
-          widgetRendered = true;
+      if (emergencySol?.token) {
+        log({ tokenLength: emergencySol.token.length }, 'ensureFormTurnstile: emergency Capzy solved Turnstile, injecting token');
+        await injectTurnstileToken(form, emergencySol.token, widgetInfo.callback);
+        if (await hasToken()) {
+          return { turnstile: true, interactive: false };
         }
       }
     }
-
-    if (executeCount < MAX_EXECUTE_RETRIES && Date.now() >= nextExecuteAt) {
-      executeCount += 1;
-      executeAttempt = await form.evaluate((element) => {
-        const widgetEl = element.querySelector('.cf-turnstile[data-sitekey]') as HTMLElement | null;
-        const api = (window as unknown as { turnstile?: { execute?: (container: HTMLElement | string) => void; getResponse?: (id?: string) => string; } }).turnstile;
-        if (!widgetEl || !api?.execute) return 'unavailable';
-        const storedId = widgetEl.dataset.widgetId;
-        try { if (storedId) { api.execute(storedId); } else { api.execute(widgetEl); } return 'executed'; } catch { return 'execute-error'; }
-      }).catch(() => 'page-error');
-      const backoffMs = [5_000, 8_000, 12_000, 17_000][executeCount - 1] ?? 17_000;
-      nextExecuteAt = Date.now() + backoffMs;
-    }
-
-    if (Date.now() > clickAttemptedAt + 3_000) {
-      clickAttemptedAt = Date.now();
-      await interactWithTurnstileCheckbox(page).catch(() => {});
-    }
-
-    await attemptSleep(Math.min(250, Math.max(0, deadline - Date.now())));
-  }
-
-  await awaitSolver();
-  if (await hasToken()) {
-    return { turnstile: true, interactive: false };
-  }
-
-  // Emergency final Capzy solve attempt before declaring verification failure
-  if (!await hasToken() && widgetInfo.sitekey) {
-    log({}, 'ensureFormTurnstile: final emergency Capzy Turnstile solve attempt');
-    const emergencySol = await solveTurnstileWithCapzy(
-      sanitizeChallengeUrl(page.url()),
-      widgetInfo.sitekey,
-      proxyUrl,
-      await page.evaluate(() => navigator.userAgent).catch(() => undefined),
-      35_000,
-      widgetInfo.action ?? undefined,
-      widgetInfo.cdata ?? undefined,
-      overrideKeys,
-    ).catch(() => null);
-
-    if (emergencySol?.cookies) {
-      const cookieList = Object.entries(emergencySol.cookies)
-        .filter(([name]) => name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf'))
-        .map(([name, value]) => ({
-          name,
-          value,
-          domain: '.codeforces.com',
-          path: '/',
-        }));
-      if (cookieList.length > 0) {
-        await page.context().addCookies(cookieList).catch(() => {});
-      }
-    }
-    if (emergencySol?.token) {
-      log({ tokenLength: emergencySol.token.length }, 'ensureFormTurnstile: emergency Capzy solved Turnstile, injecting token');
-      await injectTurnstileToken(form, emergencySol.token, widgetInfo.callback);
-      if (await hasToken()) {
-        return { turnstile: true, interactive: false };
-      }
-    }
+  } finally {
+    solverAbort.abort(new Error('Form Turnstile finished'));
   }
 
   // If no Turnstile widget is present on the form, but clearance cookies are present and submit button is enabled,
@@ -713,16 +672,28 @@ export async function clickSubmitForm(page: Page, timeoutMs = 30_000): Promise<{
   let settled = false;
   const navigationResponses = new Map<Request, Response>();
   const onRequest = (request: Request) => {
-    const url = new URL(request.url());
-    if (request.isNavigationRequest() && request.frame() === page.mainFrame() && request.method() === 'POST' &&
-      url.hostname === 'codeforces.com' && /\/submit(?:\/\d+\/[a-z0-9]+)?\/?$/i.test(url.pathname)) posted = request;
+    try {
+      const url = new URL(request.url());
+      if (request.isNavigationRequest() && request.frame() === page.mainFrame() && request.method() === 'POST' &&
+        url.hostname === 'codeforces.com' && /\/submit(?:\/\d+\/[a-z0-9]+)?\/?$/i.test(url.pathname)) posted = request;
+    } catch {}
   };
   const onResponse = (value: Response) => {
     const request = value.request();
     if (request.isNavigationRequest() && request.frame() === page.mainFrame()) navigationResponses.set(request, value);
     if (request === posted) response = value;
   };
-  const onFailure = (request: Request) => { if (request === posted) failure = request.failure()?.errorText ?? 'network failure'; };
+  const isPostedOrRedirect = (request: Request): boolean => {
+    let cur: Request | null = request;
+    while (cur) {
+      if (cur === posted) return true;
+      cur = cur.redirectedFrom();
+    }
+    return false;
+  };
+  const onFailure = (request: Request) => {
+    if (posted && isPostedOrRedirect(request)) failure = request.failure()?.errorText ?? 'network failure';
+  };
   page.on('request', onRequest);
   page.on('response', onResponse);
   page.on('requestfailed', onFailure);
@@ -803,6 +774,6 @@ export function isSubmissionHistory(url: string): boolean {
   try {
     const parsed = new URL(url);
     if (parsed.hostname !== 'codeforces.com') return false;
-    return /^\/(?:contest\/\d+\/(?:my|status|submission\/\d+)|gym\/\d+\/(?:my|status)|problemset\/(?:status|submission\/\d+\/\d+)|submissions(?:\/[a-zA-Z0-9_.-]+)?)\/?$/.test(parsed.pathname);
+    return /^\/(?:contest\/\d+\/(?:my|status|submission\/\d+)|gym\/\d+\/(?:my|status|submission\/\d+)|problemset\/(?:status|submission\/\d+\/\d+)|submissions(?:\/[a-zA-Z0-9_.-]+)?)\/?$/.test(parsed.pathname);
   } catch { return false; }
 }

@@ -492,6 +492,13 @@ export function getCPSolverUrl(): string {
   return raw ? raw.replace(/\/+$/, '') : '';
 }
 
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 /**
  * Non-blocking, zero-overhead Telegram notification sender.
  * Works across both the main backend (with Prisma/config) and the isolated submitter.
@@ -560,13 +567,23 @@ export async function checkCPSolverHealth(): Promise<{
       signal: AbortSignal.timeout(8_000),
     });
     if (!res.ok) {
-      return { ok: false, url, error: `HTTP ${res.status}: ${res.statusText}` };
+      if (res.status === 502) {
+        return { ok: false, url, error: 'HTTP 502 Bad Gateway on /health: the gateway did not receive a valid upstream response' };
+      }
+      const status = `${res.status} ${res.statusText || ''}`.trim();
+      return { ok: false, url, error: `HTTP ${status} on /health` };
     }
-    const data = (await res.json()) as any;
+    const data = await res.json().catch(() => null);
+    if (typeof data?.status !== 'string') {
+      return { ok: false, url, error: 'Invalid /health response: expected JSON with a status field' };
+    }
+    if (data.status !== 'ok') {
+      return { ok: false, url, status: data.status, error: `Service reported status "${data.status}" on /health` };
+    }
     return {
       ok: true,
       url,
-      status: data.status || 'ok',
+      status: data.status,
       uptimeSeconds: data.uptimeSeconds,
       totalProxies: data.proxyPool?.total ?? 0,
       activeIndex: data.proxyPool?.activeIndex ?? 0,
@@ -1852,7 +1869,7 @@ export async function solveTurnstileOrchestrated(params: {
     let useDirectFallback = false;
     for (let attempt = 1; attempt <= maxTries; attempt++) {
       throwIfAttemptAborted();
-      const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Turnstile via CPSolver (${solverHost})...</b>`;
+      const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Turnstile via CPSolver (${escapeHtml(solverHost)})...</b>`;
       await sendSolverTelegramNotification(attemptNotice).catch(() => undefined);
 
       log({ attempt, maxTries, directFallback: useDirectFallback }, 'Invoking CPSolver');
@@ -1875,7 +1892,7 @@ export async function solveTurnstileOrchestrated(params: {
         const reason = res.verificationRequired ? 'verification declined' : 'connection timed out (service unresponsive)';
         logWarn({ attempt, durationMs: res.durationMs, reason }, `CPSolver Turnstile ${reason}; falling back to CapSolver / Capzy`);
         await sendSolverTelegramNotification(
-          `⚠️ <b>CPSolver Turnstile ${reason}. Falling back to CapSolver / Capzy...</b>`,
+          `⚠️ <b>CPSolver Turnstile ${escapeHtml(reason)}. Falling back to CapSolver / Capzy...</b>`,
         ).catch(() => undefined);
         break;
       }
@@ -1889,7 +1906,7 @@ export async function solveTurnstileOrchestrated(params: {
 
       if (res.ok && (hasValidToken || (isInterstitialKey && hasClearanceOrCookies))) {
         const sec = Math.max(1, Math.round(res.durationMs / 1000));
-        const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${res.proxyUsed}</code>` : '';
+        const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${escapeHtml(res.proxyUsed)}</code>` : '';
         const mode = hasValidToken ? 'token' : 'clearance-cookies';
         const successNotice = `✅ <b>Turnstile solved via CPSolver!</b> <i>(${sec}s, attempt ${attempt}/${maxTries}, mode=${mode})</i>${proxyInfo}`;
         await sendSolverTelegramNotification(successNotice).catch(() => undefined);
@@ -1915,7 +1932,7 @@ export async function solveTurnstileOrchestrated(params: {
         useDirectFallback = true;
       }
 
-      const errBrief = res.error ? ` (${res.error.slice(0, 100)})` : '';
+      const errBrief = res.error ? ` (${escapeHtml(res.error.slice(0, 100))})` : '';
       logWarn({ attempt, error: res.error, durationMs: Date.now() - attemptStartTime }, 'CPSolver attempt failed');
       const failNotice = `⚠️ <b>[Attempt ${attempt}/${maxTries} failed]</b><i>${errBrief}</i>`;
       await sendSolverTelegramNotification(failNotice).catch(() => undefined);
@@ -1960,8 +1977,9 @@ export async function solveTurnstileOrchestrated(params: {
     };
   }
 
-  const capzyErrDetail = getLastCapzyError() ? `: <i>${getLastCapzyError()}</i>` : '';
-  const tip = getLastCapzyError() && /balance|credit|unauthorized|exist|invalid/i.test(getLastCapzyError()!)
+  const lastCapzyErr = getLastCapzyError();
+  const capzyErrDetail = lastCapzyErr ? `: <i>${escapeHtml(lastCapzyErr)}</i>` : '';
+  const tip = lastCapzyErr && /balance|credit|unauthorized|exist|invalid/i.test(lastCapzyErr)
     ? `\n💡 <i>Please update your API key using <code>/addcapzy &lt;key&gt;</code> or <code>/capsolver &lt;key&gt;</code></i>`
     : '';
   const failNotice = `❌ <b>CapSolver / Capzy also failed to solve Turnstile${capzyErrDetail}.</b>${tip}`;
@@ -2021,7 +2039,7 @@ export async function solveCloudflareOrchestrated(params: {
     let useDirectFallback = false;
     for (let attempt = 1; attempt <= maxTries; attempt++) {
       throwIfAttemptAborted();
-      const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Cloudflare Challenge via CPSolver (${solverHost})...</b>`;
+      const attemptNotice = `🧩 <b>[Attempt ${attempt}/${maxTries}] Solving Cloudflare Challenge via CPSolver (${escapeHtml(solverHost)})...</b>`;
       await sendSolverTelegramNotification(attemptNotice).catch(() => undefined);
 
       const proxyForCPSolver = useDirectFallback
@@ -2039,7 +2057,7 @@ export async function solveCloudflareOrchestrated(params: {
       const hasToken = typeof res.token === 'string' && res.token.trim().length > 10;
       if (res.ok && (hasToken || isRealClearanceValue(res.cfClearance) || hasClearanceCookie(res.cookies))) {
         const sec = Math.max(1, Math.round(res.durationMs / 1000));
-        const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${res.proxyUsed}</code>` : '';
+        const proxyInfo = res.proxyUsed ? `\n🌐 Proxy: <code>${escapeHtml(res.proxyUsed)}</code>` : '';
         const successNotice = `✅ <b>Cloudflare Challenge cleared via CPSolver!</b> <i>(${sec}s, attempt ${attempt}/${maxTries})</i>${proxyInfo}`;
         await sendSolverTelegramNotification(successNotice).catch(() => undefined);
 
@@ -2058,7 +2076,7 @@ export async function solveCloudflareOrchestrated(params: {
         const reason = isDeclined ? 'challenge declined' : 'connection timed out (service unresponsive)';
         logWarn({ attempt, error: res.error, reason }, `CPSolver ${reason}; falling back to CapSolver / Capzy`);
         await sendSolverTelegramNotification(
-          `⚠️ <b>CPSolver ${reason}. Falling back to CapSolver / Capzy...</b>`,
+          `⚠️ <b>CPSolver ${escapeHtml(reason)}. Falling back to CapSolver / Capzy...</b>`,
         ).catch(() => undefined);
         break;
       }
@@ -2067,7 +2085,7 @@ export async function solveCloudflareOrchestrated(params: {
         useDirectFallback = true;
       }
 
-      const errBrief = res.error ? ` (${res.error.slice(0, 100)})` : '';
+      const errBrief = res.error ? ` (${escapeHtml(res.error.slice(0, 100))})` : '';
       logWarn({ attempt, error: res.error }, 'CPSolver challenge attempt failed');
       const failNotice = `⚠️ <b>[Attempt ${attempt}/${maxTries} failed]</b><i>${errBrief}</i>`;
       await sendSolverTelegramNotification(failNotice).catch(() => undefined);
@@ -2098,7 +2116,7 @@ export async function solveCloudflareOrchestrated(params: {
   );
   throwIfAttemptAborted();
 
-  if (capzySol && (capzySol.token || capzySol.cookies)) {
+  if (capzySol && (capzySol.token || capzySol.cookies || capzySol.cfClearance)) {
     setLastCapzyError(null);
     const successNotice = `✅ <b>Cloudflare Challenge cleared via CapSolver / Capzy!</b>`;
     await sendSolverTelegramNotification(successNotice).catch(() => undefined);
@@ -2108,8 +2126,9 @@ export async function solveCloudflareOrchestrated(params: {
     };
   }
 
-  const capzyErrDetail = getLastCapzyError() ? `: <i>${getLastCapzyError()}</i>` : '';
-  const tip = getLastCapzyError() && /balance|credit|unauthorized|exist|invalid/i.test(getLastCapzyError()!)
+  const lastCapzyErr = getLastCapzyError();
+  const capzyErrDetail = lastCapzyErr ? `: <i>${escapeHtml(lastCapzyErr)}</i>` : '';
+  const tip = lastCapzyErr && /balance|credit|unauthorized|exist|invalid/i.test(lastCapzyErr)
     ? `\n💡 <i>Please update your API key using <code>/addcapzy &lt;key&gt;</code> or <code>/capsolver &lt;key&gt;</code></i>`
     : '';
   const failNotice = `❌ <b>CapSolver / Capzy also failed to clear Cloudflare Challenge${capzyErrDetail}.</b>${tip}`;

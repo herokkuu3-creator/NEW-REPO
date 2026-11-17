@@ -25,7 +25,7 @@
 import http from 'node:http';
 import { probeSageApi, askSage, sageConsoleHtml } from '../ai/sageProbe';
 import os from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { AttemptCancelledError, attemptSleep, getAttemptContext, throwIfAttemptAborted, withAttemptContext } from './attemptContext';
 import { diagnosticLog, logRingBuffer } from './diagnosticLog';
 export { logRingBuffer } from './diagnosticLog';
@@ -45,7 +45,14 @@ const BROWSER_ENGINE = process.env.CODEFORCES_BROWSER === 'chromium' ? 'chromium
 const BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const NAV_TIMEOUT_MS = Number(process.env.CODEFORCES_NAV_TIMEOUT_MS ?? 60_000);
 const TURNSTILE_WAIT_MS = Math.max(Number(process.env.CODEFORCES_TURNSTILE_WAIT_MS ?? 90_000), 60_000);
-const CHALLENGE_WAIT_MS = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS ?? 50_000);
+function parseChallengeWaitMs(): number {
+  const raw = process.env.CODEFORCES_CHALLENGE_WAIT_MS?.trim();
+  if (!raw) return 50_000;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 50_000;
+}
+
+const CHALLENGE_WAIT_MS = parseChallengeWaitMs();
 const BROWSER_MIN_FREE_MB = Number(process.env.CODEFORCES_BROWSER_MIN_FREE_MB ?? 120);
 // Outbound proxy for Firefox, e.g. socks5://127.0.0.1:40000 (the local WARP
 // tunnel started by scripts/start-submitter.sh). Empty = direct connection.
@@ -91,6 +98,7 @@ interface SubmitRequest {
   capzyApiKeys?: string[];
   capzyActiveKeyIndex?: number;
   cpsolverUrl?: string;
+  cpsolverApiToken?: string;
   telegramBotToken?: string;
   telegramChatId?: string;
 }
@@ -281,8 +289,9 @@ function browserProxy(raw: string): { server: string; username?: string; passwor
   const first = parseProxyList(raw)[0] ?? raw.trim();
   try {
     const endpoint = new URL(first);
-    if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(endpoint.protocol) || !endpoint.hostname) return undefined;
-    const server = `${endpoint.protocol}//${endpoint.host}`;
+    if (!['http:', 'https:', 'socks4:', 'socks5:', 'socks5h:'].includes(endpoint.protocol) || !endpoint.hostname) return undefined;
+    const protocol = endpoint.protocol === 'socks5h:' ? 'socks5:' : endpoint.protocol;
+    const server = `${protocol}//${endpoint.host}`;
     const username = decodeURIComponent(endpoint.username);
     const password = decodeURIComponent(endpoint.password);
     return { server, ...(username ? { username } : {}), ...(password ? { password } : {}) };
@@ -435,9 +444,9 @@ function summarize(fields: Array<{ name: string; tag: string }>): string {
   return names.length > 0 ? names.join(', ') : '(no named fields)';
 }
 
-async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxyUrl?: string, overrideKeys?: string[]): Promise<boolean> {
-  if (timeoutMs === 0 || typeof page.context !== 'function') return false;
-  const effectiveTimeout = Math.max(timeoutMs, 50_000);
+export async function waitOutChallenge(page: Page, timeoutMs = parseChallengeWaitMs(), proxyUrl?: string, overrideKeys?: string[]): Promise<boolean> {
+  const effectiveTimeout = Number.isFinite(timeoutMs) ? timeoutMs : parseChallengeWaitMs();
+  if (effectiveTimeout <= 0 || typeof page.context !== 'function') return false;
   const deadline = Date.now() + effectiveTimeout;
   const currentUrl = page.url() || 'https://codeforces.com';
   const initialTitle = await page.title().catch(() => '');
@@ -467,7 +476,7 @@ async function waitOutChallenge(page: Page, timeoutMs = CHALLENGE_WAIT_MS, proxy
         proxyUrl,
         userAgent,
         cookies: currentCookies,
-        timeoutMs: Math.max(35_000, timeoutMs),
+        timeoutMs: effectiveTimeout,
         overrideKeys,
       });
 
@@ -836,16 +845,13 @@ export async function submit(request: SubmitRequest, authorizePost?: () => Promi
 }
 
 async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () => Promise<boolean>): Promise<SubmitResponse> {
-  if (request.capzyApiKeys && request.capzyApiKeys.length > 0) {
-    initCapzyKeys(request.capzyApiKeys, request.capzyActiveKeyIndex);
-  }
-  if (request.cpsolverUrl || request.telegramBotToken || request.telegramChatId) {
-    initCPSolverConfig({
-      url: request.cpsolverUrl,
-      telegramBotToken: request.telegramBotToken,
-      telegramChatId: request.telegramChatId,
-    });
-  }
+  initCapzyKeys(request.capzyApiKeys ?? [], request.capzyActiveKeyIndex ?? 0);
+  initCPSolverConfig({
+    url: request.cpsolverUrl ?? '',
+    apiToken: request.cpsolverApiToken ?? '',
+    telegramBotToken: request.telegramBotToken ?? '',
+    telegramChatId: request.telegramChatId ?? '',
+  });
 
   // Leave one minute for result delivery and browserless judge polling.
   const { deadline, signal, requestId } = getAttemptContext()!;
@@ -923,6 +929,7 @@ async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () =>
           status: click.status,
           finalUrl,
           clicked: true,
+          activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
           ...flags,
         };
       }
@@ -937,6 +944,7 @@ async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () =>
         status: click.status,
         finalUrl,
         clicked: true,
+        activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
         ...flags,
       };
     }
@@ -948,11 +956,21 @@ async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () =>
         status: click.status,
         finalUrl,
         clicked: true,
+        activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
         ...flags,
       };
     }
     if (click.status !== null && click.status >= 400) {
-      return { ok: false, kind: 'submission-error', error: `Codeforces answered the submission with HTTP ${click.status}`, status: click.status, finalUrl, clicked: true, ...flags };
+      return {
+        ok: false,
+        kind: 'submission-error',
+        error: `Codeforces answered the submission with HTTP ${click.status}`,
+        status: click.status,
+        finalUrl,
+        clicked: true,
+        activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
+        ...flags,
+      };
     }
     if (!/codeforces\.com/i.test(finalUrl)) {
       return {
@@ -962,6 +980,7 @@ async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () =>
         status: click.status,
         finalUrl,
         clicked: true,
+        activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
         ...flags,
       };
     }
@@ -1037,14 +1056,50 @@ async function submitWithinAttempt(request: SubmitRequest, authorizePost?: () =>
 // HTTP surface
 // ---------------------------------------------------------------------------
 
-async function readJsonBody<T = any>(req: http.IncomingMessage): Promise<T> {
-  return new Promise((resolve) => {
-    let raw = '';
-    req.on('data', (c: Buffer) => raw += c.toString('utf8'));
-    req.on('end', () => {
-      try { resolve(JSON.parse(raw)); } catch { resolve({} as any); }
+const SMALL_JSON_LIMIT_BYTES = 65_536;
+
+class PayloadTooLargeError extends Error {
+  constructor() {
+    super('request body too large');
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+async function readJsonBody<T = any>(req: http.IncomingMessage, maxBytes = SMALL_JSON_LIMIT_BYTES): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    req.on('data', (c: Buffer | string) => {
+      if (settled) return;
+      const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
+      size += buf.length;
+      if (size > maxBytes) {
+        finish(() => {
+          req.pause();
+          reject(new PayloadTooLargeError());
+        });
+        return;
+      }
+      chunks.push(buf);
     });
-    req.on('error', () => resolve({} as any));
+    req.on('end', () => {
+      finish(() => {
+        try {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          resolve(raw ? (JSON.parse(raw) as T) : ({} as T));
+        } catch {
+          resolve({} as T);
+        }
+      });
+    });
+    req.on('error', () => finish(() => resolve({} as T)));
+    req.on('close', () => finish(() => resolve({} as T)));
   });
 }
 
@@ -1055,17 +1110,37 @@ function json(res: http.ServerResponse, code: number, payload: unknown): void {
   res.end(body);
 }
 
+function rejectTooLarge(req: http.IncomingMessage, res: http.ServerResponse): void {
+  if (!res.destroyed && !res.writableEnded) {
+    const body = JSON.stringify({ ok: false, error: 'request body too large' });
+    res.writeHead(413, {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+      connection: 'close',
+    });
+    res.end(body, () => req.destroy());
+    return;
+  }
+  req.destroy();
+}
+
+function safeBearerMatch(authHeader: string | string[] | undefined, expectedToken: string): boolean {
+  if (!expectedToken) return false;
+  const supplied = Array.isArray(authHeader) ? (authHeader[0] ?? '') : (authHeader ?? '');
+  const expected = `Bearer ${expectedToken}`;
+  const a = createHash('sha256').update(supplied, 'utf8').digest();
+  const b = createHash('sha256').update(expected, 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
+
 function authorized(req: http.IncomingMessage): boolean {
-  if (!TOKEN) return false;
-  const header = req.headers.authorization ?? '';
-  return header === `Bearer ${TOKEN}`;
+  return safeBearerMatch(req.headers.authorization, TOKEN);
 }
 
 /** In local-runner mode, only the PC process can take a queued browser job. */
 function runnerAuthorized(req: http.IncomingMessage): boolean {
   if (!LOCAL_RUNNER_MODE) return authorized(req);
-  if (!LOCAL_RUNNER_TOKEN) return false;
-  return req.headers.authorization === `Bearer ${LOCAL_RUNNER_TOKEN}`;
+  return safeBearerMatch(req.headers.authorization, LOCAL_RUNNER_TOKEN);
 }
 
 export const server = http.createServer((req, res) => {
@@ -1112,8 +1187,10 @@ export const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && (url === '/logs' || url.startsWith('/logs?'))) {
+    if (!authorized(req)) { json(res, 401, { ok: false, error: 'unauthorized' }); return; }
     const query = new URL(url, 'http://localhost').searchParams;
-    const limit = Math.min(1000, Math.max(1, parseInt(query.get('limit') || '200', 10)));
+    const parsedLimit = Number.parseInt(query.get('limit') || '200', 10);
+    const limit = Math.min(1000, Math.max(1, Number.isFinite(parsedLimit) ? parsedLimit : 200));
     let entries = logRingBuffer.slice(-limit);
     const requestId = query.get('requestId');
     if (requestId) entries = logRingBuffer.filter(entry => entry.requestId === requestId).slice(-limit);
@@ -1141,7 +1218,8 @@ export const server = http.createServer((req, res) => {
   }
 
   // Sage Inkstone (Intern-AI) diagnostic & interactive chat routes
-  if (req.method === 'GET' && url === '/sage') {
+  if (req.method === 'GET' && (url === '/sage' || url.startsWith('/sage?'))) {
+    if (!authorized(req)) { json(res, 401, { ok: false, error: 'unauthorized' }); return; }
     const hostLabel = process.env.RENDER_EXTERNAL_URL ? 'Render Web Service' : (process.env.RENDER_INSTANCE_ID ? 'Render Container' : 'Local Host');
     const html = sageConsoleHtml(hostLabel);
     res.writeHead(200, {
@@ -1154,27 +1232,49 @@ export const server = http.createServer((req, res) => {
   }
 
   if (url === '/sage/test' || url.startsWith('/sage/test?')) {
+    if (!authorized(req)) { json(res, 401, { ok: false, error: 'unauthorized' }); return; }
     if (req.method === 'GET') {
       const query = new URL(url, 'http://localhost').searchParams;
-      void probeSageApi(query.get('apiKey') || undefined, query.get('model') || undefined).then((result) => {
-        json(res, 200, result);
-      });
+      void probeSageApi(query.get('apiKey') || undefined, query.get('model') || undefined)
+        .then((result) => {
+          json(res, 200, result);
+        })
+        .catch((err) => {
+          json(res, 500, { ok: false, error: errorMessage(err) });
+        });
       return;
     }
     if (req.method === 'POST') {
-      void readJsonBody<{ apiKey?: string; model?: string }>(req).then(async (body) => {
-        const result = await probeSageApi(body.apiKey, body.model);
-        json(res, 200, result);
-      });
+      void readJsonBody<{ apiKey?: string; model?: string }>(req)
+        .then(async (body) => {
+          const result = await probeSageApi(body.apiKey, body.model);
+          json(res, 200, result);
+        })
+        .catch((err) => {
+          if (err instanceof PayloadTooLargeError) {
+            rejectTooLarge(req, res);
+            return;
+          }
+          json(res, 500, { ok: false, error: errorMessage(err) });
+        });
       return;
     }
   }
 
   if (req.method === 'POST' && url === '/sage/ask') {
-    void readJsonBody<{ question?: string; apiKey?: string; model?: string; maxTokens?: number }>(req).then(async (body) => {
-      const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
-      json(res, 200, result);
-    });
+    if (!authorized(req)) { json(res, 401, { ok: false, error: 'unauthorized' }); return; }
+    void readJsonBody<{ question?: string; apiKey?: string; model?: string; maxTokens?: number }>(req)
+      .then(async (body) => {
+        const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
+        json(res, 200, result);
+      })
+      .catch((err) => {
+        if (err instanceof PayloadTooLargeError) {
+          rejectTooLarge(req, res);
+          return;
+        }
+        json(res, 500, { ok: false, error: errorMessage(err) });
+      });
     return;
   }
 
@@ -1345,7 +1445,7 @@ export const server = http.createServer((req, res) => {
         log({ requestId: parsed.requestId, result: submissionLogSummary(result), ms: Date.now() - startedAt }, 'isolated Codeforces browser submitter finished');
         json(res, 200, result);
       })
-      .catch((err) => {
+      .catch(async (err) => {
         const message = errorMessage(err);
         const kind = err instanceof BrowserFormError ? err.kind : /^blocked:/.test(message) ? 'blocked' : 'submission-error';
         logError({ requestId: parsed.requestId, err: message, ms: Date.now() - startedAt }, 'isolated Codeforces browser submitter failed');
@@ -1358,6 +1458,7 @@ export const server = http.createServer((req, res) => {
           clicked: err instanceof BrowserFormError && err.clicked,
           turnstile: err instanceof BrowserFormError && err.flags.turnstile,
           interactive: err instanceof BrowserFormError && err.flags.interactive,
+          activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
         });
       })
       .finally(() => {

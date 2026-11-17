@@ -269,9 +269,10 @@ export async function testAllProxiesOneByOne(
   let completed = 0;
   const runner = Promise.all(
     list.map(async (p, i) => {
+      let perProxyTimer: ReturnType<typeof setTimeout> | undefined;
       try {
         const timeoutPromise = new Promise<ProxyTestResult>((resolve) => {
-          setTimeout(() => {
+          perProxyTimer = setTimeout(() => {
             resolve({ ok: false, latencyMs: timeoutSeconds * 1000, error: `Timed out after ${timeoutSeconds}s` });
           }, (timeoutSeconds + 1) * 1000);
         });
@@ -296,15 +297,22 @@ export async function testAllProxiesOneByOne(
         if (onProgress) {
           await onProgress(status, completed, list.length);
         }
+      } finally {
+        if (perProxyTimer) clearTimeout(perProxyTimer);
       }
     }),
   );
 
+  let overallTimer: ReturnType<typeof setTimeout> | undefined;
   const overallTimeout = new Promise<void>((resolve) => {
-    setTimeout(resolve, Math.max(10_000, (timeoutSeconds + 3) * 1000));
+    overallTimer = setTimeout(resolve, Math.max(10_000, (timeoutSeconds + 3) * 1000));
   });
 
-  await Promise.race([runner, overallTimeout]);
+  try {
+    await Promise.race([runner, overallTimeout]);
+  } finally {
+    if (overallTimer) clearTimeout(overallTimer);
+  }
   return results;
 }
 

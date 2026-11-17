@@ -49,11 +49,15 @@ async function callApi<T>(method: string, params: Record<string, string | number
       if (value !== undefined) query.set(key, String(value));
     }
     const url = `${API_BASE}/${method}${query.toString() ? `?${query}` : ''}`;
-    const response = await fetch(url, {
-      headers: { accept: 'application/json' },
-      signal: AbortSignal.timeout(30_000),
-    });
-    nextAllowedAt = Date.now() + MIN_GAP_MS;
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(30_000),
+      });
+    } finally {
+      nextAllowedAt = Date.now() + MIN_GAP_MS;
+    }
 
     let body: unknown;
     try {

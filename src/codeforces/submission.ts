@@ -309,13 +309,15 @@ function finishPost(
  * a real reason instead of starving the container.
  */
 function challengeWaitMs(): number {
-  const configured = Number(process.env.CODEFORCES_CHALLENGE_WAIT_MS);
+  const raw = process.env.CODEFORCES_CHALLENGE_WAIT_MS?.trim();
+  if (!raw) return 50_000;
+  const configured = Number(raw);
   return Number.isFinite(configured) && configured >= 0 ? configured : 50_000;
 }
 
-async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxyUrl?: string): Promise<boolean> {
-  if (timeoutMs === 0 || typeof page.context !== 'function') return false;
-  const effectiveTimeout = Math.max(timeoutMs, 50_000);
+export async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxyUrl?: string): Promise<boolean> {
+  const effectiveTimeout = Number.isFinite(timeoutMs) ? timeoutMs : challengeWaitMs();
+  if (effectiveTimeout <= 0 || typeof page.context !== 'function') return false;
   const deadline = Date.now() + effectiveTimeout;
   const currentUrl = page.url() || 'https://codeforces.com';
   const initialTitle = await page.title().catch(() => '');
@@ -344,7 +346,7 @@ async function waitOutChallenge(page: Page, timeoutMs = challengeWaitMs(), proxy
         proxyUrl,
         userAgent,
         cookies: currentCookies,
-        timeoutMs: Math.max(35_000, timeoutMs),
+        timeoutMs: effectiveTimeout,
       });
 
       const solveDuration = Date.now() - solveStart;

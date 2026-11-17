@@ -1,5 +1,6 @@
 /** Local PC browser runner. It polls Render over HTTPS; no inbound port is needed. */
 import { BrowserFormError } from './browserForm';
+import { getActiveCapzyKeyIndex } from './capzyKeyManager';
 import { submit } from './submitterService';
 
 const base = process.env.CODEFORCES_SUBMITTER_URL?.replace(/\/+$/, '');
@@ -49,6 +50,7 @@ async function run(id: string): Promise<void> {
       clicked: form?.clicked ?? false,
       turnstile: form?.flags.turnstile ?? false,
       interactive: form?.flags.interactive ?? false,
+      activeCapzyKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
     };
   }
   await deliver(id, result);

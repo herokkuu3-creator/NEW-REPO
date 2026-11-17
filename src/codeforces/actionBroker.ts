@@ -6,6 +6,9 @@ import { randomUUID } from 'node:crypto';
 interface Job {
   id: string;
   payload: unknown;
+  networkMode: NetworkMode;
+  removedProxies: string[];
+  proxy: string | null;
   createdAt: number;
   ready: boolean;
   claimed: boolean;
@@ -39,59 +42,83 @@ export class ActionBroker {
   get nextNetworkMode(): NetworkMode {
     this.expire();
     if (!this.job || !this.job.ready || this.job.claimed || this.job.result !== null) return 'proxy';
-    const payload = this.job.payload as { networkMode?: unknown };
-    return payload.networkMode === 'tailscale' ? 'tailscale' : 'proxy';
+    return this.job.networkMode;
   }
 
   networkMode(id: string): NetworkMode | null {
     this.expire();
     if (!this.job || this.job.id !== id) return null;
-    const payload = this.job.payload as { networkMode?: unknown };
-    return payload.networkMode === 'tailscale' ? 'tailscale' : 'proxy';
+    const payload = this.job.payload as { networkMode?: unknown } | null;
+    if (payload?.networkMode !== undefined) {
+      return payload.networkMode === 'tailscale' ? 'tailscale' : 'proxy';
+    }
+    return this.job.networkMode;
   }
 
   get nextRemovedProxies(): string[] {
     this.expire();
     if (!this.job || !this.job.ready || this.job.claimed || this.job.result !== null) return [];
-    const payload = this.job.payload as { removedProxies?: unknown };
-    return Array.isArray(payload?.removedProxies) ? (payload.removedProxies as unknown[]).map(String) : [];
+    return [...this.job.removedProxies];
   }
 
   removedProxies(id: string): string[] {
     this.expire();
     if (!this.job || this.job.id !== id) return [];
-    const payload = this.job.payload as { removedProxies?: unknown };
-    return Array.isArray(payload?.removedProxies) ? (payload.removedProxies as unknown[]).map(String) : [];
+    const payload = this.job.payload as { removedProxies?: unknown } | null;
+    if (Array.isArray(payload?.removedProxies)) {
+      return (payload.removedProxies as unknown[]).map(String);
+    }
+    return [...this.job.removedProxies];
   }
 
   get nextProxy(): string | null {
     this.expire();
     if (!this.job || !this.job.ready || this.job.claimed || this.job.result !== null) return null;
-    const payload = this.job.payload as { proxy?: unknown; preferredProxy?: unknown };
-    return typeof payload?.proxy === 'string'
-      ? payload.proxy
-      : typeof payload?.preferredProxy === 'string'
-      ? payload.preferredProxy
-      : null;
+    return this.job.proxy;
   }
 
   proxy(id: string): string | null {
     this.expire();
     if (!this.job || this.job.id !== id) return null;
-    const payload = this.job.payload as { proxy?: unknown; preferredProxy?: unknown };
-    return typeof payload?.proxy === 'string'
-      ? payload.proxy
-      : typeof payload?.preferredProxy === 'string'
-      ? payload.preferredProxy
-      : null;
+    const payload = this.job.payload as { proxy?: unknown; preferredProxy?: unknown } | null;
+    if (typeof payload?.proxy === 'string') return payload.proxy;
+    if (typeof payload?.preferredProxy === 'string') return payload.preferredProxy;
+    return this.job.proxy;
   }
 
   async enqueue(payload: unknown, requestedId?: string): Promise<string> {
     if (requestedId && this.job?.id === requestedId) return requestedId;
     if (this.busy) throw new Error('a Codeforces submission is already running');
     const id = requestedId && /^[a-f0-9-]{36}$/.test(requestedId) ? requestedId : randomUUID();
-    this.job = { id, payload, createdAt: this.now(), ready: false, claimed: false, result: null,
-      guarded: (payload as { requiresPostAuthorization?: boolean } | null)?.requiresPostAuthorization === true, postStarted: false };
+    const obj = payload && typeof payload === 'object'
+      ? (payload as {
+          networkMode?: unknown;
+          removedProxies?: unknown;
+          proxy?: unknown;
+          preferredProxy?: unknown;
+          requiresPostAuthorization?: boolean;
+        })
+      : null;
+    const networkMode: NetworkMode = obj?.networkMode === 'tailscale' ? 'tailscale' : 'proxy';
+    const removedProxies = Array.isArray(obj?.removedProxies) ? (obj.removedProxies as unknown[]).map(String) : [];
+    const proxy = typeof obj?.proxy === 'string'
+      ? obj.proxy
+      : typeof obj?.preferredProxy === 'string'
+        ? obj.preferredProxy
+        : null;
+    this.job = {
+      id,
+      payload,
+      networkMode,
+      removedProxies,
+      proxy,
+      createdAt: this.now(),
+      ready: false,
+      claimed: false,
+      result: null,
+      guarded: obj?.requiresPostAuthorization === true,
+      postStarted: false,
+    };
     try {
       await this.dispatch(id);
       if (this.job?.id === id) this.job.ready = true;

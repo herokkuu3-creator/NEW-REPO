@@ -142,7 +142,8 @@ export function toPlaywrightProxy(raw: string): { server: string; username?: str
   try {
     const endpoint = new URL(first);
     if (!['http:', 'https:', 'socks4:', 'socks5:', 'socks5h:'].includes(endpoint.protocol) || !endpoint.hostname) return undefined;
-    const server = `${endpoint.protocol}//${endpoint.host}`;
+    const protocol = endpoint.protocol === 'socks5h:' ? 'socks5:' : endpoint.protocol;
+    const server = `${protocol}//${endpoint.host}`;
     const username = endpoint.username ? decodeURIComponent(endpoint.username) : undefined;
     const password = endpoint.password ? decodeURIComponent(endpoint.password) : undefined;
     return { server, ...(username ? { username } : {}), ...(password ? { password } : {}) };
@@ -163,7 +164,7 @@ export interface ProxyTestResult {
  * Native Node.js TCP HTTP CONNECT test.
  * Zero dependency on curl binary — runs anywhere Node runs with minimal data (~150 bytes).
  */
-async function testHttpProxyNative(
+export async function testHttpProxyNative(
   proxyUrl: string,
   timeoutSeconds = 8,
 ): Promise<ProxyTestResult> {
@@ -293,7 +294,14 @@ async function testHttpProxyNative(
             tlsTunnel.setTimeout(timeoutMs);
 
             let traceBody = '';
-            const parseTraceResult = () => {
+            const parseTraceResult = (): ProxyTestResult => {
+              if (!traceBody.includes('ip=')) {
+                return {
+                  ok: false,
+                  latencyMs: Date.now() - start,
+                  error: 'Unexpected trace response (missing ip=)',
+                };
+              }
               const ipMatch = traceBody.match(/^ip=([^\r\n]+)/m);
               const locMatch = traceBody.match(/^loc=([^\r\n]+)/m);
               return {
@@ -312,9 +320,22 @@ async function testHttpProxyNative(
               }
             });
 
-            tlsTunnel.on('error', () => {
+            tlsTunnel.on('error', (err) => {
               cleanup();
-              finish({ ok: true, latencyMs });
+              finish({
+                ok: false,
+                latencyMs: Date.now() - start,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+
+            tlsTunnel.on('timeout', () => {
+              cleanup();
+              finish({
+                ok: false,
+                latencyMs: Date.now() - start,
+                error: `TLS tunnel timed out after ${timeoutSeconds}s`,
+              });
             });
 
             tlsTunnel.on('close', () => {
@@ -326,9 +347,13 @@ async function testHttpProxyNative(
               cleanup();
               finish(parseTraceResult());
             });
-          } catch {
+          } catch (err) {
             cleanup();
-            finish({ ok: true, latencyMs });
+            finish({
+              ok: false,
+              latencyMs: Date.now() - start,
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
         } else if (statusCode === 407) {
           cleanup();
@@ -519,7 +544,8 @@ export async function selectWorkingProxy(
       const prefHash = proxyHash(prefMatch);
       const prefMasked = maskProxyUrl(prefMatch);
       log(`Testing preferred proxy ${prefMasked} (~150B trace check)...`);
-      const ok = await tester(prefMatch);
+      const prefRes = await tester(prefMatch);
+      const ok = typeof prefRes === 'boolean' ? prefRes : prefRes.ok;
       if (ok) {
         log(`Preferred proxy ${prefMasked} is alive and verified!`);
         selected = { proxy: prefMatch, index: proxies.indexOf(prefMatch) };

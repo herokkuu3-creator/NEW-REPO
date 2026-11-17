@@ -69,7 +69,7 @@ export function cookieHeader(state: StoredCodeforcesState, nowSeconds = Date.now
   const byName = new Map<string, string>();
   for (const c of state.cookies) {
     if (!/(^|\.)codeforces\.com$/i.test(c.domain.replace(/^\./, ''))) continue;
-    if (typeof c.expires === 'number' && c.expires > 0 && c.expires < nowSeconds) continue;
+    if (typeof c.expires === 'number' && c.expires >= 0 && c.expires < nowSeconds) continue;
     // Cloudflare clearance is bound to the exporting browser's fingerprint; ours differs.
     if (/^(cf_clearance|__cf_bm|_cfuvid)$/i.test(c.name)) continue;
     byName.set(c.name, c.value);

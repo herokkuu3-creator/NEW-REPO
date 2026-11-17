@@ -9,7 +9,7 @@ import { CODEFORCES_ATTEMPT_MS } from './attempts';
 import { getRemovedProxyHashes, resolveActiveProxy, type ActiveProxyResult } from './proxyManager';
 import { sendTelegramMessage } from '../notifications/telegram';
 import { getCapzyApiKeys, getActiveCapzyKeyIndex, setActiveCapzyKeyIndex } from './capzyKeyManager';
-import { getCPSolverUrl } from './captchaSolver';
+import * as captchaSolver from './captchaSolver';
 
 function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -169,7 +169,8 @@ export async function submitViaRemoteSubmitter(
     requiresPostAuthorization: true,
     capzyApiKeys: await getCapzyApiKeys().catch(() => []),
     capzyActiveKeyIndex: await getActiveCapzyKeyIndex().catch(() => 0),
-    cpsolverUrl: getCPSolverUrl(),
+    cpsolverUrl: captchaSolver.getCPSolverUrl(),
+    cpsolverApiToken: readCPSolverApiToken(),
     telegramBotToken: process.env.TELEGRAM_BOT_TOKEN?.trim(),
     telegramChatId: process.env.TELEGRAM_CHAT_ID?.trim(),
   };
@@ -309,6 +310,16 @@ export async function waitForActionResult(url: string, token: string, id: string
   return { ok: false, kind: 'blocked', clicked: !cancelled, safeToRetry: !!cancelled,
     error: cancelled ? 'Eight-minute limit reached; browser job cancelled before submission'
       : 'Eight-minute limit reached; the runner may have submitted. No duplicate submission was started; checking Codeforces history.' };
+}
+
+function readCPSolverApiToken(): string | undefined {
+  try {
+    return typeof captchaSolver.getCPSolverApiToken === 'function'
+      ? (captchaSolver.getCPSolverApiToken() || undefined)
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function sleep(ms: number): Promise<void> {
