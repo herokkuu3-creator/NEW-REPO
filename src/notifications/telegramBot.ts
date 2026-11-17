@@ -406,6 +406,7 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
 
   let stopped = false;
   const abort = new AbortController();
+  const hasCustomOwnerStore = Boolean(deps.getOwner || deps.setOwner);
   const instanceId = deps.instanceId ?? `${process.env.RENDER_INSTANCE_ID ?? 'local'}:${process.pid}:${randomUUID()}`;
   const getOwner = deps.getOwner ?? (() => getSystemState(POLLER_OWNER_KEY));
   const setOwner = deps.setOwner ?? ((id: string) => setSystemState(POLLER_OWNER_KEY, `${id}@${Date.now()}`));
@@ -452,13 +453,16 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
     let conflictSince: number | null = null;
     let offset = 0;
     while (!stopped) {
-      if (!(await stillOwner())) {
-        logger.info('a newer instance took over the telegram bot - this instance stops polling');
-        break;
-      }
-      if (Date.now() - lastHeartbeat > 30_000) {
-        await setOwner(instanceId).catch(() => null);
-        lastHeartbeat = Date.now();
+      const inHandoverWindow = hasCustomOwnerStore || conflictSince !== null || Date.now() - startedAt < HANDOVER_GRACE_MS * 2;
+      if (inHandoverWindow) {
+        if (!(await stillOwner())) {
+          logger.info('a newer instance took over the telegram bot - this instance stops polling');
+          break;
+        }
+        if (Date.now() - lastHeartbeat > 30_000) {
+          await setOwner(instanceId).catch(() => null);
+          lastHeartbeat = Date.now();
+        }
       }
       try {
         const updates = await tgApi<TgUpdate[]>(
@@ -491,6 +495,8 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
             logger.info('a newer instance took over the telegram bot - this instance stops polling');
             break;
           }
+          await setOwner(instanceId).catch(() => null);
+          lastHeartbeat = Date.now();
           const now = Date.now();
           conflictSince ??= now;
           if (now - startedAt < HANDOVER_GRACE_MS) {
@@ -4598,6 +4604,7 @@ export async function handleBoostSolutionViews(msg: TgMessage, commandArg?: stri
       topicId = parseInt(arg, 10);
       const post = await prisma.solutionPost.findFirst({
         where: { publishedUrl: { contains: String(topicId) } },
+        select: { publishedUrl: true, title: true, problemSlug: true },
       });
       if (post && post.publishedUrl) {
         targetUrl = post.publishedUrl;
@@ -4611,6 +4618,7 @@ export async function handleBoostSolutionViews(msg: TgMessage, commandArg?: stri
       topicId = extractTopicIdFromUrl(arg);
       const post = await prisma.solutionPost.findFirst({
         where: { publishedUrl: arg },
+        select: { publishedUrl: true, title: true, problemSlug: true },
       });
       if (post) {
         title = post.title || title;
@@ -4623,6 +4631,7 @@ export async function handleBoostSolutionViews(msg: TgMessage, commandArg?: stri
     const latest = await prisma.solutionPost.findFirst({
       where: { status: 'PUBLISHED', publishedUrl: { not: null } },
       orderBy: { publishedAt: 'desc' },
+      select: { publishedUrl: true, title: true, problemSlug: true },
     });
     if (!latest || !latest.publishedUrl) {
       await replyHtml('⚠️ No published solution articles found. Pass a topic ID or URL:\n<code>/boostviews 8603495</code>');

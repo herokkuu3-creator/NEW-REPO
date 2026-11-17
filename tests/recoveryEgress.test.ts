@@ -62,6 +62,7 @@ vi.mock('../src/notifications/telegram', () => ({
   sendTelegramMessage: h.sendTelegramMessage,
 }));
 
+import { config } from '../src/config';
 import { PrismaRecoveryStore } from '../src/recovery/prismaStore';
 import {
   createProductionRecoveryService,
@@ -232,7 +233,7 @@ describe('Recovery Postgres egress optimizations', () => {
       accountId: 'acc-1',
       status: RecoveryStatus.RECOVERY_PENDING,
       reason: 'EXPIRED',
-      telegramChatId: '',
+      telegramChatId: config.telegram.chatId,
       tokenHash: 'hash',
       tokenExpiresAt: new Date(Date.now() + 60_000),
       tokenUsedAt: null,

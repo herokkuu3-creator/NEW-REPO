@@ -311,8 +311,13 @@ export class RecoveryService {
   private readonly byRecovery = new Map<string, PortalSession>();
   private readonly lockedAccounts = new Set<string>();
   private tickRunning = false;
+  private nextIdleDbCheckAt = 0;
 
   constructor(private readonly deps: RecoveryDeps) {}
+
+  invalidateIdleCache(): void {
+    this.nextIdleDbCheckAt = 0;
+  }
 
   get activeSessionCount(): number {
     return [...this.byRecovery.values()].filter((s) => !s.finished).length;
@@ -325,6 +330,7 @@ export class RecoveryService {
     account: RecoveryAccount,
     reason: 'EXPIRED' | 'REJECTED' | 'VERIFICATION_REQUIRED',
   ): Promise<{ recovery: RecoveryRecord; created: boolean }> {
+    this.nextIdleDbCheckAt = 0;
     const now = this.deps.now();
     return this.deps.store.create({
       accountId: account.id,
@@ -343,6 +349,7 @@ export class RecoveryService {
    * (`query-failed`) are transient and never change an account.
    */
   async monitorAccounts(): Promise<MonitorSummary> {
+    this.nextIdleDbCheckAt = 0;
     const summary: MonitorSummary = { checked: 0, active: [], transient: [], opened: [], alreadyOpen: [], resolved: [], errors: [] };
     const accounts = await this.deps.listAccounts();
     for (const account of accounts) {
@@ -394,16 +401,22 @@ export class RecoveryService {
   /** Called every minute. Idempotent and restart-safe: claims advance nextReminderAt first. */
   async tick(): Promise<{ notified: number }> {
     if (this.tickRunning) return { notified: 0 };
+    const now = this.deps.now();
+    if (process.env.NODE_ENV !== 'test' && this.sessions.size === 0 && now.getTime() < this.nextIdleDbCheckAt) {
+      return { notified: 0 };
+    }
     this.tickRunning = true;
     try {
-      const now = this.deps.now();
       const storeWithMeta = this.deps.store as RecoveryStore & {
         listOpenMeta?: () => Promise<Array<{ id: string; status: RecoveryStatus; nextReminderAt: Date | null }>>;
       };
       const open = storeWithMeta.listOpenMeta
         ? await storeWithMeta.listOpenMeta()
         : await this.deps.store.listOpen();
-      if (open.length === 0) return { notified: 0 };
+      if (open.length === 0) {
+        this.nextIdleDbCheckAt = now.getTime() + 60 * 60_000;
+        return { notified: 0 };
+      }
 
       const reaped = await this.reapOrphans(open, now);
       const hasDue =
@@ -414,8 +427,18 @@ export class RecoveryService {
             r.nextReminderAt !== null &&
             r.nextReminderAt.getTime() <= now.getTime(),
         );
-      if (!hasDue) return { notified: 0 };
+      if (!hasDue) {
+        let earliestMs = now.getTime() + 60 * 60_000;
+        for (const r of open) {
+          if (REMINDABLE_STATUSES.includes(r.status) && r.nextReminderAt !== null) {
+            earliestMs = Math.min(earliestMs, r.nextReminderAt.getTime());
+          }
+        }
+        this.nextIdleDbCheckAt = Math.max(now.getTime(), Math.min(earliestMs, now.getTime() + 60 * 60_000));
+        return { notified: 0 };
+      }
 
+      this.nextIdleDbCheckAt = 0;
       const due = await this.deps.store.claimDueReminders(now, this.deps.limits.reminderIntervalMs, 25);
       if (due.length === 0) return { notified: 0 };
       return { notified: await this.notify(due) };
@@ -684,6 +707,7 @@ export class RecoveryService {
       };
     }
 
+    this.nextIdleDbCheckAt = 0;
     this.lockedAccounts.add(account.id);
     try {
       const consumed = await this.deps.store.consumeToken(tokenHash, this.deps.now());
@@ -841,6 +865,7 @@ export class RecoveryService {
   async openPortalSession(token: string, opts?: { mobile?: boolean }): Promise<OpenResult> {
     if (!isWellFormedToken(token)) return { ok: false, reason: 'invalid' };
     if (this.activeSessionCount >= this.deps.limits.maxConcurrency) return { ok: false, reason: 'busy' };
+    this.nextIdleDbCheckAt = 0;
 
     const consumed = await this.deps.store.consumeToken(hashRecoveryToken(token), this.deps.now());
     if (!consumed.ok) {
@@ -1036,6 +1061,7 @@ export class RecoveryService {
     message: string,
     opts: { notify: boolean },
   ): Promise<void> {
+    this.nextIdleDbCheckAt = 0;
     const now = this.deps.now();
     const next = new Date(now.getTime() + this.deps.limits.reminderIntervalMs);
     await this.deps.store.markFailed(recovery.id, category, message, next).catch(() => undefined);
@@ -1112,6 +1138,7 @@ export class RecoveryService {
   // -- explicit cancellation / operator commands ----------------------------------
 
   async cancelRecovery(recoveryId: string): Promise<boolean> {
+    this.nextIdleDbCheckAt = 0;
     const live = this.byRecovery.get(recoveryId);
     if (live && !live.finished) {
       live.stopReason = 'cancelled';
@@ -1124,6 +1151,7 @@ export class RecoveryService {
   }
 
   async cancelByLabel(label: string): Promise<'cancelled' | 'none' | 'unknown_account'> {
+    this.nextIdleDbCheckAt = 0;
     const accounts = await this.deps.listAccounts();
     const account = accounts.find((a) => lower(a.label) === lower(label) || lower(a.username) === lower(label));
     if (!account) return 'unknown_account';
@@ -1137,6 +1165,7 @@ export class RecoveryService {
     label: string,
     reason: 'EXPIRED' | 'REJECTED' | 'VERIFICATION_REQUIRED' = 'EXPIRED',
   ): Promise<'sent' | 'unknown_account' | 'active' | 'in_progress'> {
+    this.nextIdleDbCheckAt = 0;
     const accounts = await this.deps.listAccounts();
     const account = accounts.find((a) => lower(a.label) === lower(label) || lower(a.username) === lower(label));
     if (!account) return 'unknown_account';

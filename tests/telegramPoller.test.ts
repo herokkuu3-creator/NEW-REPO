@@ -24,6 +24,7 @@ vi.mock('../src/database/models', () => ({
   setSystemState: vi.fn(async () => undefined),
 }));
 
+import { getSystemState, setSystemState } from '../src/database/models';
 import { isConflictError, startTelegramBot } from '../src/notifications/telegramBot';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -147,5 +148,59 @@ describe('telegram poller handover', () => {
     );
     await sleep(60);
     expect(polls).toBeGreaterThan(2);
+  });
+
+  it('skips periodic DB owner checks after the startup handover window and re-checks on 409 Conflict', async () => {
+    const getOwnerMock = vi.mocked(getSystemState);
+    const setOwnerMock = vi.mocked(setSystemState);
+    getOwnerMock.mockReset().mockResolvedValue('inst-1@1000');
+    setOwnerMock.mockReset().mockResolvedValue(undefined);
+
+    let fakeNow = 1_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => fakeNow);
+    let pollCount = 0;
+    let triggerConflict = false;
+
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (url.endsWith('/getUpdates')) {
+        pollCount += 1;
+        await sleep(5);
+        if (triggerConflict) {
+          triggerConflict = false;
+          return {
+            ok: false,
+            status: 409,
+            json: async () => ({ ok: false, description: 'Conflict: terminated by other getUpdates request' }),
+          } as unknown as Response;
+        }
+        return { ok: true, status: 200, json: async () => ({ ok: true, result: [] }) } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, result: true }) } as unknown as Response;
+    });
+
+    try {
+      stops.push(startTelegramBot({ instanceId: 'inst-1', retryDelayMs: 5 }));
+      await sleep(30);
+      expect(pollCount).toBeGreaterThanOrEqual(1);
+      expect(getOwnerMock).toHaveBeenCalled();
+
+      // Advance past HANDOVER_GRACE_MS * 2 (180s) so quiet polling performs zero DB calls
+      fakeNow += 200_000;
+      await sleep(15);
+      const readsAfterGrace = getOwnerMock.mock.calls.length;
+      const writesAfterGrace = setOwnerMock.mock.calls.length;
+      const pollsBeforeQuiet = pollCount;
+      await sleep(40);
+      expect(pollCount).toBeGreaterThan(pollsBeforeQuiet + 1);
+      expect(getOwnerMock.mock.calls.length).toBe(readsAfterGrace);
+      expect(setOwnerMock.mock.calls.length).toBe(writesAfterGrace);
+
+      // A 409 conflict immediately re-checks DB ownership
+      triggerConflict = true;
+      await sleep(35);
+      expect(getOwnerMock.mock.calls.length).toBeGreaterThan(readsAfterGrace);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });

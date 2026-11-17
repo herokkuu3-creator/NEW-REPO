@@ -238,11 +238,16 @@ export async function triggerCodeforcesRun(reason: string): Promise<CodeforcesTr
   return { started: true, message: `Codeforces run triggered (${reason})` };
 }
 
+let cfRetryNextPollAt = 0;
+let cfRetryCompletedDate: string | null = null;
+
 export async function runCodeforcesNow(
   reason: string,
   options: CodeforcesRunOptions = {},
 ): Promise<CodeforcesRunReport | null> {
   if (runInProgress) return null;
+  cfRetryNextPollAt = 0;
+  cfRetryCompletedDate = null;
   return executeCodeforcesRun(reason, options);
 }
 
@@ -1260,8 +1265,15 @@ async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minut
   if (isRetry && !isAfterCodeforcesSchedule(new Date(), hour, minute, timezone)) return;
 
   const date = todayInTimezone();
+  if (isRetry && process.env.NODE_ENV !== 'test' && (cfRetryCompletedDate === date || Date.now() < cfRetryNextPollAt)) {
+    return;
+  }
   const state = await readCodeforcesDailyState(date);
-  if (isRetry && state.retryCount >= CODEFORCES_DAILY_RETRY_LIMIT) return;
+  if (isRetry && state.retryCount >= CODEFORCES_DAILY_RETRY_LIMIT) {
+    cfRetryCompletedDate = date;
+    cfRetryNextPollAt = Date.now() + 60 * 60_000;
+    return;
+  }
 
   const accountIds = await loadEnabledAccountIds();
   const completed = new Set(state.completedAccountIds);
@@ -1270,7 +1282,11 @@ async function runAutomaticCodeforcesDaily(isRetry: boolean, hour: number, minut
   // itself still has its bounded three-attempt recovery; subsequent cron ticks
   // only retry failures that occurred before any proxy browser was opened.
   const pendingIds = accountIds.filter((id) => !completed.has(id) && !browserAttempted.has(id));
-  if (pendingIds.length === 0) return;
+  if (pendingIds.length === 0) {
+    cfRetryCompletedDate = date;
+    cfRetryNextPollAt = Date.now() + 60 * 60_000;
+    return;
+  }
 
   if (isRetry) state.retryCount += 1;
   await writeCodeforcesDailyState(state);

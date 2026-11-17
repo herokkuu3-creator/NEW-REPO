@@ -326,11 +326,16 @@ async function loadCodeChefStorageState(
   return null;
 }
 
+let ccRetryNextPollAt = 0;
+let ccRetryCompletedDate: string | null = null;
+
 export async function runCodeChefNow(
   reason: 'manual' | 'cron' = 'manual',
   options: CodeChefRunOptions = {},
 ): Promise<CodeChefReport | null> {
   if (runInProgress) return null;
+  ccRetryNextPollAt = 0;
+  ccRetryCompletedDate = null;
   runInProgress = true;
   activeRangeAbortController = new AbortController();
   const signal = activeRangeAbortController.signal;
@@ -838,15 +843,26 @@ export async function runAutomaticCodeChefDaily(
   if (isRetry && !isAfterCodeChefSchedule(new Date(), hour, minute, timezone)) return;
 
   const today = todayInTimezone();
+  if (isRetry && process.env.NODE_ENV !== 'test' && (ccRetryCompletedDate === today || Date.now() < ccRetryNextPollAt)) {
+    return;
+  }
   const state = await readCodeChefDailyState(today);
-  if (isRetry && state.retryCount >= CODECHEF_DAILY_RETRY_LIMIT) return;
+  if (isRetry && state.retryCount >= CODECHEF_DAILY_RETRY_LIMIT) {
+    ccRetryCompletedDate = today;
+    ccRetryNextPollAt = Date.now() + 60 * 60_000;
+    return;
+  }
 
   if (!isRetry) {
     await Promise.resolve(ensureCodeChefAccountsSeeded()).catch(() => {});
   }
   const accounts = await loadActiveCodeChefAccountSummaries().catch(() => []);
   const pending = accounts.filter((a) => a.lastSubmissionDate !== today);
-  if (pending.length === 0) return;
+  if (pending.length === 0) {
+    ccRetryCompletedDate = today;
+    ccRetryNextPollAt = Date.now() + 60 * 60_000;
+    return;
+  }
 
   if (isRetry) {
     state.retryCount += 1;

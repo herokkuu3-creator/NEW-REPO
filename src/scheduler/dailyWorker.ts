@@ -248,6 +248,7 @@ export async function executeDailyRun(
   const forceRun = isForceReason(reason);
 
   try {
+    resetDailyRetryPollGate();
     pruneDiagnostics();
     await ensureAccountsSeeded();
 
@@ -337,6 +338,11 @@ export async function executeDailyRun(
     logger.info({ summary: summarizeReport(report) }, 'multi-account daily run finished');
 
     const anyIncomplete = outcomes.some(o => o.kind !== 'solved' && o.kind !== 'skipped');
+    if (outcomes.some(o => o.kind === 'solved')) {
+      void import('../solutionPosts/scheduler')
+        .then((m) => m.notifySolutionPostSchedulerWork())
+        .catch(() => undefined);
+    }
     if (anyIncomplete) {
       let retry = { date: today, count: 0, lastAttemptAt: Date.now() };
       try {
@@ -1092,19 +1098,35 @@ export function startScheduler(): () => void {
 export const DAILY_RETRY_LIMIT = 5;
 export const DAILY_RETRY_GAP_MS = 60 * 60 * 1000; // 1 hour gap between retry attempts
 
+let dailyRetryNextPollAt = 0;
+let dailyRetryCompletedDate: string | null = null;
+
+export function resetDailyRetryPollGate(): void {
+  dailyRetryNextPollAt = 0;
+  dailyRetryCompletedDate = null;
+}
+
 export async function triggerDailyRetry(): Promise<void> {
   if (runInProgress) return;
   const { isRangeJobActive } = await import('./rangeSubmission').catch(() => ({ isRangeJobActive: () => false }));
   if (isRangeJobActive()) return;
   if (!isPastScheduledDailyTime()) return;
   const today = leetcodeDayKey();
+  const nowMs = Date.now();
+  if (process.env.NODE_ENV !== 'test' && (dailyRetryCompletedDate === today || nowMs < dailyRetryNextPollAt)) {
+    return;
+  }
   const accountRows = await prisma.account
     .findMany({
       where: { status: { not: AccountStatus.DISABLED } },
       select: { id: true },
     })
     .catch(() => []);
-  if (accountRows.length === 0) return;
+  if (accountRows.length === 0) {
+    dailyRetryCompletedDate = today;
+    dailyRetryNextPollAt = nowMs + 60 * 60_000;
+    return;
+  }
 
   const accountIds = accountRows.map((account) => account.id);
   const runRows = await prisma.dailyRun
@@ -1118,7 +1140,11 @@ export async function triggerDailyRetry(): Promise<void> {
     const row = runByAccount.get(id);
     return !row || row.state !== RunState.SUCCESS || /^(SOLVED_NOT_SUBMITTED|EDITOR_FILLED)/.test(row.submissionStatus ?? '');
   });
-  if (!hasIncomplete) return;
+  if (!hasIncomplete) {
+    dailyRetryCompletedDate = today;
+    dailyRetryNextPollAt = nowMs + 60 * 60_000;
+    return;
+  }
 
   let retry = { date: today, count: 0, lastAttemptAt: 0 };
   try {
@@ -1135,10 +1161,15 @@ export async function triggerDailyRetry(): Promise<void> {
   } catch {
     // A malformed retry marker is safe to reset for today's recovery window.
   }
-  if (retry.count >= DAILY_RETRY_LIMIT) return;
+  if (retry.count >= DAILY_RETRY_LIMIT) {
+    dailyRetryCompletedDate = today;
+    dailyRetryNextPollAt = nowMs + 60 * 60_000;
+    return;
+  }
 
   const now = Date.now();
   if (retry.lastAttemptAt > 0 && now - retry.lastAttemptAt < DAILY_RETRY_GAP_MS) {
+    dailyRetryNextPollAt = retry.lastAttemptAt + DAILY_RETRY_GAP_MS;
     const remainingMin = Math.ceil((DAILY_RETRY_GAP_MS - (now - retry.lastAttemptAt)) / 60000);
     logger.debug({ today, count: retry.count, remainingMin }, 'waiting for 1 hour gap before daily retry');
     return;

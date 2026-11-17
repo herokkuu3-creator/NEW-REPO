@@ -102,6 +102,7 @@ const ACCOUNT_CREDENTIAL_SELECT = {
 const activeUpvoteJobs = new Set<string>();
 const activeViewBoosts = new Set<string>();
 let upvoteRecoveryInProgress = false;
+let nextUpvoteRecoveryPollAt = 0;
 interface UpvoteQueueItem {
   post: UpvoteTarget;
   options: { initialDelayMs?: number; accountGapMs?: number; force?: boolean };
@@ -912,6 +913,7 @@ export async function scheduleSolutionArticleUpvotes(
   post: UpvoteTarget,
   options: { initialDelayMs?: number; accountGapMs?: number; force?: boolean } = {},
 ): Promise<{ scheduled: boolean; count: number; initialDelayMs: number; accountGapMs: number }> {
+  nextUpvoteRecoveryPollAt = 0;
   const initialDelay = options.initialDelayMs ?? UPVOTE_INITIAL_DELAY_MS;
   const gap = options.accountGapMs ?? UPVOTE_ACCOUNT_GAP_MS;
 
@@ -1105,8 +1107,10 @@ async function loadSystemStateMap(keys: string[], includeValue: boolean): Promis
  */
 export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
   if (typeof prisma.solutionPost?.findMany !== 'function' || upvoteRecoveryInProgress) return;
+  if (process.env.NODE_ENV !== 'test' && Date.now() < nextUpvoteRecoveryPollAt) return;
   upvoteRecoveryInProgress = true;
   try {
+    let triggeredAny = false;
     const now = new Date();
     const parts = new Intl.DateTimeFormat('en-US', {
       timeZone: 'Asia/Kolkata',
@@ -1154,6 +1158,7 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
         { postId: post.id, problemSlug: post.problemSlug, publishedUrl: post.publishedUrl },
         'recovering today unverified solution article upvote',
       );
+      triggeredAny = true;
       await scheduleSolutionArticleUpvotes(post, { force: false });
     }
 
@@ -1180,11 +1185,15 @@ export async function recoverUnverifiedArticleUpvotes(): Promise<void> {
       if (!post.publishedUrl) continue;
       if (!existingViewStates.has(`solution-post-views:${post.id}`)) {
         logger.info({ postId: post.id, publishedUrl: post.publishedUrl }, 'auto-boosting article views for recent published post');
+        triggeredAny = true;
         activeViewBoosts.add(post.id);
         void boostSolutionArticleViews({ id: post.id, publishedUrl: post.publishedUrl, problemSlug: post.problemSlug })
           .catch((err) => logger.warn({ postId: post.id, err: err instanceof Error ? err.message : String(err) }, 'view boost error'))
           .finally(() => activeViewBoosts.delete(post.id));
       }
+    }
+    if (!triggeredAny) {
+      nextUpvoteRecoveryPollAt = Date.now() + 60 * 60_000;
     }
   } catch (err) {
     logger.warn(

@@ -15,6 +15,11 @@ const queuePrefix = 'solution-post-daily-publication:queue:';
 type Gate = { nextAt: number; owner?: string; leaseUntil?: number; lastPostId?: string; lastPublishedAt?: string };
 let draining = false;
 let stopQueueKeepAlive: (() => void) | undefined;
+let nextDailyQueuePollAt = 0;
+
+export function notifyDailyPublicationQueued(): void {
+  nextDailyQueuePollAt = 0;
+}
 
 const DAILY_POST_SELECT = {
   id: true,
@@ -143,12 +148,15 @@ async function publishDailyPostInternal(id: string, now: Date, alreadyQueued: bo
 
 /** Durable daily-only queue; manual publishing never enters this gate. */
 export async function publishDailyPost(id: string, now = new Date()): Promise<SolutionPost> {
+  notifyDailyPublicationQueued();
   return publishDailyPostInternal(id, now, false);
 }
 
 /** Runs every minute and on boot; cooldowns consume no generation retries. */
-export async function processDailyPublicationQueue() {
+export async function processDailyPublicationQueue(now = new Date()) {
   if (draining) return;
+  const nowMs = now.getTime();
+  if (process.env.NODE_ENV !== 'test' && nowMs < nextDailyQueuePollAt) return;
   draining = true;
   try {
     const rows = await prisma.systemState.findMany({
@@ -173,7 +181,10 @@ export async function processDailyPublicationQueue() {
     const hasWork = runnable.length > 0;
     if (hasWork && !stopQueueKeepAlive) stopQueueKeepAlive = startArticleWorkKeepAlive();
     else if (!hasWork && stopQueueKeepAlive) { stopQueueKeepAlive(); stopQueueKeepAlive = undefined; }
-    if (!hasWork) return;
+    if (!hasWork) {
+      nextDailyQueuePollAt = nowMs + 60 * 60_000;
+      return;
+    }
 
     // Avoid fetching SolutionPost rows or context blobs on every minute tick while the gate is in cooldown.
     let gateRow: { value: string } | null | undefined = rows.find(row => row.key === DAILY_PUBLICATION_STATE_KEY);
@@ -187,6 +198,8 @@ export async function processDailyPublicationQueue() {
       try {
         const gate: Gate = JSON.parse(gateRow.value);
         if (Number.isFinite(gate.nextAt) && isGateBlocked(gate, Date.now())) {
+          const until = gate.nextAt > Date.now() ? gate.nextAt : (gate.leaseUntil ?? Date.now() + 60 * 60_000);
+          nextDailyQueuePollAt = Math.min(until, Date.now() + 60 * 60_000);
           return;
         }
       } catch {
@@ -194,20 +207,35 @@ export async function processDailyPublicationQueue() {
       }
     }
 
+    let publishedOne = false;
+    let hitCooldown = false;
     for (const item of runnable) {
       try {
         const post = await publishDailyPostInternal(item.postId, new Date(), true);
         if (post.status === 'PUBLISHED') {
+          publishedOne = true;
           if (config.telegram.enabled) await sendTelegramMessage(`✅ Queued daily article published\n${post.publishedUrl}`).catch(() => undefined);
           break;
         }
-        if (post.lastError === 'DAILY_PUBLICATION_COOLDOWN') break;
+        if (post.lastError === 'DAILY_PUBLICATION_COOLDOWN') {
+          hitCooldown = true;
+          break;
+        }
       } catch {
         const data = JSON.parse(item.value);
         await prisma.systemState.updateMany({ where: { key: item.key, value: item.value },
           data: { value: JSON.stringify({ ...data, failures: (data.failures ?? 0) + 1 }) } });
         logger.warn({ postId: data.postId }, 'queued daily publication failed; draft retained');
       }
+    }
+    if (publishedOne) {
+      nextDailyQueuePollAt = runnable.length > 1
+        ? Date.now() + Math.min(DAILY_PUBLICATION_GAP_MS, 60 * 60_000)
+        : Date.now() + 60 * 60_000;
+    } else if (hitCooldown) {
+      nextDailyQueuePollAt = Date.now() + Math.min(DAILY_PUBLICATION_GAP_MS, 5 * 60_000);
+    } else {
+      nextDailyQueuePollAt = 0;
     }
   } finally { draining = false; }
 }

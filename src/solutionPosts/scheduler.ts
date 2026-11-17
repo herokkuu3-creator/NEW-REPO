@@ -160,6 +160,7 @@ export async function runManualQuestion(questionNumber: number, accountIds: stri
         ? await retryPost(existing.id, true, onStage, mode)
         : await generateForRun(account.id, run.id, true, onStage, mode);
       if (isCoarenaPaused(post)) {
+        notifySolutionPostSchedulerWork();
         const pause = coarenaPauseProgress(post);
         results.push({ accountId: account.id, postId: post.id, status: post.status, error: pause.error });
         await reportProgress(onProgress, { accountId: account.id, postId: post.id, questionNumber, submissionId, ...pause });
@@ -327,6 +328,7 @@ export async function runCombined(accountIds: string[], now = new Date(), onProg
         ? await retryPost(existing.id, forceRetry, onStage, mode)
         : await generateForRun(accountId, run.runId, forceRetry, onStage, mode);
       if (isCoarenaPaused(post)) {
+        notifySolutionPostSchedulerWork();
         const pause = coarenaPauseProgress(post);
         results.push({ accountId, postId: post.id, status: post.status, error: pause.error });
         await reportProgress(onProgress, { accountId, postId: post.id, submissionId: run.submissionId, ...pause });
@@ -379,10 +381,21 @@ export async function setSelectedAccounts(accountIds: string[]) {
 
 export function isScheduledSolutionRunInProgress(): boolean { return scheduledRunInProgress; }
 
+let nextScheduledPostsPollAt = 0;
+let nextCoarenaResumePollAt = 0;
+
+export function notifySolutionPostSchedulerWork(): void {
+  nextScheduledPostsPollAt = 0;
+  nextCoarenaResumePollAt = 0;
+}
+
 /** Called by cron, restart catch-up, and the authenticated external wake endpoint. */
 export async function runScheduledSolutionPosts(now = new Date()) {
   if (scheduledRunInProgress) return { status: 'BUSY' as const };
   if (!afterPostSchedule(now)) return { status: 'BEFORE_SCHEDULE' as const };
+  if (process.env.NODE_ENV !== 'test' && now.getTime() < nextScheduledPostsPollAt) {
+    return { status: 'IDLE' as const };
+  }
   scheduledRunInProgress = true;
   const startedAt = now.toISOString();
   const saveState = async (value: object) => {
@@ -402,6 +415,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
     });
     if (!preferences.length) {
       await saveState({ status: 'IDLE', selected: 0, eligible: 0, reason: 'NO_SELECTED_ACCOUNTS' });
+      nextScheduledPostsPollAt = now.getTime() + 60 * 60_000;
       return { status: 'IDLE' as const };
     }
     const selected = await prisma.account.findMany({
@@ -410,6 +424,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
     });
     if (!selected.length) {
       await saveState({ status: 'IDLE', selected: 0, eligible: 0, reason: 'NO_SELECTED_ACCOUNTS' });
+      nextScheduledPostsPollAt = now.getTime() + 60 * 60_000;
       return { status: 'IDLE' as const };
     }
     const today = now.toISOString().slice(0, 10);
@@ -455,6 +470,7 @@ export async function runScheduledSolutionPosts(now = new Date()) {
     if (!pendingIds.length) {
       await saveState({ status: 'IDLE', selected: ids.length, eligible: eligibleIds.length,
         reason: !ids.length ? 'NO_SELECTED_ACCOUNTS' : eligibleIds.length ? 'DAILY_RETRY_LIMIT' : 'NO_PENDING_WORK' });
+      nextScheduledPostsPollAt = now.getTime() + 30 * 60_000;
       return { status: 'IDLE' as const };
     }
     await saveState({ status: 'RUNNING', accountIds: pendingIds });
@@ -493,6 +509,7 @@ let stopCoarenaQueueKeepAlive: (() => void) | undefined;
 /** Handles both manual and daily posts, even after their original schedule date. */
 export async function resumePausedCoarenaArticles(now = new Date()): Promise<void> {
   if (coarenaResumeInProgress) return;
+  if (process.env.NODE_ENV !== 'test' && now.getTime() < nextCoarenaResumePollAt) return;
   coarenaResumeInProgress = true;
   try {
     const posts = await prisma.solutionPost.findMany({
@@ -506,9 +523,18 @@ export async function resumePausedCoarenaArticles(now = new Date()): Promise<voi
     } else {
       stopCoarenaQueueKeepAlive?.();
       stopCoarenaQueueKeepAlive = undefined;
+      nextCoarenaResumePollAt = now.getTime() + 60 * 60_000;
+      return;
     }
+    let processedAny = false;
     for (const paused of posts) {
-      if (!paused.leaseUntil || paused.leaseUntil > now) break;
+      if (!paused.leaseUntil || paused.leaseUntil > now) {
+        if (paused.leaseUntil) {
+          nextCoarenaResumePollAt = Math.min(paused.leaseUntil.getTime(), now.getTime() + 60 * 60_000);
+        }
+        break;
+      }
+      processedAny = true;
       try {
         // generatePost claims ownership with a database compare-and-set.
         const ready = await retryPost(paused.id);
@@ -521,6 +547,7 @@ export async function resumePausedCoarenaArticles(now = new Date()): Promise<voi
           'Coarena article resume did not complete');
       }
     }
+    if (processedAny) nextCoarenaResumePollAt = 0;
   } finally { coarenaResumeInProgress = false; }
 }
 
