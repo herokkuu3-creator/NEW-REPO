@@ -26,7 +26,7 @@ import {
   patchAccount,
   saveAccount,
 } from '../database/accounts';
-import { findCredentialsForAccount, saveEncryptedCredentials } from '../security/credentialStore';
+import { deleteEncryptedCredentials, findCredentialsForAccount, listCredentialLabels, saveEncryptedCredentials } from '../security/credentialStore';
 import { loginToLeetCode } from '../leetcode/auth';
 import {
   clearLeetCodeLoginCooldown,
@@ -42,8 +42,10 @@ import { getMobileTunnel, getOrCreateRecoveryTunnelToken } from '../recovery/mob
 import {
   cancelAllLeetCodePairingSessions,
   createLeetCodePairingSession,
+  DEFAULT_PAIRING_TTL_MS,
   formatTelegramPairingPrompt,
   getLatestPendingLeetCodePairingSession,
+  getLeetCodePairingSession,
   resolvePublicBaseUrl,
   type CreatedLeetCodePairingSession,
 } from '../leetcode/loginHandoff';
@@ -58,6 +60,7 @@ import {
   formatCodeforcesRangeStatus,
   getCodeforcesRangeStatus,
   isCodeforcesRunInProgress,
+  matchQueueEntry,
   resolveCurrentEntry,
   runCodeforcesNow,
   type CodeforcesNetworkMode,
@@ -122,7 +125,7 @@ import { boostSolutionArticleViews, extractTopicIdFromUrl, fetchLiveSolutionMetr
 import { prisma } from '../database/prisma';
 import { firecrawlProbeRequest, probeFirecrawl } from '../solutionPosts/firecrawlProbe';
 import { probeFirecrawlAgent } from '../solutionPosts/firecrawlAgentProbe';
-import { answerChat } from './aiChat';
+import { answerChat, isSensitiveChatText } from './aiChat';
 import { probeSageApi, askSage } from '../ai/sageProbe';
 import { isSageProvider } from '../config/solutionPostProvider';
 
@@ -229,6 +232,7 @@ let pendingQueuePrompt = false;
 let pendingCapzyPrompt = false;
 let pendingAddCapzyPrompt = false;
 let pendingSolutionKeysPrompt = false;
+let pendingPickerQueueMode = false;
 
 export function getPendingPromptType(): PendingPromptType {
   return pendingPromptType;
@@ -239,20 +243,33 @@ export function setPendingPromptType(val: PendingPromptType): void {
   pendingRangePrompt = val === 'leetcode';
   pendingQueuePrompt = val === 'queue';
   pendingCapzyPrompt = val === 'capzy';
+  pendingAddCapzyPrompt = val === 'addcapzy';
+  pendingSolutionKeysPrompt = val === 'solutionkeys';
+  if (val !== 'codeforces' && val !== 'codechef' && val !== 'leetcode') {
+    pendingPickerQueueMode = false;
+  }
 }
 
 export function isPendingCapzyPrompt(): boolean {
   return pendingCapzyPrompt;
 }
 
+export function isPendingAddCapzyPrompt(): boolean {
+  return pendingAddCapzyPrompt;
+}
+
+export function isPendingSolutionKeysPrompt(): boolean {
+  return pendingSolutionKeysPrompt;
+}
+
 export function setPendingCapzyPrompt(val: boolean): void {
-  pendingCapzyPrompt = val;
   if (val) {
-    pendingPromptType = 'capzy';
-    pendingRangePrompt = false;
-    pendingQueuePrompt = false;
-  } else if (pendingPromptType === 'capzy') {
-    pendingPromptType = null;
+    setPendingPromptType('capzy');
+  } else {
+    pendingCapzyPrompt = false;
+    if (pendingPromptType === 'capzy') {
+      pendingPromptType = null;
+    }
   }
 }
 
@@ -261,13 +278,13 @@ export function isPendingQueuePrompt(): boolean {
 }
 
 export function setPendingQueuePrompt(val: boolean): void {
-  pendingQueuePrompt = val;
   if (val) {
-    pendingPromptType = 'queue';
-    pendingRangePrompt = false;
-    pendingCapzyPrompt = false;
-  } else if (pendingPromptType === 'queue') {
-    pendingPromptType = null;
+    setPendingPromptType('queue');
+  } else {
+    pendingQueuePrompt = false;
+    if (pendingPromptType === 'queue') {
+      pendingPromptType = null;
+    }
   }
 }
 
@@ -521,6 +538,10 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
 
   return () => {
     stopped = true;
+    if (batchRunTimer) {
+      clearTimeout(batchRunTimer);
+      batchRunTimer = undefined;
+    }
     abort.abort(); // release the long-poll immediately on shutdown
   };
 }
@@ -566,6 +587,7 @@ export function isLikelyProxyPayload(text: string): boolean {
 export async function handleMessage(
   msg: TgMessage,
   contestSolutionUi: ContestSolutionUiDeps = defaultContestSolutionUiDeps,
+  options: { bypassInteractivePrompts?: boolean } = {},
 ): Promise<void> {
   // Access control: one allowed chat only.
   if (String(msg.chat.id) !== config.telegram.chatId) {
@@ -573,34 +595,20 @@ export async function handleMessage(
     return;
   }
 
+  const bypassPrompts = Boolean(options.bypassInteractivePrompts);
   const text = (msg.text ?? '').trim();
   const lowerText = text.toLowerCase();
+  const isCancel = extractTelegramCommand(text).command === '/cancel' || lowerText === 'cancel';
 
-  if ((text === '/cancel' || lowerText === 'cancel') && activeLeetCodeLogin) {
+  if (!bypassPrompts && isCancel && activeLeetCodeLogin) {
     activeLeetCodeLogin.abort();
     await reply('🛑 Cancelling the active LeetCode login…');
     return;
   }
 
-  // Support plain text "start queue" / "queue start"
-  if (lowerText === 'start queue' || lowerText === 'queue start') {
-    pendingQueuePrompt = true;
-    pendingPromptType = 'queue';
-    pendingRangePrompt = false;
-    await replyHtml(formatQueuePromptMessage());
-    return;
-  }
-  if (lowerText.startsWith('start queue ') || lowerText.startsWith('queue start ')) {
-    const directCmd = text.slice(12).trim();
-    if (directCmd) {
-      await handleQueueCommandInput(directCmd);
-      return;
-    }
-  }
-
   // Handle active interactive login prompt (/lclogin or /cflogin)
-  if (activeLoginPrompt) {
-    if (text === '/cancel' || lowerText === 'cancel') {
+  if (!bypassPrompts && activeLoginPrompt) {
+    if (isCancel) {
       cancelAllLeetCodePairingSessions();
       activeLoginPrompt = null;
       await reply('✖️ Login process cancelled.');
@@ -657,60 +665,135 @@ export async function handleMessage(
     }
   }
 
+  // Support plain text "start queue" / "queue start" (checked after activeLoginPrompt so passwords aren't hijacked)
+  if (!bypassPrompts && (lowerText === 'start queue' || lowerText === 'queue start')) {
+    setPendingPromptType('queue');
+    await replyHtml(formatQueuePromptMessage());
+    return;
+  }
+  if (!bypassPrompts && (lowerText.startsWith('start queue ') || lowerText.startsWith('queue start '))) {
+    const directCmd = text.slice(12).trim();
+    if (directCmd) {
+      await handleQueueCommandInput(directCmd);
+      return;
+    }
+  }
+
   // Handle active queue prompt
-  if (pendingQueuePrompt) {
-    if (text === '/cancel' || lowerText === 'cancel') {
-      pendingQueuePrompt = false;
-      pendingPromptType = null;
+  if (!bypassPrompts && pendingQueuePrompt) {
+    if (isCancel) {
+      setPendingPromptType(null);
+      pendingPickerQueueMode = false;
       await reply('✖️ Command queuing cancelled.');
       return;
     }
-    const isInteractiveCommand = /^\/(?:cfrange|cf_range|cfbatch|cf_batch|ccrange|cc_range|ccbatch|cc_batch|questionrangesubmission|question_range_submission|rangesubmission|completeincomplete|complete_incomplete|solveincomplete|solve_incomplete|incomplete|unsolved|solveunsolved|solve_unsolved)\b/.test(text.toLowerCase());
-    if (!isInteractiveCommand) {
-      const handled = await handleQueueCommandInput(text);
-      if (handled) {
-        pendingQueuePrompt = false;
-        pendingPromptType = null;
+    if (msg.document && !text) {
+      setPendingPromptType(null);
+      pendingPickerQueueMode = false;
+    } else {
+      const needsInteractivePicker = (() => {
+        if (!text.startsWith('/')) return false;
+        const parsedQueue = extractTelegramCommand(text);
+        const cmdTokens = parsedQueue.arg.split(/\s+/).filter(Boolean);
+        switch (parsedQueue.command) {
+          case '/cfrange':
+          case '/cf_range':
+          case '/cfbatch':
+          case '/cf_batch': {
+            const parsedCount = Number.parseInt(cmdTokens[0] ?? '', 10);
+            return !cmdTokens[0] || !Number.isFinite(parsedCount) || parsedCount <= 0 || cmdTokens.length < 2;
+          }
+          case '/ccrange':
+          case '/cc_range':
+          case '/ccbatch':
+          case '/cc_batch': {
+            const parsedCount = Number.parseInt(cmdTokens[0] ?? '', 10);
+            return !cmdTokens[0] || !Number.isFinite(parsedCount) || parsedCount <= 0;
+          }
+          case '/questionrangesubmission':
+          case '/question_range_submission':
+          case '/rangesubmission': {
+            if (cmdTokens.length === 0) return true;
+            return parseQuestionRange(cmdTokens[0] ?? '').ok && cmdTokens.length < 2;
+          }
+          case '/completeincomplete':
+          case '/complete_incomplete':
+          case '/solveincomplete':
+          case '/solve_incomplete':
+          case '/incomplete':
+          case '/unsolved':
+          case '/solveunsolved':
+          case '/solve_unsolved': {
+            if (cmdTokens.length === 0) return true;
+            const parsedCount = Number.parseInt(cmdTokens[0] ?? '', 10);
+            return Number.isFinite(parsedCount) && parsedCount >= 1 && cmdTokens.length < 2;
+          }
+          default:
+            return false;
+        }
+      })();
+      if (!needsInteractivePicker) {
+        const handled = await handleQueueCommandInput(text);
+        if (handled) {
+          setPendingPromptType(null);
+          pendingPickerQueueMode = false;
+        }
+        return;
       }
-      return;
+      pendingQueuePrompt = false;
+      if (pendingPromptType === 'queue') pendingPromptType = null;
+      pendingPickerQueueMode = true;
     }
   }
 
   // Handle active Capzy / CapSolver key prompt (replace)
-  if (pendingCapzyPrompt) {
-    if (text === '/cancel' || lowerText === 'cancel') {
-      pendingCapzyPrompt = false;
-      pendingPromptType = null;
+  if (!bypassPrompts && pendingCapzyPrompt) {
+    if (isCancel) {
+      setPendingPromptType(null);
       await reply('✖️ CapSolver key setup cancelled.');
       return;
     }
-    await handleCapSolverCommand(text);
-    return;
+    if (msg.document || text.startsWith('/')) {
+      setPendingCapzyPrompt(false);
+    } else {
+      await handleCapSolverCommand(text);
+      return;
+    }
   }
 
   // Handle active Add Capzy / CapSolver key prompt (append)
-  if (pendingAddCapzyPrompt) {
-    if (text === '/cancel' || lowerText === 'cancel') {
+  if (!bypassPrompts && pendingAddCapzyPrompt) {
+    if (isCancel) {
       pendingAddCapzyPrompt = false;
-      pendingPromptType = null;
+      if (pendingPromptType === 'addcapzy') pendingPromptType = null;
       await reply('✖️ Add CapSolver key cancelled.');
       return;
     }
-    await handleAddCapSolverCommand(text);
-    return;
+    if (msg.document || text.startsWith('/')) {
+      pendingAddCapzyPrompt = false;
+      if (pendingPromptType === 'addcapzy') pendingPromptType = null;
+    } else {
+      await handleAddCapSolverCommand(text);
+      return;
+    }
   }
 
   // API keys are append-only. The prompt remains available even after the pool already has keys.
-  if (pendingSolutionKeysPrompt) {
-    if (text === '/cancel' || lowerText === 'cancel') {
+  if (!bypassPrompts && pendingSolutionKeysPrompt) {
+    if (isCancel) {
       pendingSolutionKeysPrompt = false;
-      pendingPromptType = null;
+      if (pendingPromptType === 'solutionkeys') pendingPromptType = null;
       await reply('✖️ Article API-key setup cancelled.');
       return;
     }
-    await deleteSensitiveTelegramMessage(msg);
-    await handleAddSolutionApiKeys(text);
-    return;
+    if (msg.document || text.startsWith('/')) {
+      pendingSolutionKeysPrompt = false;
+      if (pendingPromptType === 'solutionkeys') pendingPromptType = null;
+    } else {
+      await deleteSensitiveTelegramMessage(msg);
+      await handleAddSolutionApiKeys(text);
+      return;
+    }
   }
 
   if (text.startsWith('/')) {
@@ -754,19 +837,19 @@ export async function handleMessage(
         await handleReplaceSolutionApiKeys(commandArg);
         return;
       case '/ask':
-        void handleAiChat(commandArg);
+        void handleAiChat(commandArg).catch((err) => logger.warn({ err: errText(err) }, 'telegram /ask failed'));
         return;
       case '/asksage':
       case '/sage':
       case '/askinkstone':
       case '/inkstone':
-        void handleAskSage(commandArg);
+        void handleAskSage(commandArg).catch((err) => logger.warn({ err: errText(err) }, 'telegram /asksage failed'));
         return;
       case '/testsage':
       case '/testinkstone':
       case '/testinternai':
         await deleteSensitiveTelegramMessage(msg);
-        void handleTestSage(commandArg);
+        void handleTestSage(commandArg).catch((err) => logger.warn({ err: errText(err) }, 'telegram /testsage failed'));
         return;
       case '/testfirecrawl':
         await deleteSensitiveTelegramMessage(msg);
@@ -793,7 +876,7 @@ export async function handleMessage(
       case '/boostviews':
       case '/boost_views':
       case '/solutionviews':
-        void handleBoostSolutionViews(msg, commandArg);
+        void handleBoostSolutionViews(msg, commandArg).catch((err) => logger.warn({ err: errText(err) }, 'telegram /boostviews failed'));
         return;
       case '/lclogin':
       case '/lc_login':
@@ -889,7 +972,7 @@ export async function handleMessage(
         return;
       case '/renew': {
         if (!commandArg) {
-          pendingRenewalLabel = pendingLeetCodeVerificationHandoff?.label;
+          pendingRenewalLabel = getPendingLeetCodeVerificationHandoff()?.label;
           pendingRangePrompt = false;
           pendingPromptType = null;
           await reply(RENEW_INSTRUCTIONS);
@@ -900,8 +983,9 @@ export async function handleMessage(
           return;
         }
         pendingRenewalLabel = commandArg;
-        if (pendingLeetCodeVerificationHandoff) {
-          pendingLeetCodeVerificationHandoff.label = commandArg;
+        const activeHandoff = getPendingLeetCodeVerificationHandoff();
+        if (activeHandoff && activeHandoff.label.toLowerCase() !== commandArg.toLowerCase()) {
+          pendingLeetCodeVerificationHandoff = null;
         }
         if (hasRecoveryService()) {
           const account = await findStoredLeetCodeAccount(commandArg);
@@ -938,14 +1022,16 @@ export async function handleMessage(
       case '/ccbatch':
       case '/cc_batch': {
         const parsedCount = Number.parseInt(commandArg, 10);
+        const forceQueue = pendingQueuePrompt || pendingPickerQueueMode;
+        pendingQueuePrompt = false;
+        pendingPickerQueueMode = false;
         if (!Number.isFinite(parsedCount) || parsedCount <= 0) {
-          pendingPromptType = 'codechef';
-          pendingRangePrompt = false;
-          await handleCodeChefRangePrompt(defaultCodeChefUiDeps);
+          setPendingPromptType('codechef');
+          pendingPickerQueueMode = forceQueue;
+          await handleCodeChefRangePrompt(defaultCodeChefUiDeps, forceQueue);
           return;
         }
-        pendingPromptType = null;
-        pendingRangePrompt = false;
+        setPendingPromptType(null);
         const count = Math.min(50, Math.max(1, parsedCount));
         await handleCodeChefTrigger({ forceNext: true, count });
         return;
@@ -985,21 +1071,23 @@ export async function handleMessage(
         const tokens = commandArg.split(/\s+/).filter(Boolean);
         const rawCount = tokens[0];
         const parsedCount = parseInt(rawCount ?? '', 10);
+        const forceQueue = pendingQueuePrompt || pendingPickerQueueMode;
+        pendingQueuePrompt = false;
+        pendingPickerQueueMode = false;
         if (!rawCount || isNaN(parsedCount) || parsedCount <= 0) {
-          pendingPromptType = 'codeforces';
-          pendingRangePrompt = false;
-          await handleCodeforcesRangePrompt(defaultCodeforcesSubmitUiDeps);
+          setPendingPromptType('codeforces');
+          pendingPickerQueueMode = forceQueue;
+          await handleCodeforcesRangePrompt(defaultCodeforcesSubmitUiDeps, forceQueue);
           return;
         }
-        pendingPromptType = null;
-        pendingRangePrompt = false;
+        setPendingPromptType(null);
         const count = Math.min(50, Math.max(1, parsedCount));
         const modifier = tokens[1]?.toLowerCase();
         if (modifier === 'all' || modifier === '--all') {
           await handleCodeforcesTrigger({ forceNext: true, count });
           return;
         }
-        await handleCodeforcesRangePickerCommand(count);
+        await handleCodeforcesRangePickerCommand(count, defaultCodeforcesSubmitUiDeps, config.telegram.chatId, forceQueue);
         return;
       }
       case '/cfrangestatus':
@@ -1156,12 +1244,14 @@ export async function handleMessage(
       case '/unsolved':
       case '/solveunsolved':
       case '/solve_unsolved':
-        pendingPromptType = null;
+        pendingQueuePrompt = false;
+        pendingPickerQueueMode = false;
+        setPendingPromptType(null);
         await handleIncompleteQuestionsCommand(commandArg, defaultRemovalDeps, defaultRangeUiDeps, msg.chat.id);
         return;
       case '/cancelincomplete':
       case '/cancel_incomplete':
-        pendingPromptType = null;
+        setPendingPromptType(null);
         await handleCancelRange();
         return;
       case '/incompletestatus':
@@ -1172,18 +1262,20 @@ export async function handleMessage(
       case '/cfclearcookies':
         await handleCfRemoveSession();
         return;
-    case '/questionrangesubmission':
+      case '/questionrangesubmission':
       case '/question_range_submission':
-      case '/rangesubmission':
-        pendingRangePrompt = false;
-        pendingPromptType = null;
-        await handleQuestionRangeCommand(commandArg);
+      case '/rangesubmission': {
+        const forceQueue = pendingQueuePrompt || pendingPickerQueueMode;
+        pendingQueuePrompt = false;
+        pendingPickerQueueMode = false;
+        setPendingPromptType(null);
+        await handleQuestionRangeCommand(commandArg, defaultRemovalDeps, defaultRangeUiDeps, msg.chat.id, forceQueue);
         return;
+      }
       case '/cancelrange':
       case '/cancel_range':
       case '/stoprange':
-        pendingRangePrompt = false;
-        pendingPromptType = null;
+        setPendingPromptType(null);
         await handleCancelRange();
         return;
       case '/rangestatus':
@@ -1198,18 +1290,14 @@ export async function handleMessage(
           await handleQueueCommandInput(commandArg);
           return;
         }
-        pendingQueuePrompt = true;
-        pendingPromptType = 'queue';
-        pendingRangePrompt = false;
+        setPendingPromptType('queue');
         await replyHtml(formatQueuePromptMessage());
         return;
       }
       case '/queue': {
         const lowerArg = commandArg.toLowerCase();
         if (!commandArg || lowerArg === 'start') {
-          pendingQueuePrompt = true;
-          pendingPromptType = 'queue';
-          pendingRangePrompt = false;
+          setPendingPromptType('queue');
           await replyHtml(formatQueuePromptMessage());
           return;
         }
@@ -1239,32 +1327,63 @@ export async function handleMessage(
         await reply(handleClearQueue());
         return;
       case '/cancel': {
+        const chatKey = String(msg.chat.id);
         const cancelledPairings = cancelAllLeetCodePairingSessions();
+        const activeHandoff = getPendingLeetCodeVerificationHandoff();
         const hadPendingRenewal = Boolean(
-          pendingRenewalLabel || pendingLeetCodeVerificationHandoff || cancelledPairings > 0,
+          pendingRenewalLabel || activeHandoff || cancelledPairings > 0,
         );
+        const hadActiveLoginPrompt = Boolean(activeLoginPrompt);
+        const hadCapzyPrompt = pendingCapzyPrompt;
+        const hadAddCapzyPrompt = pendingAddCapzyPrompt;
+        const hadSolutionKeysPrompt = pendingSolutionKeysPrompt;
+        const hadQueuePrompt = pendingQueuePrompt;
+        const hadRangePrompt = pendingRangePrompt;
+        const hadPromptType = pendingPromptType;
+
         pendingRenewalLabel = undefined;
         pendingLeetCodeVerificationHandoff = null;
-        pendingRangePrompt = false;
-        pendingPromptType = null;
+        activeLoginPrompt = null;
+        setPendingPromptType(null);
+        pendingPickerQueueMode = false;
+
+        const hadContestSelection = contestSolutionSelections.delete(chatKey);
+        const hadDailySolSelection = dailySolutionSelections.delete(chatKey);
+        const hadManualSolSelection = manualSolutionSelections.delete(chatKey);
+        const hadCfRangeSelection = cfRangeSelections.delete(chatKey);
+        const hadCoinSelection = coinClaimSelections.delete(chatKey);
+        const hadIncompleteSelection = lcIncompleteSelections.delete(chatKey);
+        let hadLcRangeSelection = lcRangeSelections.delete(chatKey);
+        for (const k of lcRangeSelections.keys()) {
+          if (k.startsWith(`${chatKey}:`)) {
+            lcRangeSelections.delete(k);
+            hadLcRangeSelection = true;
+          }
+        }
+
         if (activeLeetCodeLogin) {
           activeLeetCodeLogin.abort();
           activeLeetCodeLogin = null;
           await reply('✖️ Active LeetCode login cancelled.');
           return;
         }
-        if (activeLoginPrompt) {
-          activeLoginPrompt = null;
+        if (hadActiveLoginPrompt) {
           await reply('✖️ Login process cancelled.');
           return;
         }
-        if (pendingCapzyPrompt) {
-          pendingCapzyPrompt = false;
+        if (hadCapzyPrompt) {
           await reply('✖️ CapSolver key setup cancelled.');
           return;
         }
-        if (pendingQueuePrompt) {
-          pendingQueuePrompt = false;
+        if (hadAddCapzyPrompt) {
+          await reply('✖️ Add CapSolver key cancelled.');
+          return;
+        }
+        if (hadSolutionKeysPrompt) {
+          await reply('✖️ Article API-key setup cancelled.');
+          return;
+        }
+        if (hadQueuePrompt) {
           await reply('✖️ Command queuing cancelled.');
           return;
         }
@@ -1280,8 +1399,21 @@ export async function handleMessage(
           await reply('✖️ Pending session renewal cancelled.');
           return;
         }
-        if (contestSolutionSelections.delete(String(msg.chat.id))) {
+        if (hadContestSelection) {
           await reply('✖️ Contest solution selection cancelled.');
+          return;
+        }
+        if (
+          hadDailySolSelection ||
+          hadManualSolSelection ||
+          hadCfRangeSelection ||
+          hadCoinSelection ||
+          hadIncompleteSelection ||
+          hadLcRangeSelection ||
+          hadRangePrompt ||
+          hadPromptType
+        ) {
+          await reply('✖️ Pending selection/prompt cancelled.');
           return;
         }
         await reply(
@@ -1298,67 +1430,73 @@ export async function handleMessage(
   }
 
   // Text replies to interactive prompts (when not a document and starts with a digit/hash):
-  if (!msg.document && pendingPromptType === 'solutionquestion' && /^\s*#?\d{1,5}\s*$/.test(text)) {
-    pendingPromptType = null;
+  if (!bypassPrompts && !msg.document && pendingPromptType === 'solutionquestion' && /^\s*#?\d{1,5}\s*$/.test(text)) {
+    setPendingPromptType(null);
     const key = String(msg.chat.id);
     const selected = [...(manualSolutionSelections.get(key) ?? new Set<string>())];
     manualSolutionSelections.delete(key);
     await startDailySolutionWorkflow(selected, Number(text.trim().replace(/^#/, '')));
     return;
   }
-  if (!msg.document && /^\s*#?\d/.test(text)) {
+  if (!bypassPrompts && !msg.document && /^\s*#?\d/.test(text)) {
+    const queueMode = pendingPickerQueueMode;
     if (pendingPromptType === 'codeforces') {
-      pendingPromptType = null;
-      pendingRangePrompt = false;
+      pendingPickerQueueMode = false;
+      setPendingPromptType(null);
       const count = parseInt(text.replace(/^[#\s]+/, ''), 10);
       if (!isNaN(count) && count > 0) {
-        await handleCodeforcesRangePickerCommand(Math.min(50, count));
+        await handleCodeforcesRangePickerCommand(Math.min(50, count), defaultCodeforcesSubmitUiDeps, config.telegram.chatId, queueMode);
         return;
       }
     } else if (pendingPromptType === 'codechef') {
-      pendingPromptType = null;
-      pendingRangePrompt = false;
+      pendingPickerQueueMode = false;
+      setPendingPromptType(null);
       const count = parseInt(text.replace(/^[#\s]+/, ''), 10);
       if (!isNaN(count) && count > 0) {
-        await handleCodeChefTrigger({ forceNext: true, count: Math.min(50, count) });
+        if (queueMode) {
+          await handleQueueCommandInput(`/ccrange ${Math.min(50, count)}`);
+        } else {
+          await handleCodeChefTrigger({ forceNext: true, count: Math.min(50, count) });
+        }
         return;
       }
     } else if (pendingPromptType === 'incomplete') {
-      pendingPromptType = null;
+      pendingPickerQueueMode = false;
+      setPendingPromptType(null);
       const count = parseInt(text.replace(/^[#\s]+/, ''), 10);
       if (!isNaN(count) && count > 0) {
         await handleIncompleteQuestionsCommand(String(count), defaultRemovalDeps, defaultRangeUiDeps, msg.chat.id);
         return;
       }
     } else if (pendingPromptType === 'leetcode' || pendingRangePrompt) {
-      pendingPromptType = null;
-      pendingRangePrompt = false;
-      await handleQuestionRangeCommand(text);
+      pendingPickerQueueMode = false;
+      setPendingPromptType(null);
+      await handleQuestionRangeCommand(text, defaultRemovalDeps, defaultRangeUiDeps, msg.chat.id, queueMode);
       return;
     }
   }
 
   // Non-command message: check if it's pasted Capzy / CapSolver API key(s)
-  if (!msg.document && isLikelyCapzyKey(text)) {
+  if (!bypassPrompts && !msg.document && isLikelyCapzyKey(text)) {
     await handleCapSolverCommand(text);
     return;
   }
 
   // Non-command message: check if it's pasted proxy list first
-  if (!msg.document && isLikelyProxyPayload(text)) {
+  if (!bypassPrompts && !msg.document && isLikelyProxyPayload(text)) {
     await handleAddProxyCommand(text);
     return;
   }
 
   // A lone number is normally a reply to a picker. If the active poller did
   // not see that picker, never silently reinterpret the selection as AI chat.
-  if (!msg.document && /^\s*#?\d{1,5}\s*$/.test(text)) {
+  if (!bypassPrompts && !msg.document && /^\s*#?\d{1,5}\s*$/.test(text)) {
     await reply('No selection is waiting for that number. Reopen the relevant command and try again. To ask the AI about a number, use /ask.');
     return;
   }
 
-  if (!msg.document && text && !pendingRenewalLabel && !looksLikeCookiePayload(text)) {
-    void handleAiChat(text);
+  if (!bypassPrompts && !msg.document && text && !pendingRenewalLabel && !looksLikeCookiePayload(text)) {
+    void handleAiChat(text).catch((err) => logger.warn({ err: errText(err) }, 'telegram AI chat failed'));
     return;
   }
 
@@ -1367,7 +1505,12 @@ export async function handleMessage(
   let fileName: string | undefined;
   if (msg.document) {
     fileName = msg.document.file_name;
-    payload = await downloadDocument(msg.document);
+    try {
+      payload = await downloadDocument(msg.document);
+    } catch (err) {
+      await reply(`⚠️ Could not download file${fileName ? ` (${fileName})` : ''}: ${errText(err)}`);
+      return;
+    }
   }
   if (!payload) {
     await reply('📎 Send a cookie .json file (or paste the cookies) to add an account. /accounts lists them.');
@@ -1433,7 +1576,11 @@ export async function processCookieMessage(
     };
   }
 
-  const handoff = pendingLeetCodeVerificationHandoff;
+  const activeHandoff = getPendingLeetCodeVerificationHandoff();
+  const handoff =
+    activeHandoff && (!opts.label || opts.label.toLowerCase() === activeHandoff.label.toLowerCase())
+      ? activeHandoff
+      : null;
   const effectiveOpts = handoff
     ? {
         ...opts,
@@ -1465,13 +1612,24 @@ export async function processCookieMessage(
     pendingLeetCodeVerificationHandoff = null;
     pendingRenewalLabel = undefined;
     if (result.status === AccountStatus.ACTIVE) {
-      const verifiedUsername = result.username || handoff.identifier;
-      await saveEncryptedCredentials('leetcode', result.label, {
-        username: verifiedUsername,
-        password: handoff.password,
-        label: result.label,
-      });
-      handoffNotice = `\n🔐 Verified live on server & encrypted credentials saved for ${result.label}.`;
+      const identifierMatches =
+        handoff.identifier.includes('@') ||
+        !result.username ||
+        result.username.toLowerCase() === handoff.identifier.toLowerCase();
+      if (identifierMatches) {
+        const verifiedUsername = result.username || handoff.identifier;
+        await saveEncryptedCredentials('leetcode', result.label, {
+          username: verifiedUsername,
+          password: handoff.password,
+          label: result.label,
+        });
+        handoffNotice = `\n🔐 Verified live on server & encrypted credentials saved for ${result.label}.`;
+      } else {
+        logger.warn(
+          { label: result.label, expectedIdentifier: handoff.identifier, actualUsername: result.username },
+          'Skipped saving handoff credentials because authenticated LeetCode username did not match handoff identifier',
+        );
+      }
     }
   }
 
@@ -1504,6 +1662,7 @@ function scheduleBatchRun(): void {
       );
     })().catch((err) => logger.warn({ err: errText(err) }, 'batch run trigger failed'));
   }, BATCH_RUN_DELAY_MS);
+  batchRunTimer.unref?.();
 }
 
 /**
@@ -1673,7 +1832,7 @@ export async function handleCodeChefTrigger(
 
   const statusMessage = await tgApi<{ message_id: number }>('sendMessage', {
     chat_id: config.telegram.chatId,
-    text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${initialBlocks}`,
+    text: truncateHtml(`${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${initialBlocks}`, 3800),
     parse_mode: 'HTML',
     disable_web_page_preview: true,
   });
@@ -1686,7 +1845,7 @@ export async function handleCodeChefTrigger(
     let body = blocks.join('\n\n');
     if (extraFooter) body += extraFooter;
 
-    const fullText = `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${body}`;
+    const fullText = truncateHtml(`${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${body}`, 3800);
 
     const updated = await tgApi('editMessageText', {
       chat_id: config.telegram.chatId,
@@ -1829,7 +1988,7 @@ export async function handleCodeChefTrigger(
     await tgApi('editMessageText', {
       chat_id: config.telegram.chatId,
       message_id: statusMessage.message_id,
-      text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${html(errText(err))}`,
+      text: truncateHtml(`${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${html(errText(err))}`, 3800),
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     }).catch(() => undefined);
@@ -1891,8 +2050,8 @@ export const defaultCodeChefUiDeps: CodeChefUiDeps = {
   },
 };
 
-export function buildCodeChefRangeCountPicker(): { text: string; buttons: InlineButton[][] } {
-  const shouldQueue = isAnyWorkerBusy() || pendingQueuePrompt;
+export function buildCodeChefRangeCountPicker(forceQueue = false): { text: string; buttons: InlineButton[][] } {
+  const shouldQueue = forceQueue || isAnyWorkerBusy() || pendingQueuePrompt;
   const actionPrefix = shouldQueue ? 'ccrange:q:' : 'ccrange:run:';
   const labelSuffix = shouldQueue ? ' (Queue 📥)' : '';
 
@@ -1920,17 +2079,24 @@ export function buildCodeChefRangeCountPicker(): { text: string; buttons: Inline
 
 export async function handleCodeChefRangePrompt(
   deps: CodeChefUiDeps = defaultCodeChefUiDeps,
+  forceQueue = false,
 ): Promise<void> {
-  if (deps.inProgress()) {
+  const queueMode = forceQueue || pendingQueuePrompt || pendingPickerQueueMode;
+  pendingQueuePrompt = false;
+  if (pendingPromptType === 'queue') pendingPromptType = null;
+  if (!queueMode && deps.inProgress()) {
+    pendingPickerQueueMode = false;
     await deps.send('🚧 A CodeChef run is already in progress — wait for its report, then try again.');
     return;
   }
   const accounts = await deps.listAccounts();
   if (accounts.length === 0) {
+    pendingPickerQueueMode = false;
     await deps.send('📭 No active CodeChef accounts configured.');
     return;
   }
-  const picker = buildCodeChefRangeCountPicker();
+  pendingPickerQueueMode = queueMode;
+  const picker = buildCodeChefRangeCountPicker(queueMode);
   await deps.send(picker.text, picker.buttons);
 }
 
@@ -1943,21 +2109,24 @@ export async function handleCodeChefRangeButton(
   triggerFn: typeof handleCodeChefTrigger = handleCodeChefTrigger,
 ): Promise<void> {
   if (data === 'ccrange:x') {
-    pendingPromptType = null;
+    pendingQueuePrompt = false;
+    pendingPickerQueueMode = false;
+    setPendingPromptType(null);
     await deps.answer(callbackId, 'Cancelled');
     await deps.edit(chatId, messageId, '✖️ CodeChef batch submission cancelled.');
     return;
   }
 
-  if (deps.inProgress()) {
-    await deps.answer(callbackId, 'A CodeChef run is already in progress');
-    await deps.edit(chatId, messageId, '🚧 A CodeChef run is already in progress — wait for its report, then try again.');
-    return;
-  }
-
   if (data.startsWith('ccrange:run:') || data.startsWith('ccrange:q:')) {
-    pendingPromptType = null;
     const isQueue = data.startsWith('ccrange:q:');
+    if (!isQueue && deps.inProgress()) {
+      await deps.answer(callbackId, 'A CodeChef run is already in progress');
+      await deps.edit(chatId, messageId, '🚧 A CodeChef run is already in progress — wait for its report, then try again.');
+      return;
+    }
+    pendingQueuePrompt = false;
+    pendingPickerQueueMode = false;
+    setPendingPromptType(null);
     const rawCount = data.slice(isQueue ? 'ccrange:q:'.length : 'ccrange:run:'.length);
     const count = Math.min(50, Math.max(1, parseInt(rawCount, 10) || 5));
     const accounts = await deps.listAccounts();
@@ -2023,10 +2192,10 @@ export async function handleTriggerSubmission(
 // Daily submit + article picker (/dailysolution, /manualsolution)
 // ---------------------------------------------------------------------------
 
-const dailySolutionSelections = new Map<string, Set<string>>();
+export const dailySolutionSelections = new Map<string, Set<string>>();
 // Manual choices intentionally live only for the current Telegram interaction.
 // They never change the durable 06:00 schedule selection.
-const manualSolutionSelections = new Map<string, Set<string>>();
+export const manualSolutionSelections = new Map<string, Set<string>>();
 
 export function buildDailySolutionPicker(accounts: AccountRecord[], selected: ReadonlySet<string>) {
   const allSelected = accounts.length > 0 && accounts.every(account => selected.has(account.id));
@@ -2147,7 +2316,7 @@ function renderSolutionWorkflowProgress(
     lines.push(`└ ${solutionStageText(state?.stage ?? 'queued', state?.error, state?.previousError, state?.detail)}`);
     lines.push('');
   });
-  return lines.join('\n').slice(0, 3900);
+  return truncateHtml(lines.join('\n'), 3800);
 }
 
 async function startDailySolutionWorkflow(accountIds: string[], questionNumber?: number, publicationMode: 'daily' | 'manual' = 'daily'): Promise<void> {
@@ -3372,7 +3541,7 @@ export async function handleCodeforcesTrigger(
 
   const statusMessage = await tgApi<{ message_id: number }>('sendMessage', {
     chat_id: config.telegram.chatId,
-    text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${initialBlocks}`,
+    text: truncateHtml(`${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${initialBlocks}`, 3800),
     parse_mode: 'HTML',
     disable_web_page_preview: true,
   });
@@ -3385,7 +3554,7 @@ export async function handleCodeforcesTrigger(
     let body = blocks.join('\n\n');
     if (extraFooter) body += extraFooter;
 
-    const fullText = `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${body}`;
+    const fullText = truncateHtml(`${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n${body}`, 3800);
 
     const updated = await tgApi('editMessageText', {
       chat_id: config.telegram.chatId,
@@ -3560,7 +3729,7 @@ export async function handleCodeforcesTrigger(
     await tgApi('editMessageText', {
       chat_id: config.telegram.chatId,
       message_id: statusMessage.message_id,
-      text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${html(errText(err))}`,
+      text: truncateHtml(`${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${html(errText(err))}`, 3800),
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     }).catch(() => undefined);
@@ -3576,6 +3745,86 @@ export async function handleCodeforcesSubmitNext(
   return handleCodeforcesTrigger({ forceNext: true, count: 1 }, runner, inProgress);
 }
 
+const HAS_HTML_MARKUP_RE = /<\/?(?:b|strong|i|em|code|pre|a|span|blockquote|u|s)(?:\s[^>]*)?>/i;
+
+function stripHtmlMarkupTags(html: string): string {
+  return html
+    .replace(/<\/?(?:b|strong|i|em|code|pre|a|span|blockquote|u|s)(?:\s[^>]*)?>/gi, '')
+    .replace(/&(lt|gt|quot|#39|amp);/gi, (full, entity: string) => {
+      switch (entity.toLowerCase()) {
+        case 'lt': return '<';
+        case 'gt': return '>';
+        case 'quot': return '"';
+        case '#39': return "'";
+        case 'amp': return '&';
+        default: return full;
+      }
+    });
+}
+
+async function sendTgUiMessage(
+  text: string,
+  buttons: InlineButton[][] | undefined,
+  useHtml: boolean,
+): Promise<void> {
+  try {
+    await tgApi('sendMessage', {
+      chat_id: config.telegram.chatId,
+      text,
+      ...(useHtml ? { parse_mode: 'HTML' } : {}),
+      disable_web_page_preview: true,
+      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+    });
+  } catch (err) {
+    if (useHtml && errText(err).includes("can't parse entities")) {
+      await tgApi('sendMessage', {
+        chat_id: config.telegram.chatId,
+        text: stripHtmlMarkupTags(text),
+        disable_web_page_preview: true,
+        ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+      });
+      return;
+    }
+    throw err;
+  }
+}
+
+async function editTgUiMessage(
+  chatId: number | string,
+  messageId: number,
+  text: string,
+  buttons: InlineButton[][] | undefined,
+  useHtml: boolean,
+): Promise<void> {
+  try {
+    await tgApi('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      ...(useHtml ? { parse_mode: 'HTML' } : {}),
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: buttons ?? [] },
+    });
+  } catch (err) {
+    const msg = errText(err);
+    if (/message is not modified/i.test(msg)) return;
+    if (useHtml && msg.includes("can't parse entities")) {
+      await tgApi('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: stripHtmlMarkupTags(text),
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: buttons ?? [] },
+      }).catch((retryErr) => {
+        if (/message is not modified/i.test(errText(retryErr))) return;
+        throw retryErr;
+      });
+      return;
+    }
+    throw err;
+  }
+}
+
 export interface CodeforcesSubmitUiDeps {
   listAccounts: () => Promise<Awaited<ReturnType<typeof listCodeforcesAccounts>>>;
   runner: typeof runCodeforcesNow;
@@ -3585,29 +3834,12 @@ export interface CodeforcesSubmitUiDeps {
   answer: (callbackId: string, text?: string) => Promise<void>;
 }
 
-const defaultCodeforcesSubmitUiDeps: CodeforcesSubmitUiDeps = {
+export const defaultCodeforcesSubmitUiDeps: CodeforcesSubmitUiDeps = {
   listAccounts: () => listCodeforcesAccounts(false),
   runner: runCodeforcesNow,
   inProgress: isCodeforcesRunInProgress,
-  send: async (text, buttons) => {
-    await tgApi('sendMessage', {
-      chat_id: config.telegram.chatId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
-    });
-  },
-  edit: async (chatId, messageId, text, buttons) => {
-    await tgApi('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      reply_markup: { inline_keyboard: buttons ?? [] },
-    });
-  },
+  send: (text, buttons) => sendTgUiMessage(text, buttons, true),
+  edit: (chatId, messageId, text, buttons) => editTgUiMessage(chatId, messageId, text, buttons, true),
   answer: async (callbackId, text) => {
     await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text, show_alert: true } : {}) });
   },
@@ -4228,7 +4460,7 @@ export async function formatCapzyStatusMessage(): Promise<string> {
     } else {
       lines.push('🔴 <b>Primary Solver: CPSolver (Local/Render)</b>');
       lines.push(`├ URL: <code>${escapeHtml(cpUrl)}</code>`);
-      lines.push(`└ Status: <b>Offline/Unreachable</b> (<i>${escapeHtml(health.error ?? 'unknown')}</i>)`);
+      lines.push(`└ Status: <b>Health check failed</b> (<i>${escapeHtml(health.error ?? 'unknown')}</i>)`);
     }
   } else {
     lines.push('⚪ <b>Primary Solver: CPSolver (Local/Render)</b>');
@@ -4298,8 +4530,7 @@ export async function formatCapzyStatusMessage(): Promise<string> {
 export async function handleCapSolverCommand(commandArg?: string): Promise<void> {
   const arg = (commandArg ?? '').trim();
   if (arg) {
-    pendingCapzyPrompt = false;
-    pendingPromptType = null;
+    setPendingPromptType(null);
     await reply('⏳ Verifying and saving CapSolver/Capzy API keys...');
     const saveResult = await saveCapzyApiKeys(arg);
     if (!saveResult.ok || saveResult.keys.length === 0) {
@@ -4338,11 +4569,7 @@ export async function handleCapSolverCommand(commandArg?: string): Promise<void>
   }
 
   // If no argument provided: prompt user
-  pendingCapzyPrompt = true;
-  pendingAddCapzyPrompt = false;
-  pendingPromptType = 'capzy';
-  pendingRangePrompt = false;
-  pendingQueuePrompt = false;
+  setPendingPromptType('capzy');
 
   const currentStatus = await formatCapzyStatusMessage();
   const promptMsg = [
@@ -4365,9 +4592,7 @@ export async function handleCapSolverCommand(commandArg?: string): Promise<void>
 export async function handleAddCapSolverCommand(commandArg?: string): Promise<void> {
   const arg = (commandArg ?? '').trim();
   if (arg) {
-    pendingAddCapzyPrompt = false;
-    pendingCapzyPrompt = false;
-    pendingPromptType = null;
+    setPendingPromptType(null);
     await reply('⏳ Verifying and appending CapSolver/Capzy API key(s)...');
     const addResult = await addCapzyApiKeys(arg);
     if (!addResult.ok || addResult.totalKeys.length === 0) {
@@ -4419,11 +4644,7 @@ export async function handleAddCapSolverCommand(commandArg?: string): Promise<vo
   }
 
   // If no argument provided: prompt user
-  pendingAddCapzyPrompt = true;
-  pendingCapzyPrompt = false;
-  pendingPromptType = 'addcapzy';
-  pendingRangePrompt = false;
-  pendingQueuePrompt = false;
+  setPendingPromptType('addcapzy');
 
   const currentStatus = await formatCapzyStatusMessage();
   const promptMsg = [
@@ -4510,11 +4731,7 @@ export async function formatSolutionKeyStatus(): Promise<string> {
 export async function handleAddSolutionApiKeys(commandArg?: string): Promise<void> {
   const raw = (commandArg ?? '').trim();
   if (!raw) {
-    pendingSolutionKeysPrompt = true;
-    pendingPromptType = 'solutionkeys';
-    pendingCapzyPrompt = false;
-    pendingAddCapzyPrompt = false;
-    pendingQueuePrompt = false;
+    setPendingPromptType('solutionkeys');
     await replyHtml([
       await formatSolutionKeyStatus(), '', '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
       '➕ <b>Add Intern-AI API Key(s)</b>', '',
@@ -4523,8 +4740,7 @@ export async function handleAddSolutionApiKeys(commandArg?: string): Promise<voi
     ].join('\n'));
     return;
   }
-  pendingSolutionKeysPrompt = false;
-  pendingPromptType = null;
+  setPendingPromptType(null);
   try {
     const result = await appendSolutionApiKeys(raw);
     if (result.added) await resetFailedSolutionPostRetries();
@@ -4606,73 +4822,73 @@ export async function handleBoostSolutionViews(msg: TgMessage, commandArg?: stri
   let title = 'Solution Article';
   let problemSlug = '';
 
-  if (arg) {
-    if (/^\d+$/.test(arg)) {
-      topicId = parseInt(arg, 10);
-      const post = await prisma.solutionPost.findFirst({
-        where: { publishedUrl: { contains: String(topicId) } },
-        select: { publishedUrl: true, title: true, problemSlug: true },
-      });
-      if (post && post.publishedUrl) {
-        targetUrl = post.publishedUrl;
-        title = post.title || title;
-        problemSlug = post.problemSlug;
-      } else {
-        targetUrl = `https://leetcode.com/discuss/topic/${topicId}/`;
-      }
-    } else if (arg.includes('leetcode.com')) {
-      targetUrl = arg;
-      topicId = extractTopicIdFromUrl(arg);
-      const post = await prisma.solutionPost.findFirst({
-        where: { publishedUrl: arg },
-        select: { publishedUrl: true, title: true, problemSlug: true },
-      });
-      if (post) {
-        title = post.title || title;
-        problemSlug = post.problemSlug;
+  try {
+    if (arg) {
+      if (/^\d+$/.test(arg)) {
+        topicId = parseInt(arg, 10);
+        const post = await prisma.solutionPost.findFirst({
+          where: { publishedUrl: { contains: String(topicId) } },
+          select: { publishedUrl: true, title: true, problemSlug: true },
+        });
+        if (post && post.publishedUrl) {
+          targetUrl = post.publishedUrl;
+          title = post.title || title;
+          problemSlug = post.problemSlug;
+        } else {
+          targetUrl = `https://leetcode.com/discuss/topic/${topicId}/`;
+        }
+      } else if (arg.includes('leetcode.com')) {
+        targetUrl = arg;
+        topicId = extractTopicIdFromUrl(arg);
+        const post = await prisma.solutionPost.findFirst({
+          where: { publishedUrl: arg },
+          select: { publishedUrl: true, title: true, problemSlug: true },
+        });
+        if (post) {
+          title = post.title || title;
+          problemSlug = post.problemSlug;
+        }
       }
     }
-  }
 
-  if (!targetUrl || !topicId) {
-    const latest = await prisma.solutionPost.findFirst({
-      where: { status: 'PUBLISHED', publishedUrl: { not: null } },
-      orderBy: { publishedAt: 'desc' },
-      select: { publishedUrl: true, title: true, problemSlug: true },
-    });
-    if (!latest || !latest.publishedUrl) {
-      await replyHtml('⚠️ No published solution articles found. Pass a topic ID or URL:\n<code>/boostviews 8603495</code>');
+    if (!targetUrl || !topicId) {
+      const latest = await prisma.solutionPost.findFirst({
+        where: { status: 'PUBLISHED', publishedUrl: { not: null } },
+        orderBy: { publishedAt: 'desc' },
+        select: { publishedUrl: true, title: true, problemSlug: true },
+      });
+      if (!latest || !latest.publishedUrl) {
+        await replyHtml('⚠️ No published solution articles found. Pass a topic ID or URL:\n<code>/boostviews 8603495</code>');
+        return;
+      }
+      const pubUrl = latest.publishedUrl;
+      targetUrl = pubUrl;
+      topicId = extractTopicIdFromUrl(pubUrl);
+      title = latest.title || title;
+      problemSlug = latest.problemSlug;
+    }
+
+    if (!topicId || !targetUrl) {
+      await replyHtml('❌ Could not determine topic ID to boost views.');
       return;
     }
-    const pubUrl = latest.publishedUrl;
-    targetUrl = pubUrl;
-    topicId = extractTopicIdFromUrl(pubUrl);
-    title = latest.title || title;
-    problemSlug = latest.problemSlug;
-  }
 
-  if (!topicId || !targetUrl) {
-    await replyHtml('❌ Could not determine topic ID to boost views.');
-    return;
-  }
+    await replyHtml(
+      `🚀 <b>Verifying Article Views…</b>\n` +
+        `🔗 <a href="${escapeHtml(targetUrl)}">${escapeHtml(title)}</a> (Topic #${topicId})\n` +
+        `⏳ Visiting and registering article views across accounts (LeetCode 1-hr cooldown applies). Please wait…`,
+    );
 
-  await replyHtml(
-    `🚀 <b>Verifying Article Views…</b>\n` +
-      `🔗 <a href="${targetUrl}">${escapeHtml(title)}</a> (Topic #${topicId})\n` +
-      `⏳ Visiting and registering article views across accounts (LeetCode 1-hr cooldown applies). Please wait…`,
-  );
-
-  try {
     const res = await boostSolutionArticleViews({ publishedUrl: targetUrl, topicId, problemSlug });
     const live = await fetchLiveSolutionMetrics(topicId).catch(() => null);
     await replyHtml(
       `🎉 <b>Views Verification Completed!</b>\n` +
-        `🔗 <a href="${targetUrl}">${escapeHtml(title)}</a> (Topic #${topicId})\n` +
+        `🔗 <a href="${escapeHtml(targetUrl)}">${escapeHtml(title)}</a> (Topic #${topicId})\n` +
         `👁️ LeetCode Live Views: <b>${live?.hitCount ?? res.liveHitCount ?? 'N/A'}</b> | ⬆️ Live Upvotes: <b>${live?.upvotes ?? 'N/A'}</b>\n` +
         `📊 Accounts Processed: <b>${res.accountsProcessed}</b>`,
     );
   } catch (err) {
-    await replyHtml(`❌ Failed to boost views: ${escapeHtml(err instanceof Error ? err.message : String(err))}`);
+    await replyHtml(`❌ Failed to boost views: ${escapeHtml(errText(err))}`).catch(() => undefined);
   }
 }
 
@@ -4703,6 +4919,10 @@ export async function handleAskSage(question?: string): Promise<void> {
       '❓ <b>Usage:</b> <code>/asksage &lt;your question&gt;</code> (or <code>/sage &lt;question&gt;</code>)\n' +
       'Ask any question to Sage Inkstone (Intern-AI) directly from this server.'
     );
+    return;
+  }
+  if (isSensitiveChatText(q)) {
+    await reply('Please remove credentials or session data before asking the AI.');
     return;
   }
   await reply('🤔 Thinking with Sage Inkstone (Intern-AI)…');
@@ -4917,7 +5137,7 @@ async function startSelectedCodeforcesRun(
   const report = await deps.runner(CODEFORCES_MANUAL_REASON, {
     forceDailyAttempt: true,
     ...(accountIds ? { accountIds } : {}),
-    onAccountOutcome: (outcome, index, total) => deps.send(formatCodeforcesAccountMessage(outcome, index, total)),
+    onAccountOutcome: (outcome, index, total) => deps.send(escapeHtml(formatCodeforcesAccountMessage(outcome, index, total))),
   });
   if (!report) {
     await deps.send('⏳ Not started: another Codeforces run began at the same moment. Try again after it finishes.');
@@ -4957,17 +5177,18 @@ async function handleCodeforcesSubmitButton(
   await deps.edit(
     chatId,
     messageId,
-    `🚀 Submitting the next Codeforces source solution for ${description}.\n\n📬 You will receive the verdict here.`,
+    `🚀 Submitting the next Codeforces source solution for ${escapeHtml(description)}.\n\n📬 You will receive the verdict here.`,
   );
   void startSelectedCodeforcesRun(data === 'cfsub:all' ? undefined : [selected[0]!.id], description, deps).catch(async (err) => {
     logger.warn({ err: errText(err) }, 'custom Codeforces submission failed');
-    await deps.send(`⚠️ Codeforces submission failed: ${errText(err)}`).catch(() => undefined);
+    await deps.send(`⚠️ Codeforces submission failed: ${escapeHtml(errText(err))}`).catch(() => undefined);
   });
 }
 
 export interface CodeforcesRangeSelectionState {
   count: number;
   selectedAccountIds: Set<string>;
+  queueMode?: boolean;
 }
 
 export const cfRangeSelections = new Map<string, CodeforcesRangeSelectionState>();
@@ -4977,6 +5198,7 @@ export function buildCodeforcesRangePicker(
   count: number,
   accounts: Awaited<ReturnType<typeof listCodeforcesAccounts>>,
   selected: ReadonlySet<string>,
+  queueMode = false,
 ): { text: string; buttons: InlineButton[][] } {
   const allSelected = accounts.length > 0 && accounts.every((account) => selected.has(account.id));
   const buttons: InlineButton[][] = accounts.map((account) => [{
@@ -4990,8 +5212,8 @@ export function buildCodeforcesRangePicker(
   const startLabel = selected.size > 0
     ? `🚀 Start Batch (${count} Qs · ${selected.size} acc)`
     : `🚀 Start Batch (${count} Qs)`;
-  
-  const shouldQueue = isAnyWorkerBusy() || pendingQueuePrompt;
+
+  const shouldQueue = queueMode || isAnyWorkerBusy() || pendingQueuePrompt;
   const finalBtnLabel = shouldQueue ? startLabel.replace('🚀 Start Batch', '📥 Enqueue Batch') : startLabel;
   const finalBtnAction = shouldQueue ? 'cfrange:q' : 'cfrange:run';
 
@@ -5017,7 +5239,11 @@ export async function handleCodeforcesRangePickerCommand(
   count: number,
   deps: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
   chatId: number | string = config.telegram.chatId,
+  forceQueue = false,
 ): Promise<void> {
+  const queueMode = forceQueue || pendingPickerQueueMode;
+  pendingQueuePrompt = false;
+  pendingPickerQueueMode = false;
   const accounts = await deps.listAccounts();
   if (accounts.length === 0) {
     await deps.send('📭 No active Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
@@ -5028,26 +5254,27 @@ export async function handleCodeforcesRangePickerCommand(
   if (accounts.length === 1 && accounts[0]) {
     selected.add(accounts[0].id);
   }
-  cfRangeSelections.set(key, { count, selectedAccountIds: selected });
-  const picker = buildCodeforcesRangePicker(count, accounts, selected);
+  cfRangeSelections.set(key, { count, selectedAccountIds: selected, queueMode });
+  const picker = buildCodeforcesRangePicker(count, accounts, selected, queueMode);
   await deps.send(picker.text, picker.buttons);
 }
 
-export function buildCodeforcesRangeCountPicker(): { text: string; buttons: InlineButton[][] } {
+export function buildCodeforcesRangeCountPicker(forceQueue = false): { text: string; buttons: InlineButton[][] } {
   const text = [
     '<b>🔢 Codeforces Batch Submission</b>',
     '<code>━━━━━━━━━━━━━━━━━━━━</code>',
     'How many questions do you want to submit?',
     'Select a batch size below, or reply with <code>/cfrange &lt;count&gt;</code>:',
   ].join('\n');
+  const prefix = forceQueue ? 'cfrange:qc:' : 'cfrange:c:';
   const buttons: InlineButton[][] = [
     [
-      { text: '5 Questions', callback_data: 'cfrange:c:5' },
-      { text: '10 Questions', callback_data: 'cfrange:c:10' },
+      { text: '5 Questions', callback_data: `${prefix}5` },
+      { text: '10 Questions', callback_data: `${prefix}10` },
     ],
     [
-      { text: '15 Questions', callback_data: 'cfrange:c:15' },
-      { text: '20 Questions', callback_data: 'cfrange:c:20' },
+      { text: '15 Questions', callback_data: `${prefix}15` },
+      { text: '20 Questions', callback_data: `${prefix}20` },
     ],
     [
       { text: '✖️ Cancel', callback_data: 'cfrange:x' },
@@ -5058,17 +5285,23 @@ export function buildCodeforcesRangeCountPicker(): { text: string; buttons: Inli
 
 export async function handleCodeforcesRangePrompt(
   deps: CodeforcesSubmitUiDeps = defaultCodeforcesSubmitUiDeps,
+  forceQueue = false,
 ): Promise<void> {
-  if (deps.inProgress()) {
+  const queueMode = forceQueue || pendingPickerQueueMode;
+  pendingQueuePrompt = false;
+  if (!queueMode && deps.inProgress()) {
+    pendingPickerQueueMode = false;
     await deps.send('🚧 A Codeforces run is already in progress — wait for its report, then try again.');
     return;
   }
   const accounts = await deps.listAccounts();
   if (accounts.length === 0) {
+    pendingPickerQueueMode = false;
     await deps.send('📭 No active Codeforces accounts configured — send a Codeforces session JSON through /renew first.');
     return;
   }
-  const picker = buildCodeforcesRangeCountPicker();
+  pendingPickerQueueMode = queueMode;
+  const picker = buildCodeforcesRangeCountPicker(queueMode);
   await deps.send(picker.text, picker.buttons);
 }
 
@@ -5085,14 +5318,19 @@ export async function handleCodeforcesRangeButton(
   if (data === 'cfrange:x') {
     cfRangeSelections.delete(key);
     pendingPromptType = null;
+    pendingQueuePrompt = false;
+    pendingPickerQueueMode = false;
     await deps.answer(callbackId, 'Cancelled');
     await deps.edit(chatId, messageId, '✖️ Codeforces batch submission cancelled.');
     return;
   }
 
-  if (data.startsWith('cfrange:c:')) {
+  if (data.startsWith('cfrange:c:') || data.startsWith('cfrange:qc:')) {
+    const queueMode = data.startsWith('cfrange:qc:') || pendingPickerQueueMode;
     pendingPromptType = null;
-    const rawCount = data.slice('cfrange:c:'.length);
+    pendingQueuePrompt = false;
+    pendingPickerQueueMode = false;
+    const rawCount = data.slice(data.startsWith('cfrange:qc:') ? 'cfrange:qc:'.length : 'cfrange:c:'.length);
     const count = Math.min(50, Math.max(1, parseInt(rawCount, 10) || 5));
     const accounts = await deps.listAccounts();
     if (accounts.length === 0) {
@@ -5105,9 +5343,9 @@ export async function handleCodeforcesRangeButton(
     if (accounts.length === 1 && accounts[0]) {
       selected.add(accounts[0].id);
     }
-    cfRangeSelections.set(key, { count, selectedAccountIds: selected });
+    cfRangeSelections.set(key, { count, selectedAccountIds: selected, queueMode });
     await deps.answer(callbackId, `${count} questions selected`);
-    const picker = buildCodeforcesRangePicker(count, accounts, selected);
+    const picker = buildCodeforcesRangePicker(count, accounts, selected, queueMode);
     await deps.edit(chatId, messageId, picker.text, picker.buttons);
     return;
   }
@@ -5134,7 +5372,7 @@ export async function handleCodeforcesRangeButton(
       accounts.forEach((account) => state.selectedAccountIds.add(account.id));
     }
     await deps.answer(callbackId, allSelected ? 'Cleared all' : 'All accounts selected');
-    const picker = buildCodeforcesRangePicker(state.count, accounts, state.selectedAccountIds);
+    const picker = buildCodeforcesRangePicker(state.count, accounts, state.selectedAccountIds, Boolean(state.queueMode));
     await deps.edit(chatId, messageId, picker.text, picker.buttons);
     return;
   }
@@ -5151,7 +5389,7 @@ export async function handleCodeforcesRangeButton(
       state.selectedAccountIds.add(id);
     }
     await deps.answer(callbackId, state.selectedAccountIds.has(id) ? 'Selected' : 'Unselected');
-    const picker = buildCodeforcesRangePicker(state.count, accounts, state.selectedAccountIds);
+    const picker = buildCodeforcesRangePicker(state.count, accounts, state.selectedAccountIds, Boolean(state.queueMode));
     await deps.edit(chatId, messageId, picker.text, picker.buttons);
     return;
   }
@@ -5165,6 +5403,8 @@ export async function handleCodeforcesRangeButton(
 
     const { count, selectedAccountIds } = state;
     cfRangeSelections.delete(key);
+    pendingQueuePrompt = false;
+    pendingPickerQueueMode = false;
 
     const desc = selectedAccounts.length === 1
       ? cfAccountName(selectedAccounts[0]!)
@@ -5172,7 +5412,7 @@ export async function handleCodeforcesRangeButton(
 
     if (data === 'cfrange:q') {
       await deps.answer(callbackId, 'Batch Queued 📥');
-      await deps.edit(chatId, messageId, `📥 <b>Queued Codeforces batch</b> (${count} Qs) for ${desc}...`);
+      await deps.edit(chatId, messageId, `📥 <b>Queued Codeforces batch</b> (${count} Qs) for ${escapeHtml(desc)}...`);
       const cmdStr = `/cfrange ${count} ${Array.from(selectedAccountIds).join(',')}`;
       await handleQueueCommandInput(cmdStr, { notify: async (text, html) => { if (html) await replyHtml(text); else await reply(text); } });
       return;
@@ -5182,7 +5422,7 @@ export async function handleCodeforcesRangeButton(
     await deps.edit(
       chatId,
       messageId,
-      `🚀 Starting Codeforces batch (${count} Qs) for ${desc}…`,
+      `🚀 Starting Codeforces batch (${count} Qs) for ${escapeHtml(desc)}…`,
     );
 
     void triggerFn({
@@ -5191,7 +5431,7 @@ export async function handleCodeforcesRangeButton(
       accountIds: Array.from(selectedAccountIds),
     }).catch(async (err) => {
       logger.warn({ err: errText(err) }, 'Codeforces batch trigger failed');
-      await deps.send(`⚠️ Codeforces batch failed to start: ${errText(err)}`).catch(() => undefined);
+      await deps.send(`⚠️ Codeforces batch failed to start: ${escapeHtml(errText(err))}`).catch(() => undefined);
     });
     return;
   }
@@ -5243,7 +5483,7 @@ export async function handleCodeforcesManualNext(
   await deps.send(picker.text, picker.buttons);
 }
 
-async function handleCodeforcesManualButton(
+export async function handleCodeforcesManualButton(
   chatId: number | string,
   messageId: number,
   callbackId: string,
@@ -5272,12 +5512,12 @@ async function handleCodeforcesManualButton(
     chatId,
     messageId,
     [
-      `📱 Manual Codeforces submission for ${cfAccountName(account)}`,
-      `Problem: ${entry.contestId}${entry.problemIndex}${entry.problemName ? ` — ${entry.problemName}` : ''}`,
+      `📱 Manual Codeforces submission for ${escapeHtml(cfAccountName(account))}`,
+      `Problem: ${escapeHtml(String(entry.contestId))}${escapeHtml(String(entry.problemIndex))}${entry.problemName ? ` — ${escapeHtml(entry.problemName)}` : ''}`,
       `Language: ${entry.language === 'python' ? 'Python 3' : 'GNU C++'}`,
       '',
-      `1. Open source: ${entry.rawUrl}`,
-      `2. Open submit page: ${submitPageUrl(entry)}`,
+      `1. Open source: ${escapeHtml(entry.rawUrl)}`,
+      `2. Open submit page: ${escapeHtml(submitPageUrl(entry))}`,
       '3. Paste the source and submit in the same Codeforces account on your phone.',
       '',
       'After an Accepted verdict, the next automatic or manual run detects it and moves to the following problem.',
@@ -5309,28 +5549,15 @@ function coinHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-const defaultCoinClaimUiDeps: CoinClaimUiDeps = {
+export const defaultCoinClaimUiDeps: CoinClaimUiDeps = {
   listAccounts: async () => (await listAccounts()).filter((account) => account.status !== AccountStatus.DISABLED),
   claim: claimContestRewardForAccount,
   busy: () => isRunInProgress() || Boolean(currentRangeJob()) || coinClaimInProgress,
   send: async (text, buttons) => {
-    await tgApi('sendMessage', {
-      chat_id: config.telegram.chatId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
-    });
+    await sendTgUiMessage(text, buttons, true);
   },
   edit: async (chatId, messageId, text, buttons) => {
-    await tgApi('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      reply_markup: { inline_keyboard: buttons ?? [] },
-    });
+    await editTgUiMessage(chatId, messageId, text, buttons, true);
   },
   answer: async (callbackId, text) => {
     await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text, show_alert: true } : {}) });
@@ -5483,7 +5710,7 @@ export async function handleCoinClaimButton(
         ['<b>🎁 LEETCODE CONTEST REWARD</b>', '<code>━━━━━━━━━━━━━━━━━━━━</code>', ...lines].join('\n'),
       );
     } catch (err) {
-      await deps.edit(chatId, messageId, `⚠️ Reward check stopped: ${errText(err)}`).catch(() => undefined);
+      await deps.edit(chatId, messageId, `⚠️ Reward check stopped: ${coinHtml(errText(err))}`).catch(() => undefined);
     } finally {
       coinClaimInProgress = false;
     }
@@ -5505,28 +5732,40 @@ export interface RemovalDeps {
 
 const RUN_BUSY_TEXT = '🚧 A run is in progress right now - wait for its report, then try again (removing an account mid-run would break it).';
 
-const defaultRemovalDeps: RemovalDeps = {
+export const defaultRemovalDeps: RemovalDeps = {
   listAccounts,
-  deleteAccountById,
-  deleteAllAccounts,
+  deleteAccountById: async (id: string) => {
+    const acc = await getAccountById(id).catch(() => null)
+      ?? (await listAccounts().catch(() => [] as AccountRecord[])).find((a) => a.id === id)
+      ?? null;
+    const deleted = await deleteAccountById(id);
+    if (deleted && acc?.label) {
+      await deleteEncryptedCredentials('leetcode', acc.label).catch(() => undefined);
+    }
+    return deleted;
+  },
+  deleteAllAccounts: async () => {
+    const [accounts, labels] = await Promise.all([
+      listAccounts().catch(() => [] as AccountRecord[]),
+      listCredentialLabels('leetcode').catch(() => [] as string[]),
+    ]);
+    const deleted = await deleteAllAccounts();
+    const allLabels = new Set<string>([
+      ...labels,
+      ...accounts.map((a) => a.label).filter(Boolean),
+    ]);
+    await Promise.all(
+      Array.from(allLabels).map((label) => deleteEncryptedCredentials('leetcode', label).catch(() => undefined)),
+    );
+    return deleted;
+  },
   clearLegacySession: () => deleteSystemState(SystemKeys.storageState),
-  isRunInProgress,
+  isRunInProgress: () => isRunInProgress() || Boolean(currentRangeJob()) || coinClaimInProgress,
   send: async (text, buttons) => {
-    await tgApi('sendMessage', {
-      chat_id: config.telegram.chatId,
-      text,
-      disable_web_page_preview: true,
-      ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
-    });
+    await sendTgUiMessage(text, buttons, HAS_HTML_MARKUP_RE.test(text));
   },
   edit: async (chatId, messageId, text, buttons) => {
-    await tgApi('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      disable_web_page_preview: true,
-      reply_markup: { inline_keyboard: buttons ?? [] },
-    });
+    await editTgUiMessage(chatId, messageId, text, buttons, HAS_HTML_MARKUP_RE.test(text));
   },
   answer: async (callbackId, text) => {
     await tgApi('answerCallbackQuery', { callback_query_id: callbackId, ...(text ? { text, show_alert: true } : {}) });
@@ -5795,19 +6034,20 @@ export interface RangeAccountSectionState {
 
 export function truncateHtml(html: string, maxLen = 3800): string {
   if (html.length <= maxLen) return html;
-  let truncated = html.slice(0, maxLen - 20);
+  let truncated = html.slice(0, Math.max(0, maxLen - 20));
   const lastLt = truncated.lastIndexOf('<');
   const lastGt = truncated.lastIndexOf('>');
   if (lastLt > lastGt) {
     truncated = truncated.slice(0, lastLt);
   }
+  truncated = truncated.replace(/&[a-zA-Z0-9#]*$/, '');
   const openTags: string[] = [];
   const tagRe = /<\/?([a-zA-Z0-9]+)(?:\s+[^>]*)?>/g;
   let match: RegExpExecArray | null;
   while ((match = tagRe.exec(truncated)) !== null) {
     const isClosing = match[0].startsWith('</');
     const tagName = match[1]!.toLowerCase();
-    if (['b', 'i', 'code', 'pre', 'a', 'span', 'strong', 'em'].includes(tagName)) {
+    if (['b', 'i', 'code', 'pre', 'a', 'span', 'strong', 'em', 'u', 's', 'blockquote'].includes(tagName)) {
       if (isClosing) {
         const lastIdx = openTags.lastIndexOf(tagName);
         if (lastIdx !== -1) openTags.splice(lastIdx, 1);
@@ -5962,7 +6202,9 @@ export async function handleQuestionRangeTrigger(
 ): Promise<StartRangeResult> {
   let configuredAccounts: AccountRecord[] = [];
   if (target === 'all') {
-    configuredAccounts = await triggerDeps.listAccounts().catch(() => []);
+    configuredAccounts = (await triggerDeps.listAccounts().catch(() => [])).filter(
+      (a) => a.status !== AccountStatus.DISABLED,
+    );
     if (options?.accountIds && options.accountIds.length > 0) {
       configuredAccounts = configuredAccounts.filter(
         (a) =>
@@ -5973,7 +6215,9 @@ export async function handleQuestionRangeTrigger(
     }
     if (configuredAccounts.length === 0) return { started: false, reason: 'no-accounts' };
   } else if (typeof target !== 'string') {
-    const all = await triggerDeps.listAccounts().catch(() => []);
+    const all = (await triggerDeps.listAccounts().catch(() => [])).filter(
+      (a) => a.status !== AccountStatus.DISABLED,
+    );
     configuredAccounts = all.filter(
       (a) =>
         target.includes(a.id) ||
@@ -5982,8 +6226,21 @@ export async function handleQuestionRangeTrigger(
     );
     if (configuredAccounts.length === 0) return { started: false, reason: 'account-not-found' };
   } else {
-    const acc = await triggerDeps.getAccount(target).catch(() => null);
-    if (!acc) return { started: false, reason: 'account-not-found' };
+    let acc = await triggerDeps.getAccount(target).catch(() => null);
+    if (!acc) {
+      const all = await triggerDeps.listAccounts().catch(() => []);
+      const needle = target.trim().toLowerCase();
+      acc =
+        all.find(
+          (a) =>
+            a.id === target ||
+            a.label.toLowerCase() === needle ||
+            (a.username && a.username.toLowerCase() === needle),
+        ) ?? null;
+    }
+    if (!acc || acc.status === AccountStatus.DISABLED) {
+      return { started: false, reason: 'account-not-found' };
+    }
     configuredAccounts = [acc];
   }
 
@@ -6218,6 +6475,32 @@ export async function handleQuestionRangeTrigger(
     await editProgress();
   };
 
+  const renderErrorMessage = async (err: unknown): Promise<void> => {
+    if (pendingEditTimer) {
+      clearTimeout(pendingEditTimer);
+      pendingEditTimer = null;
+    }
+    if (editInFlight) {
+      await editInFlight.catch(() => undefined);
+    }
+    if (!statusMessageId) return;
+    const errorText = truncateHtml(
+      `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${escapeHtml(errText(err))}`,
+      3800,
+    );
+    if (triggerDeps.edit) {
+      await triggerDeps.edit(chatId, statusMessageId, errorText).catch(() => undefined);
+    } else {
+      await tgApi('editMessageText', {
+        chat_id: chatId,
+        message_id: statusMessageId,
+        text: errorText,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }).catch(() => undefined);
+    }
+  };
+
   const deps: RangeDeps = defaultRangeDeps(async () => undefined, onProgress);
 
   const res = await triggerDeps.startJob(range, target, deps, options ?? { mode });
@@ -6247,15 +6530,7 @@ export async function handleQuestionRangeTrigger(
           return results;
         } catch (err) {
           logger.warn({ err: errText(err) }, 'LeetCode range execution error');
-          if (statusMessageId) {
-            await tgApi('editMessageText', {
-              chat_id: chatId,
-              message_id: statusMessageId,
-              text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${escapeHtml(errText(err))}`,
-              parse_mode: 'HTML',
-              disable_web_page_preview: true,
-            }).catch(() => undefined);
-          }
+          await renderErrorMessage(err);
           throw err;
         }
       })();
@@ -6298,15 +6573,7 @@ export async function handleQuestionRangeTrigger(
       return results;
     } catch (err) {
       logger.warn({ err: errText(err) }, 'LeetCode range execution error');
-      if (statusMessageId) {
-        await tgApi('editMessageText', {
-          chat_id: chatId,
-          message_id: statusMessageId,
-          text: `${title}\n<code>━━━━━━━━━━━━━━━━━━━━</code>\n⚠️ Error: ${escapeHtml(errText(err))}`,
-          parse_mode: 'HTML',
-          disable_web_page_preview: true,
-        }).catch(() => undefined);
-      }
+      await renderErrorMessage(err);
       throw err;
     }
   })();
@@ -6328,6 +6595,7 @@ const defaultRangeUiDeps: RangeUiDeps = {
 export interface LeetCodeRangeSelectionState {
   range: QuestionRange;
   selectedAccountIds: Set<string>;
+  queueMode?: boolean;
 }
 
 export const lcRangeSelections = new Map<string, LeetCodeRangeSelectionState>();
@@ -6337,27 +6605,29 @@ export function buildRangePicker(
   range: QuestionRange,
   accounts: AccountRecord[],
   selected: ReadonlySet<string> = new Set(),
+  queueMode = false,
 ): { text: string; buttons: InlineButton[][] } {
+  const activeAccounts = accounts.filter((a) => a.status !== AccountStatus.DISABLED);
   const size = rangeSize(range);
   const tag = `${range.from}-${range.to}`;
-  
-  const shouldQueue = isAnyWorkerBusy() || pendingQueuePrompt;
+
+  const shouldQueue = queueMode || isAnyWorkerBusy() || pendingQueuePrompt;
   const actionPrefix = shouldQueue ? 'qr:q:' : 'qr:';
-  
-  const allSelected = accounts.length > 0 && accounts.every((a) => selected.has(a.id));
+
+  const allSelected = activeAccounts.length > 0 && activeAccounts.every((a) => selected.has(a.id));
   const selCount = selected.size;
 
-  const buttons: InlineButton[][] = accounts.map((a) => [
+  const buttons: InlineButton[][] = activeAccounts.map((a) => [
     {
       text: `${selected.has(a.id) ? '✅' : '▫️'} ${accountName(a)}`.slice(0, 60),
       callback_data: `${actionPrefix}${tag}:a:${a.id}`,
     },
   ]);
 
-  if (accounts.length > 1) {
+  if (activeAccounts.length > 1) {
     buttons.push([
       {
-        text: `${allSelected ? '✅' : '👥'} Select All (${accounts.length})`,
+        text: `${allSelected ? '✅' : '👥'} Select All (${activeAccounts.length})`,
         callback_data: `${actionPrefix}${tag}:toggle:all`,
       },
     ]);
@@ -6382,17 +6652,17 @@ export function buildRangePicker(
       },
     ]);
   } else {
-    if (accounts.length > 1) {
+    if (activeAccounts.length > 1) {
       buttons.push([
         {
-          text: shouldQueue ? `📥 Enqueue All (${accounts.length}, Parallel)` : `⚡ All accounts (${accounts.length}, Parallel - Fast)`,
+          text: shouldQueue ? `📥 Enqueue All (${activeAccounts.length}, Parallel)` : `⚡ All accounts (${activeAccounts.length}, Parallel - Fast)`,
           callback_data: `${actionPrefix}${tag}:all:parallel`,
         },
       ]);
     }
     buttons.push([
       {
-        text: shouldQueue ? `📥 Enqueue All (${accounts.length}, Sequential)` : `👥 All accounts (${accounts.length}, one by one)`,
+        text: shouldQueue ? `📥 Enqueue All (${activeAccounts.length}, Sequential)` : `👥 All accounts (${activeAccounts.length}, one by one)`,
         callback_data: `${actionPrefix}${tag}:all`,
       },
     ]);
@@ -6401,7 +6671,7 @@ export function buildRangePicker(
   buttons.push([{ text: '✖️ Cancel', callback_data: 'qr:x' }]);
 
   const selectionHint = selCount > 0
-    ? `<i>Selected: ${selCount} of ${accounts.length} account${accounts.length === 1 ? '' : 's'}</i>`
+    ? `<i>Selected: ${selCount} of ${activeAccounts.length} account${activeAccounts.length === 1 ? '' : 's'}</i>`
     : '<i>Tap account(s) to select, or tap All accounts below:</i>';
 
   const text = [
@@ -6417,17 +6687,18 @@ export function buildRangePicker(
   return { text, buttons };
 }
 
-export function buildQuickRangeButtons(): InlineButton[][] {
+export function buildQuickRangeButtons(forceQueue = false): InlineButton[][] {
+  const prefix = forceQueue ? 'qr:qr:' : 'qr:r:';
   return [
     [
-      { text: '1–25', callback_data: 'qr:r:1-25' },
-      { text: '26–50', callback_data: 'qr:r:26-50' },
-      { text: '51–100', callback_data: 'qr:r:51-100' },
+      { text: '1–25', callback_data: `${prefix}1-25` },
+      { text: '26–50', callback_data: `${prefix}26-50` },
+      { text: '51–100', callback_data: `${prefix}51-100` },
     ],
     [
-      { text: '101–200', callback_data: 'qr:r:101-200' },
-      { text: '201–300', callback_data: 'qr:r:201-300' },
-      { text: '301–400', callback_data: 'qr:r:301-400' },
+      { text: '101–200', callback_data: `${prefix}101-200` },
+      { text: '201–300', callback_data: `${prefix}201-300` },
+      { text: '301–400', callback_data: `${prefix}301-400` },
     ],
     [
       { text: '✖️ Cancel', callback_data: 'qr:x' },
@@ -6465,10 +6736,11 @@ export function buildIncompletePicker(
   accounts: AccountRecord[],
   selected: ReadonlySet<string> = new Set(),
 ): { text: string; buttons: InlineButton[][] } {
-  const allSelected = accounts.length > 0 && accounts.every((a) => selected.has(a.id));
+  const activeAccounts = accounts.filter((a) => a.status !== AccountStatus.DISABLED);
+  const allSelected = activeAccounts.length > 0 && activeAccounts.every((a) => selected.has(a.id));
   const selCount = selected.size;
 
-  const buttons: InlineButton[][] = accounts.map((a) => [
+  const buttons: InlineButton[][] = activeAccounts.map((a) => [
     {
       text: `${selected.has(a.id) ? '✅' : '▫️'} ${accountName(a)}`.slice(0, 60),
       callback_data: `lcincomp:a:${a.id}`,
@@ -6477,7 +6749,7 @@ export function buildIncompletePicker(
 
   buttons.push([
     {
-      text: allSelected ? '✖️ Deselect All' : `👥 All accounts (${accounts.length})`,
+      text: allSelected ? '✖️ Deselect All' : `👥 All accounts (${activeAccounts.length})`,
       callback_data: 'lcincomp:all',
     },
   ]);
@@ -6501,16 +6773,16 @@ export function buildIncompletePicker(
       },
     ]);
   } else {
-    if (accounts.length > 1) {
+    if (activeAccounts.length > 1) {
       buttons.push([
         {
-          text: `⚡ All accounts (${accounts.length}, Parallel - Fast)`,
+          text: `⚡ All accounts (${activeAccounts.length}, Parallel - Fast)`,
           callback_data: 'lcincomp:all:parallel',
         },
       ]);
       buttons.push([
         {
-          text: `👥 All accounts (${accounts.length}, Sequential)`,
+          text: `👥 All accounts (${activeAccounts.length}, Sequential)`,
           callback_data: 'lcincomp:all:seq',
         },
       ]);
@@ -6520,7 +6792,7 @@ export function buildIncompletePicker(
   buttons.push([{ text: '✖️ Cancel', callback_data: 'lcincomp:x' }]);
 
   const selectionHint = selCount > 0
-    ? `<i>Selected: ${selCount} of ${accounts.length} account${accounts.length === 1 ? '' : 's'}</i>`
+    ? `<i>Selected: ${selCount} of ${activeAccounts.length} account${activeAccounts.length === 1 ? '' : 's'}</i>`
     : '<i>Tap account(s) to select, or tap All accounts below:</i>';
 
   const text = [
@@ -6542,12 +6814,14 @@ export async function handleIncompleteQuestionsCommand(
   deps: RemovalDeps = defaultRemovalDeps,
   ui: RangeUiDeps = defaultRangeUiDeps,
   chatId: number | string = config.telegram.chatId,
-): Promise<void> {
-  const accounts = await deps.listAccounts();
+): Promise<StartRangeResult | undefined> {
+  pendingQueuePrompt = false;
+  pendingPickerQueueMode = false;
+  const accounts = (await deps.listAccounts()).filter((a) => a.status !== AccountStatus.DISABLED);
   if (accounts.length === 0) {
     pendingPromptType = null;
     await deps.send('📭 No accounts configured — send cookie .json files first (/renew).');
-    return;
+    return undefined;
   }
 
   if (!arg.trim()) {
@@ -6561,7 +6835,7 @@ export async function handleIncompleteQuestionsCommand(
       '<i>The solver finds questions left unsolved or attempted without acceptance starting from #1, and solves them one by one.</i>',
     ].join('\n');
     await deps.send(promptText, buttons);
-    return;
+    return undefined;
   }
 
   pendingPromptType = null;
@@ -6569,7 +6843,7 @@ export async function handleIncompleteQuestionsCommand(
   const rawCount = parseInt(tokens[0] || '', 10);
   if (isNaN(rawCount) || rawCount < 1) {
     await deps.send('⚠️ Send how many questions to solve, e.g. /solveincomplete 10');
-    return;
+    return undefined;
   }
   const count = rawCount;
 
@@ -6606,6 +6880,10 @@ export async function handleIncompleteQuestionsCommand(
       },
     );
 
+    if (result.started || 'queued' in result) {
+      void result.done.catch(() => undefined);
+    }
+
     if (!result.started) {
       if ('queued' in result) {
         await deps.send(`🗂️ Queued: solving ${count} incomplete questions (Queue position: ${result.position})`);
@@ -6617,7 +6895,7 @@ export async function handleIncompleteQuestionsCommand(
         );
       }
     }
-    return;
+    return result;
   }
 
   const sel = new Set<string>();
@@ -6629,6 +6907,7 @@ export async function handleIncompleteQuestionsCommand(
     picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
   }
   await deps.send(picker.text, picker.buttons);
+  return undefined;
 }
 
 export async function handleIncompleteButton(
@@ -6644,12 +6923,14 @@ export async function handleIncompleteButton(
   if (data === 'lcincomp:x') {
     lcIncompleteSelections.delete(key);
     pendingPromptType = null;
+    pendingQueuePrompt = false;
+    pendingPickerQueueMode = false;
     await deps.answer(callbackId, 'Cancelled');
     await deps.edit(chatId, messageId, '✖️ Incomplete question solver cancelled.');
     return;
   }
 
-  const accounts = await deps.listAccounts();
+  const accounts = (await deps.listAccounts()).filter((a) => a.status !== AccountStatus.DISABLED);
   if (accounts.length === 0) {
     await deps.answer(callbackId, 'No accounts');
     await deps.edit(chatId, messageId, '📭 No active accounts configured. Add one with /renew first.');
@@ -6761,6 +7042,10 @@ export async function handleIncompleteButton(
       },
     );
 
+    if (result.started || 'queued' in result) {
+      void result.done.catch(() => undefined);
+    }
+
     if (!result.started && 'queued' in result) {
       await deps.send(`🗂️ Queued: solving ${count} incomplete questions on ${selected.length} account(s)${modeStr} (Queue position: ${result.position})`);
     }
@@ -6770,14 +7055,26 @@ export async function handleIncompleteButton(
   await deps.answer(callbackId);
 }
 
+function clearChatRangeSelections(chatKey: string): void {
+  for (const key of lcRangeSelections.keys()) {
+    if (key === chatKey || key.startsWith(`${chatKey}:`)) {
+      lcRangeSelections.delete(key);
+    }
+  }
+}
+
 export async function handleQuestionRangeCommand(
   arg: string,
   deps: RemovalDeps = defaultRemovalDeps,
   ui: RangeUiDeps = defaultRangeUiDeps,
   chatId: number | string = config.telegram.chatId,
+  forceQueue = false,
 ): Promise<void> {
+  const queueMode = forceQueue || pendingPickerQueueMode;
+  pendingQueuePrompt = false;
+  pendingPickerQueueMode = false;
   if (!arg.trim()) {
-    const accounts = await deps.listAccounts();
+    const accounts = (await deps.listAccounts()).filter((a) => a.status !== AccountStatus.DISABLED);
     if (accounts.length === 0) {
       pendingRangePrompt = false;
       pendingPromptType = null;
@@ -6786,7 +7083,8 @@ export async function handleQuestionRangeCommand(
     }
     pendingRangePrompt = true;
     pendingPromptType = 'leetcode';
-    const buttons = buildQuickRangeButtons();
+    pendingPickerQueueMode = queueMode;
+    const buttons = buildQuickRangeButtons(queueMode);
     const promptText = [
       '🎯 Which questions? Send the range, e.g. 200-400',
       'How many questions do you want to submit? Which range do you want to solve?',
@@ -6804,7 +7102,7 @@ export async function handleQuestionRangeCommand(
     await deps.send(`⚠️ ${parsed.error}\nExample: /questionrangesubmission 200-400`);
     return;
   }
-  const accounts = await deps.listAccounts();
+  const accounts = (await deps.listAccounts()).filter((a) => a.status !== AccountStatus.DISABLED);
   if (accounts.length === 0) {
     await deps.send('📭 No accounts configured — send cookie .json files first (/renew).');
     return;
@@ -6837,6 +7135,9 @@ export async function handleQuestionRangeCommand(
     }
 
     const result = await ui.start(parsed.range, target, { mode });
+    if (result.started || 'queued' in result) {
+      void result.done.catch(() => undefined);
+    }
     if (!result.started) {
       if ('queued' in result) {
         await deps.send(`🗂️ Queued: questions #${parsed.range.from}–#${parsed.range.to} (Queue position: ${result.position})`);
@@ -6853,10 +7154,10 @@ export async function handleQuestionRangeCommand(
 
   const sel = new Set<string>();
   const key = `${chatId}:${parsed.range.from}-${parsed.range.to}`;
-  lcRangeSelections.set(key, { range: parsed.range, selectedAccountIds: sel });
-  lcRangeSelections.set(String(chatId), { range: parsed.range, selectedAccountIds: sel });
+  lcRangeSelections.set(key, { range: parsed.range, selectedAccountIds: sel, queueMode });
+  lcRangeSelections.set(String(chatId), { range: parsed.range, selectedAccountIds: sel, queueMode });
 
-  const picker = buildRangePicker(parsed.range, accounts, sel);
+  const picker = buildRangePicker(parsed.range, accounts, sel, queueMode);
   if (ui.current()) {
     picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
   }
@@ -6873,36 +7174,44 @@ export async function handleRangeButton(
 ): Promise<void> {
   const chatKey = String(chatId);
   if (data === 'qr:x') {
-    lcRangeSelections.delete(chatKey);
+    clearChatRangeSelections(chatKey);
     pendingRangePrompt = false;
+    pendingQueuePrompt = false;
+    pendingPickerQueueMode = false;
     pendingPromptType = null;
     await deps.answer(callbackId, 'Cancelled');
     await deps.edit(chatId, messageId, '✖️ Question-range submission cancelled — nothing was started.');
     return;
   }
-  if (data.startsWith('qr:r:')) {
-    const rangeStr = data.slice('qr:r:'.length);
+  if (data.startsWith('qr:r:') || data.startsWith('qr:qr:')) {
+    const isQrQueued = data.startsWith('qr:qr:');
+    const queueMode = isQrQueued || pendingPickerQueueMode;
+    const rangeStr = data.slice(isQrQueued ? 'qr:qr:'.length : 'qr:r:'.length);
     const parsedRange = parseQuestionRange(rangeStr);
     if (!parsedRange.ok) {
       await deps.answer(callbackId, 'Invalid range');
       return;
     }
-    const accounts = await deps.listAccounts();
+    const accounts = (await deps.listAccounts()).filter((a) => a.status !== AccountStatus.DISABLED);
     if (accounts.length === 0) {
       pendingRangePrompt = false;
+      pendingQueuePrompt = false;
+      pendingPickerQueueMode = false;
       pendingPromptType = null;
       await deps.answer(callbackId, 'No accounts configured');
       await deps.edit(chatId, messageId, '📭 No accounts configured — send cookie .json files first (/renew).');
       return;
     }
     pendingRangePrompt = false;
+    pendingQueuePrompt = false;
+    pendingPickerQueueMode = false;
     pendingPromptType = null;
     const sel = new Set<string>();
     const key = `${chatId}:${parsedRange.range.from}-${parsedRange.range.to}`;
-    lcRangeSelections.set(key, { range: parsedRange.range, selectedAccountIds: sel });
-    lcRangeSelections.set(chatKey, { range: parsedRange.range, selectedAccountIds: sel });
+    lcRangeSelections.set(key, { range: parsedRange.range, selectedAccountIds: sel, queueMode });
+    lcRangeSelections.set(chatKey, { range: parsedRange.range, selectedAccountIds: sel, queueMode });
 
-    const picker = buildRangePicker(parsedRange.range, accounts, sel);
+    const picker = buildRangePicker(parsedRange.range, accounts, sel, queueMode);
     if (ui.current()) {
       picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
     }
@@ -6911,7 +7220,6 @@ export async function handleRangeButton(
     return;
   }
 
-  const isQueuedAction = data.startsWith('qr:q:') || isAnyWorkerBusy() || pendingQueuePrompt;
   const rawData = data.startsWith('qr:q:') ? data.slice('qr:q:'.length) : (data.startsWith('qr:') ? data.slice('qr:'.length) : data);
   const m = /^(\d+)-(\d+):(.+)$/.exec(rawData);
   const parsed = m ? parseQuestionRange(`${m[1]}-${m[2]}`) : null;
@@ -6924,14 +7232,17 @@ export async function handleRangeButton(
   const toNum = parsed.range.to;
   const tagKey = `${chatId}:${fromNum}-${toNum}`;
   const action = m[3]!;
+  const existingState = lcRangeSelections.get(tagKey) ?? lcRangeSelections.get(chatKey);
+  const stateQueueMode = Boolean(existingState?.queueMode);
+  const isQueuedAction = data.startsWith('qr:q:') || stateQueueMode || isAnyWorkerBusy() || pendingQueuePrompt;
 
   // 1. Checkbox toggle for an account: qr:[q:]from-to:a:<accountId>
   if (action.startsWith('a:')) {
     const targetAccountId = action.slice(2);
-    const accounts = await deps.listAccounts();
-    let state = lcRangeSelections.get(tagKey) ?? lcRangeSelections.get(chatKey);
+    const accounts = (await deps.listAccounts()).filter((a) => a.status !== AccountStatus.DISABLED);
+    let state = existingState;
     if (!state || state.range.from !== fromNum || state.range.to !== toNum) {
-      state = { range: parsed.range, selectedAccountIds: new Set<string>() };
+      state = { range: parsed.range, selectedAccountIds: new Set<string>(), queueMode: isQueuedAction };
       lcRangeSelections.set(tagKey, state);
       lcRangeSelections.set(chatKey, state);
     }
@@ -6941,7 +7252,7 @@ export async function handleRangeButton(
       state.selectedAccountIds.add(targetAccountId);
     }
     await deps.answer(callbackId, state.selectedAccountIds.has(targetAccountId) ? 'Selected ✅' : 'Unselected ▫️');
-    const picker = buildRangePicker(parsed.range, accounts, state.selectedAccountIds);
+    const picker = buildRangePicker(parsed.range, accounts, state.selectedAccountIds, isQueuedAction);
     if (ui.current()) {
       picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
     }
@@ -6951,10 +7262,10 @@ export async function handleRangeButton(
 
   // 2. Select All toggle: qr:[q:]from-to:toggle:all
   if (action === 'toggle:all') {
-    const accounts = await deps.listAccounts();
-    let state = lcRangeSelections.get(tagKey) ?? lcRangeSelections.get(chatKey);
+    const accounts = (await deps.listAccounts()).filter((a) => a.status !== AccountStatus.DISABLED);
+    let state = existingState;
     if (!state || state.range.from !== fromNum || state.range.to !== toNum) {
-      state = { range: parsed.range, selectedAccountIds: new Set<string>() };
+      state = { range: parsed.range, selectedAccountIds: new Set<string>(), queueMode: isQueuedAction };
       lcRangeSelections.set(tagKey, state);
       lcRangeSelections.set(chatKey, state);
     }
@@ -6964,7 +7275,7 @@ export async function handleRangeButton(
       accounts.forEach((a) => state!.selectedAccountIds.add(a.id));
     }
     await deps.answer(callbackId, allSelected ? 'Cleared all' : 'All accounts selected');
-    const picker = buildRangePicker(parsed.range, accounts, state.selectedAccountIds);
+    const picker = buildRangePicker(parsed.range, accounts, state.selectedAccountIds, isQueuedAction);
     if (ui.current()) {
       picker.text += '\n\n🗂️ A range process is already running. This request will be queued and started automatically after the current job completes or is cancelled.';
     }
@@ -6977,7 +7288,7 @@ export async function handleRangeButton(
   let mode: 'parallel' | 'sequential' = 'parallel';
 
   if (action === 'run:parallel' || action === 'run:seq') {
-    const state = lcRangeSelections.get(tagKey) ?? lcRangeSelections.get(chatKey);
+    const state = existingState;
     if (!state || state.selectedAccountIds.size === 0) {
       await deps.answer(callbackId, 'Select at least one account');
       return;
@@ -6997,8 +7308,9 @@ export async function handleRangeButton(
   }
 
   // Clean up selection state
-  lcRangeSelections.delete(tagKey);
-  lcRangeSelections.delete(chatKey);
+  clearChatRangeSelections(chatKey);
+  pendingQueuePrompt = false;
+  pendingPickerQueueMode = false;
 
   if (isQueuedAction) {
     await deps.answer(callbackId, `Queuing range #${parsed.range.from}-${parsed.range.to} 📥`);
@@ -7010,6 +7322,9 @@ export async function handleRangeButton(
   }
 
   const result = await ui.start(parsed.range, target, { mode });
+  if (result.started || 'queued' in result) {
+    void result.done.catch(() => undefined);
+  }
   if (!result.started) {
     if ('queued' in result) {
       await deps.answer(callbackId, `Queued #${result.position} 🗂️`);
@@ -7121,6 +7436,8 @@ export const VALID_QUEUE_COMMANDS = new Set([
   '/ccaccounts', '/cc_accounts',
   // LeetCode
   '/questionrangesubmission', '/question_range_submission', '/rangesubmission',
+  '/completeincomplete', '/complete_incomplete', '/solveincomplete', '/solve_incomplete',
+  '/incomplete', '/unsolved', '/solveunsolved', '/solve_unsolved',
   '/triggersubmission', '/trigger_submission',
   '/claimcoins', '/claim_coins', '/claimoffer', '/claimreward',
   '/rangestatus', '/range_status',
@@ -7439,7 +7756,11 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
       const tokens = commandArg.split(/\s+/).filter(Boolean);
       const parsedCount = parseInt(tokens[0] ?? '', 10);
       const count = !isNaN(parsedCount) && parsedCount > 0 ? Math.min(50, parsedCount) : 5;
-      const accountIds = tokens[1] ? tokens[1].split(',') : undefined;
+      const targetArg = tokens[1];
+      const accountIds =
+        targetArg && targetArg !== 'all' && targetArg !== '--all'
+          ? targetArg.split(',').map((s) => s.trim()).filter(Boolean)
+          : undefined;
       const res = await handleCodeforcesTrigger({ forceNext: true, count, accountIds });
       if (res?.done) await res.done;
       return;
@@ -7451,7 +7772,11 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
       const tokens = commandArg.split(/\s+/).filter(Boolean);
       const parsedCount = parseInt(tokens[0] ?? '', 10);
       const count = !isNaN(parsedCount) && parsedCount > 0 ? Math.min(50, parsedCount) : 5;
-      const accountIds = tokens[1] ? tokens[1].split(',') : undefined;
+      const targetArg = tokens[1];
+      const accountIds =
+        targetArg && targetArg !== 'all' && targetArg !== '--all'
+          ? targetArg.split(',').map((s) => s.trim()).filter(Boolean)
+          : undefined;
       const res = await handleCodeChefTrigger({ forceNext: true, count, accountIds });
       if (res?.done) await res.done;
       return;
@@ -7464,7 +7789,8 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
     case '/unsolved':
     case '/solveunsolved':
     case '/solve_unsolved': {
-      await handleIncompleteQuestionsCommand(commandArg, defaultRemovalDeps, defaultRangeUiDeps, config.telegram.chatId);
+      const res = await handleIncompleteQuestionsCommand(commandArg, defaultRemovalDeps, defaultRangeUiDeps, config.telegram.chatId);
+      if (res && (res.started || 'queued' in res)) await res.done;
       return;
     }
     case '/questionrangesubmission':
@@ -7473,7 +7799,7 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
       const parts = commandArg.trim().split(/\s+/);
       const parsed = parseQuestionRange(parts[0] || '');
       const rawTarget = parts[1] || 'all';
-      let accountId = rawTarget;
+      let accountId: string | 'all' | string[] = rawTarget;
       let mode: 'parallel' | 'sequential' = 'parallel';
       if (parts[2]) {
         const mStr = parts[2].toLowerCase();
@@ -7482,9 +7808,14 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
       } else if (rawTarget === 'all:seq') {
         accountId = 'all';
         mode = 'sequential';
-      } else if (rawTarget === 'all:parallel') {
+      } else if (rawTarget === 'all:parallel' || rawTarget === 'all') {
         accountId = 'all';
         mode = 'parallel';
+      } else if (!rawTarget.includes(',')) {
+        mode = 'sequential';
+      }
+      if (rawTarget.includes(',') && rawTarget !== 'all:seq' && rawTarget !== 'all:parallel') {
+        accountId = rawTarget.split(',').map((s) => s.trim()).filter(Boolean);
       }
       if (parsed.ok) {
         const res = await handleQuestionRangeTrigger(parsed.range, accountId, defaultRangeTriggerDeps, config.telegram.chatId, { mode });
@@ -7533,11 +7864,15 @@ export async function executeQueuedCommand(item: QueuedCommandItem): Promise<voi
       return;
     }
     default: {
-      await handleMessage({
-        message_id: 0,
-        chat: { id: config.telegram.chatId },
-        text: item.rawText,
-      });
+      await handleMessage(
+        {
+          message_id: 0,
+          chat: { id: config.telegram.chatId },
+          text: item.rawText,
+        },
+        defaultContestSolutionUiDeps,
+        { bypassInteractivePrompts: true },
+      );
       return;
     }
   }
@@ -7551,6 +7886,7 @@ export interface PendingLeetCodeVerificationHandoff {
   identifier: string;
   password: string;
   createdAt: number;
+  pairingToken?: string;
 }
 
 let pendingLeetCodeVerificationHandoff: PendingLeetCodeVerificationHandoff | null = null;
@@ -7581,7 +7917,31 @@ export function setPendingRenewalLabel(label: string | undefined): void {
   pendingRenewalLabel = label;
 }
 
+export function clearPendingLeetCodeVerificationHandoff(label?: string): void {
+  if (!pendingLeetCodeVerificationHandoff) return;
+  if (label && pendingLeetCodeVerificationHandoff.label.toLowerCase() !== label.toLowerCase()) {
+    return;
+  }
+  if (pendingRenewalLabel && pendingRenewalLabel.toLowerCase() === pendingLeetCodeVerificationHandoff.label.toLowerCase()) {
+    pendingRenewalLabel = undefined;
+  }
+  pendingLeetCodeVerificationHandoff = null;
+  clearLeetCodeLoginCooldownsForTests();
+}
+
 export function getPendingLeetCodeVerificationHandoff(): PendingLeetCodeVerificationHandoff | null {
+  if (!pendingLeetCodeVerificationHandoff) return null;
+  if (Date.now() - pendingLeetCodeVerificationHandoff.createdAt > DEFAULT_PAIRING_TTL_MS) {
+    clearPendingLeetCodeVerificationHandoff();
+    return null;
+  }
+  if (pendingLeetCodeVerificationHandoff.pairingToken) {
+    const session = getLeetCodePairingSession(pendingLeetCodeVerificationHandoff.pairingToken);
+    if (session && session.status !== 'pending') {
+      clearPendingLeetCodeVerificationHandoff();
+      return null;
+    }
+  }
   return pendingLeetCodeVerificationHandoff;
 }
 
@@ -7822,18 +8182,19 @@ export async function handleExecuteLogin(
 
       if (!res.ok || !res.storageState) {
         if (res.code === 'VERIFICATION_REQUIRED') {
+          const pairingSession = createLeetCodePairingSession({
+            label,
+            identifier,
+            password,
+          });
           pendingRenewalLabel = label;
           pendingLeetCodeVerificationHandoff = {
             label,
             identifier,
             password,
             createdAt: Date.now(),
+            pairingToken: pairingSession.token,
           };
-          const pairingSession = createLeetCodePairingSession({
-            label,
-            identifier,
-            password,
-          });
 
           const d = res.diagnostic;
           const challengeType = d?.challengeType ?? 'cloudflare_interstitial';
@@ -8291,25 +8652,55 @@ async function codeforcesUserProgressText(): Promise<string> {
   return lines.join('\n');
 }
 
-async function handleCfSetProgress(arg?: string): Promise<void> {
+export async function handleCfSetProgress(arg?: string): Promise<void> {
   const parts = (arg ?? '').trim().split(/\s+/);
-  if (parts.length < 2 || !parts[0] || !parts[1]) {
+  const username = parts[0];
+  const problemKey = parts.slice(1).join(' ').trim();
+  if (!username || !problemKey) {
     await replyHtml('<b>Usage:</b> <code>/cfsetprogress &lt;username&gt; &lt;nextProblemKey&gt;</code>\n<i>Example: <code>/cfsetprogress pts003 628B</code></i>');
     return;
   }
-  const [username, problemKey] = parts;
-  await saveUsernameProgress(username!, { nextKey: problemKey! });
-  const accounts = await listCodeforcesAccounts(true);
-  const matched = accounts.find((a) => (a.username ?? '').toLowerCase() === username!.toLowerCase());
-  if (matched) {
-    const { prisma } = await import('../database/prisma');
-    await prisma.codeforcesProgress.upsert({
-      where: { accountId: matched.id },
-      create: { accountId: matched.id, nextKey: problemKey! },
-      update: { nextKey: problemKey! },
-    });
+
+  let matchedEntry: SourceIndexEntry | undefined;
+  try {
+    const source = await loadRuntimeSourceIndex();
+    matchedEntry = source.queue.find((entry) => matchQueueEntry(entry, problemKey));
+  } catch (err) {
+    await replyHtml(`⚠️ Could not load Codeforces source queue to validate <code>${escapeHtml(problemKey)}</code>: ${escapeHtml(errText(err))}`);
+    return;
   }
-  await replyHtml(`✅ Set next problem for <b><code>${escapeHtml(username!)}</code></b> to <code>${escapeHtml(problemKey!)}</code>.\n<i>Permanent progress saved in DB${matched ? ` and synced to active account <code>${escapeHtml(matched.label)}</code>` : ''}.</i>`);
+
+  if (!matchedEntry) {
+    await replyHtml(
+      `⚠️ Problem <code>${escapeHtml(problemKey)}</code> was not found in the Codeforces source queue.\n` +
+      `<i>Use a valid contest key like <code>628B</code> from the repository queue.</i>`,
+    );
+    return;
+  }
+
+  const canonicalKey = matchedEntry.key;
+  await saveUsernameProgress(username, { nextKey: canonicalKey });
+  const accounts = await listCodeforcesAccounts(true);
+  const needle = username.toLowerCase();
+  const matchedAccounts = accounts.filter(
+    (a) => (a.username ?? '').toLowerCase() === needle || a.label.toLowerCase() === needle,
+  );
+  if (matchedAccounts.length > 0) {
+    const { prisma } = await import('../database/prisma');
+    await Promise.all(
+      matchedAccounts.map((matched) =>
+        prisma.codeforcesProgress.upsert({
+          where: { accountId: matched.id },
+          create: { accountId: matched.id, nextKey: canonicalKey },
+          update: { nextKey: canonicalKey },
+        }),
+      ),
+    );
+  }
+  const syncedNote = matchedAccounts.length > 0
+    ? ` and synced to ${matchedAccounts.map((m) => `<code>${escapeHtml(m.label)}</code>`).join(', ')}`
+    : '';
+  await replyHtml(`✅ Set next problem for <b><code>${escapeHtml(username)}</code></b> to <code>${escapeHtml(canonicalKey)}</code>.\n<i>Permanent progress saved in DB${syncedNote}.</i>`);
 }
 
 async function statusText(): Promise<string> {
@@ -8371,8 +8762,8 @@ function escapeHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function accountStatusIcon(status: string): string {
-  switch (status.toUpperCase()) {
+function accountStatusIcon(status?: string | null): string {
+  switch ((status ?? '').toUpperCase()) {
     case 'ACTIVE': return '🟢';
     case 'EXPIRED': return '🟠';
     case 'REJECTED': return '🔴';
@@ -8386,8 +8777,13 @@ function looksLikeCookiePayload(text: string): boolean {
   return (
     t.includes('LEETCODE_SESSION') ||
     t.includes('csrftoken') ||
+    t.includes('cf_clearance') ||
+    t.includes('JSESSIONID') ||
+    t.includes('39ce7') ||
     t.startsWith('{') ||
-    t.startsWith('[')
+    t.startsWith('[') ||
+    /"domain"\s*:\s*"[^"]*(?:leetcode|codeforces)\.com/i.test(t) ||
+    /"httpOnly"\s*:\s*(?:true|false)/i.test(t)
   );
 }
 
@@ -8436,9 +8832,9 @@ async function tgApi<T = unknown>(
     body: JSON.stringify(body),
     signal: cancel ? AbortSignal.any([timeout, cancel]) : timeout,
   });
-  const json = (await res.json()) as { ok: boolean; result?: T; description?: string };
-  if (!res.ok || !json.ok) {
-    throw new Error(`telegram ${method} failed: HTTP ${res.status} ${json.description ?? ''}`.trim());
+  const json = (await res.json().catch(() => null)) as { ok?: boolean; result?: T; description?: string } | null;
+  if (!res.ok || !json?.ok) {
+    throw new Error(`telegram ${method} failed: HTTP ${res.status} ${json?.description ?? ''}`.trim());
   }
   return json.result as T;
 }

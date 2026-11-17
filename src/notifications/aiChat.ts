@@ -6,7 +6,7 @@ export { askSage, probeSageApi } from '../ai/sageProbe';
 
 /** Do not forward recognizable credentials or session data to an AI provider. */
 export function isSensitiveChatText(text: string): boolean {
-  return /(?:\b(?:fc-|sk-|cc_|xpl_|gsk_|coa_)[A-Za-z0-9_-]{12,}|\b(?:LEETCODE_SESSION|csrftoken|password|authorization|api[_ -]?key)\s*[:=]\s*\S+)/i.test(text);
+  return /(?:\b(?:fc-|sk-|cc_|xpl_|gsk_|coa_|capzy_|CAP-)[A-Za-z0-9_-]{12,}|\b(?:LEETCODE_SESSION|csrftoken|cf_clearance|JSESSIONID|39ce7|password|authorization|api[_ -]?key)\s*[:=]\s*\S+|"(?:LEETCODE_SESSION|csrftoken|cf_clearance|JSESSIONID|39ce7)"|"httpOnly"\s*:)/i.test(text);
 }
 
 export async function answerChat(text: string): Promise<string> {
@@ -31,6 +31,9 @@ export async function answerChat(text: string): Promise<string> {
 }
 
 export async function answerSageChat(text: string, options?: { model?: string; apiKey?: string }): Promise<string> {
+  if (!text.trim()) return 'Send /asksage followed by your question.';
+  if (text.length > 4000) return 'Please keep your question under 4,000 characters.';
+  if (isSensitiveChatText(text)) return 'Please remove credentials or session data before asking the AI.';
   const res = await askSage(text, options);
   if (!res.ok) {
     return `Sage AI query failed: ${res.error || 'Unknown error'}. Check /testsage and try again.`;
