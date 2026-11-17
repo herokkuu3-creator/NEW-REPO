@@ -23,7 +23,7 @@ import { logger } from '../logger';
  */
 
 export interface RemoteInput {
-  type: 'move' | 'down' | 'up' | 'wheel';
+  type: 'move' | 'down' | 'up' | 'tap' | 'wheel';
   x: number;
   y: number;
   deltaY?: number;
@@ -87,7 +87,7 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
     const context = await browser.newContext({
       viewport,
       locale: 'en-US',
-      serviceWorkers: 'block',
+      serviceWorkers: 'allow',
       acceptDownloads: false,
       permissions: [],
     });
@@ -129,6 +129,7 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
     }
 
     let closed = false;
+    let inputQueue = Promise.resolve();
     const owned = browser;
     return {
       page,
@@ -152,16 +153,29 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
         const x = Math.min(Math.max(0, ev.x), viewport.width - 1);
         const y = Math.min(Math.max(0, ev.y), viewport.height - 1);
         if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-        if (ev.type === 'move') await page.mouse.move(x, y);
-        else if (ev.type === 'down') {
-          await page.mouse.move(x, y);
-          await page.mouse.down({ button: 'left' });
-        } else if (ev.type === 'up') {
-          await page.mouse.move(x, y);
-          await page.mouse.up({ button: 'left' });
-        } else if (ev.type === 'wheel') {
-          await page.mouse.wheel(0, Math.min(Math.max(-1200, ev.deltaY ?? 0), 1200));
-        }
+        const run = async () => {
+          if (closed) return;
+          if (ev.type === 'move') await page.mouse.move(x, y);
+          else if (ev.type === 'down') {
+            await page.mouse.move(x, y);
+            await page.mouse.down({ button: 'left' });
+          } else if (ev.type === 'up') {
+            await page.mouse.move(x, y);
+            await page.mouse.up({ button: 'left' });
+          } else if (ev.type === 'tap') {
+            await page.mouse.move(x, y);
+            await page.mouse.down({ button: 'left' });
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            if (!closed) {
+              await page.mouse.move(x, y);
+              await page.mouse.up({ button: 'left' });
+            }
+          } else if (ev.type === 'wheel') {
+            await page.mouse.wheel(0, Math.min(Math.max(-1200, ev.deltaY ?? 0), 1200));
+          }
+        };
+        inputQueue = inputQueue.then(run, run);
+        await inputQueue;
       },
       async captureStorageState() {
         const state = await context.storageState();

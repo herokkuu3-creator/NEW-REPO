@@ -101,6 +101,7 @@ export const SystemKeys = {
   capzyApiKeys: 'capzyApiKeys', // JSON string[] of Capzy / CapSolver API keys
   capzyActiveKeyIndex: 'capzyActiveKeyIndex', // string of active key index ('0', '1', ...)
   questionSolutionFailures: 'questionSolutionFailures:v1', // JSON map of per-question solution-section failure counts & failed UUIDs
+  recoveryTunnelToken: 'recoveryTunnelToken', // secret bearer token for Mobile/Home IP reverse tunnel WebSocket
 } as const;
 
 /**

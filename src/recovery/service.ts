@@ -81,6 +81,11 @@ export interface TelegramMarkup {
   inline_keyboard: { text: string; url: string }[][];
 }
 
+export interface EgressStatus {
+  mode: 'mobile_tunnel' | 'residential_proxy' | 'datacenter';
+  label: string;
+}
+
 export interface RecoveryDeps {
   store: RecoveryStore;
   now(): Date;
@@ -97,7 +102,8 @@ export interface RecoveryDeps {
     state: StorageStateShape,
   ): Promise<{ authenticated: boolean; username?: string | null; cause?: 'signed-out' | 'query-failed' }>;
   getCredentials(account: RecoveryAccount): Promise<RecoveryCredentials | null>;
-  openBrowser(): Promise<RemoteBrowser>;
+  openBrowser(opts?: { viewport?: { width: number; height: number } }): Promise<RemoteBrowser>;
+  getEgressStatus?(): Promise<EgressStatus>;
   sendTelegram(text: string, markup?: TelegramMarkup): Promise<boolean>;
   onRecovered?(account: RecoveryAccount): Promise<void> | void;
   limits: RecoveryLimits;
@@ -451,8 +457,7 @@ export class RecoveryService {
         lines.push(
           'Your account credentials are already securely saved.',
           '',
-          'Open the recovery link to verify from your <b>local IP</b> (bypasses datacenter Cloudflare blocks) and automatically sync your session back to the bot:',
-          `<code>npm.cmd run auth:login -- "${esc(link)}"</code>`,
+          'Tap <b>Reconnect Account</b> in Mobile Chrome to complete LeetCode Cloudflare verification and restore your session automatically.',
         );
         buttons.push([{ text: '🔗 Reconnect Account', url: link }]);
       } else {
@@ -503,6 +508,14 @@ export class RecoveryService {
     if (!row.tokenExpiresAt || row.tokenExpiresAt <= this.deps.now()) return { state: 'expired' };
     const account = await this.deps.getAccount(row.accountId);
     return { state: 'valid', label: account?.label };
+  }
+
+  /** Reports which outbound IP/proxy path the server recovery browser will use. */
+  async getEgressStatus(): Promise<EgressStatus> {
+    if (this.deps.getEgressStatus) {
+      return this.deps.getEgressStatus();
+    }
+    return { mode: 'datacenter', label: 'Server IP (standard)' };
   }
 
   /** Polls recovery progress for the open browser tab without consuming the token. */
@@ -789,7 +802,7 @@ export class RecoveryService {
   }
 
   /** Consumes the one-time token and starts the isolated recovery browser session. */
-  async openPortalSession(token: string): Promise<OpenResult> {
+  async openPortalSession(token: string, opts?: { mobile?: boolean }): Promise<OpenResult> {
     if (!isWellFormedToken(token)) return { ok: false, reason: 'invalid' };
     if (this.activeSessionCount >= this.deps.limits.maxConcurrency) return { ok: false, reason: 'busy' };
 
@@ -839,7 +852,7 @@ export class RecoveryService {
     this.lockedAccounts.add(account.id);
     this.sessions.set(session.secretHash, session);
     this.byRecovery.set(recovery.id, session);
-    session.done = this.runSession(session, recovery, account, creds).catch((err) => {
+    session.done = this.runSession(session, recovery, account, creds, opts).catch((err) => {
       logger.error({ label: account.label, err: err instanceof Error ? err.message : String(err) }, 'recovery session crashed');
     });
     return { ok: true, secret, label: account.label };
@@ -855,13 +868,14 @@ export class RecoveryService {
     recovery: RecoveryRecord,
     account: RecoveryAccount,
     creds: RecoveryCredentials,
+    opts?: { mobile?: boolean },
   ): Promise<void> {
     const limits = this.deps.limits;
     const deadline = this.deps.now().getTime() + limits.sessionTimeoutMs;
     const hardStop = setTimeout(() => s.abort.abort(), limits.sessionTimeoutMs + 5000);
     try {
       try {
-        s.browser = await this.deps.openBrowser();
+        s.browser = await this.deps.openBrowser(opts?.mobile ? { viewport: { width: 430, height: 760 } } : undefined);
       } catch {
         return void (await this.failRecovery(recovery, s, 'BROWSER_LAUNCH_FAILED', describeCategory('BROWSER_LAUNCH_FAILED'), { notify: true }));
       }

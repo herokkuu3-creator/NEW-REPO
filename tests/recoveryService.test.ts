@@ -73,6 +73,8 @@ describe('RecoveryService', () => {
   const createService = (opts?: {
     verifyStoredSession?: (acc: RecoveryAccount) => Promise<any>;
     verifyCapturedSession?: (state: StorageStateShape) => Promise<any>;
+    openBrowser?: (browserOpts?: { viewport?: { width: number; height: number } }) => Promise<RemoteBrowser>;
+    getEgressStatus?: () => Promise<{ mode: 'mobile_tunnel' | 'residential_proxy' | 'datacenter'; label: string }>;
   }) => {
     return new RecoveryService({
       store,
@@ -100,7 +102,8 @@ describe('RecoveryService', () => {
         opts?.verifyCapturedSession ??
         (async (state) => ({ authenticated: true, username: 'test_user_1' })),
       getCredentials: async (acc) => credentialsMap.get(acc.id) ?? null,
-      openBrowser: async () => fakeBrowser,
+      openBrowser: opts?.openBrowser ?? (async () => fakeBrowser),
+      getEgressStatus: opts?.getEgressStatus,
       sendTelegram: async (text, markup) => {
         telegramMessages.push({ text, markup });
         return true;
@@ -751,6 +754,28 @@ describe('RecoveryService', () => {
       }
       expect(accountsMap.get('acc-1')?.storageState).toContain('old-1');
       expect(accountsMap.get('acc-1')?.status).not.toBe(AccountStatus.ACTIVE);
+    });
+
+    it('passes mobile viewport 430x760 to openBrowser when openPortalSession is called with { mobile: true } and reports egress status', async () => {
+      accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
+      const openBrowserSpy = vi.fn(async () => fakeBrowser);
+      const svc = createService({
+        openBrowser: openBrowserSpy,
+        getEgressStatus: async () => ({ mode: 'mobile_tunnel', label: 'Phone IP tunnel active' }),
+      });
+
+      expect(await svc.getEgressStatus()).toEqual({ mode: 'mobile_tunnel', label: 'Phone IP tunnel active' });
+      expect(await createService().getEgressStatus()).toEqual({ mode: 'datacenter', label: 'Server IP (standard)' });
+
+      await svc.openRecovery(accountsMap.get('acc-1')!, 'EXPIRED');
+      await svc.tick();
+      const token = telegramMessages[0].markup.inline_keyboard[0][0].url.split('/auth/recover/')[1];
+
+      const opened = await svc.openPortalSession(token, { mobile: true });
+      expect(opened.ok).toBe(true);
+      await vi.waitFor(() => {
+        expect(openBrowserSpy).toHaveBeenCalledWith({ viewport: { width: 430, height: 760 } });
+      });
     });
   });
 });

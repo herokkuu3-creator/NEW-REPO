@@ -464,6 +464,73 @@ describe('Recovery Routes', () => {
       expect(userJsRes.headers['content-type']).toContain('text/javascript');
       expect(userJsRes.body).toContain('==UserScript==');
       expect(userJsRes.body).toContain('GM_cookie');
+
+      const setupRes = await app.inject({ method: 'GET', url: '/auth/recover/termux-setup.sh' });
+      expect(setupRes.statusCode).toBe(200);
+      expect(setupRes.headers['content-type']).toContain('text/x-shellscript');
+      expect(setupRes.body).toContain('tunnel-client.mjs');
+
+      const clientRes = await app.inject({ method: 'GET', url: '/auth/recover/tunnel-client.mjs' });
+      expect(clientRes.statusCode).toBe(200);
+      expect(clientRes.headers['content-type']).toContain('text/javascript');
+      expect(clientRes.body).toContain('TUNNEL_TOKEN');
+    });
+
+    it('prioritizes Mobile Chrome verification, handles tap input, surfaces egress status, and passes mobile viewport on /start', async () => {
+      mockService.getEgressStatus = vi.fn(async () => ({
+        mode: 'mobile_tunnel' as const,
+        label: 'Phone IP tunnel active',
+      }));
+
+      const portalRes = await app.inject({
+        method: 'GET',
+        url: `/auth/recover/${validToken}`,
+      });
+      expect(portalRes.statusCode).toBe(200);
+      expect(portalRes.body).toContain('Phone-IP Tunnel ACTIVE');
+      const startIdx = portalRes.body.indexOf('<button type="submit">Start recovery</button>');
+      const detailsIdx = portalRes.body.indexOf('<details class="card">');
+      expect(startIdx).toBeGreaterThan(-1);
+      expect(detailsIdx).toBeGreaterThan(startIdx);
+
+      const pollRes = await app.inject({
+        method: 'GET',
+        url: `/auth/recover/${validToken}/poll`,
+      });
+      expect(pollRes.statusCode).toBe(200);
+      expect(JSON.parse(pollRes.body)).toEqual({
+        state: 'valid',
+        label: 'black_sheep_7',
+        username: 'black_sheep_7',
+        egress: { mode: 'mobile_tunnel', label: 'Phone IP tunnel active' },
+      });
+
+      const mobileStart = await app.inject({
+        method: 'POST',
+        url: `/auth/recover/${validToken}/start?mobile=1`,
+      });
+      expect(mobileStart.statusCode).toBe(303);
+      expect(mockService.openPortalSession).toHaveBeenCalledWith(validToken, { mobile: true });
+
+      const uaMobileStart = await app.inject({
+        method: 'POST',
+        url: `/auth/recover/${validToken}/start`,
+        headers: { 'user-agent': 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36' },
+      });
+      expect(uaMobileStart.statusCode).toBe(303);
+      expect(mockService.openPortalSession).toHaveBeenCalledWith(validToken, { mobile: true });
+
+      const tapRes = await app.inject({
+        method: 'POST',
+        url: '/auth/recover/session/input',
+        headers: { cookie: `${RECOVERY_COOKIE}=secret-session-key-12345678901234567890` },
+        payload: { type: 'tap', x: 145, y: 310 },
+      });
+      expect(tapRes.statusCode).toBe(200);
+      expect(mockService.portalInput).toHaveBeenCalledWith(
+        'secret-session-key-12345678901234567890',
+        { type: 'tap', x: 145, y: 310 },
+      );
     });
   });
 });

@@ -2,7 +2,8 @@ import { randomBytes } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { resolvePublicBaseUrl } from '../leetcode/loginHandoff';
-import type { RecoveryService } from './service';
+import { buildMobileTunnelClientJs, buildTermuxSetupSh } from './mobileTunnel';
+import type { EgressStatus, RecoveryService } from './service';
 
 /**
  * Recovery portal HTTP surface.
@@ -55,11 +56,20 @@ export class WindowLimiter {
 }
 
 const inputSchema = z.object({
-  type: z.enum(['move', 'down', 'up', 'wheel']),
+  type: z.enum(['move', 'down', 'up', 'tap', 'wheel']),
   x: z.number().finite().min(-5).max(5000),
   y: z.number().finite().min(-5).max(5000),
   deltaY: z.number().finite().optional(),
 });
+
+function isMobileRequest(req: FastifyRequest): boolean {
+  const q = req.query as { mobile?: string } | undefined;
+  if (q?.mobile === '1') return true;
+  const b = req.body as { mobile?: unknown } | undefined;
+  if (b && typeof b === 'object' && b.mobile === '1') return true;
+  const ua = String(req.headers['user-agent'] ?? '');
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+}
 
 function cookieOf(req: FastifyRequest, name: string): string | undefined {
   const raw = req.headers.cookie;
@@ -108,9 +118,13 @@ pre{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:10px 1
 textarea{width:100%;min-height:110px;background:#0f172a;border:1px solid #475569;border-radius:8px;color:#f8fafc;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem;margin:8px 0 10px}
 input[type=file]{color:#cbd5e1;font-size:.86rem;margin-bottom:6px;display:block}
 summary{cursor:pointer;font-weight:600;color:#94a3b8}
-#screen{width:100%;max-width:1024px;border-radius:8px;background:#fff;touch-action:none;user-select:none;cursor:pointer}
+#screenWrap{position:relative;display:inline-block;width:100%;max-width:1024px}
+#screen{width:100%;display:block;border-radius:8px;background:#fff;touch-action:none;user-select:none;-webkit-user-select:none;cursor:pointer}
+#tapDot{position:absolute;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:999px;border:3px solid #38bdf8;background:rgba(56,189,248,.3);pointer-events:none;opacity:0;transform:scale(.6);transition:opacity .28s ease,transform .28s ease}
+#tapDot.on{opacity:1;transform:scale(1.15)}
 #banner,.banner{padding:11px 14px;border-radius:8px;background:#0b3b8c;margin-bottom:14px;font-size:.94rem}
-.banner.ok,#banner.ok{background:#14532d;border:1px solid #22c55e}.banner.bad,#banner.bad{background:#7f1d1d;border:1px solid #ef4444}`;
+.banner.ok,#banner.ok{background:#14532d;border:1px solid #22c55e}.banner.bad,#banner.bad{background:#7f1d1d;border:1px solid #ef4444}
+@media (max-width:600px){body{padding:10px 8px}.card{padding:14px}h1{font-size:1.18rem}}`;
 
 function shell(title: string, body: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${PAGE_CSS}</style></head><body><main>${body}</main></body></html>`;
@@ -136,7 +150,32 @@ function restoredPage(label: string, username?: string | null): string {
   );
 }
 
-function recoveryPortalPage(nonce: string, origin: string, token: string, label: string): string {
+function formatEgressBanner(egress?: EgressStatus): { cls: string; text: string } {
+  if (egress?.mode === 'mobile_tunnel') {
+    return {
+      cls: 'banner ok',
+      text: '🟢 Phone-IP Tunnel ACTIVE — your Mobile Chrome verification routes through your own phone IP.',
+    };
+  }
+  if (egress?.mode === 'residential_proxy') {
+    return {
+      cls: 'banner ok',
+      text: '🟢 Residential Proxy ACTIVE — tap "Start recovery" below to verify directly in Mobile Chrome.',
+    };
+  }
+  return {
+    cls: 'banner',
+    text: '📱 Mobile Chrome Ready — tap "Start recovery" below and complete only LeetCode Cloudflare verification.',
+  };
+}
+
+function recoveryPortalPage(
+  nonce: string,
+  origin: string,
+  token: string,
+  label: string,
+  egress?: EgressStatus,
+): string {
   const recoverUrl = `${origin}/auth/recover/${token}`;
   const bootstrapUrl = `${recoverUrl}/bootstrap`;
   const completeUrl = `${recoverUrl}/complete`;
@@ -147,42 +186,35 @@ function recoveryPortalPage(nonce: string, origin: string, token: string, label:
     JSON.stringify({ token, label, origin, bootstrapUrl, completeUrl }),
     'utf8',
   ).toString('base64url');
+  const egressBanner = formatEgressBanner(egress);
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reconnect LeetCode account</title><style>${PAGE_CSS}</style></head><body><main>
 <div class="card">
   <h1>Reconnect <code>${esc(label)}</code></h1>
-  <div id="recoverStatusBanner" class="banner">Verify on your <b>local IP</b> below (bypasses Cloudflare datacenter blocks) — your session automatically syncs to the Telegram bot.</div>
-  <p>Datacenter servers on Render are flagged by Cloudflare on LeetCode login. Pick any local-IP verification option below; once you pass verification locally, your fresh cookies are pushed directly to the bot and this tab updates automatically.</p>
+  <div id="recoverStatusBanner" class="${egressBanner.cls}">${esc(egressBanner.text)}</div>
+  <p>Your saved credentials and cookies are handled automatically. Just tap <b>Start recovery</b> and solve LeetCode's Cloudflare check if prompted.</p>
+  <form id="startRecoveryForm" method="post" action="/auth/recover/${esc(token)}/start"><button type="submit">Start recovery</button></form>
+  ${egress?.mode === 'datacenter' || !egress ? '<p style="font-size:.86rem;opacity:.82;margin-top:10px;margin-bottom:0">Using a blocked datacenter IP? Enable the one-time <b>Phone-IP Tunnel</b> below (or send <code>/mobile</code> in Telegram) so Mobile Chrome always exits through your phone IP.</p>' : ''}
 </div>
 <div id="local-recover-config" hidden data-token="${esc(token)}" data-label="${esc(label)}" data-origin="${esc(origin)}" data-bootstrap-url="${esc(bootstrapUrl)}" data-complete-url="${esc(completeUrl)}"></div>
 
-<div class="card">
-  <h2>Option 1 (Recommended): 1-Click Local-IP Browser Verifier</h2>
-  <p>Opens Chrome/Edge on your own network, auto-fills your saved credentials once Cloudflare clears, captures the authenticated session, sends it to the bot, and redirects back here.</p>
-  <div class="actions">
-    <a class="btn" href="/auth/recover/${esc(token)}/launch.cmd">⚡ Download &amp; Run 1-Click Verifier (.cmd)</a>
-  </div>
-  <p style="font-size:.88rem;opacity:.85;margin-top:8px">Or paste one command into your terminal:</p>
-  <pre id="psCmd">${esc(psCmd)}</pre>
-  <button type="button" class="secondary" data-copy-target="psCmd">📋 Copy PowerShell Command</button>
-  <pre id="shCmd">${esc(shCmd)}</pre>
-  <button type="button" class="secondary" data-copy-target="shCmd">📋 Copy macOS / Linux Command</button>
-  <pre id="npmCmd">${esc(npmCmd)}</pre>
-  <button type="button" class="secondary" data-copy-target="npmCmd">📋 Copy Repo npm Command</button>
-</div>
+<details class="card">
+  <summary>Phone-IP Tunnel (One-Time Android Setup — avoids Cloudflare datacenter blocks)</summary>
+  <p style="margin-top:12px">Run our tiny background tunnel once on Android (via Termux) so every Mobile Chrome recovery automatically uses your phone's IP address instead of Render's datacenter IP.</p>
+  <p style="font-size:.9rem">Send <code>/mobile</code> to the Telegram bot to get your personalized 1-line Android setup command, which installs and connects <a class="btn secondary" style="padding:4px 8px;font-size:.82rem" href="/auth/recover/termux-setup.sh">termux-setup.sh</a>.</p>
+</details>
 
-<div class="card">
-  <h2>Option 2: Automatic Browser Redirect (Tampermonkey Userscript)</h2>
-  <p>Install the one-time userscript below in Tampermonkey (Chrome/Edge) to automatically redirect recovery links to <code>leetcode.com</code> on your local IP, auto-fill credentials, send cookies to the bot, and redirect back here.</p>
+<details class="card">
+  <summary>Alternative: Mobile Extension Browser or Cookie Upload</summary>
+  <h2 style="margin-top:12px">Browser Extension Redirect (Edge Canary / Firefox / Desktop)</h2>
+  <p>Install the one-time userscript below in Tampermonkey/Violentmonkey to verify directly on <code>leetcode.com</code> and auto-sync cookies back to the bot:</p>
   <div class="actions">
     <a class="btn secondary" href="/auth/recover/userscript.user.js" target="_blank" rel="noopener">🧩 Install Userscript (One-Time)</a>
-    <a class="btn" id="redirectLeetCodeBtn" href="https://leetcode.com/accounts/login/#lc_recover=${esc(hashPayload)}">🚀 Verify on LeetCode.com (Local IP)</a>
+    <a class="btn" id="redirectLeetCodeBtn" href="https://leetcode.com/accounts/login/#lc_recover=${esc(hashPayload)}">🚀 Verify on LeetCode.com</a>
   </div>
   <div id="userscriptHint" style="font-size:.86rem;opacity:.8"></div>
-</div>
 
-<div class="card">
-  <h2>Option 3: Direct Cookie / storageState Upload</h2>
+  <h2 style="margin-top:16px">Direct Cookie / storageState Upload</h2>
   <p>Already signed in to LeetCode in another tab? Paste Cookie-Editor JSON, Playwright <code>storageState.json</code>, or <code>LEETCODE_SESSION=...; csrftoken=...</code> (or select a file):</p>
   <form id="directUploadForm">
     <input type="file" id="cookieFile" accept=".json,.txt">
@@ -190,18 +222,29 @@ function recoveryPortalPage(nonce: string, origin: string, token: string, label:
     <button type="submit" id="directSubmitBtn">🔗 Verify &amp; Restore Session</button>
   </form>
   <div id="directStatus" class="banner" style="display:none;margin-top:12px"></div>
-</div>
+</details>
 
 <details class="card">
-  <summary>Fallback: Server Remote Browser (datacenter IP — may be blocked by Cloudflare)</summary>
-  <p style="margin-top:12px">A secure browser will open on the server. Complete LeetCode's verification when it appears; the server then signs in with your saved credentials and stores the new session.</p>
-  <form method="post" action="/auth/recover/${esc(token)}/start"><button type="submit">Start recovery</button></form>
+  <summary>Desktop / Laptop Verifier (Windows, macOS, Linux)</summary>
+  <p style="margin-top:12px">Optional if you happen to be on a PC/laptop:</p>
+  <div class="actions">
+    <a class="btn" href="/auth/recover/${esc(token)}/launch.cmd">⚡ Download &amp; Run 1-Click Verifier (.cmd)</a>
+  </div>
+  <pre id="psCmd">${esc(psCmd)}</pre>
+  <button type="button" class="secondary" data-copy-target="psCmd">📋 Copy PowerShell Command</button>
+  <pre id="shCmd">${esc(shCmd)}</pre>
+  <button type="button" class="secondary" data-copy-target="shCmd">📋 Copy macOS / Linux Command</button>
+  <pre id="npmCmd">${esc(npmCmd)}</pre>
+  <button type="button" class="secondary" data-copy-target="npmCmd">📋 Copy Repo npm Command</button>
 </details>
 
 <script nonce="${nonce}">
 (function(){
   var done=false;
   var banner=document.getElementById('recoverStatusBanner');
+  var startForm=document.getElementById('startRecoveryForm');
+  var isMobile=(window.matchMedia&&window.matchMedia('(pointer:coarse)').matches)||/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent||'');
+  if(startForm&&isMobile){startForm.action='/auth/recover/${esc(token)}/start?mobile=1';}
   document.querySelectorAll('[data-copy-target]').forEach(function(btn){
     btn.addEventListener('click',function(){
       var target=document.getElementById(btn.getAttribute('data-copy-target'));
@@ -276,6 +319,14 @@ function recoveryPortalPage(nonce: string, origin: string, token: string, label:
         done=true;
         banner.className='banner bad';
         banner.textContent='This recovery link expired. Use the latest link from Telegram.';
+      }else if(s.egress&&s.egress.mode){
+        if(s.egress.mode==='mobile_tunnel'){
+          banner.className='banner ok';
+          banner.textContent='🟢 Phone-IP Tunnel ACTIVE — your Mobile Chrome verification routes through your own phone IP.';
+        }else if(s.egress.mode==='residential_proxy'){
+          banner.className='banner ok';
+          banner.textContent='🟢 Residential Proxy ACTIVE — tap "Start recovery" below to verify directly in Mobile Chrome.';
+        }
       }
     }).catch(function(){});
   }
@@ -787,27 +838,28 @@ function buildUserscript(): string {
 }
 
 function viewerPage(nonce: string, label: string): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reconnect LeetCode account</title><style>${PAGE_CSS}</style></head><body><main>
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>Reconnect LeetCode account</title><style>${PAGE_CSS}</style></head><body><main>
 <h1>Reconnect <code>${esc(label)}</code></h1>
 <div id="banner">Starting a secure browser…</div>
-<img id="screen" alt="Remote browser view" draggable="false">
-<p><button class="secondary" id="cancel">Cancel recovery</button></p>
-<p style="font-size:.85rem;opacity:.75">You only interact with LeetCode's own verification. Your saved password never reaches this page; the server enters it after verification.</p>
+<div id="screenWrap"><img id="screen" alt="Remote browser view" draggable="false"><div id="tapDot"></div></div>
+<p style="margin-top:10px"><button class="secondary" id="cancel">Cancel recovery</button></p>
+<p style="font-size:.85rem;opacity:.75">Tap LeetCode's Cloudflare checkbox above when it appears. Your saved credentials and session sync happen automatically.</p>
 <script nonce="${nonce}">
 (function(){
-  var img=document.getElementById('screen'),banner=document.getElementById('banner'),vw=1024,vh=720,done=false,busy=false,last=null,lastMove=0;
-  function pos(cx,cy){var r=img.getBoundingClientRect();return{x:(cx-r.left)*vw/r.width,y:(cy-r.top)*vh/r.height};}
-  function send(ev){if(done)return;fetch('/auth/recover/session/input',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(ev)}).catch(function(){});}
-  img.addEventListener('mousedown',function(e){e.preventDefault();var p=pos(e.clientX,e.clientY);send({type:'down',x:p.x,y:p.y});});
-  img.addEventListener('mouseup',function(e){e.preventDefault();var p=pos(e.clientX,e.clientY);send({type:'up',x:p.x,y:p.y});});
-  img.addEventListener('mousemove',function(e){var t=Date.now();if(t-lastMove<80)return;lastMove=t;var p=pos(e.clientX,e.clientY);send({type:'move',x:p.x,y:p.y});});
+  var img=document.getElementById('screen'),dot=document.getElementById('tapDot'),banner=document.getElementById('banner'),vw=430,vh=760,done=false,busy=false,last=null,lastMove=0,lastTouchAt=0,touchStart=null,q=Promise.resolve();
+  function pos(cx,cy){var r=img.getBoundingClientRect();return{x:(cx-r.left)*vw/Math.max(1,r.width),y:(cy-r.top)*vh/Math.max(1,r.height)};}
+  function showDot(cx,cy){var r=img.getBoundingClientRect();dot.style.left=(cx-r.left)+'px';dot.style.top=(cy-r.top)+'px';dot.classList.add('on');setTimeout(function(){dot.classList.remove('on');},280);}
+  function send(ev){if(done)return;q=q.then(function(){return fetch('/auth/recover/session/input',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(ev)}).catch(function(){});});}
+  img.addEventListener('mousedown',function(e){e.preventDefault();if(Date.now()-lastTouchAt<700)return;var p=pos(e.clientX,e.clientY);showDot(e.clientX,e.clientY);send({type:'down',x:p.x,y:p.y});});
+  img.addEventListener('mouseup',function(e){e.preventDefault();if(Date.now()-lastTouchAt<700)return;var p=pos(e.clientX,e.clientY);send({type:'up',x:p.x,y:p.y});});
+  img.addEventListener('mousemove',function(e){if(Date.now()-lastTouchAt<700)return;var t=Date.now();if(t-lastMove<80)return;lastMove=t;var p=pos(e.clientX,e.clientY);send({type:'move',x:p.x,y:p.y});});
   img.addEventListener('wheel',function(e){e.preventDefault();var p=pos(e.clientX,e.clientY);send({type:'wheel',x:p.x,y:p.y,deltaY:e.deltaY});},{passive:false});
-  img.addEventListener('touchstart',function(e){e.preventDefault();var t=e.changedTouches[0],p=pos(t.clientX,t.clientY);send({type:'move',x:p.x,y:p.y});send({type:'down',x:p.x,y:p.y});},{passive:false});
-  img.addEventListener('touchend',function(e){e.preventDefault();var t=e.changedTouches[0],p=pos(t.clientX,t.clientY);send({type:'up',x:p.x,y:p.y});},{passive:false});
+  img.addEventListener('touchstart',function(e){e.preventDefault();lastTouchAt=Date.now();var t=e.changedTouches[0];if(!t)return;touchStart={cx:t.clientX,cy:t.clientY};},{passive:false});
+  img.addEventListener('touchend',function(e){e.preventDefault();lastTouchAt=Date.now();var t=e.changedTouches[0];if(!t)return;var dx=touchStart?t.clientX-touchStart.cx:0,dy=touchStart?t.clientY-touchStart.cy:0;touchStart=null;var p=pos(t.clientX,t.clientY);if(Math.hypot(dx,dy)<=18){showDot(t.clientX,t.clientY);send({type:'tap',x:p.x,y:p.y});}else{send({type:'wheel',x:p.x,y:p.y,deltaY:-dy*1.4});}},{passive:false});
   document.getElementById('cancel').addEventListener('click',function(){fetch('/auth/recover/session/cancel',{method:'POST',credentials:'same-origin'}).catch(function(){});});
   function frame(){if(done||busy)return;busy=true;fetch('/auth/recover/session/frame?'+Date.now(),{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.blob():null;}).then(function(b){if(b){var u=URL.createObjectURL(b);img.src=u;if(last)URL.revokeObjectURL(last);last=u;}}).catch(function(){}).then(function(){busy=false;});}
   function status(){fetch('/auth/recover/session/status',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){banner.textContent='This session is no longer active.';banner.className='bad';done=true;return null;}return r.json();}).then(function(s){if(!s)return;vw=s.viewport.width;vh=s.viewport.height;banner.textContent=s.message+(s.username?' ('+s.username+')':'');if(s.phase==='success'){banner.className='ok';}else if(s.phase==='failed'||s.phase==='cancelled'){banner.className='bad';}if(s.final){done=true;}}).catch(function(){});}
-  setInterval(frame,450);setInterval(status,1000);frame();status();
+  setInterval(frame,400);setInterval(status,1000);frame();status();
 })();
 </script></main></body></html>`;
 }
@@ -888,15 +940,34 @@ export function registerRecoveryRoutes(
     return reply.type('text/javascript; charset=utf-8').send(buildUserscript());
   });
 
+  app.get('/auth/recover/tunnel-client.mjs', async (req, reply) => {
+    if (!sessionLimiter.allow(req.ip)) return tooMany(reply);
+    reply.header('Cache-Control', 'no-store');
+    reply.header('X-Robots-Tag', 'noindex, nofollow');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    return reply.type('text/javascript; charset=utf-8').send(buildMobileTunnelClientJs());
+  });
+
+  app.get('/auth/recover/termux-setup.sh', async (req, reply) => {
+    if (!sessionLimiter.allow(req.ip)) return tooMany(reply);
+    reply.header('Cache-Control', 'no-store');
+    reply.header('X-Robots-Tag', 'noindex, nofollow');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    return reply.type('text/x-shellscript; charset=utf-8').send(buildTermuxSetupSh(requestOrigin(req)));
+  });
+
   app.get('/auth/recover/:token/poll', async (req, reply) => {
     secure(reply);
     if (!sessionLimiter.allow(req.ip)) return tooMany(reply);
     const { token } = req.params as { token: string };
-    if (typeof service.getRecoveryPollStatus === 'function') {
-      return reply.send(await service.getRecoveryPollStatus(token));
+    const status =
+      typeof service.getRecoveryPollStatus === 'function'
+        ? await service.getRecoveryPollStatus(token)
+        : await service.inspectToken(token);
+    if (typeof service.getEgressStatus === 'function') {
+      return reply.send({ ...status, egress: await service.getEgressStatus() });
     }
-    const inspected = await service.inspectToken(token);
-    return reply.send(inspected);
+    return reply.send(status);
   });
 
   app.post('/auth/recover/:token/bootstrap', async (req, reply) => {
@@ -1049,14 +1120,17 @@ export function registerRecoveryRoutes(
       return reply.code(page.code).type('text/html; charset=utf-8').send(messagePage(page.title, page.text));
     }
     const origin = requestOrigin(req);
-    return reply.type('text/html; charset=utf-8').send(recoveryPortalPage(nonce, origin, token, inspected.label ?? 'account'));
+    const egress = typeof service.getEgressStatus === 'function' ? await service.getEgressStatus() : undefined;
+    return reply.type('text/html; charset=utf-8').send(recoveryPortalPage(nonce, origin, token, inspected.label ?? 'account', egress));
   });
 
   app.post('/auth/recover/:token/start', async (req, reply) => {
     secure(reply);
     if (!tokenLimiter.allow(req.ip)) return tooMany(reply);
     const { token } = req.params as { token: string };
-    const result = await service.openPortalSession(token);
+    const result = isMobileRequest(req)
+      ? await service.openPortalSession(token, { mobile: true })
+      : await service.openPortalSession(token);
     if (!result.ok) {
       const page = REASON_PAGES[result.reason]!;
       return reply.code(page.code).type('text/html; charset=utf-8').send(messagePage(page.title, result.message ?? page.text));

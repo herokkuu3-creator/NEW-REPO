@@ -30,6 +30,7 @@ import { PIN_COOKIE, PinGate, pinPage, readPinFromEnv, safeNext } from './pinGat
 import { registerSolutionPostRoutes } from '../solutionPosts/routes';
 import type { RecoveryService } from '../recovery/service';
 import { registerRecoveryRoutes } from '../recovery/routes';
+import { getMobileTunnel } from '../recovery/mobileTunnel';
 import { runRemoteBrowserPoc } from '../recovery/poc';
 import { registerVisualAssetRoutes } from '../solutionPosts/visualStore';
 import { registerRangeDiagnostics } from '../scheduler/rangeDiagnostics';
@@ -216,6 +217,23 @@ export async function startHealthServer(
       if (recovery.activeSessionCount > 0) return reply.code(409).send({ ok: false, error: 'a recovery session is active' });
       const { screenshot, ...result } = await runRemoteBrowserPoc({ settleMs: 12_000 });
       return { ok: true, result, frameBytes: screenshot?.length ?? 0 };
+    });
+
+    const tunnel = getMobileTunnel();
+    app.server.on('upgrade', (req, socket, head) => {
+      const urlPath = (req.url || '').split('?')[0];
+      if (urlPath === '/auth/recover/tunnel') {
+        tunnel.handleUpgrade(req, socket, head);
+        return;
+      }
+      socket.destroy();
+    });
+    app.addHook('onClose', async () => {
+      await tunnel.close();
+    });
+    app.get('/admin/recovery/tunnel', async (req, reply) => {
+      if (!requireAdmin(req.headers.authorization)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
+      return { ok: true, tunnel: tunnel.getStatus(), egress: await recovery.getEgressStatus() };
     });
   }
 

@@ -10,6 +10,7 @@ import { resolvePublicBaseUrl } from '../leetcode/loginHandoff';
 import { clearLeetCodeLoginCooldown, openLightweightLeetCodeSession, verifyStoredLeetCodeAccount } from '../leetcode/sessionManager';
 import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { PrismaRecoveryStore } from './prismaStore';
+import { getMobileTunnel } from './mobileTunnel';
 import { openRemoteBrowser } from './remoteBrowser';
 import { loadRecoveryLimits, RecoveryService, type RecoveryAccount } from './service';
 
@@ -63,9 +64,24 @@ export function createProductionRecoveryService(hooks: RecoveryRuntimeHooks = {}
       const creds = await findCredentialsForAccount('leetcode', full);
       return creds ? { username: creds.username, password: creds.password } : null;
     },
-    openBrowser: async () => {
+    getEgressStatus: async () => {
+      if (getMobileTunnel().isConnected()) {
+        return { mode: 'mobile_tunnel', label: 'Phone IP tunnel active' };
+      }
       const lcProxy = await resolveLeetCodeResidentialProxy();
-      return openRemoteBrowser({ headless: true, proxyUrl: lcProxy?.url });
+      if (lcProxy?.url) {
+        return { mode: 'residential_proxy', label: 'Configured residential proxy' };
+      }
+      return { mode: 'datacenter', label: 'Server IP (standard)' };
+    },
+    openBrowser: async (opts) => {
+      const tunnelProxy = await getMobileTunnel().ensureProxyListening();
+      if (tunnelProxy) {
+        logger.info('recovery browser routing through connected mobile IP tunnel');
+        return openRemoteBrowser({ headless: true, proxyUrl: tunnelProxy, viewport: opts?.viewport });
+      }
+      const lcProxy = await resolveLeetCodeResidentialProxy();
+      return openRemoteBrowser({ headless: true, proxyUrl: lcProxy?.url, viewport: opts?.viewport });
     },
     sendTelegram: (text, markup) =>
       sendTelegramMessage(text, { parseMode: 'HTML', disableWebPagePreview: true, replyMarkup: markup }),
