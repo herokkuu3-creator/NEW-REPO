@@ -90,6 +90,9 @@ export function isTerminalCodeChefVerdict(verdict: string | null | undefined): b
 }
 
 export async function claimDailyAttempt(accountId: string, today: string, key: string, force = false): Promise<boolean> {
+  if (typeof prisma.codeChefProgress?.upsert === 'function') {
+    await getCodeChefProgress(accountId);
+  }
   if (force) {
     await prisma.codeChefProgress.updateMany({
       where: { accountId },
@@ -151,7 +154,7 @@ export async function ensureCodeChefAccountsSeeded(): Promise<void> {
     // Note: We use username as label
     const existing = await prisma.codeChefAccount.findUnique({
       where: { label: username },
-      select: { id: true, storageState: true },
+      select: { id: true, storageState: true, status: true },
     });
     if (!existing) {
       await prisma.codeChefAccount.create({
@@ -176,7 +179,12 @@ export async function ensureCodeChefAccountsSeeded(): Promise<void> {
         storedPassword = undefined;
       }
       if (storedPassword !== password) {
-        await patchCodeChefAccount(existing.id, { storageState: JSON.stringify({ username, password, cookies: [], origins: [] }) });
+        await patchCodeChefAccount(existing.id, {
+          storageState: JSON.stringify({ username, password, cookies: [], origins: [] }),
+          ...(existing.status !== CodeChefAccountStatus.DISABLED
+            ? { status: CodeChefAccountStatus.ACTIVE, lastError: null }
+            : {}),
+        });
         resetCodeChefRetryPollGate();
       }
     }

@@ -18,14 +18,28 @@ export async function loginOnCodeChefPage(page: Page, username: string, password
 
   logger.info('Waiting for login to process...');
   await page.waitForFunction(() => {
-    return !document.querySelector('form input[name="pass"]')
-      || !!document.querySelector('.messages.error, .login-error, .error, [role="alert"]');
+    if (!document.querySelector('form input[name="pass"]')) return true;
+    return Array.from(document.querySelectorAll('.messages.error, .login-error, .error'))
+      .some(el => Boolean((el.textContent || '').trim()));
   }, undefined, { timeout: waitMs }).catch(() => null);
 
-  const errorText = await page.evaluate(() => {
-    return Array.from(document.querySelectorAll('.messages.error, .login-error, .error'))
-      .map(el => (el.textContent || '').trim()).filter(Boolean).join('; ');
-  });
+  const readErrorText = () =>
+    page.evaluate(() =>
+      Array.from(document.querySelectorAll('.messages.error, .login-error, .error'))
+        .map(el => (el.textContent || '').trim())
+        .filter(Boolean)
+        .join('; '),
+    );
+
+  let errorText = '';
+  try {
+    errorText = await readErrorText();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/Execution context was destroyed/i.test(msg)) throw err;
+    await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => undefined);
+    errorText = await readErrorText();
+  }
   if (errorText) throw new Error(`CodeChef login failed: ${errorText}`);
 
   const cookies = await page.context().cookies('https://www.codechef.com');

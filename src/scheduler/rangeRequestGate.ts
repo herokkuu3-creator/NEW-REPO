@@ -10,16 +10,21 @@ export class RangeRequestGate {
   private nextRequest = 0;
   private nextSubmit = 0;
   private blockedUntil = 0;
+  private rateLimitUntil = 0;
   constructor(private readonly now = Date.now, private readonly requestGap = 1000, private readonly submitGap = RANGE_SUBMIT_GAP_MS) {}
   observe(error: unknown): void {
     const category = leetCodeRequestFailure(error).category;
     if (!['rate-limit', 'challenge', 'access-denied'].includes(category)) return;
     const delay = error instanceof LeetCodeHttpError ? error.retryAfterMs : undefined;
-    this.blockedUntil = Math.max(this.blockedUntil, this.now() + Math.max(delay ?? 60000, 1000));
+    const until = this.now() + Math.max(delay ?? 60000, 1000);
+    this.blockedUntil = Math.max(this.blockedUntil, until);
+    if (category === 'rate-limit') {
+      this.rateLimitUntil = Math.max(this.rateLimitUntil, until);
+    }
   }
   clearCooldown(): void {
     const now = this.now();
-    this.blockedUntil = 0;
+    this.blockedUntil = this.rateLimitUntil > now ? this.rateLimitUntil : 0;
     if (this.nextRequest > now) {
       this.nextRequest = now;
     }

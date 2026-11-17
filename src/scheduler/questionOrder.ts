@@ -106,7 +106,7 @@ export async function prepareShuffledBatch<T>(platform: 'codeforces' | 'codechef
       saved.order[0]! : cursor.nextKey;
     return { queue: base, nextKey, initial };
   }
-  if (count <= 1 || startIndex >= base.length) return { queue: base, nextKey: cursor.nextKey, initial };
+  if (count <= 1 || startIndex < 0 || startIndex >= base.length) return { queue: base, nextKey: cursor.nextKey, initial };
   const window = base.slice(startIndex, startIndex + count);
   const original = window.map(keyOf);
   const order = shuffle(original);

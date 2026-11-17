@@ -640,6 +640,7 @@ async function executeRangeJob(
         info.accountIndex = Math.min(accounts.length, info.accountIndex + 1);
 
         try {
+          if (concurrency <= 1) info.doneInAccount = 0;
           const result = await runAccountRange(
             account,
             range,
@@ -978,7 +979,7 @@ async function runAccountRange(
           ));
       blockedStreak = countsAsBlockedStreak ? blockedStreak + 1 : 0;
       if (!countsAsBlockedStreak) cooledDown = false;
-      if (blockedStreak >= deps.blockedStreakLimit) {
+      if (blockedStreak >= deps.blockedStreakLimit && pending.length > 0) {
         if (cooledDown) {
           result.stoppedEarly = 'blocked';
           break;
@@ -987,11 +988,14 @@ async function runAccountRange(
         blockedStreak = 0;
         const minutes = Math.round(deps.blockedCooldownMs / 60_000);
         info.pausedReason = `LeetCode is blocking requests — cooling down ${minutes} min`;
-        await deps
-          .notify(`🧊 LeetCode is blocking requests for ${who(result)} — cooling down for ${minutes} min before continuing.`)
-          .catch(() => undefined);
-        await deps.sleep(deps.blockedCooldownMs, signal);
-        info.pausedReason = null;
+        try {
+          await deps
+            .notify(`🧊 LeetCode is blocking requests for ${who(result)} — cooling down for ${minutes} min before continuing.`)
+            .catch(() => undefined);
+          await deps.sleep(deps.blockedCooldownMs, signal);
+        } finally {
+          info.pausedReason = null;
+        }
       }
 
       if (deps.questionGapMs > 0 && stepIndex < order.length && touchedLeetCode && !signal.aborted) {
@@ -1036,10 +1040,13 @@ async function waitForDailyRun(deps: RangeDeps, info: RangeJobInfo, signal: Abor
   if (!deps.isDailyRunInProgress()) return;
   info.pausedReason = 'the daily run is in progress';
   logger.info('range job paused while the daily run is in progress');
-  while (deps.isDailyRunInProgress() && !signal.aborted) {
-    await deps.sleep(deps.dailyRunPollMs, signal);
+  try {
+    while (deps.isDailyRunInProgress() && !signal.aborted) {
+      await deps.sleep(deps.dailyRunPollMs, signal);
+    }
+  } finally {
+    info.pausedReason = null;
   }
-  info.pausedReason = null;
 }
 
 interface OneOutcome {
@@ -1430,11 +1437,12 @@ async function solveOne(
     };
 
     // 4) Submit with comment-stripping fallback (C++ only) + judge failure fallback
-    const submitCode = async (code: string, lang: string) => {
+    const submitCode = async (code: string, lang: string, uuidOnSend?: string) => {
       const strippedCode = lang === 'cpp' ? stripCppComments(code) : code;
       const useStripped = lang === 'cpp' && strippedCode.trim().length > 0 && strippedCode !== code;
       const codeToTryFirst = useStripped ? strippedCode : code;
       const subId = await sendCode(codeToTryFirst, lang);
+      if (uuidOnSend) usedCommunityUuids?.add(uuidOnSend);
 
       let verdict = await readVerdict(subId);
 
@@ -1602,6 +1610,7 @@ async function solveOne(
     let walkcccOnlyCode: string | undefined;
 
     for (const snippet of languagesToTry) {
+      if (signal?.aborted) throw Error('Range cancelled before selecting solution');
       const langProblem = buildProblemForLanguage(n, slug, questionTitle, q, snippet);
       if (deps.fetchCommunity) {
         try {
@@ -1612,7 +1621,6 @@ async function solveOne(
             ...(graphql && { graphql }),
           });
           if (commSol?.code) {
-            usedCommunityUuids?.add(commSol.uuid);
             excludeUuids.add(commSol.uuid);
             communityCode = commSol.code;
             communityUuid = commSol.uuid;
@@ -1654,7 +1662,7 @@ async function solveOne(
       return err(reason);
     }
 
-    let { verdict, submissionId, code: acceptedCode } = await submitCode(solutionCode, chosenLang);
+    let { verdict, submissionId, code: acceptedCode } = await submitCode(solutionCode, chosenLang, communityUuid);
 
     if (communityCode && verdict.classification !== 'ACCEPTED' && verdict.classification !== 'UNKNOWN') {
       const fallbackCode = await getWalkcccForLang(chosenLang, chosenProblem);
@@ -1943,20 +1951,38 @@ export async function openRequestSession(
     cookies: deduplicateLeetCodeCookies(initialState.cookies ?? []),
     transport: initialState.transport ?? (proxyUrl ? { proxyUrl, userAgent } : { userAgent }),
   };
+  let baselineState: StorageStateShape = {
+    ...initialState,
+    transport: currentState.transport,
+  };
   let activeCtx = await createCtx(currentState);
+  let closed = false;
 
   const syncContextFromStorage = async (nextState: StorageStateShape) => {
+    if (closed) return;
     const mergedState: StorageStateShape = {
       ...nextState,
       cookies: deduplicateLeetCodeCookies(nextState.cookies ?? []),
       transport: nextState.transport ?? currentState.transport,
       origins: nextState.origins?.length ? nextState.origins : currentState.origins,
     };
+    const nextCtx = await createCtx(mergedState);
+    if (closed) {
+      await nextCtx.dispose().catch(() => undefined);
+      return;
+    }
     const previousCtx = activeCtx;
-    activeCtx = await createCtx(mergedState);
+    activeCtx = nextCtx;
     currentState = mergedState;
+    if (mergedState.transport) {
+      baselineState = {
+        ...baselineState,
+        transport: mergedState.transport,
+      };
+    }
     await previousCtx.dispose().catch(() => undefined);
-    await persistCookies(account, initialState, { storageState: async () => mergedState }).catch(() => false);
+    if (closed) return;
+    await persistCookies(account, baselineState, { storageState: async () => mergedState }).catch(() => false);
   };
 
   const requestProxy = {
@@ -1996,15 +2022,17 @@ export async function openRequestSession(
   let ghostSyncedDuringSubmit = false;
 
   const ensureGhostSession = async (): Promise<GhostBrowserSession> => {
+    if (closed) throw new Error('Request session closed');
     if (ghostSession) return ghostSession;
     const snapshot = await activeCtx.storageState().catch(() => null);
+    if (closed) throw new Error('Request session closed');
     const latestState: StorageStateShape = snapshot
       ? {
           ...currentState,
           cookies: snapshot.cookies as StorageStateShape['cookies'],
         }
       : currentState;
-    ghostSession = await openGhost(latestState, {
+    const createdGhost = await openGhost(latestState, {
       userAgent,
       proxyUrl,
       onStorageState: async (nextState) => {
@@ -2012,7 +2040,16 @@ export async function openRequestSession(
         await syncContextFromStorage(nextState);
       },
     });
-    return ghostSession;
+    if (closed) {
+      await createdGhost.close().catch(() => undefined);
+      throw new Error('Request session closed');
+    }
+    if (ghostSession) {
+      await createdGhost.close().catch(() => undefined);
+      return ghostSession;
+    }
+    ghostSession = createdGhost;
+    return createdGhost;
   };
 
   return {
@@ -2120,10 +2157,13 @@ export async function openRequestSession(
       graphql: (q, v, s) => api.graphql(q, v, s as never),
     },
     close: async () => {
+      if (closed) return;
+      closed = true;
       cancelled.abort();
-      await ghostSession?.close().catch(() => undefined);
+      const activeGhost = ghostSession;
       ghostSession = null;
-      await persistCookies(account, initialState, activeCtx).catch(() => false);
+      await activeGhost?.close().catch(() => undefined);
+      await persistCookies(account, baselineState, activeCtx).catch(() => false);
       await activeCtx.dispose().catch(() => undefined);
     },
   };

@@ -53,11 +53,45 @@ export function normalizeCodeChefVerdict(value: unknown): string | null {
 function responseDetails(value: unknown, depth = 0): { id?: string; verdict?: string } {
   if (!value || typeof value !== 'object' || depth > 5) return {};
   const object = value as Record<string, unknown>;
-  const idValue = object.upid ?? object.up_id ?? object.solution_id ?? object.solutionId ?? object.submission_id ?? object.submissionId ?? object.id ?? object.sub_id;
-  const id = (typeof idValue === 'number' || typeof idValue === 'string') && /^[1-9]\d{0,18}$/.test(String(idValue)) ? String(idValue) : undefined;
-  const verdict = normalizeCodeChefVerdict(object.result_code ?? object.verdict ?? object.result ?? object.status ?? object.STATUS ?? object.verdict_code ?? object.result_description) ?? undefined;
-  const child = responseDetails(object.data ?? object.result ?? object.details, depth + 1);
-  return { id: id ?? child.id, verdict: verdict ?? child.verdict };
+  let id: string | undefined;
+  for (const idValue of [
+    object.upid,
+    object.up_id,
+    object.solution_id,
+    object.solutionId,
+    object.submission_id,
+    object.submissionId,
+    object.id,
+    object.sub_id,
+  ]) {
+    if ((typeof idValue === 'number' || typeof idValue === 'string') && /^[1-9]\d{0,18}$/.test(String(idValue))) {
+      id = String(idValue);
+      break;
+    }
+  }
+  let verdict: string | undefined;
+  for (const candidate of [
+    object.result_code,
+    object.verdict,
+    object.result,
+    object.status,
+    object.STATUS,
+    object.verdict_code,
+    object.result_description,
+  ]) {
+    const normalized = normalizeCodeChefVerdict(candidate);
+    if (normalized) {
+      verdict = normalized;
+      break;
+    }
+  }
+  for (const nested of [object.data, object.result, object.details]) {
+    if (id && verdict) break;
+    const child = responseDetails(nested, depth + 1);
+    if (!id && child.id) id = child.id;
+    if (!verdict && child.verdict) verdict = child.verdict;
+  }
+  return { id, verdict };
 }
 
 export async function selectCodeChefLanguage(page: Page, language = 'cpp'): Promise<void> {
@@ -67,18 +101,28 @@ export async function selectCodeChefLanguage(page: Page, language = 'cpp'): Prom
 
   // 1. Check if C++ is ALREADY selected
   const isAlreadyCpp = await page.evaluate(() => {
+    for (const el of Array.from(document.querySelectorAll('select'))) {
+      if ((el as HTMLElement).offsetParent === null) continue;
+      const selectedText = (el.selectedOptions[0]?.textContent ?? el.value ?? '').trim();
+      if (/^C\+\+(?:14|17|20|23)?(?:\s|\(|$)/i.test(selectedText)) return true;
+      return false;
+    }
+
     const selectors = [
       '#language-select',
       '[data-cy="language-select"]',
       '[class*="language" i]',
       '[class*="Language" i]',
-      'button',
-      'select',
     ];
     for (const sel of selectors) {
       const elements = document.querySelectorAll(sel);
       for (const el of Array.from(elements)) {
-        const text = (el.textContent || (el as HTMLSelectElement).value || '').trim();
+        if ((el as HTMLElement).offsetParent === null) continue;
+        const text = (
+          el instanceof HTMLSelectElement
+            ? el.selectedOptions[0]?.textContent ?? el.value
+            : el.textContent || ''
+        ).trim();
         if (/^C\+\+(?:14|17|20|23)?(?:\s|\(|$)/i.test(text)) return true;
       }
     }
@@ -246,29 +290,10 @@ export async function submitViaCodeChefApi(
     } catch {}
 
     logger.info({ problemCode, langId }, 'Submitting to CodeChef via /api/ide/submit...');
-    const postRes = await request.post(`${base}/api/ide/submit`, {
-      timeout: 30000,
-      headers: {
-        'x-csrf-token': csrf,
-        'x-requested-with': 'XMLHttpRequest',
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        origin: base,
-        referer: `${base}/problems/${problemCode}?tab=ide`,
-      },
-      form: {
-        sourceCode: code,
-        language: langId,
-        problemCode,
-        contestCode: 'PRACTICE',
-      },
-    });
-    let posted = await postRes.json().catch(() => null);
-
-    // If rate-limited (1 submission in 3s on CodeChef), wait 4 seconds and retry once
-    if (Array.isArray(posted?.errors) && posted.errors.some((e: string) => /1 submissions in 3 seconds/i.test(e))) {
-      logger.info('CodeChef 3s rate-limit hit; waiting 4s and retrying API submit...');
-      await new Promise(resolve => setTimeout(resolve, 4000));
-      const retryRes = await request.post(`${base}/api/ide/submit`, {
+    let postRes: Awaited<ReturnType<APIRequestContext['post']>>;
+    let posted: any;
+    try {
+      postRes = await request.post(`${base}/api/ide/submit`, {
         timeout: 30000,
         headers: {
           'x-csrf-token': csrf,
@@ -284,7 +309,40 @@ export async function submitViaCodeChefApi(
           contestCode: 'PRACTICE',
         },
       });
-      posted = await retryRes.json().catch(() => null);
+      posted = await postRes.json().catch(() => null);
+
+      // If rate-limited (1 submission in 3s on CodeChef), wait 4 seconds and retry once
+      if (Array.isArray(posted?.errors) && posted.errors.some((e: string) => /1 submissions in 3 seconds/i.test(e))) {
+        logger.info('CodeChef 3s rate-limit hit; waiting 4s and retrying API submit...');
+        await new Promise(resolve => setTimeout(resolve, 4000));
+        postRes = await request.post(`${base}/api/ide/submit`, {
+          timeout: 30000,
+          headers: {
+            'x-csrf-token': csrf,
+            'x-requested-with': 'XMLHttpRequest',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            origin: base,
+            referer: `${base}/problems/${problemCode}?tab=ide`,
+          },
+          form: {
+            sourceCode: code,
+            language: langId,
+            problemCode,
+            contestCode: 'PRACTICE',
+          },
+        });
+        posted = await postRes.json().catch(() => null);
+      }
+    } catch (postErr) {
+      const error = postErr instanceof Error ? postErr.message : String(postErr);
+      logger.warn({ problemCode, err: error }, 'CodeChef API submit POST errored after dispatch; refusing UI fallback');
+      return {
+        ok: false,
+        clicked: true,
+        kind: 'error',
+        verdict: 'UNKNOWN',
+        error,
+      };
     }
 
     if (Array.isArray(posted?.errors) && posted.errors.some((e: string) => /does not belong to the contest|no such problem/i.test(e))) {
@@ -591,7 +649,7 @@ export async function submitOnCodeChefPage(
       }
 
       // 4. Fallback check: recent user submissions table fallback every ~6 seconds
-      if (pollCount % 24 === 0 && (!submissionId || !verdict)) {
+      if (pollCount % 24 === 0 && submissionId && !verdict) {
         try {
           const handle = targetHandle || await page.evaluate(() => {
             const m = document.cookie.match(/Drupal\.visitor\.name=([^;]+)/);
@@ -607,16 +665,16 @@ export async function submitOnCodeChefPage(
             if (recentHtml) {
               const rows = recentHtml.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
               for (const r of (rows ?? [])) {
-                if (r.toUpperCase().includes(problemCode)) {
-                  const solMatch = r.match(/viewsolution\/(\d+)/i);
-                  if (solMatch?.[1]) submissionId ??= solMatch[1];
-                  const vMatch = r.match(/title=['"](accepted|wrong answer|time limit exceeded|compilation error|runtime error)/i);
-                  if (vMatch?.[1]) {
-                    const norm = normalizeCodeChefVerdict(vMatch[1]);
-                    if (norm) verdict = norm;
+                const solMatch = r.match(/viewsolution\/(\d+)/i);
+                if (solMatch?.[1] !== submissionId) continue;
+                for (const vMatch of r.matchAll(/title=['"]([^'"]+)['"]/gi)) {
+                  const norm = normalizeCodeChefVerdict(vMatch[1]);
+                  if (norm) {
+                    verdict = norm;
+                    break;
                   }
-                  break;
                 }
+                break;
               }
             }
           }

@@ -352,15 +352,26 @@ export async function executeDailyRun(
         .catch(() => undefined);
     }
     if (anyIncomplete) {
-      let retry = { date: today, count: 0, lastAttemptAt: Date.now() };
       try {
         const raw = await getSystemState(SystemKeys.dailyRetryState);
-        const parsed = raw ? JSON.parse(raw) as { date?: unknown; count?: unknown; lastAttemptAt?: unknown } : null;
-        if (parsed?.date === today && Number.isInteger(parsed.count)) {
-          retry.count = Number(parsed.count);
+        const retry = { date: today, count: 0, lastAttemptAt: Date.now() };
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw) as { date?: unknown; count?: unknown; lastAttemptAt?: unknown } | null;
+            if (parsed?.date === today && Number.isInteger(parsed.count) && Number(parsed.count) >= 0) {
+              retry.count = Number(parsed.count);
+            }
+          } catch {
+            // Malformed retry marker is safe to reset to count: 0.
+          }
         }
-      } catch {}
-      await setSystemState(SystemKeys.dailyRetryState, JSON.stringify(retry));
+        await setSystemState(SystemKeys.dailyRetryState, JSON.stringify(retry));
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'failed to read/update dailyRetryState after incomplete run',
+        );
+      }
     }
 
     return report;
@@ -373,6 +384,8 @@ export async function executeDailyRun(
 // Per-account pipeline
 // ---------------------------------------------------------------------------
 
+type ParsedStorageState = Extract<ReturnType<typeof parseStoredStorageState>, { ok: true }>['state'];
+
 async function runForAccount(
   account: AccountRecord,
   today: string,
@@ -380,6 +393,7 @@ async function runForAccount(
   renewalTriggered = false,
   usedCommunityUuids: Set<string> = new Set(),
   expectedChallengeDate?: string,
+  allowAutoRefresh = true,
 ): Promise<AccountOutcome> {
   const label = account.label;
 
@@ -389,11 +403,13 @@ async function runForAccount(
     await patchAccount(account.id, { status: AccountStatus.UNKNOWN, lastError: state.error, checked: true });
     return { label, username: account.username, kind: 'failed', error: state.error };
   }
+  let currentState: ParsedStorageState = state.state;
+  let persistedViaGhost = false;
 
   let session: BrowserSession | null = null;
   try {
     // --- 1) Session check (API-only, no page navigation) -------------------
-    session = await launchWithStorageStateObject(state.state, label);
+    session = await launchWithStorageStateObject(currentState, label);
     if (!session) {
       await patchAccount(account.id, {
         status: AccountStatus.UNKNOWN,
@@ -412,16 +428,27 @@ async function runForAccount(
     const check = await checkSession(api);
 
     if (!check.authenticated) {
-      if (check.cause === 'signed-out') {
+      if (check.cause === 'signed-out' && allowAutoRefresh) {
         const refreshOutcome = await refreshLeetCodeAccount(account).catch(() => null);
         if (refreshOutcome?.status === 'refreshed') {
           logger.info({ label }, 'account session auto-refreshed via credentials — retrying');
           const updated = await getAccountById(account.id);
           if (updated) {
             await session.close().catch(() => undefined);
-            return runForAccount(updated, today, forceRun, renewalTriggered, usedCommunityUuids);
+            session = null;
+            return runForAccount(
+              updated,
+              today,
+              forceRun,
+              renewalTriggered,
+              usedCommunityUuids,
+              expectedChallengeDate,
+              false,
+            );
           }
         }
+      }
+      if (check.cause === 'signed-out') {
         // A live "signed out" response from the agent server proves only that
         // LeetCode rejected this transferred session there. It does NOT prove
         // that the token itself has expired, so keep the cookies and classify
@@ -573,19 +600,33 @@ async function runForAccount(
     run = await updateRun(run.id, { solution: solution.code });
 
     // --- 6) Apply the solution ---------------------------------------------
+    const submitForSolution = (code: string) =>
+      config.transport === 'api'
+        ? submitViaApi(account, username, api, problem, code, run, {
+            getState: () => currentState,
+            onGhostCookiesPersisted: async (updatedState) => {
+              persistedViaGhost = true;
+              currentState = updatedState;
+              if (typeof activeSession.context.addCookies === 'function' && updatedState.cookies?.length) {
+                await activeSession.context.addCookies(updatedState.cookies as never).catch(() => undefined);
+              }
+            },
+          })
+        : submitViaBrowser(account, username, activeSession, problem, code, run);
+
     let outcome = await submitDailySolutionWithCommentFallback(
       solution.code,
-      (code) =>
-        config.transport === 'api'
-          ? submitViaApi(account, username, api, problem, code, run)
-          : submitViaBrowser(account, username, activeSession, problem, code, run),
+      submitForSolution,
       label,
       problem.slug,
     );
 
     // If solution was submitted but rejected at judge (wrong answer, compile error, runtime error),
     // retry with fallback: if community failed, try walkccc; if walkccc failed, try community!
-    if (outcome.kind !== 'solved' && outcome.kind !== 'skipped' && outcome.kind !== 'expired') {
+    if (
+      outcome.state === RunState.SUBMISSION_REJECTED &&
+      !/judge polling timed out/i.test(outcome.error ?? '')
+    ) {
       if (solution.source === 'community') {
         logger.warn(
           { label, problem: problem.slug, verdict: outcome.submissionStatus, err: outcome.error },
@@ -604,10 +645,7 @@ async function runForAccount(
             run = await updateRun(run.id, { solution: walkSol.code });
             outcome = await submitDailySolutionWithCommentFallback(
               walkSol.code,
-              (code) =>
-                config.transport === 'api'
-                  ? submitViaApi(account, username, api, problem, code, run)
-                  : submitViaBrowser(account, username, activeSession, problem, code, run),
+              submitForSolution,
               label,
               problem.slug,
             );
@@ -632,10 +670,7 @@ async function runForAccount(
             run = await updateRun(run.id, { solution: commSol.code });
             outcome = await submitDailySolutionWithCommentFallback(
               commSol.code,
-              (code) =>
-                config.transport === 'api'
-                  ? submitViaApi(account, username, api, problem, code, run)
-                  : submitViaBrowser(account, username, activeSession, problem, code, run),
+              submitForSolution,
               label,
               problem.slug,
             );
@@ -646,7 +681,9 @@ async function runForAccount(
       }
     }
 
-    await persistRotatedCookiesFromContext(account, state.state, activeSession.context);
+    if (!persistedViaGhost) {
+      await persistRotatedCookiesFromContext(account, currentState, activeSession.context);
+    }
     const resultOutcome = contestReward.claimed ? { ...outcome, coinsCollected: true } : outcome;
     return (checkinResult.checkedIn || checkinResult.awarded) ? { ...resultOutcome, dailyCheckin: true } : resultOutcome;
   } catch (err) {
@@ -853,6 +890,10 @@ async function submitViaApi(
   problem: ReturnType<typeof parseProblem>,
   code: string,
   run: DailyRunRecord,
+  ghostSync?: {
+    getState: () => ParsedStorageState;
+    onGhostCookiesPersisted: (updatedState: ParsedStorageState) => Promise<void> | void;
+  },
 ): Promise<AccountOutcome> {
   if (!problem.questionId) {
     return finishRun(account, username, run, RunState.SUBMISSION_ERROR, {
@@ -873,11 +914,14 @@ async function submitViaApi(
       });
     } catch (submitErr) {
       const failure = leetCodeRequestFailure(submitErr);
-      const parsedState = parseStoredStorageState(account.storageState);
+      const latestState = ghostSync?.getState();
+      const parsedState = latestState
+        ? { ok: true as const, state: latestState }
+        : parseStoredStorageState(account.storageState);
       const canUpgradeGhost =
         parsedState.ok &&
         !(submitErr instanceof LeetCodeHttpError && submitErr.status === 200) &&
-        (looksLikeChallenge(submitErr) ||
+        (failure.category === 'challenge' ||
           failure.category === 'access-denied' ||
           failure.category === 'session-csrf');
       if (!canUpgradeGhost) throw submitErr;
@@ -886,17 +930,26 @@ async function submitViaApi(
         { label: account.label, slug: problem.slug, category: failure.category },
         'daily API submit challenged/rejected; retrying via ghost-mode stealth Chromium fallback',
       );
+      let ghostSynced = false;
       const ghostResult = await submitViaGhostBrowser(parsedState.state, {
         slug: problem.slug,
         questionId,
         lang: config.llm.language,
         code,
         onStorageState: async (updatedState) => {
+          ghostSynced = true;
           await persistRotatedCookiesFromContext(account, parsedState.state, {
             storageState: async () => updatedState,
           });
+          await ghostSync?.onGhostCookiesPersisted(updatedState);
         },
       });
+      if (!ghostSynced && ghostResult.storageState) {
+        await persistRotatedCookiesFromContext(account, parsedState.state, {
+          storageState: async () => ghostResult.storageState,
+        });
+        await ghostSync?.onGhostCookiesPersisted(ghostResult.storageState);
+      }
       submissionId = ghostResult.submissionId;
     }
     const result = await api.awaitSubmission(submissionId, problem.slug);
@@ -1150,17 +1203,24 @@ export async function triggerDailyRetry(): Promise<void> {
   let retry = { date: today, count: 0, lastAttemptAt: 0 };
   try {
     const raw = await getSystemState(SystemKeys.dailyRetryState);
-    const parsed = raw ? JSON.parse(raw) as { date?: unknown; count?: unknown; lastAttemptAt?: unknown } : null;
-    if (parsed?.date === today) {
-      if (Number.isInteger(parsed.count) && Number(parsed.count) >= 0) {
-        retry.count = Number(parsed.count);
-      }
-      if (typeof parsed.lastAttemptAt === 'number' && parsed.lastAttemptAt > 0) {
-        retry.lastAttemptAt = parsed.lastAttemptAt;
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as { date?: unknown; count?: unknown; lastAttemptAt?: unknown } | null;
+        if (parsed?.date === today) {
+          if (Number.isInteger(parsed.count) && Number(parsed.count) >= 0) {
+            retry.count = Number(parsed.count);
+          }
+          if (typeof parsed.lastAttemptAt === 'number' && parsed.lastAttemptAt > 0) {
+            retry.lastAttemptAt = parsed.lastAttemptAt;
+          }
+        }
+      } catch {
+        // A malformed retry marker is safe to reset for today's recovery window.
       }
     }
-  } catch {
-    // A malformed retry marker is safe to reset for today's recovery window.
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'failed to read dailyRetryState in triggerDailyRetry');
+    return;
   }
   if (retry.count >= DAILY_RETRY_LIMIT) {
     setDailyRetryCompletedDate(today);
@@ -1176,10 +1236,14 @@ export async function triggerDailyRetry(): Promise<void> {
     return;
   }
 
-  const trigger = await triggerRun('cron-retry');
-  if (!trigger.started) return;
-  retry.count += 1;
-  retry.lastAttemptAt = Date.now();
+  const previousRetry = { ...retry };
+  retry = { date: today, count: retry.count + 1, lastAttemptAt: Date.now() };
   await setSystemState(SystemKeys.dailyRetryState, JSON.stringify(retry));
+
+  const trigger = await triggerRun('cron-retry');
+  if (!trigger.started) {
+    await setSystemState(SystemKeys.dailyRetryState, JSON.stringify(previousRetry)).catch(() => undefined);
+    return;
+  }
   logger.info({ today, attempt: retry.count, limit: DAILY_RETRY_LIMIT, nextRetryGapHours: 1 }, 'LeetCode daily retry scheduled');
 }

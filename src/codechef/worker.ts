@@ -3,7 +3,7 @@ import { CodeChefAccountStatus } from '@prisma/client';
 import { logger } from '../logger';
 import { config } from '../config';
 import { prepareShuffledBatch, plannedProgress } from '../scheduler/questionOrder';
-import { getSystemState, setSystemState, SystemKeys } from '../database/models';
+import * as dbModels from '../database/models';
 import { isRunInProgress as isLeetCodeBusy } from '../scheduler/dailyWorker';
 import { sendTelegramMessage } from '../notifications/telegram';
 import * as ccStorage from './storage';
@@ -334,6 +334,8 @@ async function loadCodeChefStorageState(
   return null;
 }
 
+const reportDailyMeta = new WeakMap<CodeChefReport, { exhaustedAccountIds: string[]; ambiguousAccountIds: string[] }>();
+
 export async function runCodeChefNow(
   reason: 'manual' | 'cron' = 'manual',
   options: CodeChefRunOptions = {},
@@ -345,6 +347,8 @@ export async function runCodeChefNow(
   const signal = activeRangeAbortController.signal;
   try {
     const report: CodeChefReport = { date: todayInTimezone(), outcomes: [] };
+    const reportMeta = { exhaustedAccountIds: [] as string[], ambiguousAccountIds: [] as string[] };
+    reportDailyMeta.set(report, reportMeta);
     await ensureCodeChefAccountsSeeded();
     const requestedAccountIds = options.accountIds ? new Set(options.accountIds) : null;
     const accounts = (await loadActiveCodeChefAccountSummaries()).filter(
@@ -380,120 +384,181 @@ export async function runCodeChefNow(
         continue;
       }
 
-      await options.onProgress?.({
-        phase: 'checking',
-        label: account.label,
-        username: account.username,
-        index: accIndex + 1,
-        total: accounts.length,
-        accIndex,
-        accTotal: accounts.length,
-      });
-
-      let currentProgress = await getCodeChefProgress(account.id);
-      const plan = await prepareShuffledBatch('codechef', account.id, sourceQueue, currentProgress,
-        findNextCodeChefSourceIndex(sourceQueue, currentProgress), batchCount, entry => entry.problemCode!);
-      const queue = plan.queue;
-      currentProgress = plannedProgress(plan, currentProgress);
-      logger.info({ accountId: account.id, count: batchCount, nextKey: plan.nextKey }, 'CodeChef account batch order prepared');
-      let validCandidate = await advanceToNextValidProblem(
-        account.id,
-        account.label,
-        account.username,
-        queue,
-        findNextCodeChefSourceIndex(queue, currentProgress),
-        options.onProgress,
-        accIndex + 1,
-        accounts.length,
-        signal,
-        accIndex,
-        accounts.length,
-        1,
-        batchCount,
-      );
-
-      if (signal.aborted) break;
-
-      if (!validCandidate) {
-        const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, error: 'Source queue exhausted or no valid problems remain' };
-        report.outcomes.push(row);
-        await options.onProgress?.({
-          phase: 'skipped',
-          label: account.label,
-          username: account.username,
-          index: accIndex + 1,
-          total: accounts.length,
-          accIndex,
-          accTotal: accounts.length,
-          error: row.error,
-        });
-        continue;
-      }
-
-      let index = validCandidate.index;
-      let entry = validCandidate.entry;
-
-      let claimed = await claimDailyAttempt(account.id, report.date, entry.problemCode!, forceAttempt);
-      if (!claimed) {
-        logger.info({ account: account.label, problem: entry.problemCode }, 'Today’s CodeChef attempt is already claimed');
-        const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, problem: entry.problemCode, error: 'Today’s CodeChef attempt is already completed or awaiting confirmation' };
-        report.outcomes.push(row);
-        await options.onProgress?.({
-          phase: 'skipped',
-          label: account.label,
-          username: account.username,
-          problemCode: entry.problemCode,
-          index: accIndex + 1,
-          total: accounts.length,
-          accIndex,
-          accTotal: accounts.length,
-          error: row.error,
-        });
-        continue;
-      }
-
+      let claimed = false;
       let mayHaveSubmitted = false;
-      const rawStorageState = await loadCodeChefStorageState(account);
-      let credentials: Partial<CodeChefState> & { username?: string; password?: string } = {};
-      if (rawStorageState) {
-        try {
-          credentials = JSON.parse(rawStorageState) as Partial<CodeChefState> & { username?: string; password?: string };
-        } catch {
-          credentials = {};
-        }
-      }
-      let state: CodeChefState | undefined = credentials.cookies?.length ? { cookies: credentials.cookies, origins: [] } : undefined;
-
-      const login = async (): Promise<void> => {
-        await options.onProgress?.({
-          phase: 'logging-in',
-          label: account.label,
-          username: account.username,
-          index: accIndex + 1,
-          total: accounts.length,
-          accIndex,
-          accTotal: accounts.length,
-        });
-        logger.info({ account: account.label }, 'Authenticating account on CodeChef...');
-        const updated = await loginToCodeChef(credentials.username ?? account.username ?? account.label, credentials.password ?? '');
-        state = { cookies: updated.cookies, origins: [] };
-        await patchCodeChefAccount(account.id, { storageState: JSON.stringify({ username: credentials.username, password: credentials.password, ...updated }), checked: true });
-        logger.info({ account: account.label }, 'CodeChef account session saved to DB');
-        await options.onProgress?.({
-          phase: 'session-ready',
-          label: account.label,
-          username: account.username,
-          index: accIndex + 1,
-          total: accounts.length,
-          accIndex,
-          accTotal: accounts.length,
-        });
-      };
+      let entry: CodeChefSourceEntry | undefined;
 
       try {
+        await options.onProgress?.({
+          phase: 'checking',
+          label: account.label,
+          username: account.username,
+          index: accIndex + 1,
+          total: accounts.length,
+          accIndex,
+          accTotal: accounts.length,
+        });
+
+        let currentProgress = await getCodeChefProgress(account.id);
+        const orderStateKey = `question-order:v1:codechef:${account.id}`;
+        let plan: Awaited<ReturnType<typeof prepareShuffledBatch<CodeChefSourceEntry>>>;
+        try {
+          plan = await prepareShuffledBatch(
+            'codechef',
+            account.id,
+            sourceQueue,
+            currentProgress,
+            findNextCodeChefSourceIndex(sourceQueue, currentProgress),
+            batchCount,
+            (item) => item.problemCode!,
+          );
+        } catch (planErr) {
+          const planMsg = planErr instanceof Error ? planErr.message : String(planErr);
+          if (!/Source queue changed inside an unfinished shuffled batch/i.test(planMsg)) {
+            throw planErr;
+          }
+          const rawSaved = await dbModels.getSystemState(orderStateKey).catch(() => null);
+          let hasRetiredRemoved = false;
+          if (rawSaved) {
+            try {
+              const parsed = JSON.parse(rawSaved) as { original?: unknown } | null;
+              if (Array.isArray(parsed?.original)) {
+                const sourceCodes = new Set(sourceQueue.map((item) => item.problemCode));
+                hasRetiredRemoved = parsed.original.some(
+                  (k) =>
+                    typeof k === 'string' &&
+                    RETIRED_OR_INVALID_CODECHEF_PROBLEMS.has(k) &&
+                    !sourceCodes.has(k),
+                );
+              }
+            } catch {
+              hasRetiredRemoved = false;
+            }
+          }
+          if (!hasRetiredRemoved) {
+            throw planErr;
+          }
+          logger.warn(
+            { accountId: account.id, orderStateKey },
+            'Recovering wedged CodeChef shuffled batch containing retired problems',
+          );
+          if (typeof dbModels.deleteSystemState === 'function') {
+            await dbModels.deleteSystemState(orderStateKey);
+          } else {
+            await dbModels.setSystemState(orderStateKey, '');
+          }
+          plan = await prepareShuffledBatch(
+            'codechef',
+            account.id,
+            sourceQueue,
+            currentProgress,
+            findNextCodeChefSourceIndex(sourceQueue, currentProgress),
+            batchCount,
+            (item) => item.problemCode!,
+          );
+        }
+
+        const queue = plan.queue;
+        currentProgress = plannedProgress(plan, currentProgress);
+        logger.info({ accountId: account.id, count: batchCount, nextKey: plan.nextKey }, 'CodeChef account batch order prepared');
+        const validCandidate = await advanceToNextValidProblem(
+          account.id,
+          account.label,
+          account.username,
+          queue,
+          findNextCodeChefSourceIndex(queue, currentProgress),
+          options.onProgress,
+          accIndex + 1,
+          accounts.length,
+          signal,
+          accIndex,
+          accounts.length,
+          1,
+          batchCount,
+        );
+
+        if (signal.aborted) break;
+
+        if (!validCandidate) {
+          reportMeta.exhaustedAccountIds.push(account.id);
+          const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, error: 'Source queue exhausted or no valid problems remain' };
+          report.outcomes.push(row);
+          await options.onProgress?.({
+            phase: 'skipped',
+            label: account.label,
+            username: account.username,
+            index: accIndex + 1,
+            total: accounts.length,
+            accIndex,
+            accTotal: accounts.length,
+            error: row.error,
+          });
+          continue;
+        }
+
+        let index = validCandidate.index;
+        entry = validCandidate.entry;
+
+        claimed = await claimDailyAttempt(account.id, report.date, entry.problemCode!, forceAttempt);
+        if (!claimed) {
+          logger.info({ account: account.label, problem: entry.problemCode }, 'Today’s CodeChef attempt is already claimed');
+          const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, problem: entry.problemCode, error: 'Today’s CodeChef attempt is already completed or awaiting confirmation' };
+          report.outcomes.push(row);
+          await options.onProgress?.({
+            phase: 'skipped',
+            label: account.label,
+            username: account.username,
+            problemCode: entry.problemCode,
+            index: accIndex + 1,
+            total: accounts.length,
+            accIndex,
+            accTotal: accounts.length,
+            error: row.error,
+          });
+          continue;
+        }
+
+        const rawStorageState = await loadCodeChefStorageState(account);
+        let credentials: Partial<CodeChefState> & { username?: string; password?: string } = {};
+        if (rawStorageState) {
+          try {
+            credentials = JSON.parse(rawStorageState) as Partial<CodeChefState> & { username?: string; password?: string };
+          } catch {
+            credentials = {};
+          }
+        }
+        let state: CodeChefState | undefined = credentials.cookies?.length ? { cookies: credentials.cookies, origins: [] } : undefined;
+
+        const login = async (): Promise<void> => {
+          await options.onProgress?.({
+            phase: 'logging-in',
+            label: account.label,
+            username: account.username,
+            index: accIndex + 1,
+            total: accounts.length,
+            accIndex,
+            accTotal: accounts.length,
+          });
+          logger.info({ account: account.label }, 'Authenticating account on CodeChef...');
+          const updated = await loginToCodeChef(credentials.username ?? account.username ?? account.label, credentials.password ?? '');
+          state = { cookies: updated.cookies, origins: [] };
+          await patchCodeChefAccount(account.id, { storageState: JSON.stringify({ username: credentials.username, password: credentials.password, ...updated }), checked: true });
+          logger.info({ account: account.label }, 'CodeChef account session saved to DB');
+          await options.onProgress?.({
+            phase: 'session-ready',
+            label: account.label,
+            username: account.username,
+            index: accIndex + 1,
+            total: accounts.length,
+            accIndex,
+            accTotal: accounts.length,
+          });
+        };
+
         if (!state) await login();
 
         let retiredSkips = 0;
+        let accountSubmissions = 0;
         for (let step = 0; step < batchCount; step++) {
           if (signal.aborted) break;
 
@@ -516,7 +581,25 @@ export async function runCodeChefNow(
             step + 1,
             batchCount,
           );
-          if (signal.aborted || !candidate) break;
+          if (signal.aborted) break;
+          if (!candidate) {
+            reportMeta.exhaustedAccountIds.push(account.id);
+            if (accountSubmissions === 0) {
+              const row: CodeChefOutcome = { label: account.label, performed: false, skipped: true, error: 'Source queue exhausted or no valid problems remain' };
+              report.outcomes.push(row);
+              await options.onProgress?.({
+                phase: 'skipped',
+                label: account.label,
+                username: account.username,
+                index: accIndex + 1,
+                total: accounts.length,
+                accIndex,
+                accTotal: accounts.length,
+                error: row.error,
+              });
+            }
+            break;
+          }
 
           index = candidate.index;
           entry = candidate.entry;
@@ -574,18 +657,19 @@ export async function runCodeChefNow(
             stepTotal: batchCount,
           });
 
+          const problemUrl = entry.problemUrl ?? `https://www.codechef.com/problems/${entry.problemCode}`;
           mayHaveSubmitted = true;
           // 1. Direct API submit (0MB browser RAM, takes 2-3s, completely avoids Render OOM)
           let posted: CodeChefSubmitResult | null = null;
           if (state) {
-            posted = await submitDirectlyViaCodeChefApi(state, entry.problemUrl!, code, entry.language, 90000);
+            posted = await submitDirectlyViaCodeChefApi(state, problemUrl, code, entry.language, 90000);
           }
 
           // 2. If signed-out, re-login and retry
           if (posted?.kind === 'signed-out' && !posted.clicked) {
             logger.warn({ account: account.label }, 'CodeChef session expired before submit click; re-authenticating...');
             await login();
-            posted = await submitDirectlyViaCodeChefApi(state, entry.problemUrl!, code, entry.language, 90000);
+            posted = await submitDirectlyViaCodeChefApi(state, problemUrl, code, entry.language, 90000);
           }
 
           const isProblemInvalid = posted?.problemInvalid || /does not belong to the contest|no such problem|does not exist in Practice/i.test(posted?.error ?? '');
@@ -626,7 +710,7 @@ export async function runCodeChefNow(
           // 3. Fallback to browser submit flow ONLY if explicitly allowed and API had a generic error
           if (!posted || (!posted.performed && !posted.clicked && posted.kind === 'error' && process.env.CODECHEF_ALLOW_BROWSER_FALLBACK === 'true')) {
             logger.info({ account: account.label }, 'Falling back to browser submit flow for CodeChef...');
-            posted = await submitToCodeChef(state, entry.problemUrl!, code, entry.language, account.username ?? credentials.username);
+            posted = await submitToCodeChef(state, problemUrl, code, entry.language, account.username ?? credentials.username);
           }
 
           mayHaveSubmitted = posted.clicked === true;
@@ -636,94 +720,103 @@ export async function runCodeChefNow(
           row.error = posted.error;
           row.performed = posted.performed === true && !!posted.submissionId;
 
-            const isCompleted = row.performed || (posted.submissionId && isTerminalCodeChefVerdict(posted.verdict)) || isTerminalCodeChefVerdict(posted.verdict);
-            if (isCompleted) {
-              if (activeRangeJob) activeRangeJob.completed++;
-              await completeCurrentProblem(account.id, {
-                completedKey: entry.problemCode!,
-                nextKey: queue[index + 1]?.problemCode ?? null,
-                submissionId: posted.submissionId ?? null,
-                verdict: posted.verdict ?? null,
-              });
-              await patchCodeChefAccount(account.id, {
-                status: CodeChefAccountStatus.ACTIVE,
-                lastSubmissionDate: report.date,
-                lastSubmissionId: posted.submissionId ?? null,
-                lastVerdict: posted.verdict ?? null,
-                lastError: null,
-                checked: true,
-              });
-              await options.onProgress?.({
-                phase: 'completed',
-                label: account.label,
-                username: account.username,
-                problemCode: entry.problemCode,
-                verdict: posted.verdict,
-                submissionId: posted.submissionId,
-                index: progressIndex,
-                total: progressTotal,
-                accIndex,
-                accTotal: accounts.length,
-                stepIndex: step + 1,
-                stepTotal: batchCount,
-              });
+          const isCompleted = Boolean(row.performed || (posted.submissionId && isTerminalCodeChefVerdict(posted.verdict)));
+          if (isCompleted) {
+            if (activeRangeJob) activeRangeJob.completed++;
+            await completeCurrentProblem(account.id, {
+              completedKey: entry.problemCode!,
+              nextKey: queue[index + 1]?.problemCode ?? null,
+              submissionId: posted.submissionId ?? null,
+              verdict: posted.verdict ?? null,
+            });
+            await patchCodeChefAccount(account.id, {
+              status: CodeChefAccountStatus.ACTIVE,
+              lastSubmissionDate: report.date,
+              lastSubmissionId: posted.submissionId ?? null,
+              lastVerdict: posted.verdict ?? null,
+              lastError: null,
+              checked: true,
+            });
+            await options.onProgress?.({
+              phase: 'completed',
+              label: account.label,
+              username: account.username,
+              problemCode: entry.problemCode,
+              verdict: posted.verdict,
+              submissionId: posted.submissionId,
+              index: progressIndex,
+              total: progressTotal,
+              accIndex,
+              accTotal: accounts.length,
+              stepIndex: step + 1,
+              stepTotal: batchCount,
+            });
+          } else {
+            if (activeRangeJob) activeRangeJob.failed++;
+            await recordAttempt(account.id, { submissionId: posted.submissionId ?? null, verdict: posted.verdict ?? null });
+            await patchCodeChefAccount(account.id, { lastError: posted.error ?? 'No confirmed CodeChef result', checked: true });
+            if (!mayHaveSubmitted) {
+              await releaseDailyAttempt(account.id, report.date);
             } else {
-              if (activeRangeJob) activeRangeJob.failed++;
-              await recordAttempt(account.id, { submissionId: posted.submissionId ?? null, verdict: posted.verdict ?? null });
-              await patchCodeChefAccount(account.id, { lastError: posted.error ?? 'No confirmed CodeChef result', checked: true });
-              if (!mayHaveSubmitted) await releaseDailyAttempt(account.id, report.date);
-              await options.onProgress?.({
-                phase: 'failed',
-                label: account.label,
-                username: account.username,
-                problemCode: entry.problemCode,
-                error: posted.error,
-                index: progressIndex,
-                total: progressTotal,
-                accIndex,
-                accTotal: accounts.length,
-                stepIndex: step + 1,
-                stepTotal: batchCount,
-              });
+              reportMeta.ambiguousAccountIds.push(account.id);
             }
+            await options.onProgress?.({
+              phase: 'failed',
+              label: account.label,
+              username: account.username,
+              problemCode: entry.problemCode,
+              error: posted.error,
+              index: progressIndex,
+              total: progressTotal,
+              accIndex,
+              accTotal: accounts.length,
+              stepIndex: step + 1,
+              stepTotal: batchCount,
+            });
+          }
 
-            report.outcomes.push(row);
-            await options.onAccountOutcome?.(row, progressIndex, progressTotal);
+          accountSubmissions++;
+          report.outcomes.push(row);
+          await options.onAccountOutcome?.(row, progressIndex, progressTotal);
 
-            if (step < batchCount - 1 && !signal.aborted) {
-              if (activeRangeJob) {
-                activeRangeJob.state = 'waiting';
-                activeRangeJob.waitEndsAt = Date.now() + CODECHEF_RANGE_GAP_MS;
-              }
-              await options.onProgress?.({
-                phase: 'waiting',
-                label: account.label,
-                username: account.username,
-                problemCode: entry.problemCode,
-                index: progressIndex,
-                total: progressTotal,
-                accIndex,
-                accTotal: accounts.length,
-                stepIndex: step + 1,
-                stepTotal: batchCount,
-                waitSeconds: Math.round(CODECHEF_RANGE_GAP_MS / 1000),
-              });
-              await sleepWithAbort(CODECHEF_RANGE_GAP_MS, signal);
-              if (activeRangeJob) {
-                activeRangeJob.state = 'running';
-                activeRangeJob.waitEndsAt = undefined;
-              }
-              if (signal.aborted) {
-                logger.info('CodeChef batch run aborted by user during pacing delay');
-                break;
-              }
+          if (step < batchCount - 1 && !signal.aborted) {
+            if (activeRangeJob) {
+              activeRangeJob.state = 'waiting';
+              activeRangeJob.waitEndsAt = Date.now() + CODECHEF_RANGE_GAP_MS;
+            }
+            await options.onProgress?.({
+              phase: 'waiting',
+              label: account.label,
+              username: account.username,
+              problemCode: entry.problemCode,
+              index: progressIndex,
+              total: progressTotal,
+              accIndex,
+              accTotal: accounts.length,
+              stepIndex: step + 1,
+              stepTotal: batchCount,
+              waitSeconds: Math.round(CODECHEF_RANGE_GAP_MS / 1000),
+            });
+            await sleepWithAbort(CODECHEF_RANGE_GAP_MS, signal);
+            if (activeRangeJob) {
+              activeRangeJob.state = 'running';
+              activeRangeJob.waitEndsAt = undefined;
+            }
+            if (signal.aborted) {
+              logger.info('CodeChef batch run aborted by user during pacing delay');
+              break;
             }
           }
+        }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         logger.warn({ accountId: account.id, error: errorMsg }, 'CodeChef account run failed');
         await patchCodeChefAccount(account.id, { lastError: errorMsg, checked: true }).catch(() => undefined);
-        if (claimed && !mayHaveSubmitted) await releaseDailyAttempt(account.id, report.date).catch(() => undefined);
+        if (claimed && !mayHaveSubmitted) {
+          await releaseDailyAttempt(account.id, report.date).catch(() => undefined);
+        } else if (claimed && mayHaveSubmitted) {
+          reportMeta.ambiguousAccountIds.push(account.id);
+        }
         report.outcomes.push({ label: account.label, performed: false, error: errorMsg, problem: entry?.problemCode });
         await options.onProgress?.({
           phase: 'failed',
@@ -796,21 +889,31 @@ export function isAfterCodeChefSchedule(
 export interface CodeChefDailyState {
   date: string;
   retryCount: number;
+  exhaustedAccountIds?: string[];
+  ambiguousAccountIds?: string[];
 }
 
 export const CODECHEF_DAILY_RETRY_LIMIT = 10;
 
 export async function readCodeChefDailyState(date: string): Promise<CodeChefDailyState> {
   try {
-    const raw = await getSystemState(SystemKeys.codechefDailyState);
+    const raw = await dbModels.getSystemState(dbModels.SystemKeys.codechefDailyState);
     const parsed = raw ? (JSON.parse(raw) as Partial<CodeChefDailyState>) : null;
     if (parsed?.date === date) {
+      const exhaustedAccountIds = Array.isArray(parsed.exhaustedAccountIds)
+        ? parsed.exhaustedAccountIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+        : [];
+      const ambiguousAccountIds = Array.isArray(parsed.ambiguousAccountIds)
+        ? parsed.ambiguousAccountIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+        : [];
       return {
         date,
         retryCount:
           Number.isInteger(parsed.retryCount) && Number(parsed.retryCount) >= 0
             ? Number(parsed.retryCount)
             : 0,
+        ...(exhaustedAccountIds.length > 0 ? { exhaustedAccountIds } : {}),
+        ...(ambiguousAccountIds.length > 0 ? { ambiguousAccountIds } : {}),
       };
     }
   } catch {
@@ -820,7 +923,13 @@ export async function readCodeChefDailyState(date: string): Promise<CodeChefDail
 }
 
 export async function writeCodeChefDailyState(state: CodeChefDailyState): Promise<void> {
-  await setSystemState(SystemKeys.codechefDailyState, JSON.stringify(state));
+  const payload: CodeChefDailyState = {
+    date: state.date,
+    retryCount: state.retryCount,
+    ...(state.exhaustedAccountIds?.length ? { exhaustedAccountIds: [...new Set(state.exhaustedAccountIds)] } : {}),
+    ...(state.ambiguousAccountIds?.length ? { ambiguousAccountIds: [...new Set(state.ambiguousAccountIds)] } : {}),
+  };
+  await dbModels.setSystemState(dbModels.SystemKeys.codechefDailyState, JSON.stringify(payload));
 }
 
 export async function runAutomaticCodeChefDaily(
@@ -867,7 +976,11 @@ export async function runAutomaticCodeChefDaily(
     setCodeChefRetryNextPollAt(Date.now() + 60 * 60_000);
     return;
   }
-  const pending = accounts.filter((a) => a.lastSubmissionDate !== today);
+  const excludedAccountIds = new Set([
+    ...(state.exhaustedAccountIds ?? []),
+    ...(state.ambiguousAccountIds ?? []),
+  ]);
+  const pending = accounts.filter((a) => a.lastSubmissionDate !== today && !excludedAccountIds.has(a.id));
   if (pending.length === 0) {
     setCodeChefRetryCompletedDate(today);
     setCodeChefRetryNextPollAt(Date.now() + 60 * 60_000);
@@ -891,7 +1004,22 @@ export async function runAutomaticCodeChefDaily(
     'automatic CodeChef daily run starting',
   );
 
-  await runCodeChefNow('cron', { forceDailyAttempt: true });
+  const report = await runCodeChefNow('cron', {
+    accountIds: pending.map((a) => a.id),
+    forceDailyAttempt: true,
+  });
+  if (report) {
+    const meta = reportDailyMeta.get(report);
+    if (meta && (meta.exhaustedAccountIds.length > 0 || meta.ambiguousAccountIds.length > 0)) {
+      if (meta.exhaustedAccountIds.length > 0) {
+        state.exhaustedAccountIds = [...new Set([...(state.exhaustedAccountIds ?? []), ...meta.exhaustedAccountIds])];
+      }
+      if (meta.ambiguousAccountIds.length > 0) {
+        state.ambiguousAccountIds = [...new Set([...(state.ambiguousAccountIds ?? []), ...meta.ambiguousAccountIds])];
+      }
+      await writeCodeChefDailyState(state);
+    }
+  }
 }
 
 export function startCodeChefScheduler(): () => void {
