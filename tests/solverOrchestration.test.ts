@@ -206,6 +206,18 @@ describe('Solver Orchestration & Fallback Engine', () => {
     expect(sentTelegramMessages.some((msg) => msg.includes('Turnstile solved via CapSolver / Capzy'))).toBe(true);
   });
 
+  it.each([
+    [502, '<html>Bad Gateway</html>', 'HTTP 502 Bad Gateway'],
+    [401, '{}', 'HTTP 401'],
+    [200, '<html>Loading</html>', 'Invalid /health response'],
+    [200, '{}', 'Invalid /health response'],
+    [200, '{"status":"degraded"}', 'Service reported status "degraded"'],
+  ] as const)('reports CPSolver health failure for HTTP %i and body %s', async (status, body, reason) => {
+    process.env.CPSOLVER_URL = 'https://cpsolver.test.com';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, { status })));
+    expect(await checkCPSolverHealth()).toMatchObject({ ok: false, error: expect.stringContaining(reason) });
+  });
+
   it('checks CPSolver health and reports online status with proxy pool info', async () => {
     process.env.CPSOLVER_URL = 'https://cpsolver.test.com';
 

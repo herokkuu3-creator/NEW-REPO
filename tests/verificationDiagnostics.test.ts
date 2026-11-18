@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConcurrencyQueue } from '../CPSolver/src/queue';
+import { config } from '../CPSolver/src/config';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { BrowserManager } from '../CPSolver/src/browser';
@@ -36,6 +37,32 @@ describe('offline verification failure evidence', () => {
     expect(state.launchingPromise).toBeNull();
     launch.mockRestore();
     (BrowserManager as any).instance = null;
+  });
+
+  it('returns a completed solve while new context creation waits for recycling', async () => {
+    const manager = BrowserManager.getInstance();
+    const state = manager as any;
+    let releaseClose!: () => void;
+    const closing = new Promise<void>(resolve => { releaseClose = resolve; });
+    state.browser = { close: () => closing, isConnected: () => true };
+    state.solvesCount = config.maxSolvesBeforeRecycle - 1;
+    const replacement = { isConnected: () => true };
+    const launch = vi.spyOn(state, 'getOrLaunchBrowser').mockResolvedValue(replacement);
+    const completed = manager.notifySolveCompleted(1);
+    const nextBrowser = manager.ensureBrowser();
+    let responseReady = false;
+    void completed.then(() => { responseReady = true; });
+    try {
+      await Promise.resolve();
+      expect(responseReady).toBe(true);
+      expect(launch).not.toHaveBeenCalled();
+    } finally {
+      releaseClose();
+      await Promise.all([completed, nextBrowser]);
+      launch.mockRestore();
+      (BrowserManager as any).instance = null;
+    }
+    expect(await nextBrowser).toBe(replacement);
   });
 
   it('queue timeout cancels work and holds capacity until cleanup completes', async () => {
@@ -143,6 +170,61 @@ describe('offline verification failure evidence', () => {
     } finally {
       spy.mockRestore();
     }
+  });
+
+  it('waits for a LeetCode form token when the browser already has clearance', async () => {
+    vi.useFakeTimers();
+    const { solveTurnstile } = await import('../CPSolver/src/solver');
+    const target = 'https://leetcode.com/accounts/login/?next=%2F';
+    const token = 'LOCAL_FIXTURE_FORM_TOKEN';
+    const cookies = vi.fn(async () => [{ name: 'cf_clearance', value: 'LOCAL_FIXTURE_CLEARANCE' }]);
+    const readToken = vi.fn().mockResolvedValueOnce(null).mockResolvedValue(token);
+    const page = {
+      route: vi.fn(async () => {}),
+      goto: vi.fn(async () => {}),
+      on: vi.fn(),
+      setDefaultTimeout: vi.fn(),
+      evaluate: readToken,
+      title: vi.fn(async () => 'Login / Register - LeetCode'),
+      url: vi.fn(() => target),
+      frames: vi.fn(() => []),
+      context: () => ({ cookies }),
+      screenshot: vi.fn(async () => null),
+      close: vi.fn(async () => {}),
+    };
+    const context = { newPage: vi.fn(async () => page), cookies, close: vi.fn(async () => {}) };
+    const spy = vi.spyOn(BrowserManager, 'getInstance').mockReturnValue({
+      createContext: vi.fn(async () => context),
+      notifySolveCompleted: vi.fn(async () => {}),
+    } as any);
+    try {
+      const result = solveTurnstile({ siteurl: target, mode: 'harness', proxy: 'direct', timeout: 5000 });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(await result).toMatchObject({ ok: true, modeUsed: 'navigate', token });
+      expect(readToken).toHaveBeenCalledTimes(2);
+      expect(page.goto).toHaveBeenCalledWith(target, expect.objectContaining({ waitUntil: 'commit' }));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('can click a second Turnstile widget after the page challenge', async () => {
+    const { interactWithTurnstileCheckbox } = await import('../CPSolver/src/stealth');
+    const makeFrame = (id: string) => {
+      const click = vi.fn(async () => {});
+      const first = () => ({ isVisible: async () => true, click });
+      return { url: () => `https://challenges.cloudflare.com/cdn-cgi/challenge-platform/${id}`, locator: () => ({ first }), click };
+    };
+    const interstitial = makeFrame('first');
+    const inline = makeFrame('second');
+    const page = { frames: () => [interstitial, inline] };
+    const clicked = new WeakMap();
+
+    expect(await interactWithTurnstileCheckbox(page as any, clicked)).toBe(true);
+    expect(await interactWithTurnstileCheckbox(page as any, clicked)).toBe(true);
+    expect(await interactWithTurnstileCheckbox(page as any, clicked)).toBe(false);
+    expect(interstitial.click.mock.calls).toEqual([[{ timeout: 1500 }]]);
+    expect(inline.click.mock.calls).toEqual([[{ timeout: 1500 }]]);
   });
 
   it('harness fallback on 600010 unroutes synthetic HTML and reports navigate mode', async () => {

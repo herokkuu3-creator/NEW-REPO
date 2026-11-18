@@ -9,6 +9,7 @@ vi.mock('../CPSolver/src/solver', async () => {
     solverQueue: queue,
     solverStats: {},
     lastDebugScreenshot: null,
+    requiresTurnstileToken: () => false,
     solveTurnstile: (_request: unknown, signal: AbortSignal) => {
       state.signals.push(signal);
       return queue.run(async () => {
