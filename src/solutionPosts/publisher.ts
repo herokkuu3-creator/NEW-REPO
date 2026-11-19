@@ -183,7 +183,7 @@ function isContestPostingRestriction(reason: unknown): boolean {
   return typeof reason === 'string' && /banned from posting[^.]*contest rules/i.test(reason);
 }
 
-export async function publishPost(id: string) {
+export async function publishPost(id: string, options: { beforePublish?: () => Promise<void>; automaticEngagement?: false } = {}) {
   let preparationStage = 'load';
   let post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
   if (post.status === 'PUBLISHED') return post;
@@ -197,6 +197,7 @@ export async function publishPost(id: string) {
   if (articleNeedsRefresh(context)) throw new PostError('ARTICLE_LAYOUT_REFRESH_REQUIRED');
   verifyArticleCode(post.markdown, context);
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
+  const publicationData = options.automaticEngagement === false ? { automaticEngagement: false } : undefined;
   return withAccount(account, async (api, page, username) => {
     preparationStage = 'eligibility';
     await checkEligibility(api, context, username);
@@ -205,9 +206,10 @@ export async function publishPost(id: string) {
     if (duplicate) return move(post, 'SKIPPED', { lastError: 'EXISTING_ACCOUNT_SOLUTION', publishedUrl: duplicate });
     if (config.solutionPosts.publishTransport === 'api') {
       preparationStage = 'publication-api';
+      if (options.beforePublish) await options.beforePublish();
       // Claim BEFORE the sole irreversible request. An error never causes an
       // automatic repeat or a second attempt through the browser transport.
-      post = await move(post, 'PUBLISHING');
+      post = publicationData ? await move(post, 'PUBLISHING', publicationData) : await move(post, 'PUBLISHING');
       try {
         const tags = buildArticleTags(context, post.markdown!);
         logger.info({ postId: id, tags }, 'publishing solution article with tags');
@@ -231,7 +233,7 @@ export async function publishPost(id: string) {
         post = await move(post, 'PUBLISHED', { publishedAt: new Date(), lastError: null });
         logger.info({ postId: id, url, transport: 'api', executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
           revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication verified');
-        void scheduleSolutionArticleUpvotes(post).catch((upErr) => logger.warn({ postId: id, err: upErr }, 'failed to schedule article upvotes'));
+        queuePublicationUpvotes(post);
         return post;
       } catch (error) {
         if (!post.publishedUrl && error instanceof LeetCodeHttpError && isContestPostingRestriction(error.message)) {
@@ -253,7 +255,7 @@ export async function publishPost(id: string) {
             const reconciled = await move(uncertain, 'PUBLISHED', { publishedUrl: candidate, publishedAt: new Date(), lastError: null });
             logger.info({ postId: id, url: candidate, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
               revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication reconciled after response failure');
-            void scheduleSolutionArticleUpvotes(reconciled).catch((upErr) => logger.warn({ postId: id, err: upErr }, 'failed to schedule article upvotes'));
+            queuePublicationUpvotes(reconciled);
             return reconciled;
           }
         } catch { /* retain the protected result when the article cannot be positively verified */ }
@@ -262,15 +264,16 @@ export async function publishPost(id: string) {
     }
     preparationStage = 'editor';
     await prepareEditor(page, context, post.title!, post.markdown!);
+    if (options.beforePublish) await options.beforePublish();
     // CAS before the sole irreversible click. A crash after this point never repeats the click.
-    post = await move(post, 'PUBLISHING');
+    post = publicationData ? await move(post, 'PUBLISHING', publicationData) : await move(post, 'PUBLISHING');
     try {
       await page.getByRole('button', { name: 'Post', exact: true }).click({ timeout: 10000 });
       await page.waitForURL(url => validSolutionUrl(url.toString(), context.slug), { timeout: 30000 });
       post = await prisma.solutionPost.update({ where: { id }, data: { publishedUrl: page.url() } });
       await verifyPublished(api, page, post.publishedUrl!, context, post.title!, post.markdown!);
       post = await move(post, 'PUBLISHED', { publishedAt: new Date(), lastError: null });
-      void scheduleSolutionArticleUpvotes(post).catch((upErr) => logger.warn({ postId: id, err: upErr }, 'failed to schedule article upvotes'));
+      queuePublicationUpvotes(post);
       return post;
     } catch {
       // Do not transition to FAILED: a retry could produce a duplicate public post.
@@ -310,9 +313,14 @@ export async function reconcilePost(id: string, url?: string, postingRestricted 
     logger.info({ postId: id, url: candidate, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
       revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication reconciled');
     const reconciled = await move(post, 'PUBLISHED', { publishedUrl: candidate, publishedAt: new Date(), lastError: null });
-    void scheduleSolutionArticleUpvotes(reconciled).catch((upErr) => logger.warn({ postId: id, err: upErr }, 'failed to schedule article upvotes'));
+    queuePublicationUpvotes(reconciled);
     return reconciled;
   });
+}
+
+function queuePublicationUpvotes(post: Awaited<ReturnType<typeof move>>) {
+  if (post.automaticEngagement === false) return;
+  void scheduleSolutionArticleUpvotes(post).catch(err => logger.warn({ postId: post.id, err }, 'failed to schedule article upvotes'));
 }
 
 /** Read-only server diagnostics; never repeats a mutation or exposes session cookies. */

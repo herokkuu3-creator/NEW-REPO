@@ -81,6 +81,14 @@ npm run solution:post -- reconcile <postId> <publishedURL>
 
 In Telegram, `/dailysolution` opens the same durable account selection used by the 06:00 IST schedule. It preselects the accounts saved on the previous use, so accounts can be added or removed before saving or running the combined daily submission and article workflow immediately. `/manualsolution` uses that saved selection and offers either the daily problem or one LeetCode question number (for example, `3820`). For a manual question, the worker submits it, retains the exact accepted source under a namespaced non-daily run key, then generates and publishes the article through the same verified-GIF path. It never overwrites the calendar-day daily run.
 
+### Next Daily Challenge forecast
+
+Send `/predictdaily 22:30` and choose one saved LeetCode account to enable daily posting at 22:30 IST. `/predictdaily preview` fetches the forecast without submitting or posting. `/predictdaily` shows the schedule and latest outcome. `/predictdaily off` stops future work.
+
+The forecast targets the next LeetCode UTC date. The worker matches public official editorials from the preceding 15 days against the public Daily Challenge calendar and excludes the previous 30 dailies. It ranks eligible problems using editorial lead times, publication batches, and recent topics. When an AI provider is available it can reorder the verified candidates. Up to two picks are saved for the day, and forecast accuracy varies.
+
+Code submissions and draft generation may begin up to one hour before the selected time. Publication requires `SOLUTION_POST_AUTO_PUBLISH=true` and a verified accepted submission. Ready drafts publish at or after the scheduled time, before the 05:30 IST challenge rollover. A late start or slow generation may delay posting within that window. An always-on worker or the existing external health monitor is needed to wake a sleeping Render instance before the window. Apply the Prisma migrations during deployment.
+
 For provider-only testing without a database mutation or public post:
 
 ```sh

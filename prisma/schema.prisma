@@ -88,6 +88,7 @@ model SolutionPost {
   contentHash String?
   approvedHash String?
   publishedUrl String?
+  automaticEngagement Boolean @default(true)
   lastError String?
   retryCount Int @default(0)
   leaseUntil DateTime?

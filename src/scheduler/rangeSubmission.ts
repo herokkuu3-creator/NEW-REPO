@@ -185,6 +185,7 @@ type RangeQuestionMetadata = Pick<RawQuestionData, 'questionId' | 'isPaidOnly' |
 interface RangeQuestionLookup {
   slugHint?: string;
   questionCache?: Map<string, RangeQuestionMetadata>;
+  beforeSubmit?: () => Promise<void>;
 }
 
 export interface RangeProgressEvent {
@@ -1202,7 +1203,7 @@ async function solveOne(
   usedCommunityUuids?: Set<string>,
   progressCtx?: RangeProgressContext,
   signal?: AbortSignal,
-  { slugHint, questionCache }: RangeQuestionLookup = {},
+  { slugHint, questionCache, beforeSubmit }: RangeQuestionLookup = {},
 ): Promise<{ outcome: QuestionResult; touchedLeetCode: boolean; blocked: boolean; submissionLimit?: boolean; sessionFailure?: boolean; retryAfterMs?: number }> {
   let questionTitle: string | null = null;
   let slug: string | null = slugHint || null;
@@ -1284,6 +1285,7 @@ async function solveOne(
         metaData,
         topicTags,
       } = await api.question(slug);
+      if (slugHint && beforeSubmit && (returnedSlug !== slug || frontendId !== String(n))) return err('question identity mismatch');
       cachedQ = {
         questionId,
         isPaidOnly,
@@ -1394,6 +1396,7 @@ async function solveOne(
     };
     const sendCode = async (code: string, lang: string) => {
       stage = 'submit';
+      if (beforeSubmit) await beforeSubmit();
       if (signal?.aborted) throw Error('Range cancelled before submission');
       const progress = progressCtx && { ...progressCtx, questionNumber: n, questionTitle, slug };
       try {
@@ -1432,6 +1435,7 @@ async function solveOne(
             detail: `${lang} · ghost browser`,
           });
         }
+        if (beforeSubmit) await beforeSubmit();
         return await api.submitWithBrowserFallback!({ slug: slug!, questionId, lang, code }, signal);
       }
     };
@@ -2286,20 +2290,23 @@ export async function submitSingleQuestionDirectly(
   account: AccountRecord,
   questionNumber: number,
   deps: RangeDeps = defaultRangeDeps(),
+  options?: { slug: string; signal: AbortSignal; beforeSubmit: () => Promise<void> },
 ): Promise<SingleQuestionSubmitResult> {
+  const expectedUsername = options ? account.username?.toLowerCase() : undefined;
+  const openSession = () => options ? deps.openSession(account, options.signal) : deps.openSession(account);
   let session!: RangeSession;
   try {
-    session = await deps.openSession(account);
+    session = await openSession();
   } catch (err) {
     let recovered = false;
-    if (deps.refreshAccount) {
+    if (deps.refreshAccount && !options?.signal.aborted) {
       const refreshOutcome = await deps.refreshAccount(account).catch(() => null);
       if (refreshOutcome?.status === 'refreshed') {
         const updated = await deps.getAccount(account.id);
         if (updated) {
           account = updated;
           try {
-            session = await deps.openSession(account);
+            session = await openSession();
             recovered = true;
           } catch {
             // failed again
@@ -2320,14 +2327,14 @@ export async function submitSingleQuestionDirectly(
 
   try {
     let check = await session.api.checkSession();
-    if (!check.authenticated && check.cause === 'signed-out' && deps.refreshAccount) {
+    if (!check.authenticated && check.cause === 'signed-out' && deps.refreshAccount && !options?.signal.aborted) {
       const refreshOutcome = await deps.refreshAccount(account).catch(() => null);
       if (refreshOutcome?.status === 'refreshed') {
         const updated = await deps.getAccount(account.id);
         if (updated) {
           account = updated;
           await session.close().catch(() => undefined);
-          session = await deps.openSession(account);
+          session = await openSession();
           check = await session.api.checkSession();
         }
       }
@@ -2346,15 +2353,19 @@ export async function submitSingleQuestionDirectly(
         },
       };
     }
+    if (options && (!check.username || (expectedUsername && check.username.toLowerCase() !== expectedUsername))) {
+      return { outcome: { number: questionNumber, status: 'error', detail: 'account identity mismatch' } };
+    }
 
     const usedUuids = new Set<string>();
-    const abort = new AbortController();
     const { outcome } = await solveOneWithRetries(
       questionNumber,
       session.api,
       deps,
-      abort.signal,
+      options?.signal ?? new AbortController().signal,
       usedUuids,
+      undefined,
+      options && { slugHint: options.slug, beforeSubmit: options.beforeSubmit },
     );
 
     if (!outcome) {

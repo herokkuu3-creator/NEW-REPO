@@ -120,6 +120,9 @@ import {
 import { checkCPSolverHealth, getCPSolverUrl } from '../codeforces/captchaSolver';
 import { appendSolutionApiKeys, replaceSolutionApiKeys, resetSolutionApiKeyPool, removeSolutionApiKey, solutionKeyPoolStatus, testSolutionApiKey, testAllSolutionApiKeys, maskSolutionApiKey } from '../solutionPosts/keyPool';
 import { runCombined, runManualQuestion, selectedAccountIds, setSelectedAccounts } from '../solutionPosts/scheduler';
+import { predictNextDaily } from '../solutionPosts/dailyForecast';
+import { disableForecastSchedule, formatForecastPicks, getForecastScheduleStatus, isForecastPostingTime,
+  saveForecastSchedule } from '../solutionPosts/forecastScheduler';
 import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
 import { loadCoarenaKey, loadCoarenaModelOrder, maskCoarenaKey, setCoarenaModelPreference } from '../solutionPosts/coarena';
 import { boostSolutionArticleViews, extractTopicIdFromUrl, fetchLiveSolutionMetrics } from '../solutionPosts/upvote';
@@ -339,6 +342,7 @@ export const HELP_TEXT = [
   '',
   '<b>✨ 𝗔𝗜 𝗦𝗢𝗟𝗨𝗧𝗜𝗢𝗡 𝗔𝗥𝗧𝗜𝗖𝗟𝗘𝗦 (Intern-AI / Sage)</b>',
   '├ /dailysolution — Choose cached accounts for 6 AM daily submit + article',
+  '├ /predictdaily [HH:MM | preview | off] — Predict up to two problems and schedule their articles (IST)',
   '├ /manualsolution — Run the selected accounts for daily or one question number',
   '├ /contestsolution — Submit Weekly/Biweekly contest Q1 &amp; Q2 1-liner articles + GIFs',
   '├ /boostviews [url/id] — Boost views for published solution article(s) (20+ views per account)',
@@ -1338,6 +1342,10 @@ export async function handleMessage(
       case '/daily_solution':
         await sendDailySolutionPicker();
         return;
+      case '/predictdaily':
+      case '/predict_daily':
+        await handleForecastCommand(commandArg, String(msg.chat.id));
+        return;
       case '/manualsolution':
       case '/manual_solution':
         await handleManualSolutionCommand(commandArg);
@@ -1552,7 +1560,7 @@ export async function handleMessage(
         return;
       }
       default:
-        await reply('🤔 Unknown command. Available: /lclogin, /cflogin, /checksessions, /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /dailysolution, /manualsolution, /contestsolution, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /capsolver, /capsolverstatus, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /startqueue, /queuestatus, /clearqueue, /cancel, /help');
+        await reply('🤔 Unknown command. Available: /lclogin, /cflogin, /checksessions, /renew, /renew <label>, /accounts, /cfaccounts, /status, /triggersubmission, /claimcoins, /dailysolution, /predictdaily, /manualsolution, /contestsolution, /submitnextsolution, /cfrange, /cfrangestatus, /cfcancelrange, /codechef, /ccrange, /ccrangestatus, /cccancelrange, /nextsubcustomaccount, /cfnetwork, /useproxy, /testproxy, /setproxies, /addproxy, /removeproxy, /restoreproxies, /syncproxies, /capsolver, /capsolverstatus, /cfmanualnext, /questionrangesubmission, /rangestatus, /cancelrange, /removesession, /removeallsessions, /startqueue, /queuestatus, /clearqueue, /cancel, /help');
         return;
     }
   }
@@ -2353,6 +2361,85 @@ async function sendDailySolutionPicker(): Promise<void> {
   dailySolutionSelections.set(String(config.telegram.chatId), selected);
   const picker = buildDailySolutionPicker(accounts, selected);
   await defaultCoinClaimUiDeps.send(picker.text, picker.buttons);
+}
+
+const forecastAccountPickers = new Map<string, { token: string; time: string; accountIds: string[]; expiresAt: number }>();
+
+async function handleForecastCommand(argument: string, chatId: string): Promise<void> {
+  const arg = argument.trim().toLowerCase();
+  if (arg === 'off') {
+    forecastAccountPickers.delete(chatId);
+    await disableForecastSchedule();
+    await reply('Daily forecast posting is off.');
+    return;
+  }
+  if (arg === 'preview') {
+    try {
+      const forecast = await predictNextDaily();
+      await reply(`LeetCode forecast for ${forecast.target} UTC (${forecast.method})\n\n` +
+        (formatForecastPicks(forecast.picks) || 'No eligible problems were found.'));
+    } catch {
+      await reply('LeetCode did not return complete forecast data. Try /predictdaily preview again later.');
+    }
+    return;
+  }
+  const usage = 'Use /predictdaily HH:MM to choose a posting time in IST and a LeetCode account. Use /predictdaily preview for picks or /predictdaily off to stop posting.';
+  if (!arg || arg === 'status') {
+    const status = await getForecastScheduleStatus();
+    if (!status) { await reply(`Daily forecast posting is off.\n\n${usage}`); return; }
+    const { settings, account, nextTarget, last, autoPublish } = status;
+    await reply([`Daily forecast posting for ${account?.label ?? 'missing account'} at ${settings.time} IST`,
+      `Next eligible LeetCode date ${nextTarget} UTC.`,
+      !autoPublish ? 'Automatic article publishing is disabled.' : undefined,
+      !account || account.status === 'DISABLED' ? 'Select an available account to resume.' : undefined,
+      last ? `\nForecast for ${last.target} UTC (${last.method ?? last.error ?? 'preparing'})` : undefined,
+      ...last?.picks.map(pick => {
+        const expired = last.expired && ['pending', 'submitting', 'accepted', 'ready'].includes(pick.status);
+        return `#${pick.number} ${pick.title} · ${expired ? 'posting window ended' : pick.status}${pick.error ? ` (${pick.error})` : ''}${pick.url ? `\n${pick.url}` : ''}`;
+      }) ?? [], '', usage].filter(line => line !== undefined).join('\n'));
+    return;
+  }
+  if (!isForecastPostingTime(arg)) { await reply(`Enter a 24-hour time, for example /predictdaily 22:30.\n\n${usage}`); return; }
+  if (!config.solutionPosts.autoPublish) {
+    await reply('Set SOLUTION_POST_AUTO_PUBLISH=true to enable scheduled posting. /predictdaily preview is available.');
+    return;
+  }
+  const accounts = await listEnabledAccounts();
+  if (!accounts.length) { await reply('No active LeetCode accounts are configured.'); return; }
+  const token = randomUUID().slice(0, 16);
+  forecastAccountPickers.set(chatId, { token, time: arg, accountIds: accounts.map(account => account.id), expiresAt: Date.now() + 10 * 60_000 });
+  const buttons = accounts.map((account, i) => [{ text: accountName(account).slice(0, 60), callback_data: `lcforecast:${token}:${i}` }]);
+  buttons.push([{ text: 'Cancel', callback_data: `lcforecast:${token}:cancel` }]);
+  await defaultCoinClaimUiDeps.send(`Choose the account that will publish solutions for up to two predicted problems at <b>${arg} IST</b> each day. Submissions and draft generation can begin up to one hour earlier.`, buttons);
+}
+
+async function handleForecastAccountButton(chatId: number | string, messageId: number, callbackId: string, data: string) {
+  const key = String(chatId);
+  const [, token, selection] = data.split(':');
+  const picker = forecastAccountPickers.get(key);
+  const index = /^(0|[1-9]\d*)$/.test(selection ?? '') ? Number(selection) : -1;
+  const accountId = picker?.accountIds[index];
+  if (!picker || picker.token !== token || picker.expiresAt <= Date.now() || (selection !== 'cancel' && !accountId)) {
+    await defaultCoinClaimUiDeps.answer(callbackId, 'This picker expired. Run /predictdaily HH:MM again.');
+    return;
+  }
+  forecastAccountPickers.delete(key);
+  if (selection === 'cancel') {
+    await defaultCoinClaimUiDeps.answer(callbackId);
+    await defaultCoinClaimUiDeps.edit(chatId, messageId, 'Forecast setup cancelled.');
+    return;
+  }
+  try {
+    if (!accountId) throw new Error('Account unavailable');
+    const account = (await listEnabledAccounts()).find(candidate => candidate.id === accountId);
+    if (!account) throw new Error('Account unavailable');
+    const settings = await saveForecastSchedule(accountId, picker.time);
+    await defaultCoinClaimUiDeps.answer(callbackId);
+    await defaultCoinClaimUiDeps.edit(chatId, messageId,
+      `Forecast posting enabled for <b>${escapeHtml(accountName(account))}</b> at <b>${settings.time} IST</b> daily. First eligible LeetCode date <b>${settings.firstTarget} UTC</b>.`);
+  } catch {
+    await defaultCoinClaimUiDeps.answer(callbackId, 'Could not save the schedule. Check the account and run /predictdaily again.');
+  }
 }
 
 function solutionStageText(stage: string, error?: string, previousError?: string, detail?: string): string {
@@ -5983,6 +6070,11 @@ export async function handleCallbackQuery(
     return;
   }
   const data = q.data ?? '';
+
+  if (data.startsWith('lcforecast:')) {
+    await handleForecastAccountButton(chatId, messageId, q.id, data);
+    return;
+  }
 
   if (data.startsWith('lcsol:')) {
     if (data.startsWith('lcsol:m:')) { await handleManualSolutionButton(chatId, messageId, q.id, data); return; }

@@ -135,11 +135,11 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
     where: { id: accountId },
     select: ACCOUNT_SESSION_SELECT,
   });
-  // Manual and contest question submissions use namespaced DailyRun keys so they
+  // Manual, forecast, and contest submissions use namespaced DailyRun keys so they
   // never collide with the real calendar-day run. The article context still needs a
   // normal ISO challenge date for validation and presentation.
   const contextDate = /^\d{4}-\d{2}-\d{2}$/.test(run.date) ? run.date :
-    /^(?:manual:\d+|contest:[^:]+:[^:]+):(\d{4}-\d{2}-\d{2})$/.exec(run.date)?.[1] ?? new Date().toISOString().slice(0, 10);
+    /^(?:(?:manual|forecast):\d+|contest:[^:]+:[^:]+):(\d{4}-\d{2}-\d{2})$/.exec(run.date)?.[1] ?? new Date().toISOString().slice(0, 10);
   return withAccount(account, async (api, _page, username) => {
     const verdict = await api.awaitSubmission(run.submissionId!, run.problemSlug, 30000, { firstPollDelayMs: 0 });
     if (verdict.classification !== 'ACCEPTED') throw new PostError('ACCEPTED_SUBMISSION_REQUIRED');
@@ -184,22 +184,24 @@ export async function createPostRouter(correlation: { postId?: string; accountId
 export async function createCodeSolverRouter(
   correlation: { postId?: string; accountId?: string } = {},
   reportKey?: (label: string) => void,
+  deadlineAt?: number,
 ): Promise<AIModelRouter> {
   const key = await loadCoarenaKey().catch(() => null);
   if (key) {
     reportKey?.('Coarena · ' + maskCoarenaKey(key));
     return new CoarenaRouter(
       key,
-      () => createDiscoveryRouter(correlation, reportKey),
+      () => createDiscoveryRouter(correlation, reportKey, deadlineAt),
       (attempt) => {
         if (attempt.outcome === 'SUCCESS') {
           reportKey?.('Coarena · ' + maskCoarenaKey(key) + ' · ' + attempt.model);
         }
         logger.info({ ...correlation, attempt }, 'question AI solver attempt finished');
       },
+      deadlineAt,
     );
   }
-  return createDiscoveryRouter(correlation, reportKey);
+  return createDiscoveryRouter(correlation, reportKey, deadlineAt);
 }
 
 async function createDiscoveryRouter(correlation: { postId?: string; accountId?: string }, reportKey?: (label: string) => void,

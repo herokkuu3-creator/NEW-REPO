@@ -130,6 +130,7 @@ export const SystemKeys = {
   capzyActiveKeyIndex: 'capzyActiveKeyIndex', // string of active key index ('0', '1', ...)
   questionSolutionFailures: 'questionSolutionFailures:v1', // JSON map of per-question solution-section failure counts & failed UUIDs
   recoveryTunnelToken: 'recoveryTunnelToken', // secret bearer token for Mobile/Home IP reverse tunnel WebSocket
+  forecastJobPrefix: 'daily-forecast:job:',
 } as const;
 
 /**
@@ -175,7 +176,7 @@ export async function getSystemStates(keys: readonly string[]): Promise<Record<s
 
 export async function getAllSystemState(): Promise<Record<string, string>> {
   const rows = await prisma.systemState.findMany({
-    where: { NOT: { key: { startsWith: 'solution-visual:' } } },
+    where: { NOT: [{ key: { startsWith: 'solution-visual:' } }, { key: { startsWith: SystemKeys.forecastJobPrefix } }] },
     select: { key: true, value: true },
   });
   return Object.fromEntries(rows.map((r) => [r.key, r.value]));
