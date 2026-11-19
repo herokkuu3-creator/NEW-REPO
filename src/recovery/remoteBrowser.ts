@@ -120,10 +120,10 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
       });
       await cdp.send('Page.startScreencast', {
         format: 'jpeg',
-        quality: 55,
+        quality: 45,
         maxWidth: viewport.width,
         maxHeight: viewport.height,
-        everyNthFrame: 2,
+        everyNthFrame: 3,
       });
     } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'recovery screencast unavailable; using screenshots');
@@ -140,7 +140,7 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
         if (closed) return null;
         if (latest && Date.now() - latestAt < 2500) return latest;
         try {
-          const shot = await page.screenshot({ type: 'jpeg', quality: 55, timeout: 4000 });
+          const shot = await page.screenshot({ type: 'jpeg', quality: 45, timeout: 4000 });
           latest = shot;
           latestAt = Date.now();
           return shot;

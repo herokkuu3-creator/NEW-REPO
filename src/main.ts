@@ -9,7 +9,7 @@ import {
   TRIGGER_SUBMISSION_REASON,
 } from './scheduler/dailyWorker';
 import { startHealthServer } from './api/health';
-import { startTelegramBot } from './notifications/telegramBot';
+import { registerTelegramWebhookRoute, startTelegramBot } from './notifications/telegramBot';
 import { startCodeforcesScheduler, triggerCodeforcesRun } from './codeforces/worker';
 import { startCodeChefScheduler } from './codechef/worker';
 import { startMorningSessionCheckScheduler } from './security/sessionAutoRefresh';
@@ -59,6 +59,7 @@ async function main(): Promise<void> {
     runSubmission: () => runSubmissionNow(TRIGGER_SUBMISSION_REASON),
     triggerCodeforcesRun,
     recovery,
+    registerTelegramWebhook: registerTelegramWebhookRoute,
   });
   const stopScheduler = startScheduler();
   const stopTelegramBot = startTelegramBot();

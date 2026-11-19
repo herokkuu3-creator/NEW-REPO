@@ -87,6 +87,75 @@ export function buildLaunchArgs(headless = config.browser.headless): string[] {
   return args;
 }
 
+const BLOCKED_ANALYTICS_HOSTS = [
+  'google-analytics.com',
+  'analytics.google.com',
+  'googletagmanager.com',
+  'doubleclick.net',
+  'googlesyndication.com',
+  'clarity.ms',
+  'hotjar.com',
+  'sentry.io',
+  'segment.io',
+  'segment.com',
+  'intercom.io',
+  'mixpanel.com',
+  'facebook.net',
+  'connect.facebook.net',
+];
+
+/**
+ * Drops decorative heavy assets (images, media, fonts) and third-party
+ * analytics/telemetry while preserving documents, scripts, stylesheets, API
+ * requests, and all Cloudflare/Turnstile verification resources.
+ */
+export function blockNonEssentialBrowserAsset(url: string, resourceType: string): boolean {
+  const lowerUrl = url.toLowerCase();
+  if (lowerUrl.startsWith('blob:') || lowerUrl.startsWith('data:') || lowerUrl.startsWith('about:')) {
+    return false;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  const host = parsed.hostname.toLowerCase();
+  const pathname = parsed.pathname.toLowerCase();
+  if (
+    host === 'challenges.cloudflare.com' ||
+    host.endsWith('.challenges.cloudflare.com') ||
+    host === 'cloudflare.com' ||
+    host.endsWith('.cloudflare.com') ||
+    pathname.startsWith('/cdn-cgi/')
+  ) {
+    return false;
+  }
+  if (resourceType === 'image' || resourceType === 'media' || resourceType === 'font') {
+    return true;
+  }
+  if (BLOCKED_ANALYTICS_HOSTS.some((h) => host === h || host.endsWith(`.${h}`))) {
+    return true;
+  }
+  return false;
+}
+
+export async function attachBandwidthSaverRoute(context: BrowserContext): Promise<void> {
+  if (typeof context?.route !== 'function') return;
+  await context.route('**/*', async (route) => {
+    try {
+      const req = route.request();
+      if (blockNonEssentialBrowserAsset(req.url(), req.resourceType())) {
+        await route.abort().catch(() => undefined);
+        return;
+      }
+      await route.continue().catch(() => undefined);
+    } catch {
+      await route.continue().catch(() => undefined);
+    }
+  });
+}
+
 async function openPageWithCapture(context: BrowserContext, logs: string[]): Promise<Page> {
   const page = context.pages()[0] ?? (await context.newPage());
   attachLogCapture(page, logs);
@@ -111,6 +180,7 @@ export async function launchWithPersistentProfile(): Promise<BrowserSession | nu
       serviceWorkers: 'allow',
     }));
     await applyStealthScripts(activeContext, 'chromium');
+    await attachBandwidthSaverRoute(activeContext);
     const browserLogs: string[] = [];
     const page = await openPageWithCapture(activeContext, browserLogs);
     logger.info({ profilePath }, 'launched persistent Chromium profile');
@@ -159,6 +229,7 @@ export async function launchWithStorageState(): Promise<BrowserSession | null> {
       serviceWorkers: 'allow',
     }));
     await applyStealthScripts(activeContext, 'chromium');
+    await attachBandwidthSaverRoute(activeContext);
     const browserLogs: string[] = [];
     const page = await openPageWithCapture(activeContext, browserLogs);
     logger.info({ statePath }, 'launched context from storageState');
@@ -213,6 +284,7 @@ export async function launchWithStorageStateObject(
       serviceWorkers: 'allow',
     }));
     await applyStealthScripts(activeContext, 'chromium');
+    await attachBandwidthSaverRoute(activeContext);
     const browserLogs: string[] = [];
     const page = await openPageWithCapture(activeContext, browserLogs);
     logger.info({ label }, 'launched context from account storageState');

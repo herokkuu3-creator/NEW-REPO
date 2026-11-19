@@ -6,6 +6,7 @@ import { logger } from '../logger';
 import { prisma } from '../database/prisma';
 import { getSystemState, setSystemState } from '../database/models';
 import { parseStoredStorageState } from '../database/accounts';
+import { attachBandwidthSaverRoute, buildLaunchArgs } from '../browser/playwright';
 import { checkSession } from '../browser/sessionCheck';
 import { LeetCodeApi } from '../leetcode/apiClient';
 import { htmlToText } from '../leetcode/parser';
@@ -94,9 +95,13 @@ export async function withAccount<T>(account: AccountSessionRecord,
   action: (api: LeetCodeApi, page: Page, username: string) => Promise<T>): Promise<T> {
   const parsed = parseStoredStorageState(account.storageState);
   if (!parsed.ok || account.status === 'DISABLED') throw new PostError('ACCOUNT_UNAVAILABLE');
-  const browser = await chromium.launch({ headless: config.browser.headless });
+  const browser = await chromium.launch({
+    headless: config.browser.headless,
+    args: buildLaunchArgs(config.browser.headless),
+  });
   try {
     const context = await browser.newContext({ storageState: parsed.state });
+    await attachBandwidthSaverRoute(context);
     const page = await context.newPage();
     const api = new LeetCodeApi(context);
     const session = await checkSession(api);
@@ -324,14 +329,15 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     } catch { /* an unreadable historical diagnostic must not prevent a clean generation */ }
     const recentStyles = new Map(recent.map(item => [item.title ?? '', item.style ?? '']));
     for (const { title } of sameProblem) if (title && !recentStyles.has(title)) recentStyles.set(title, '');
+    const visualBaseUrl = process.env.VISUAL_ASSET_BASE_URL?.trim() || config.api.visualAssetBaseUrl || config.api.publicUrl;
     const article = await generateArticle(activeRouter, articleContext,
       [...recentStyles].map(([title, style]) => ({ title, style })),
-      plans => storeVisualAssets(plans, config.api.publicUrl), priorFailure, onStage);
+      plans => storeVisualAssets(plans, visualBaseUrl), priorFailure, onStage);
     // Public posts must contain the two independently generated, durable GIFs.
     // Never degrade a scheduled post to trace tables: that makes a successful
     // generation look complete while silently dropping the required visuals.
     if (article.visualFallback || article.visuals.length !== 2 || article.assets.length !== 2 ||
-      !await verifyHostedVisualAssets(article.assets, config.api.publicUrl)) {
+      !await verifyHostedVisualAssets(article.assets, visualBaseUrl)) {
       throw new PostError('TWO_PUBLIC_GIFS_REQUIRED');
     }
     post = await move(post, 'VALIDATING', { title: article.title, markdown: article.markdown,

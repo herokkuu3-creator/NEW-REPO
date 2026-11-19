@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { resolvePublicBaseUrl } from '../leetcode/loginHandoff';
@@ -871,10 +871,10 @@ function viewerPage(nonce: string, label: string): string {
 <p style="font-size:.85rem;opacity:.75">Tap LeetCode's Cloudflare checkbox above when it appears. Your saved credentials and session sync happen automatically.</p>
 <script nonce="${nonce}">
 (function(){
-  var img=document.getElementById('screen'),dot=document.getElementById('tapDot'),banner=document.getElementById('banner'),vw=430,vh=760,done=false,busy=false,last=null,lastMove=0,lastTouchAt=0,touchStart=null,q=Promise.resolve();
+  var img=document.getElementById('screen'),dot=document.getElementById('tapDot'),banner=document.getElementById('banner'),vw=430,vh=760,done=false,busy=false,last=null,lastEtag='',lastMove=0,lastTouchAt=0,touchStart=null,q=Promise.resolve();
   function pos(cx,cy){var r=img.getBoundingClientRect();return{x:(cx-r.left)*vw/Math.max(1,r.width),y:(cy-r.top)*vh/Math.max(1,r.height)};}
   function showDot(cx,cy){var r=img.getBoundingClientRect();dot.style.left=(cx-r.left)+'px';dot.style.top=(cy-r.top)+'px';dot.classList.add('on');setTimeout(function(){dot.classList.remove('on');},280);}
-  function send(ev){if(done)return;q=q.then(function(){return fetch('/auth/recover/session/input',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(ev)}).catch(function(){});});}
+  function send(ev){if(done)return;q=q.then(function(){return fetch('/auth/recover/session/input',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(ev)}).then(function(){if(!done&&!document.hidden)setTimeout(frame,180);}).catch(function(){});});}
   img.addEventListener('mousedown',function(e){e.preventDefault();if(Date.now()-lastTouchAt<700)return;var p=pos(e.clientX,e.clientY);showDot(e.clientX,e.clientY);send({type:'down',x:p.x,y:p.y});});
   img.addEventListener('mouseup',function(e){e.preventDefault();if(Date.now()-lastTouchAt<700)return;var p=pos(e.clientX,e.clientY);send({type:'up',x:p.x,y:p.y});});
   img.addEventListener('mousemove',function(e){if(Date.now()-lastTouchAt<700)return;var t=Date.now();if(t-lastMove<80)return;lastMove=t;var p=pos(e.clientX,e.clientY);send({type:'move',x:p.x,y:p.y});});
@@ -882,9 +882,10 @@ function viewerPage(nonce: string, label: string): string {
   img.addEventListener('touchstart',function(e){e.preventDefault();lastTouchAt=Date.now();var t=e.changedTouches[0];if(!t)return;touchStart={cx:t.clientX,cy:t.clientY};},{passive:false});
   img.addEventListener('touchend',function(e){e.preventDefault();lastTouchAt=Date.now();var t=e.changedTouches[0];if(!t)return;var dx=touchStart?t.clientX-touchStart.cx:0,dy=touchStart?t.clientY-touchStart.cy:0;touchStart=null;var p=pos(t.clientX,t.clientY);if(Math.hypot(dx,dy)<=18){showDot(t.clientX,t.clientY);send({type:'tap',x:p.x,y:p.y});}else{send({type:'wheel',x:p.x,y:p.y,deltaY:-dy*1.4});}},{passive:false});
   document.getElementById('cancel').addEventListener('click',function(){fetch('/auth/recover/session/cancel',{method:'POST',credentials:'same-origin'}).catch(function(){});});
-  function frame(){if(done||busy)return;busy=true;fetch('/auth/recover/session/frame?'+Date.now(),{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.blob():null;}).then(function(b){if(b){var u=URL.createObjectURL(b);img.src=u;if(last)URL.revokeObjectURL(last);last=u;}}).catch(function(){}).then(function(){busy=false;});}
-  function status(){fetch('/auth/recover/session/status',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){banner.textContent='This session is no longer active.';banner.className='bad';done=true;return null;}return r.json();}).then(function(s){if(!s)return;vw=s.viewport.width;vh=s.viewport.height;banner.textContent=s.message+(s.username?' ('+s.username+')':'');if(s.phase==='success'){banner.className='ok';}else if(s.phase==='failed'||s.phase==='cancelled'){banner.className='bad';}if(s.final){done=true;}}).catch(function(){});}
-  setInterval(frame,400);setInterval(status,1000);frame();status();
+  function frame(){if(done||busy||document.hidden)return;busy=true;fetch('/auth/recover/session/frame',{credentials:'same-origin',cache:'no-store',headers:lastEtag?{'If-None-Match':lastEtag}:{}}).then(function(r){if(r.status===304||r.status===204)return null;if(!r.ok)return null;var tag=r.headers.get('etag');if(tag)lastEtag=tag;return r.blob();}).then(function(b){if(b){var u=URL.createObjectURL(b);img.src=u;if(last)URL.revokeObjectURL(last);last=u;}}).catch(function(){}).then(function(){busy=false;});}
+  function status(){if(done||document.hidden)return;fetch('/auth/recover/session/status',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){banner.textContent='This session is no longer active.';banner.className='bad';done=true;return null;}return r.json();}).then(function(s){if(!s)return;vw=s.viewport.width;vh=s.viewport.height;banner.textContent=s.message+(s.username?' ('+s.username+')':'');if(s.phase==='success'){banner.className='ok';}else if(s.phase==='failed'||s.phase==='cancelled'){banner.className='bad';}if(s.final){done=true;}}).catch(function(){});}
+  document.addEventListener('visibilitychange',function(){if(!document.hidden&&!done){frame();status();}});
+  setInterval(frame,800);setInterval(status,2000);frame();status();
 })();
 </script></main></body></html>`;
 }
@@ -938,7 +939,18 @@ export function registerRecoveryRoutes(
     if (!service.portalStatus(secret)) return reply.code(401).send();
     const frame = await service.portalFrame(secret);
     if (!frame) return reply.code(204).send();
-    return reply.type('image/jpeg').send(frame);
+    const etag = `"${createHash('sha256').update(frame).digest('hex').slice(0, 16)}"`;
+    const ifNoneMatch = req.headers['if-none-match'];
+    if (
+      typeof ifNoneMatch === 'string' &&
+      ifNoneMatch.split(',').some((tag) => {
+        const trimmed = tag.trim();
+        return trimmed === etag || trimmed === `W/${etag}`;
+      })
+    ) {
+      return reply.code(304).header('ETag', etag).send();
+    }
+    return reply.header('ETag', etag).type('image/jpeg').send(frame);
   });
 
   app.post('/auth/recover/session/input', async (req, reply) => {

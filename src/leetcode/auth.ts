@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { chromium, type Browser, type Page, type Response } from 'playwright';
 import { config } from '../config';
 import { StorageStateShape, type StorageCookie } from '../browser/cookiePayload';
-import { buildLaunchArgs } from '../browser/playwright';
+import { attachBandwidthSaverRoute, buildLaunchArgs } from '../browser/playwright';
 import { applyStealthScripts } from '../browser/stealth';
 import { logger } from '../logger';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
@@ -907,6 +907,7 @@ export async function loginToLeetCode(loginInput: string, password: string,
         userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
       });
       await applyStealthScripts(context, 'chromium');
+      await attachBandwidthSaverRoute(context);
       const page = await context.newPage();
       return await loginOnLeetCodePage(page, loginInput.trim(), password, {
         ...options,

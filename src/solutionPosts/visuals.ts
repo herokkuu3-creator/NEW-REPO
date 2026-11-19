@@ -213,13 +213,27 @@ export async function renderVisualGif(input: VisualPlan): Promise<Buffer> {
   }
   gif.finish();
   let result: Buffer = Buffer.from(gif.bytes());
+  const optimized = await sharp(result, { animated: true })
+    .gif({
+      effort: 5,
+      colours: animated ? 32 : 48,
+      dither: 0,
+      interFrameMaxError: 2,
+      interPaletteMaxError: 4,
+      reuse: true,
+      keepDuplicateFrames: true,
+    })
+    .toBuffer();
+  if (optimized.length > 0 && optimized.length < result.length) {
+    result = optimized;
+  }
   // Preserve every reviewed state and dwell time. Reduce resolution only if
   // a dense animation still exceeds the hosting budget after encoding.
   if (result.length > 500000) {
     const animation = sharp(result, { animated: true });
     if (animated) animation.resize({ width: Math.floor(width * .82) });
-    result = await animation.gif({ effort: 7, colours: animated ? 48 : 64, dither: 0,
-      interFrameMaxError: 0, interPaletteMaxError: 0, keepDuplicateFrames: true }).toBuffer();
+    result = await animation.gif({ effort: 7, colours: animated ? 32 : 48, dither: 0,
+      interFrameMaxError: 2, interPaletteMaxError: 4, reuse: true, keepDuplicateFrames: true }).toBuffer();
   }
   if (result.length > 500000) throw new Error('Visual exceeds the media budget');
   return result;

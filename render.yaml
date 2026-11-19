@@ -120,6 +120,12 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      # auto: uses webhook on Render HTTPS (zero idle polling egress), polling locally
+      - key: TELEGRAM_MODE
+        value: auto
+      # Optional CDN/Cloudflare Worker origin caching /solution-assets/* in front of Render
+      - key: VISUAL_ASSET_BASE_URL
+        sync: false
       - key: SETUP_TOKEN
         sync: false # long random string; protects /admin/* endpoints
       - key: PIN_CODE

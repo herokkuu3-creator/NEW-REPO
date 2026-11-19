@@ -4,7 +4,8 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { redactSecrets } from '../security/redact';
 import { sendTelegramMessage } from './telegram';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import type { FastifyInstance } from 'fastify';
 import {
   deleteSystemState,
   getAllSystemState,
@@ -194,8 +195,9 @@ import { fetchIncompleteQuestions } from '../leetcode/incompleteQuestions';
  * FILE attachments (handled via getFile + download).
  */
 
-const POLL_TIMEOUT_S = 25;
+const POLL_TIMEOUT_S = 50;
 const MAX_DOC_BYTES = 1_000_000;
+export const TELEGRAM_WEBHOOK_PATH = '/telegram/webhook';
 
 interface TgDocument {
   file_id: string;
@@ -418,12 +420,112 @@ export interface PollerDeps {
   retryDelayMs?: number;
 }
 
+const MAX_RECENT_UPDATES = 512;
+const recentUpdateIds = new Set<number>();
+let webhookRouteCount = 0;
+
+export function getTelegramWebhookSecret(): string | null {
+  const setupToken = config.api?.setupToken?.trim();
+  const botToken = config.telegram.botToken?.trim();
+  if (!setupToken || !botToken) return null;
+  return createHash('sha256')
+    .update(`telegram-webhook:${setupToken}:${botToken}`)
+    .digest('hex')
+    .slice(0, 48);
+}
+
+export function resolveTelegramWebhookUrl(): string | null {
+  const raw = config.api?.publicUrl?.trim();
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    if (
+      url.protocol !== 'https:' ||
+      url.username ||
+      url.password ||
+      url.port ||
+      /^(localhost|127\.|0\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[)/i.test(url.hostname)
+    ) {
+      return null;
+    }
+    return `${url.origin}${TELEGRAM_WEBHOOK_PATH}`;
+  } catch {
+    return null;
+  }
+}
+
+export async function handleTelegramUpdate(update: TgUpdate): Promise<void> {
+  if (typeof update.update_id === 'number') {
+    if (recentUpdateIds.has(update.update_id)) return;
+    recentUpdateIds.add(update.update_id);
+    if (recentUpdateIds.size > MAX_RECENT_UPDATES) {
+      const oldest = recentUpdateIds.values().next().value;
+      if (oldest !== undefined) recentUpdateIds.delete(oldest);
+    }
+  }
+  if (update.message) {
+    await handleMessage(update.message).catch((err) =>
+      logger.warn({ err: errText(err) }, 'telegram message handling failed'),
+    );
+  }
+  if (update.callback_query) {
+    await handleCallbackQuery(update.callback_query).catch((err) =>
+      logger.warn({ err: errText(err) }, 'telegram button handling failed'),
+    );
+  }
+}
+
+export function registerTelegramWebhookRoute(app: FastifyInstance): void {
+  recentUpdateIds.clear();
+  webhookRouteCount += 1;
+  app.addHook('onClose', async () => {
+    webhookRouteCount = Math.max(0, webhookRouteCount - 1);
+  });
+  app.post(TELEGRAM_WEBHOOK_PATH, async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    if (!config.telegram.enabled || !config.telegram.commands) {
+      return reply.code(404).send({ ok: false });
+    }
+    const expectedSecret = getTelegramWebhookSecret();
+    const providedHeader = req.headers['x-telegram-bot-api-secret-token'];
+    const provided = typeof providedHeader === 'string' ? providedHeader : '';
+    if (!expectedSecret || !provided) {
+      return reply.code(401).send({ ok: false });
+    }
+    const ha = createHash('sha256').update(provided, 'utf8').digest();
+    const hb = createHash('sha256').update(expectedSecret, 'utf8').digest();
+    if (!timingSafeEqual(ha, hb)) {
+      return reply.code(401).send({ ok: false });
+    }
+    const body = req.body as Partial<TgUpdate> | null | undefined;
+    if (!body || typeof body !== 'object' || typeof body.update_id !== 'number') {
+      return reply.code(400).send({ ok: false });
+    }
+    void handleTelegramUpdate(body as TgUpdate).catch((err) =>
+      logger.warn({ err: errText(err) }, 'telegram webhook update failed'),
+    );
+    return reply.code(200).send({ ok: true });
+  });
+}
+
+export function shouldUseTelegramWebhook(deps: PollerDeps = {}): boolean {
+  if (!config.telegram.enabled || !config.telegram.commands) return false;
+  if (Object.keys(deps).length > 0) return false;
+  if (deps.getOwner || deps.setOwner || deps.instanceId || deps.retryDelayMs !== undefined) return false;
+  const mode = (process.env.TELEGRAM_MODE ?? config.telegram?.mode ?? 'auto').trim().toLowerCase();
+  if (mode === 'polling') return false;
+  if (webhookRouteCount <= 0 || !resolveTelegramWebhookUrl() || !getTelegramWebhookSecret()) return false;
+  if (mode === 'webhook') return true;
+  return Boolean(process.env.RENDER_INSTANCE_ID);
+}
+
 export function startTelegramBot(deps: PollerDeps = {}): () => void {
   if (!config.telegram.enabled || !config.telegram.commands) {
     logger.info('telegram command bot disabled (set TELEGRAM_BOT_TOKEN/CHAT_ID, TELEGRAM_COMMANDS=true)');
     return () => undefined;
   }
 
+  recentUpdateIds.clear();
   let stopped = false;
   const abort = new AbortController();
   const hasCustomOwnerStore = Boolean(deps.getOwner || deps.setOwner);
@@ -462,6 +564,41 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
       logger.warn({ err: errText(err) }, 'could not claim the telegram poller slot - polling anyway'),
     );
 
+    if (shouldUseTelegramWebhook(deps)) {
+      const webhookUrl = resolveTelegramWebhookUrl();
+      const secret = getTelegramWebhookSecret();
+      if (webhookUrl && secret) {
+        let registered = false;
+        for (let attempt = 0; attempt < 2 && !stopped; attempt++) {
+          try {
+            await tgApi(
+              'setWebhook',
+              {
+                url: webhookUrl,
+                secret_token: secret,
+                allowed_updates: ['message', 'callback_query'],
+                drop_pending_updates: false,
+              },
+              15_000,
+              abort.signal,
+            );
+            registered = true;
+            break;
+          } catch (err) {
+            if (stopped) return;
+            logger.warn({ attempt: attempt + 1, err: errText(err) }, 'Telegram setWebhook failed');
+            if (attempt === 0 && !stopped) await sleep(3_000);
+          }
+        }
+        if (stopped) return;
+        if (registered) {
+          logger.info({ url: webhookUrl }, 'telegram command bot running in webhook mode (zero idle polling)');
+          return;
+        }
+        logger.warn('Telegram setWebhook failed after retry — falling back to long-polling');
+      }
+    }
+
     // A leftover webhook makes getUpdates fail with HTTP 409 — drop it once.
     await tgApi('deleteWebhook', { drop_pending_updates: true }).catch((err) =>
       logger.warn({ err: errText(err) }, 'Telegram deleteWebhook failed - continuing anyway'),
@@ -497,16 +634,7 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
         }
         for (const update of updates) {
           offset = update.update_id + 1;
-          if (update.message) {
-            await handleMessage(update.message).catch((err) =>
-              logger.warn({ err: errText(err) }, 'telegram message handling failed'),
-            );
-          }
-          if (update.callback_query) {
-            await handleCallbackQuery(update.callback_query).catch((err) =>
-              logger.warn({ err: errText(err) }, 'telegram button handling failed'),
-            );
-          }
+          await handleTelegramUpdate(update);
         }
       } catch (err) {
         if (stopped) break;

@@ -390,6 +390,8 @@ export async function setSelectedAccounts(accountIds: string[]) {
 
 export function isScheduledSolutionRunInProgress(): boolean { return scheduledRunInProgress; }
 
+let lastIdleStateSignature = '';
+
 /** Called by cron, restart catch-up, and the authenticated external wake endpoint. */
 export async function runScheduledSolutionPosts(now = new Date()) {
   if (scheduledRunInProgress) return { status: 'BUSY' as const };
@@ -399,8 +401,18 @@ export async function runScheduledSolutionPosts(now = new Date()) {
   }
   scheduledRunInProgress = true;
   const startedAt = now.toISOString();
-  const saveState = async (value: object) => {
-    const state = JSON.stringify({ startedAt, date: now.toISOString().slice(0, 10), ...value });
+  const dateKey = startedAt.slice(0, 10);
+  const saveState = async (value: { status?: string; selected?: number; eligible?: number; reason?: string } & Record<string, unknown>) => {
+    if (value.status === 'IDLE') {
+      const sig = `${dateKey}:${value.reason ?? ''}:${value.selected ?? 0}:${value.eligible ?? 0}`;
+      if (process.env.NODE_ENV !== 'test' && sig === lastIdleStateSignature) {
+        return;
+      }
+      lastIdleStateSignature = sig;
+    } else {
+      lastIdleStateSignature = '';
+    }
+    const state = JSON.stringify({ startedAt, date: dateKey, ...value });
     await prisma.systemState.upsert({
       where: { key: SCHEDULE_STATE_KEY },
       create: { key: SCHEDULE_STATE_KEY, value: state },

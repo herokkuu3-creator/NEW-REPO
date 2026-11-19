@@ -98,54 +98,122 @@ export async function verifyHostedVisualAssets(assets: VisualAsset[], baseUrl: s
       try { parsed = new URL(asset.url); } catch { return false; }
       if (parsed.origin !== origin || !/^\/solution-assets\/[a-f0-9]{64}\.gif$/.test(parsed.pathname)) return false;
       let bytes: Buffer;
+      let statusCode: number;
+      let contentRange: string | null = null;
       try {
-        const response = await fetcher(asset.url, { redirect: 'error', signal: controller.signal });
-        if (!response.ok || !response.headers.get('content-type')?.toLowerCase().includes('image/gif')) return false;
+        const response = await fetcher(asset.url, {
+          redirect: 'error',
+          signal: controller.signal,
+          headers: { Range: 'bytes=0-63' },
+        });
+        statusCode = response.status;
+        if (!response.ok || (statusCode !== 200 && statusCode !== 206) ||
+            !response.headers.get('content-type')?.toLowerCase().includes('image/gif')) return false;
+        contentRange = response.headers.get('content-range');
         bytes = Buffer.from(await response.arrayBuffer());
       } catch {
         return false;
       }
-      if (bytes.length < 32 || !['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString())) return false;
+      const header = bytes.subarray(0, 6).toString();
+      if (!['GIF87a', 'GIF89a'].includes(header)) return false;
+      if (statusCode === 206) {
+        if (bytes.length < 6) return false;
+        const totalMatch = /\/(\d+)$/.exec(contentRange ?? '');
+        if (totalMatch && Number(totalMatch[1]) < 32) return false;
+      } else if (bytes.length < 32) {
+        return false;
+      }
     }
     return true;
   } finally { clearTimeout(timer); }
 }
 
-function sendGifReply(reply: FastifyReply, etag: string, bytes: Buffer) {
-  return reply
+const IMMUTABLE_CACHE_CONTROL = 'public, max-age=31536000, immutable';
+
+function sendGifReply(
+  reply: FastifyReply,
+  etag: string,
+  bytes: Buffer,
+  options?: { headOnly?: boolean; rangeHeader?: string },
+) {
+  reply
     .header('Content-Type', 'image/gif')
     .header('X-Content-Type-Options', 'nosniff')
-    .header('Cache-Control', 'public, max-age=31536000, immutable')
-    .header('ETag', etag)
-    .send(bytes);
+    .header('Cache-Control', IMMUTABLE_CACHE_CONTROL)
+    .header('CDN-Cache-Control', IMMUTABLE_CACHE_CONTROL)
+    .header('Cloudflare-CDN-Cache-Control', IMMUTABLE_CACHE_CONTROL)
+    .header('Accept-Ranges', 'bytes')
+    .header('ETag', etag);
+
+  if (options?.headOnly) {
+    return reply.code(200).header('Content-Length', String(bytes.length)).send();
+  }
+
+  if (options?.rangeHeader) {
+    const match = /^bytes=(\d+)-(\d*)$/i.exec(options.rangeHeader.trim());
+    if (match) {
+      const start = Number(match[1]);
+      const endStr = match[2];
+      if (!Number.isSafeInteger(start) || start >= bytes.length) {
+        return reply.code(416).header('Content-Range', `bytes */${bytes.length}`).send();
+      }
+      const parsedEnd = endStr ? Number(endStr) : bytes.length - 1;
+      if (!Number.isSafeInteger(parsedEnd) || parsedEnd < start) {
+        return reply.code(416).header('Content-Range', `bytes */${bytes.length}`).send();
+      }
+      const end = Math.min(parsedEnd, bytes.length - 1);
+      const chunk = bytes.subarray(start, end + 1);
+      return reply
+        .code(206)
+        .header('Content-Range', `bytes ${start}-${end}/${bytes.length}`)
+        .header('Content-Length', String(chunk.length))
+        .send(chunk);
+    }
+  }
+
+  return reply.send(bytes);
 }
 
 export function registerVisualAssetRoutes(app: FastifyInstance, options?: { enableCache?: boolean }) {
   const useCache = options?.enableCache ?? defaultCacheEnabled();
-  app.get('/solution-assets/:file', async (req, reply) => {
-    const { file } = req.params as { file: string };
-    if (!/^[a-f0-9]{64}\.gif$/.test(file)) return reply.code(404).send();
-    const digest = file.slice(0, -4);
-    const etag = `"${digest}"`;
-    const ifNoneMatch = req.headers['if-none-match'];
-    if (typeof ifNoneMatch === 'string' && ifNoneMatch.split(',').some(tag => {
-      const trimmed = tag.trim();
-      return trimmed === etag || trimmed === `W/${etag}` || trimmed === digest;
-    })) {
-      return reply.code(304).header('ETag', etag).header('Cache-Control', 'public, max-age=31536000, immutable').send();
-    }
-    if (useCache) {
-      const cached = getCachedVisual(digest);
-      if (cached) return sendGifReply(reply, etag, cached);
-    }
-    const record = await prisma.systemState.findUnique({
-      where: { key: `solution-visual:${digest}` },
-      select: { value: true },
-    });
-    if (!record || record.value.length > MAX_VISUAL_BASE64_LENGTH) return reply.code(404).send();
-    const bytes = Buffer.from(record.value, 'base64');
-    if (bytes.subarray(0, 6).toString() !== 'GIF89a' || createHash('sha256').update(bytes).digest('hex') !== digest) return reply.code(404).send();
-    if (useCache) setCachedVisual(digest, bytes);
-    return sendGifReply(reply, etag, bytes);
+  app.route({
+    method: ['GET', 'HEAD'],
+    url: '/solution-assets/:file',
+    handler: async (req, reply) => {
+      const { file } = req.params as { file: string };
+      if (!/^[a-f0-9]{64}\.gif$/.test(file)) return reply.code(404).send();
+      const digest = file.slice(0, -4);
+      const etag = `"${digest}"`;
+      const ifNoneMatch = req.headers['if-none-match'];
+      if (typeof ifNoneMatch === 'string' && ifNoneMatch.split(',').some(tag => {
+        const trimmed = tag.trim();
+        return trimmed === etag || trimmed === `W/${etag}` || trimmed === digest;
+      })) {
+        return reply
+          .code(304)
+          .header('ETag', etag)
+          .header('Cache-Control', IMMUTABLE_CACHE_CONTROL)
+          .header('CDN-Cache-Control', IMMUTABLE_CACHE_CONTROL)
+          .header('Cloudflare-CDN-Cache-Control', IMMUTABLE_CACHE_CONTROL)
+          .send();
+      }
+      const replyOpts = {
+        headOnly: req.method === 'HEAD',
+        rangeHeader: typeof req.headers.range === 'string' ? req.headers.range : undefined,
+      };
+      if (useCache) {
+        const cached = getCachedVisual(digest);
+        if (cached) return sendGifReply(reply, etag, cached, replyOpts);
+      }
+      const record = await prisma.systemState.findUnique({
+        where: { key: `solution-visual:${digest}` },
+        select: { value: true },
+      });
+      if (!record || record.value.length > MAX_VISUAL_BASE64_LENGTH) return reply.code(404).send();
+      const bytes = Buffer.from(record.value, 'base64');
+      if (bytes.subarray(0, 6).toString() !== 'GIF89a' || createHash('sha256').update(bytes).digest('hex') !== digest) return reply.code(404).send();
+      if (useCache) setCachedVisual(digest, bytes);
+      return sendGifReply(reply, etag, bytes, replyOpts);
+    },
   });
 }

@@ -9,7 +9,7 @@ const SOURCE_REPO = 'Codeforces-Problem-Solution-By-Saurav-Paul';
 const SOURCE_BRANCH = 'master';
 const SOURCE_TARBALL_URL = `https://codeload.github.com/${SOURCE_OWNER}/${SOURCE_REPO}/tar.gz/refs/heads/${SOURCE_BRANCH}`;
 const SOURCE_TOKEN_ENVS = ['GITHUB_TOKEN', 'GH_TOKEN', 'SOURCE_REPO_TOKEN'] as const;
-const INDEX_CACHE_MS = 30 * 60 * 1000;
+const INDEX_CACHE_MS = 6 * 60 * 60 * 1000;
 
 const STANDARD_RE = /^\s*(\d+)([A-Z][A-Z0-9]*)\s*-\s*(.*?)\s*\.(cpp|cc|cxx|py)\s*$/i;
 const SOURCE_EXT_RE = /\.(cpp|cc|cxx|py)$/i;

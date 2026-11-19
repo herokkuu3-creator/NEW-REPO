@@ -119,12 +119,14 @@ const envSchema = z.object({
 
   TELEGRAM_BOT_TOKEN: z.string().default(''),
   TELEGRAM_CHAT_ID: z.string().default(''),
-  // Command bot (long polling): /renew refreshes the session from cookies you
-  // paste, /status reports state. On by default whenever Telegram is configured.
+  // Command bot: /renew refreshes the session from cookies you paste, /status
+  // reports state. On by default whenever Telegram is configured.
   TELEGRAM_COMMANDS: z
     .string()
     .optional()
     .transform((v) => (v === undefined ? true : v.toLowerCase() === 'true')),
+  // auto: webhook on Render HTTPS (zero idle polling bandwidth), long-polling locally
+  TELEGRAM_MODE: z.enum(['auto', 'webhook', 'polling']).default('auto'),
 
   PORT: intFromString(3001),
   SETUP_TOKEN: z.string().min(8, 'SETUP_TOKEN must be at least 8 characters'),
@@ -133,6 +135,8 @@ const envSchema = z.object({
   // Render nothing needs configuring; set PUBLIC_URL only for a custom domain.
   PUBLIC_URL: z.string().default(''),
   RENDER_EXTERNAL_URL: z.string().default(''),
+  // Optional CDN/proxy origin caching /solution-assets/* in front of Render.
+  VISUAL_ASSET_BASE_URL: z.string().default(''),
 
   // Turnstile / Cloudflare challenge solver microservice (CPSolver)
   CPSOLVER_URL: z.string().default(''),
@@ -188,8 +192,8 @@ export type Config = Readonly<{
     keySource?: string; keyEnvironment?: ArticleKeyInput[]; keyError?: string;
     autoPublish: boolean; publishTransport: 'api' | 'browser'; modelTimeoutMs: Record<string, number>;
   };
-  telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean };
-  api: { port: number; setupToken: string; publicUrl: string };
+  telegram: { botToken: string; chatId: string; enabled: boolean; commands: boolean; mode: 'auto' | 'webhook' | 'polling' };
+  api: { port: number; setupToken: string; publicUrl: string; visualAssetBaseUrl: string };
   solver: { cpsolverUrl: string };
   sage: { apiKey: string; baseUrl: string; model: string };
   logLevel: z.infer<typeof envSchema>['LOG_LEVEL'];
@@ -260,12 +264,14 @@ function loadConfig(): Config {
       chatId: env.TELEGRAM_CHAT_ID,
       enabled: env.TELEGRAM_BOT_TOKEN.length > 0 && env.TELEGRAM_CHAT_ID.length > 0,
       commands: env.TELEGRAM_COMMANDS,
+      mode: env.TELEGRAM_MODE,
     },
     api: {
       port: env.PORT,
       setupToken: env.SETUP_TOKEN,
       publicUrl:
         env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || `http://localhost:${env.PORT}`,
+      visualAssetBaseUrl: env.VISUAL_ASSET_BASE_URL.trim().replace(/\/+$/, ''),
     },
     solver: {
       cpsolverUrl: (env.CPSOLVER_URL || env.TURNSTILE_SOLVER_URL || '').trim().replace(/\/+$/, ''),

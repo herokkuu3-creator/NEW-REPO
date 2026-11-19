@@ -1,7 +1,11 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { promisify } from 'node:util';
+import { gzip } from 'node:zlib';
 import Fastify, { FastifyInstance } from 'fastify';
+
+const gzipAsync = promisify(gzip);
 import { z } from 'zod';
 import { config } from '../config';
 import { logger, logRingBuffer } from '../logger';
@@ -73,6 +77,8 @@ export interface ApiHooks {
   triggerCodeforcesRun?: (reason: string) => Promise<{ started: boolean; message: string }>;
   /** LeetCode session recovery (portal + admin diagnostics). */
   recovery?: RecoveryService;
+  /** Optional Telegram webhook route registration (keeps health.ts decoupled from telegramBot.ts). */
+  registerTelegramWebhook?: (app: FastifyInstance) => void;
 }
 
 /** Shape of a Playwright storageState file — validated, never logged. */
@@ -188,6 +194,37 @@ export async function startHealthServer(
     trustProxy: true,
     bodyLimit: 16 * 1024 * 1024, // storageState uploads can exceed the 1MB default
   });
+
+  app.addHook('onSend', async (req, reply, payload) => {
+    if (req.method === 'HEAD') return payload;
+    if (reply.getHeader('content-encoding')) return payload;
+    if (reply.statusCode < 200 || reply.statusCode === 204 || reply.statusCode === 304) return payload;
+    const acceptEncoding = req.headers['accept-encoding'];
+    if (typeof acceptEncoding !== 'string' || !/\bgzip\b/i.test(acceptEncoding)) return payload;
+    const contentType = String(reply.getHeader('content-type') ?? '').toLowerCase();
+    if (
+      !contentType.startsWith('application/json') &&
+      !contentType.startsWith('text/') &&
+      !contentType.startsWith('application/javascript')
+    ) {
+      return payload;
+    }
+    if (typeof payload !== 'string' && !Buffer.isBuffer(payload)) return payload;
+    const buf = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
+    if (buf.length < 1024) return payload;
+    const compressed = await gzipAsync(buf, { level: 6 });
+    if (compressed.length >= buf.length) return payload;
+    reply.header('Content-Encoding', 'gzip');
+    const prevVary = reply.getHeader('vary');
+    const varyStr = Array.isArray(prevVary) ? prevVary.join(', ') : String(prevVary ?? '');
+    if (!/\baccept-encoding\b/i.test(varyStr)) {
+      reply.header('Vary', varyStr ? `${varyStr}, Accept-Encoding` : 'Accept-Encoding');
+    }
+    reply.removeHeader('content-length');
+    return compressed;
+  });
+
+  hooks.registerTelegramWebhook?.(app);
 
   // Short-lived cache + single-flight deduplication for authenticated /health
   // reads (disabled by default under Vitest unless explicitly configured).
