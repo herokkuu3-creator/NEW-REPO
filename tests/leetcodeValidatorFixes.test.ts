@@ -620,6 +620,16 @@ describe('6. sessionCheck & browser/auth challenge propagation fixes', () => {
       cause: 'query-failed',
       challenged: true,
     });
+
+    const rateLimitApi = {
+      graphql: vi.fn(async () => {
+        throw new LeetCodeHttpError('GraphQL HTTP 429', 429);
+      }),
+    } as unknown as LeetCodeApi;
+    expect(await checkSession(rateLimitApi)).toEqual({
+      authenticated: false,
+      cause: 'query-failed',
+    });
   });
 
   it('establishAuthenticatedSession reports CLOUDFLARE_VERIFICATION_REQUIRED when check.challenged is true', async () => {

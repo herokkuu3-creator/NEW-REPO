@@ -33,11 +33,19 @@ import { checkSession } from '../browser/sessionCheck';
 import { detectVerificationPage } from '../browser/cloudflareDetector';
 import { captureDiagnostics, pruneDiagnostics } from '../browser/diagnostics';
 import {
+  DailyChallengeInfo,
   DailyProblemNotFoundError,
   fetchDailyChallenge,
   fetchQuestionData,
+  RawQuestionData,
 } from '../leetcode/dailyChallenge';
-import { LeetCodeApi, LeetCodeHttpError, leetCodeRequestFailure, looksLikeChallenge } from '../leetcode/apiClient';
+import {
+  computeLeetCodeRateLimitDelayMs,
+  LeetCodeApi,
+  LeetCodeHttpError,
+  leetCodeRequestFailure,
+  looksLikeChallenge,
+} from '../leetcode/apiClient';
 import { submitViaGhostBrowser } from '../leetcode/ghostSubmit';
 import { parseProblem, ProblemParseError } from '../leetcode/parser';
 import { createLLMProvider } from '../ai/provider';
@@ -222,6 +230,113 @@ export interface DailyRunOptions {
   expectedChallengeDate?: string;
   /** Called right after EACH account finishes (index is 1-based). Errors are ignored. */
   onAccountOutcome?: (outcome: AccountOutcome, index: number, total: number) => Promise<void> | void;
+  /** Minimum gap between consecutive LeetCode /submit/ POSTs across accounts in this run. */
+  submitGapMs?: number;
+  /** Backoff schedule (ms) used when LeetCode returns HTTP 429 rate-limit responses. */
+  rateLimitBackoffMs?: readonly number[];
+  /** Optional sleep override for deterministic tests. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+const DEFAULT_DAILY_SUBMIT_GAP_MS = 15_000;
+const DEFAULT_DAILY_RATE_LIMIT_BACKOFF_MS: readonly number[] = [15_000, 30_000, 45_000];
+const TEST_DAILY_RATE_LIMIT_BACKOFF_MS: readonly number[] = [1, 1, 1];
+
+function isTestRuntime(): boolean {
+  return Boolean(process.env.VITEST || process.env.NODE_ENV === 'test');
+}
+
+function resolveDailySubmitGapMs(override?: number): number {
+  if (typeof override === 'number' && Number.isFinite(override) && override >= 0) {
+    return override;
+  }
+  const envRaw = process.env.LEETCODE_DAILY_SUBMIT_GAP_MS?.trim();
+  if (envRaw) {
+    const parsed = Number.parseInt(envRaw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return isTestRuntime() ? 0 : DEFAULT_DAILY_SUBMIT_GAP_MS;
+}
+
+function resolveDailyRateLimitBackoffMs(override?: readonly number[]): readonly number[] {
+  if (override) return override;
+  return isTestRuntime() ? TEST_DAILY_RATE_LIMIT_BACKOFF_MS : DEFAULT_DAILY_RATE_LIMIT_BACKOFF_MS;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+}
+
+interface DailyBatchContext {
+  submitGapMs: number;
+  rateLimitBackoffMs: readonly number[];
+  sleep: (ms: number) => Promise<void>;
+  nextSubmitAt: number;
+  cooldownUntil: number;
+  cachedDaily?: DailyChallengeInfo;
+  cachedQuestionBySlug: Map<string, RawQuestionData>;
+}
+
+function createDailyBatchContext(options: DailyRunOptions = {}): DailyBatchContext {
+  return {
+    submitGapMs: resolveDailySubmitGapMs(options.submitGapMs),
+    rateLimitBackoffMs: resolveDailyRateLimitBackoffMs(options.rateLimitBackoffMs),
+    sleep: options.sleep ?? defaultSleep,
+    nextSubmitAt: 0,
+    cooldownUntil: 0,
+    cachedQuestionBySlug: new Map(),
+  };
+}
+
+async function waitBeforeDailySubmit(batch: DailyBatchContext, label: string, slug: string): Promise<void> {
+  const now = Date.now();
+  const target = Math.max(batch.nextSubmitAt, batch.cooldownUntil);
+  if (target > now) {
+    const waitMs = target - now;
+    const reason = target === batch.cooldownUntil && batch.cooldownUntil >= batch.nextSubmitAt ? 'cooldown' : 'pacing';
+    logger.info({ label, slug, waitMs, reason }, 'pacing daily LeetCode submission to avoid HTTP 429 rate limit');
+    await batch.sleep(waitMs);
+  }
+  const after = Date.now();
+  batch.cooldownUntil = 0;
+  batch.nextSubmitAt = after + batch.submitGapMs;
+}
+
+function recordDailyRateLimitCooldown(batch: DailyBatchContext, waitMs: number): void {
+  const until = Date.now() + waitMs;
+  batch.cooldownUntil = Math.max(batch.cooldownUntil, until);
+  batch.nextSubmitAt = Math.max(batch.nextSubmitAt, until);
+}
+
+async function withDailyRateLimitRetry<T>(
+  operation: () => Promise<T>,
+  batch: DailyBatchContext,
+  meta: { label: string; stage: string; slug?: string },
+): Promise<T> {
+  const maxRetries = Math.min(2, batch.rateLimitBackoffMs.length);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await operation();
+    } catch (err) {
+      const failure = leetCodeRequestFailure(err);
+      if (failure.category !== 'rate-limit' || attempt >= maxRetries) {
+        throw err;
+      }
+      const waitMs = computeLeetCodeRateLimitDelayMs(err, batch.rateLimitBackoffMs[attempt]!);
+      recordDailyRateLimitCooldown(batch, waitMs);
+      logger.warn(
+        {
+          ...meta,
+          attempt: attempt + 1,
+          maxRetries,
+          waitMs,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        'LeetCode API rate-limited (HTTP 429); backing off before retry',
+      );
+      await batch.sleep(waitMs);
+    }
+  }
 }
 
 /**
@@ -311,10 +426,22 @@ export async function executeDailyRun(
     const outcomes: AccountOutcome[] = [];
     const renewalTriggered = reason === 'session-renewal';
     const usedCommunityUuids = new Set<string>();
+    const batchCtx = createDailyBatchContext(options);
     for (const account of accounts) {
       const before = outcomes.length;
       try {
-        outcomes.push(await runForAccount(account, today, forceRun, renewalTriggered, usedCommunityUuids, options.expectedChallengeDate));
+        outcomes.push(
+          await runForAccount(
+            account,
+            today,
+            forceRun,
+            renewalTriggered,
+            usedCommunityUuids,
+            options.expectedChallengeDate,
+            true,
+            batchCtx,
+          ),
+        );
       } catch (err) {
         // runForAccount wraps its own pipeline; this is a last-resort guard
         // so one broken account can never abort the whole batch.
@@ -394,6 +521,7 @@ async function runForAccount(
   usedCommunityUuids: Set<string> = new Set(),
   expectedChallengeDate?: string,
   allowAutoRefresh = true,
+  batchCtx: DailyBatchContext = createDailyBatchContext(),
 ): Promise<AccountOutcome> {
   const label = account.label;
 
@@ -444,6 +572,7 @@ async function runForAccount(
               usedCommunityUuids,
               expectedChallengeDate,
               false,
+              batchCtx,
             );
           }
         }
@@ -500,12 +629,31 @@ async function runForAccount(
     const contestReward = await claimContestReward(api, label);
 
     // --- 2) Locate the current LeetCode daily challenge --------------------
-    let daily;
+    let daily: DailyChallengeInfo;
     try {
-      daily = await fetchDailyChallenge(api);
+      if (batchCtx.cachedDaily) {
+        daily = batchCtx.cachedDaily;
+      } else {
+        daily = await withDailyRateLimitRetry(
+          () => fetchDailyChallenge(api),
+          batchCtx,
+          { label, stage: 'daily-challenge' },
+        );
+        batchCtx.cachedDaily = daily;
+      }
     } catch (err) {
       if (err instanceof DailyProblemNotFoundError) {
         return await finalizePlaceholder(account, username, today, RunState.DAILY_PROBLEM_NOT_FOUND, 'LeetCode returned no active daily challenge');
+      }
+      const failure = leetCodeRequestFailure(err);
+      if (failure.category === 'rate-limit') {
+        return await finalizePlaceholder(
+          account,
+          username,
+          today,
+          RunState.SUBMISSION_ERROR,
+          `LeetCode rate limited the daily challenge request (HTTP 429) — will retry automatically`,
+        );
       }
       if (looksLikeChallenge(err)) {
         return await finalizePlaceholder(
@@ -576,11 +724,29 @@ async function runForAccount(
     // --- 4) Fetch + parse the problem --------------------------------------
     let problem;
     try {
-      const raw = await fetchQuestionData(api, daily.slug);
+      let raw = batchCtx.cachedQuestionBySlug.get(daily.slug);
+      if (!raw) {
+        raw = await withDailyRateLimitRetry(
+          () => fetchQuestionData(api, daily.slug),
+          batchCtx,
+          { label, stage: 'question-data', slug: daily.slug },
+        );
+        batchCtx.cachedQuestionBySlug.set(daily.slug, raw);
+      }
       problem = parseProblem(raw, config.llm.language);
     } catch (err) {
       if (err instanceof ProblemParseError) {
         return await finishRun(account, username, run, RunState.PROBLEM_PARSE_FAILED, { error: err.message });
+      }
+      const failure = leetCodeRequestFailure(err);
+      if (failure.category === 'rate-limit') {
+        return await finishRun(
+          account,
+          username,
+          run,
+          RunState.SUBMISSION_ERROR,
+          { error: `LeetCode rate limited the problem request (HTTP 429) — will retry automatically` },
+        );
       }
       if (looksLikeChallenge(err)) {
         return await finishRun(
@@ -611,7 +777,7 @@ async function runForAccount(
                 await activeSession.context.addCookies(updatedState.cookies as never).catch(() => undefined);
               }
             },
-          })
+          }, batchCtx)
         : submitViaBrowser(account, username, activeSession, problem, code, run);
 
     let outcome = await submitDailySolutionWithCommentFallback(
@@ -894,6 +1060,7 @@ async function submitViaApi(
     getState: () => ParsedStorageState;
     onGhostCookiesPersisted: (updatedState: ParsedStorageState) => Promise<void> | void;
   },
+  batchCtx: DailyBatchContext = createDailyBatchContext(),
 ): Promise<AccountOutcome> {
   if (!problem.questionId) {
     return finishRun(account, username, run, RunState.SUBMISSION_ERROR, {
@@ -903,54 +1070,82 @@ async function submitViaApi(
   }
 
   const questionId = problem.questionId;
+  const maxRateLimitRetries = batchCtx.rateLimitBackoffMs.length;
   try {
-    let submissionId: string;
-    try {
-      submissionId = await api.submitSolution({
-        slug: problem.slug,
-        questionId,
-        lang: config.llm.language,
-        code,
-      });
-    } catch (submitErr) {
-      const failure = leetCodeRequestFailure(submitErr);
-      const latestState = ghostSync?.getState();
-      const parsedState = latestState
-        ? { ok: true as const, state: latestState }
-        : parseStoredStorageState(account.storageState);
-      const canUpgradeGhost =
-        parsedState.ok &&
-        !(submitErr instanceof LeetCodeHttpError && submitErr.status === 200) &&
-        (failure.category === 'challenge' ||
-          failure.category === 'access-denied' ||
-          failure.category === 'session-csrf');
-      if (!canUpgradeGhost) throw submitErr;
-
-      logger.warn(
-        { label: account.label, slug: problem.slug, category: failure.category },
-        'daily API submit challenged/rejected; retrying via ghost-mode stealth Chromium fallback',
-      );
-      let ghostSynced = false;
-      const ghostResult = await submitViaGhostBrowser(parsedState.state, {
-        slug: problem.slug,
-        questionId,
-        lang: config.llm.language,
-        code,
-        onStorageState: async (updatedState) => {
-          ghostSynced = true;
-          await persistRotatedCookiesFromContext(account, parsedState.state, {
-            storageState: async () => updatedState,
-          });
-          await ghostSync?.onGhostCookiesPersisted(updatedState);
-        },
-      });
-      if (!ghostSynced && ghostResult.storageState) {
-        await persistRotatedCookiesFromContext(account, parsedState.state, {
-          storageState: async () => ghostResult.storageState,
+    let submissionId = '';
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await waitBeforeDailySubmit(batchCtx, account.label, problem.slug);
+        submissionId = await api.submitSolution({
+          slug: problem.slug,
+          questionId,
+          lang: config.llm.language,
+          code,
         });
-        await ghostSync?.onGhostCookiesPersisted(ghostResult.storageState);
+        break;
+      } catch (submitErr) {
+        const failure = leetCodeRequestFailure(submitErr);
+        if (failure.category === 'rate-limit') {
+          const fallbackWait =
+            batchCtx.rateLimitBackoffMs[Math.min(attempt, Math.max(0, batchCtx.rateLimitBackoffMs.length - 1))] ?? 15_000;
+          const waitMs = computeLeetCodeRateLimitDelayMs(submitErr, fallbackWait);
+          recordDailyRateLimitCooldown(batchCtx, waitMs);
+          if (attempt < maxRateLimitRetries) {
+            logger.warn(
+              {
+                label: account.label,
+                slug: problem.slug,
+                attempt: attempt + 1,
+                maxRetries: maxRateLimitRetries,
+                waitMs,
+                httpStatus: submitErr instanceof LeetCodeHttpError ? submitErr.status : undefined,
+                err: submitErr instanceof Error ? submitErr.message : String(submitErr),
+              },
+              'daily API submit rate-limited (HTTP 429); backing off before retry',
+            );
+            continue;
+          }
+        }
+
+        const latestState = ghostSync?.getState();
+        const parsedState = latestState
+          ? { ok: true as const, state: latestState }
+          : parseStoredStorageState(account.storageState);
+        const canUpgradeGhost =
+          parsedState.ok &&
+          !(submitErr instanceof LeetCodeHttpError && submitErr.status === 200) &&
+          (failure.category === 'challenge' ||
+            failure.category === 'access-denied' ||
+            failure.category === 'session-csrf');
+        if (!canUpgradeGhost) throw submitErr;
+
+        logger.warn(
+          { label: account.label, slug: problem.slug, category: failure.category },
+          'daily API submit challenged/rejected; retrying via ghost-mode stealth Chromium fallback',
+        );
+        let ghostSynced = false;
+        const ghostResult = await submitViaGhostBrowser(parsedState.state, {
+          slug: problem.slug,
+          questionId,
+          lang: config.llm.language,
+          code,
+          onStorageState: async (updatedState) => {
+            ghostSynced = true;
+            await persistRotatedCookiesFromContext(account, parsedState.state, {
+              storageState: async () => updatedState,
+            });
+            await ghostSync?.onGhostCookiesPersisted(updatedState);
+          },
+        });
+        if (!ghostSynced && ghostResult.storageState) {
+          await persistRotatedCookiesFromContext(account, parsedState.state, {
+            storageState: async () => ghostResult.storageState,
+          });
+          await ghostSync?.onGhostCookiesPersisted(ghostResult.storageState);
+        }
+        submissionId = ghostResult.submissionId;
+        break;
       }
-      submissionId = ghostResult.submissionId;
     }
     const result = await api.awaitSubmission(submissionId, problem.slug);
 
@@ -972,6 +1167,16 @@ async function submitViaApi(
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    const failure = leetCodeRequestFailure(err);
+    if (failure.category === 'rate-limit') {
+      const httpTag =
+        (err instanceof LeetCodeHttpError && err.status === 429) || /\bHTTP 429\b/i.test(msg)
+          ? ' (HTTP 429)'
+          : '';
+      return finishRun(account, username, run, RunState.SUBMISSION_ERROR, {
+        error: `LeetCode rate limited the submission request${httpTag} after ${maxRateLimitRetries + 1} attempts — will retry automatically`,
+      });
+    }
     if (looksLikeChallenge(err)) {
       return finishRun(account, username, run, RunState.CLOUDFLARE_VERIFICATION_REQUIRED, {
         error: `LeetCode blocked the submission request: ${msg}`,

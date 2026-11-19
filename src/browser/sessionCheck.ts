@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { logger } from '../logger';
-import { LeetCodeApi, looksLikeChallenge } from '../leetcode/apiClient';
+import { LeetCodeApi, leetCodeRequestFailure, looksLikeChallenge } from '../leetcode/apiClient';
 
 /**
  * Session verification — API-only.
@@ -52,9 +52,10 @@ export async function checkSession(api: LeetCodeApi): Promise<SessionCheckResult
     logger.info('session check: not signed in');
     return { authenticated: false, cause: 'signed-out' };
   } catch (err) {
-    const challenged = looksLikeChallenge(err);
+    const failure = leetCodeRequestFailure(err);
+    const challenged = failure.category !== 'rate-limit' && looksLikeChallenge(err);
     logger.warn(
-      { err: err instanceof Error ? err.message : String(err), challenged },
+      { err: err instanceof Error ? err.message : String(err), category: failure.category, challenged },
       'session check query failed — treating as unauthenticated',
     );
     return challenged

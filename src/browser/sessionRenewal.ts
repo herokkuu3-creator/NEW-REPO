@@ -5,7 +5,7 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { saveStorageStateToDb, setSystemState, SystemKeys } from '../database/models';
 import { listAccounts, saveAccount } from '../database/accounts';
-import { looksLikeChallenge } from '../leetcode/apiClient';
+import { leetCodeRequestFailure, looksLikeChallenge } from '../leetcode/apiClient';
 import { checkSession } from './sessionCheck';
 import { parseCookiePayload, StorageStateShape } from './cookiePayload';
 import * as sessionManager from '../leetcode/sessionManager';
@@ -72,6 +72,14 @@ export async function validateCookiesAgainstLeetcode(
     return { ok: true, username: check.username };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    const failure = leetCodeRequestFailure(err);
+    if (failure.category === 'rate-limit') {
+      return {
+        ok: false,
+        reason: 'blocked',
+        error: `LeetCode rate limited the validation request (${msg}). The cookies may still be fine — wait a minute and send them again.`,
+      };
+    }
     if (looksLikeChallenge(err)) {
       return {
         ok: false,

@@ -205,14 +205,45 @@ export function summarizeHttpErrorBody(text: string): string {
     const cfMatch = /(?:Just a moment\.\.\.|Attention Required!\s*\|?\s*Cloudflare|Sorry, you have been blocked|cf-chl|challenge-platform)/i.exec(trimmed)?.[0];
     if (cfMatch) signals.push(cfMatch.replace(/\s+/g, ' ').trim());
   }
-
-  const normalized = trimmed.replace(/\s+/g, ' ');
-  if (title || signals.length > 0) {
-    const prefix = [title ? `[${title}]` : '', ...signals].filter(Boolean).join(' ');
-    const remaining = Math.max(0, 300 - prefix.length - 1);
-    return (remaining > 20 ? `${prefix} ${normalized.slice(0, remaining)}` : prefix).slice(0, 300);
+  if (/(?:error\s+1015|you are being rate limited|429\s+too many requests|too many requests)/i.test(trimmed)) {
+    const rateMatch = /(?:Error\s+1015[^<]{0,60}|You are being rate limited[^<]{0,60}|429\s+Too Many Requests|Too Many Requests)/i.exec(trimmed)?.[0];
+    if (rateMatch) signals.push(rateMatch.replace(/\s+/g, ' ').trim());
   }
-  return normalized.slice(0, 300);
+
+  const isHtml = /<(?:!doctype|html|head|body)\b/i.test(trimmed);
+  const visibleBodyText = isHtml
+    ? trimmed
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&amp;/gi, '&')
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/\s+/g, ' ')
+        .trim()
+    : trimmed.replace(/\s+/g, ' ');
+
+  const uniqueSignals = signals.filter(
+    (s, idx) =>
+      signals.findIndex((other) => other.toLowerCase() === s.toLowerCase()) === idx &&
+      (!title || !title.toLowerCase().includes(s.toLowerCase())),
+  );
+
+  if (title || uniqueSignals.length > 0) {
+    const prefix = [title ? `[${title}]` : '', ...uniqueSignals].filter(Boolean).join(' ');
+    const remaining = Math.max(0, 300 - prefix.length - 1);
+    const bodySuffix =
+      visibleBodyText && !prefix.toLowerCase().includes(visibleBodyText.toLowerCase())
+        ? visibleBodyText
+        : '';
+    return (bodySuffix && remaining > 20 ? `${prefix} ${bodySuffix.slice(0, remaining)}` : prefix).slice(0, 300);
+  }
+  if (isHtml) {
+    return visibleBodyText ? `[HTML] ${visibleBodyText}`.slice(0, 300) : '[HTML response]';
+  }
+  return visibleBodyText.slice(0, 300);
 }
 
 export function leetCodeRequestFailure(err: unknown): { category: string; detail: string } {
@@ -222,8 +253,14 @@ export function leetCodeRequestFailure(err: unknown): { category: string; detail
   if (/not.*(?:signed|logged).*in|not\s+authenticated|unauthenticated|authentication|session.*expired/i.test(msg) || (err instanceof LeetCodeHttpError && err.status === 401)) {
     return { category: 'session-auth', detail: 'Server session requires authentication' };
   }
-  const html = /<!doctype|<html|cloudflare|cf-chl|just a moment/i.test(msg);
-  if ((err instanceof LeetCodeHttpError && err.status === 429) || /too (?:many requests|fast)|submit.{0,20}(?:too often|too frequently)|try again.{0,12}(?:seconds?|minutes?)/i.test(msg)) return { category: 'rate-limit', detail: 'Server request rate limited; no daily quota confirmed' + (err instanceof LeetCodeHttpError && err.status === 429 ? ' (HTTP 429)' : '') };
+  const html = /<!doctype|<html|\[html(?: response)?\]|cloudflare|cf-chl|just a moment/i.test(msg);
+  const isHttp429 = (err instanceof LeetCodeHttpError && err.status === 429) || /\bHTTP 429\b/i.test(msg);
+  if (isHttp429 || /too (?:many requests|fast)|you are being rate limited|error\s+1015|submit.{0,20}(?:too often|too frequently)|try again.{0,12}(?:seconds?|minutes?)/i.test(msg)) {
+    return {
+      category: 'rate-limit',
+      detail: 'Server request rate limited; no daily quota confirmed' + (isHttp429 ? ' (HTTP 429)' : ''),
+    };
+  }
   if (html || (err instanceof LeetCodeHttpError && /non-JSON body/i.test(msg))) return { category: 'challenge', detail: 'Server returned an unexpected page; no account submission quota confirmed' };
   if (err instanceof LeetCodeHttpError && err.status === 403) return { category: 'access-denied', detail: 'Server request denied (HTTP 403); no account submission quota confirmed' };
   if (/no submission_id/.test(msg)) return { category: 'unknown-submit-response', detail: 'Submission response had no ID; outcome needs reconciliation' };
@@ -238,7 +275,7 @@ export function leetCodeRequestFailure(err: unknown): { category: string; detail
 export function isSubmissionLimitError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   // HTML or Cloudflare interstitial responses are NEVER LeetCode daily quota limits
-  if (/<!DOCTYPE|<html|<head|cloudflare|cf-chl|just a moment/i.test(msg)) {
+  if (/<!DOCTYPE|<html|<head|\[html(?: response)?\]|cloudflare|cf-chl|just a moment/i.test(msg)) {
     return false;
   }
   // A temporary submission-frequency limit is not evidence of a daily quota.
@@ -256,8 +293,18 @@ export function looksLikeChallenge(err: unknown): boolean {
     if (/non-JSON body/i.test(err.message)) return true;
   }
   const msg = err instanceof Error ? err.message : String(err);
-  if (/<!DOCTYPE|<html|<head|cloudflare|cf-chl|just a moment/i.test(msg)) return true;
+  if (/<!DOCTYPE|<html|<head|\[html(?: response)?\]|cloudflare|cf-chl|just a moment/i.test(msg)) return true;
   return false;
+}
+
+/** Computes a bounded backoff delay (ms) for an HTTP 429 rate-limit error, honoring Retry-After. */
+export function computeLeetCodeRateLimitDelayMs(err: unknown, fallbackWaitMs: number): number {
+  const retryAfterMs = err instanceof LeetCodeHttpError ? err.retryAfterMs : undefined;
+  const isTest = Boolean(process.env.VITEST || process.env.NODE_ENV === 'test');
+  if (isTest && fallbackWaitMs < 1_000) {
+    return retryAfterMs !== undefined ? Math.min(Math.max(0, retryAfterMs), 50) : Math.max(0, fallbackWaitMs);
+  }
+  return Math.min(90_000, Math.max(retryAfterMs ?? fallbackWaitMs, 5_000));
 }
 
 export interface SubmissionOutcome {

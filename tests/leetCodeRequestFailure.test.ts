@@ -150,4 +150,27 @@ describe('CSRF, headers, and HTML diagnostic helpers', () => {
     expect(deduped.some((c) => c.name === '_ga' && c.value === 'ga_keep')).toBe(true);
     expect(deduped.some((c) => c.name === 'LEETCODE_SESSION' && c.value === 'sess_active')).toBe(true);
   });
+
+  it('strips raw HTML head/meta tags from HTTP 429 HTML pages and classifies them cleanly as rate-limit', () => {
+    const html429 =
+      '<!DOCTYPE html> <html> <head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width, initial-scale=1"> <link type="text/css" rel="stylesheet" href="/static.css"> </head> <body> <h1>429 Too Many Requests</h1> <p>Please slow down and try again.</p> </body> </html>';
+    const summary = summarizeHttpErrorBody(html429);
+    expect(summary).not.toContain('<!DOCTYPE');
+    expect(summary).not.toContain('<meta');
+    expect(summary).toContain('429 Too Many Requests');
+
+    const err = new LeetCodeHttpError(`submit HTTP 429: ${summary}`, 429);
+    expect(leetCodeRequestFailure(err)).toEqual({
+      category: 'rate-limit',
+      detail: 'Server request rate limited; no daily quota confirmed (HTTP 429)',
+    });
+    expect(isSubmissionLimitError(err)).toBe(false);
+
+    const emptyHtml = '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body></body></html>';
+    const emptySummary = summarizeHttpErrorBody(emptyHtml);
+    expect(emptySummary).toBe('[HTML response]');
+    const empty403 = new LeetCodeHttpError(`submit HTTP 403: ${emptySummary}`, 403);
+    expect(leetCodeRequestFailure(empty403).category).toBe('challenge');
+    expect(looksLikeChallenge(empty403)).toBe(true);
+  });
 });

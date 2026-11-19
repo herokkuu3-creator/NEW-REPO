@@ -198,10 +198,45 @@ describe('scheduler & codechef regression fixes', () => {
       const { LeetCodeHttpError: FreshHttpError } = await import('../src/leetcode/apiClient');
       const { executeDailyRun } = await import('../src/scheduler/dailyWorker');
 
-      // 1) HTTP 429 must NOT invoke ghost browser and must NOT trigger secondary fallback
-      submitFn.mockRejectedValueOnce(new FreshHttpError('submit HTTP 429', 429));
-      const res429 = await executeDailyRun('manual-cli');
-      expect(res429.accounts[0]?.state).toBe(RunState.CLOUDFLARE_VERIFICATION_REQUIRED);
+      // 1a) Transient HTTP 429 HTML backs off, retries in-place, and succeeds without ghost browser or walkccc fallback
+      const sleeps: number[] = [];
+      submitFn
+        .mockRejectedValueOnce(new FreshHttpError('submit HTTP 429: 429 Too Many Requests', 429, 25))
+        .mockResolvedValueOnce('sub-after-429');
+      awaitFn.mockResolvedValueOnce({
+        submissionId: 'sub-after-429',
+        classification: 'ACCEPTED',
+        statusDisplay: 'Accepted',
+        runtime: '2 ms',
+        memory: '37 MB',
+        rawStatusMsg: 'Accepted',
+      });
+      const res429Recovered = await executeDailyRun('manual-cli', {
+        rateLimitBackoffMs: [10, 20],
+        sleep: async (ms) => { sleeps.push(ms); },
+      });
+      expect(res429Recovered.accounts[0]?.state).toBe(RunState.SUCCESS);
+      expect(res429Recovered.accounts[0]?.submissionId).toBe('sub-after-429');
+      expect(sleeps).toHaveLength(1);
+      expect(sleeps[0]).toBeGreaterThan(0);
+      expect(ghostSubmitFn).not.toHaveBeenCalled();
+      expect(walkcccFn).not.toHaveBeenCalled();
+
+      // 1b) Exhausted HTTP 429 must NEVER report CLOUDFLARE_VERIFICATION_REQUIRED, never invoke ghost browser, and never trigger secondary fallback
+      const exhaustedSleeps: number[] = [];
+      submitFn
+        .mockRejectedValueOnce(new FreshHttpError('submit HTTP 429: <!DOCTYPE html> <html> <head> <meta charset="utf-8">', 429))
+        .mockRejectedValueOnce(new FreshHttpError('submit HTTP 429: <!DOCTYPE html> <html> <head> <meta charset="utf-8">', 429))
+        .mockRejectedValueOnce(new FreshHttpError('submit HTTP 429: <!DOCTYPE html> <html> <head> <meta charset="utf-8">', 429));
+      const res429 = await executeDailyRun('manual-cli', {
+        rateLimitBackoffMs: [10, 20],
+        sleep: async (ms) => { exhaustedSleeps.push(ms); },
+      });
+      expect(res429.accounts[0]?.state).toBe(RunState.SUBMISSION_ERROR);
+      expect(res429.accounts[0]?.error).toContain('rate limited');
+      expect(res429.accounts[0]?.error).toContain('HTTP 429');
+      expect(res429.accounts[0]?.error).not.toContain('<!DOCTYPE');
+      expect(exhaustedSleeps).toHaveLength(2);
       expect(ghostSubmitFn).not.toHaveBeenCalled();
       expect(walkcccFn).not.toHaveBeenCalled();
 
@@ -320,6 +355,98 @@ describe('scheduler & codechef regression fixes', () => {
       getSystemStateFn.mockImplementation(async (k) => stateStore.get(k) ?? null);
       await executeDailyRun('cron');
       expect(JSON.parse(stateStore.get('dailyRetryState')!).count).toBe(0);
+    });
+
+    it('paces consecutive multi-account daily submissions and caches daily/question metadata per batch', async () => {
+      vi.resetModules();
+      const accounts = ['a1', 'a2', 'a3'].map((label) => ({
+        id: `acc-${label}`,
+        label,
+        username: label,
+        status: AccountStatus.ACTIVE,
+        storageState: JSON.stringify({ cookies: [], origins: [] }),
+      }));
+      const fetchDailyFn = vi.fn(async () => ({ date: '2026-11-19', slug: 'daily-q', title: 'Daily Q', difficulty: 'Medium' }));
+      const fetchQuestionFn = vi.fn(async () => ({}));
+      const submitFn = vi.fn(async () => 'sub-ok');
+      const awaitFn = vi.fn(async () => ({
+        submissionId: 'sub-ok',
+        classification: 'ACCEPTED',
+        statusDisplay: 'Accepted',
+        runtime: '1 ms',
+        memory: '37 MB',
+        rawStatusMsg: 'Accepted',
+      }));
+
+      doMock('../src/database/accounts', () => ({
+        ensureAccountsSeeded: vi.fn(async () => undefined),
+        listEnabledAccounts: vi.fn(async () => accounts),
+        getAccountById: vi.fn(async (id: string) => accounts.find((a) => a.id === id) ?? null),
+        parseStoredStorageState: (raw: string) => ({ ok: true as const, state: JSON.parse(raw) }),
+        patchAccount: vi.fn(async () => undefined),
+      }));
+      doMock('../src/browser/playwright', () => ({
+        launchWithStorageStateObject: vi.fn(async () => ({ context: { addCookies: vi.fn() }, page: {}, close: async () => undefined })),
+      }));
+      doMock('../src/browser/sessionCheck', () => ({
+        checkSession: vi.fn(async () => ({ authenticated: true, username: 'u' })),
+      }));
+      doMock('../src/browser/diagnostics', () => ({ captureDiagnostics: vi.fn(), pruneDiagnostics: vi.fn() }));
+      doMock('../src/leetcode/dailyCheckin', () => ({ claimDailyCheckin: vi.fn(async () => ({ checkedIn: true, awarded: false })) }));
+      doMock('../src/leetcode/contestReward', () => ({ claimContestReward: vi.fn(async () => ({ claimed: false })) }));
+      doMock('../src/leetcode/dailyChallenge', async (orig) => ({
+        ...((await orig()) as object),
+        fetchDailyChallenge: fetchDailyFn,
+        fetchQuestionData: fetchQuestionFn,
+      }));
+      doMock('../src/leetcode/parser', async (orig) => ({
+        ...((await orig()) as object),
+        parseProblem: () => ({ frontendId: '2567', slug: 'daily-q', questionId: '2567', starterCode: 'class Solution { public: int f() {} };' }),
+      }));
+      doMock('../src/solutions/communitySolutions', () => ({
+        fetchCommunitySolution: vi.fn(async () => ({
+          code: 'class Solution { public: int f() { return 0; } };',
+          uuid: 'u-1',
+          sourceUrl: 'https://leetcode.com/solutions/1',
+          title: 'Sol',
+          rankIndex: 1,
+        })),
+      }));
+      doMock('../src/leetcode/sessionManager', () => ({ persistRotatedCookiesFromContext: vi.fn(async () => undefined) }));
+      doMock('../src/notifications/notifier', () => ({ notifyMultiRunReport: vi.fn(async () => undefined) }));
+      doMock('../src/database/models', async () => ({
+        RunState,
+        SystemKeys: { lastReport: 'lastReport', dailyRetryState: 'dailyRetryState', lastRunSummary: 'lastRunSummary' },
+        getSystemState: vi.fn(async () => null),
+        setSystemState: vi.fn(async () => undefined),
+        findRunByDate: vi.fn(async () => null),
+        createRun: vi.fn(async (input: Record<string, unknown>) => ({ id: `run-${input.accountId}`, ...input, updatedAt: new Date() })),
+        updateRun: vi.fn(async (id: string, data: Record<string, unknown>) => ({ id, date: '2026-11-19', problemSlug: 'daily-q', ...data, updatedAt: new Date() })),
+        finalizeRun: vi.fn(async (id: string, state: RunState, extra: Record<string, unknown>) => ({
+          id, date: '2026-11-19', problemSlug: 'daily-q', state, submissionId: null, submissionStatus: null, runtime: null, memory: null, error: null, updatedAt: new Date(), ...extra,
+        })),
+      }));
+      doMock('../src/leetcode/apiClient', async (orig) => {
+        const real = (await orig()) as object;
+        return {
+          ...real,
+          LeetCodeApi: class { submitSolution = submitFn; awaitSubmission = awaitFn; },
+        };
+      });
+
+      const { executeDailyRun } = await import('../src/scheduler/dailyWorker');
+      const waits: number[] = [];
+      const report = await executeDailyRun('manual-cli', {
+        submitGapMs: 15_000,
+        sleep: async (ms) => { waits.push(ms); },
+      });
+      expect(report.totals.solved).toBe(3);
+      expect(fetchDailyFn).toHaveBeenCalledTimes(1);
+      expect(fetchQuestionFn).toHaveBeenCalledTimes(1);
+      expect(submitFn).toHaveBeenCalledTimes(3);
+      expect(waits).toHaveLength(2);
+      expect(waits[0]).toBeGreaterThan(10_000);
+      expect(waits[1]).toBeGreaterThan(10_000);
     });
   });
 

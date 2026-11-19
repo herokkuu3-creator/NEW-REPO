@@ -623,4 +623,57 @@ describe('solveAndSubmitContestQuestion', () => {
     expect(openSession).toHaveBeenCalledTimes(2);
     expect(run.submissionId).toBe('sub-999');
   });
+
+  it('retries transient HTTP 429 submit rate-limit without falling back to ghost browser', async () => {
+    const { prisma } = makeStores();
+    const submitViaGhost = vi.fn(async () => ({
+      submissionId: 'ghost-unused',
+      storageState: { cookies: [], origins: [] },
+    }));
+    const submitSolution = vi
+      .fn()
+      .mockRejectedValueOnce(new LeetCodeHttpError('submit HTTP 429: 429 Too Many Requests', 429, 10))
+      .mockResolvedValueOnce('sub-429-ok');
+    const session: ContestSessionLike = {
+      api: {
+        submitSolution,
+        awaitSubmission: vi.fn(async (id: string) => ({
+          submissionId: id,
+          classification: 'ACCEPTED' as const,
+          statusDisplay: 'Accepted',
+          runtime: '2 ms',
+          memory: '18 MB',
+          rawStatusMsg: 'Accepted',
+        })),
+      },
+    };
+
+    const run = await solveAndSubmitContestQuestion(
+      {
+        accountId: 'acc-1',
+        contestSlug: 'weekly-contest-433',
+        contestTitle: 'Weekly Contest 433',
+        question: sampleContestQuestion(),
+        istDate: '2026-11-15',
+      },
+      {
+        prisma,
+        openSession: async () => session,
+        checkSession: async () => ({ authenticated: true, username: 'contest_user' }),
+        fetchQuestionData: async () => sampleRawQuestion(),
+        createRouter: async () => ({
+          generate: async () => ({
+            value: 'class Solution { public: int minScore(vector<int>& n) { return accumulate(n.begin(), n.end(), 0); } };',
+            model: 'mock',
+          }),
+        }),
+        submitViaGhost,
+        language: 'cpp',
+      } satisfies ContestSolverDeps
+    );
+
+    expect(submitSolution).toHaveBeenCalledTimes(2);
+    expect(submitViaGhost).not.toHaveBeenCalled();
+    expect(run.submissionId).toBe('sub-429-ok');
+  });
 });

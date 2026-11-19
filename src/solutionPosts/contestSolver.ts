@@ -7,10 +7,10 @@ import { StorageStateShape } from '../browser/cookiePayload';
 import { checkSession, SessionCheckResult } from '../browser/sessionCheck';
 import { refreshLeetCodeAccount } from '../security/sessionAutoRefresh';
 import {
+  computeLeetCodeRateLimitDelayMs,
   LeetCodeApi,
   LeetCodeHttpError,
   leetCodeRequestFailure,
-  looksLikeChallenge,
   SubmissionOutcome,
 } from '../leetcode/apiClient';
 import { fetchQuestionData, RawQuestionData } from '../leetcode/dailyChallenge';
@@ -406,6 +406,11 @@ async function defaultFetchJudgeDetail(
   return fallback;
 }
 
+const CONTEST_SUBMIT_RATE_LIMIT_BACKOFF_MS: readonly number[] =
+  process.env.VITEST || process.env.NODE_ENV === 'test'
+    ? [1, 1, 1]
+    : [15_000, 30_000, 45_000];
+
 async function submitCandidateCode(
   session: ContestSessionLike,
   account: AccountRecord,
@@ -413,42 +418,65 @@ async function submitCandidateCode(
   params: { slug: string; questionId: string; lang: string; code: string },
   submitViaGhostFn: typeof submitViaGhostBrowser
 ): Promise<{ submissionId: string; updatedState?: StorageStateShape }> {
-  try {
-    const submissionId = await session.api.submitSolution(params);
-    return { submissionId };
-  } catch (submitErr) {
-    const failure = leetCodeRequestFailure(submitErr);
-    const canUpgradeGhost =
-      !(submitErr instanceof LeetCodeHttpError && submitErr.status === 200) &&
-      (looksLikeChallenge(submitErr) ||
-        failure.category === 'access-denied' ||
-        failure.category === 'session-csrf');
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  let lastSubmitErr: unknown;
+  for (let attempt = 0; attempt <= CONTEST_SUBMIT_RATE_LIMIT_BACKOFF_MS.length; attempt++) {
+    try {
+      const submissionId = await session.api.submitSolution(params);
+      return { submissionId };
+    } catch (submitErr) {
+      lastSubmitErr = submitErr;
+      const failure = leetCodeRequestFailure(submitErr);
+      if (failure.category === 'rate-limit' && attempt < CONTEST_SUBMIT_RATE_LIMIT_BACKOFF_MS.length) {
+        const waitMs = computeLeetCodeRateLimitDelayMs(submitErr, CONTEST_SUBMIT_RATE_LIMIT_BACKOFF_MS[attempt]!);
+        logger.warn(
+          {
+            label: account.label,
+            slug: params.slug,
+            attempt: attempt + 1,
+            maxRetries: CONTEST_SUBMIT_RATE_LIMIT_BACKOFF_MS.length,
+            waitMs,
+            err: submitErr instanceof Error ? submitErr.message : String(submitErr),
+          },
+          'contest API submit rate-limited (HTTP 429); backing off before retry'
+        );
+        await sleep(waitMs);
+        continue;
+      }
 
-    if (!canUpgradeGhost) {
-      throw submitErr;
+      const canUpgradeGhost =
+        !(submitErr instanceof LeetCodeHttpError && submitErr.status === 200) &&
+        (failure.category === 'challenge' ||
+          failure.category === 'access-denied' ||
+          failure.category === 'session-csrf');
+
+      if (!canUpgradeGhost) {
+        throw submitErr;
+      }
+
+      logger.warn(
+        { label: account.label, slug: params.slug, category: failure.category },
+        'contest API submit challenged/rejected; retrying via ghost-mode browser fallback'
+      );
+
+      const ghostResult = await submitViaGhostFn(storageState, {
+        slug: params.slug,
+        questionId: params.questionId,
+        lang: params.lang,
+        code: params.code,
+        onStorageState: async (updatedState) => {
+          await persistRotatedCookiesFromContext(account, storageState, {
+            storageState: async () => updatedState,
+          });
+        },
+      });
+      return {
+        submissionId: ghostResult.submissionId,
+        updatedState: ghostResult.storageState,
+      };
     }
-
-    logger.warn(
-      { label: account.label, slug: params.slug, category: failure.category },
-      'contest API submit challenged/rejected; retrying via ghost-mode browser fallback'
-    );
-
-    const ghostResult = await submitViaGhostFn(storageState, {
-      slug: params.slug,
-      questionId: params.questionId,
-      lang: params.lang,
-      code: params.code,
-      onStorageState: async (updatedState) => {
-        await persistRotatedCookiesFromContext(account, storageState, {
-          storageState: async () => updatedState,
-        });
-      },
-    });
-    return {
-      submissionId: ghostResult.submissionId,
-      updatedState: ghostResult.storageState,
-    };
   }
+  throw lastSubmitErr;
 }
 
 export async function solveAndSubmitContestQuestion(
