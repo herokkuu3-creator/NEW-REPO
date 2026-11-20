@@ -9,13 +9,6 @@ import { DEFAULT_DESKTOP_CHROME_USER_AGENT } from '../codeforces/browserForm';
 import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
 import {
-  solveCloudflareOrchestrated,
-  sanitizeChallengeUrl,
-  extractTurnstileSitekeyFromFrames,
-  TURNSTILE_URL_SITEKEY_RE,
-} from '../codeforces/captchaSolver';
-import { installTurnstileMetadataHook } from './auth';
-import {
   deduplicateLeetCodeCookies,
   isCsrfRejectionBody,
   isSubmissionLimitError,
@@ -154,133 +147,6 @@ function isRecoverableBrowserCrash(err: unknown, pageCrashed: boolean): boolean 
   if (pageCrashed) return true;
   const msg = err instanceof Error ? err.message : String(err);
   return /Page crashed|Target page, context or browser has been closed|Session closed|Connection closed|Browser has been closed/i.test(msg);
-}
-
-const observedGhostTurnstileSitekey = new WeakMap<Page, string>();
-
-async function extractChallengeMetadata(page: Page): Promise<{ sitekey?: string; action?: string; cdata?: string }> {
-  const detail = await page
-    .evaluate(() => {
-      const w = window as unknown as Record<string, unknown>;
-      const resourceSitekey = (): string => {
-        try {
-          const entries = performance.getEntriesByType?.('resource') as Array<{ name?: string }> | undefined;
-          if (!Array.isArray(entries)) return '';
-          for (const entry of entries) {
-            if (!entry?.name || !entry.name.includes('challenges.cloudflare.com')) continue;
-            const m = /challenges\.cloudflare\.com\/.*?\/(0x4[a-zA-Z0-9_-]{16,})(?:[/?#]|$)/i.exec(entry.name);
-            if (m?.[1]) return m[1];
-          }
-        } catch {}
-        return '';
-      };
-      const scriptSitekey = (): string => {
-        try {
-          const scripts = Array.from(document.querySelectorAll('script'));
-          for (const s of scripts) {
-            if (s.src && s.src.includes('challenges.cloudflare.com')) {
-              const m = /challenges\.cloudflare\.com\/.*?\/(0x4[a-zA-Z0-9_-]{16,})(?:[/?#]|$)/i.exec(s.src);
-              if (m?.[1]) return m[1];
-            }
-            const txt = s.textContent || '';
-            if (txt.includes('turnstile') || txt.includes('sitekey')) {
-              const m = /["']?sitekey["']?\s*[:=]\s*["'](0x4[a-zA-Z0-9_-]{16,})["']/i.exec(txt);
-              if (m?.[1]) return m[1];
-            }
-          }
-        } catch {}
-        return '';
-      };
-
-      let sitekey = typeof w.__turnstileSitekey === 'string' ? w.__turnstileSitekey.trim() : '';
-      const el = document.querySelector('[data-sitekey], [data-key], .cf-turnstile') as HTMLElement | null;
-      if (!sitekey && el) {
-        sitekey = (el.getAttribute('data-sitekey') || el.getAttribute('data-key') || el.dataset?.sitekey || '').trim();
-      }
-      if (!sitekey) {
-        const iframes = Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]'));
-        for (const iframe of iframes) {
-          const m = /\/(0x[0-9a-zA-Z_-]{10,})(?:[/?#]|$)/.exec(iframe.getAttribute('src') ?? '');
-          if (m?.[1]) {
-            sitekey = m[1];
-            break;
-          }
-        }
-      }
-      if (!sitekey) {
-        sitekey = resourceSitekey() || scriptSitekey();
-      }
-      const action =
-        (typeof w.__turnstileAction === 'string' && w.__turnstileAction) ||
-        el?.getAttribute('data-action') ||
-        el?.dataset?.action ||
-        undefined;
-      const cdata =
-        (typeof w.__turnstileCData === 'string' && w.__turnstileCData) ||
-        (typeof w.__turnstileCdata === 'string' && w.__turnstileCdata) ||
-        el?.getAttribute('data-cdata') ||
-        el?.dataset?.cdata ||
-        undefined;
-      return {
-        ...(sitekey ? { sitekey } : {}),
-        ...(action ? { action } : {}),
-        ...(cdata ? { cdata } : {}),
-      };
-    })
-    .catch((): { sitekey?: string; action?: string; cdata?: string } => ({}));
-
-  if (!detail.sitekey) {
-    const fallbackSitekey =
-      extractTurnstileSitekeyFromFrames(page) || observedGhostTurnstileSitekey.get(page);
-    if (fallbackSitekey) {
-      return { ...detail, sitekey: fallbackSitekey };
-    }
-  }
-  return detail;
-}
-
-async function applyCloudflareSolution(
-  page: Page,
-  context: BrowserContext,
-  targetUrl: string,
-  solved: NonNullable<Awaited<ReturnType<typeof solveCloudflareOrchestrated>>>,
-): Promise<void> {
-  const cookiesToSet: Array<{ name: string; value: string; domain: string; path: string; secure: boolean }> = [];
-  if (solved.cookies) {
-    for (const [name, value] of Object.entries(solved.cookies)) {
-      if ((name.toLowerCase().startsWith('cf_') || name.toLowerCase().startsWith('__cf')) && value && value !== 'cleared') {
-        cookiesToSet.push({ name, value: String(value), domain: '.leetcode.com', path: '/', secure: true });
-      }
-    }
-  }
-  if (solved.cfClearance && solved.cfClearance.length > 5 && solved.cfClearance !== 'cleared') {
-    if (!cookiesToSet.some((c) => c.name === 'cf_clearance')) {
-      cookiesToSet.push({ name: 'cf_clearance', value: solved.cfClearance, domain: '.leetcode.com', path: '/', secure: true });
-    }
-  }
-  if (cookiesToSet.length > 0) {
-    await context.addCookies(cookiesToSet).catch(() => undefined);
-  }
-  if (typeof solved.token === 'string' && solved.token.trim().length > 10) {
-    await page
-      .evaluate((token) => {
-        const inputs = Array.from(
-          document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
-            'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name="g-recaptcha-response"]',
-          ),
-        );
-        for (const el of inputs) el.value = token;
-        const w = window as unknown as { __turnstileCallback?: (t: string) => void };
-        if (typeof w.__turnstileCallback === 'function') {
-          try {
-            w.__turnstileCallback(token);
-          } catch {}
-        }
-      }, solved.token.trim())
-      .catch(() => undefined);
-    await page.waitForTimeout(1_200).catch(() => undefined);
-  }
-  await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25_000 }).catch(() => undefined);
 }
 
 /**
@@ -503,10 +369,7 @@ async function waitForPassiveChallengeSettle(
 export interface GhostBrowserDeps {
   resolveProxy?: typeof resolveLeetCodeResidentialProxy;
   submitPageFetch?: typeof submitViaPageFetch;
-  solveCloudflare?: typeof solveCloudflareOrchestrated;
   challengeWaitMs?: number;
-  retryWaitMs?: number;
-  postSolveWaitMs?: number;
 }
 
 /**
@@ -522,14 +385,7 @@ export async function openGhostBrowserSession(
 ): Promise<GhostBrowserSession> {
   const resolveProxy = deps.resolveProxy ?? resolveLeetCodeResidentialProxy;
   const pageFetch = deps.submitPageFetch ?? submitViaPageFetch;
-  const solveCloudflare = deps.solveCloudflare ?? solveCloudflareOrchestrated;
-  const challengeWaitMs = deps.challengeWaitMs ?? 20_000;
-  const retryWaitMs = deps.retryWaitMs ?? 10_000;
-  const postSolveWaitMs = deps.postSolveWaitMs ?? 10_000;
-  const canInvokeExternalSolver = !(
-    (process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST)) &&
-    !deps.solveCloudflare
-  );
+  const challengeWaitMs = deps.challengeWaitMs ?? 5_000;
 
   let currentState: StorageStateShape = {
     ...initialState,
@@ -577,7 +433,11 @@ export async function openGhostBrowserSession(
 
         const runAttempt = async (): Promise<GhostSubmitResult> => {
           if (!proxyResolved) {
-            resolvedProxyUrl = (await resolveProxy())?.url;
+            resolvedProxyUrl = (
+              deps.resolveProxy
+                ? await resolveProxy()
+                : await resolveProxy({ fallbackToSharedPool: false })
+            )?.url;
             proxyResolved = true;
           }
           const proxy = resolvedProxyUrl ? toPlaywrightProxy(resolvedProxyUrl) : undefined;
@@ -614,16 +474,6 @@ export async function openGhostBrowserSession(
                 return route.continue().catch(() => undefined);
               });
               page = await context.newPage();
-              await installTurnstileMetadataHook(page);
-              const ghostPage = page;
-              page.on('response', (response) => {
-                try {
-                  const match = TURNSTILE_URL_SITEKEY_RE.exec(response.url());
-                  if (match?.[1]) {
-                    observedGhostTurnstileSitekey.set(ghostPage, match[1]);
-                  }
-                } catch {}
-              });
               pageCrashed = false;
               page.on('crash', () => {
                 pageCrashed = true;
@@ -643,11 +493,18 @@ export async function openGhostBrowserSession(
               cookies: StorageStateShape['cookies'];
               origins: StorageStateShape['origins'];
             };
+            const mergedCookies = [...(latest.cookies ?? [])];
+            if (!selectBestCookieByName(mergedCookies, 'LEETCODE_SESSION', ORIGIN)) {
+              const preservedSession = selectBestCookieByName(currentState.cookies ?? [], 'LEETCODE_SESSION', ORIGIN);
+              if (preservedSession) {
+                mergedCookies.push(preservedSession);
+              }
+            }
             const updatedState: StorageStateShape = {
               transport:
                 currentState.transport ??
                 (resolvedProxyUrl ? { proxyUrl: resolvedProxyUrl, userAgent } : { userAgent }),
-              cookies: deduplicateLeetCodeCookies(latest.cookies, ORIGIN),
+              cookies: deduplicateLeetCodeCookies(mergedCookies, ORIGIN),
               origins: latest.origins ?? currentState.origins ?? [],
             };
             currentState = updatedState;
@@ -702,58 +559,7 @@ export async function openGhostBrowserSession(
           const targetUrl = `${ORIGIN}/problems/${params.slug}/`;
           await activePage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
-          let verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, challengeWaitMs);
-          if (verificationKind && !params.signal?.aborted && canInvokeExternalSolver) {
-            const cfMeta = await extractChallengeMetadata(activePage);
-            const currentCookies = await activeContext.cookies(ORIGIN).catch(() => []);
-            logger.info(
-              {
-                slug: params.slug,
-                verificationKind,
-                viaProxy: Boolean(proxy),
-                hasSitekey: Boolean(cfMeta.sitekey),
-              },
-              'invoking orchestrated Cloudflare solver for ghost Chromium session',
-            );
-            const solved = await solveCloudflare({
-              websiteURL: sanitizeChallengeUrl(activePage.url() || targetUrl),
-              proxyUrl: resolvedProxyUrl,
-              userAgent,
-              cookies: currentCookies,
-              sitekey: cfMeta.sitekey,
-              action: cfMeta.action,
-              cdata: cfMeta.cdata,
-              timeoutMs: 65_000,
-            }).catch((solveErr) => {
-              logger.warn(
-                { slug: params.slug, err: solveErr instanceof Error ? solveErr.message : String(solveErr) },
-                'orchestrated Cloudflare solver failed for ghost session',
-              );
-              return null;
-            });
-            logger.info(
-              {
-                slug: params.slug,
-                ok: Boolean(solved),
-                source: solved?.source,
-                hasClearance: Boolean(solved?.cfClearance),
-                hasToken: Boolean(solved?.token),
-              },
-              'orchestrated Cloudflare solver completed for ghost session',
-            );
-            if (solved && !params.signal?.aborted) {
-              await applyCloudflareSolution(activePage, activeContext, targetUrl, solved);
-              verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, postSolveWaitMs);
-            }
-          }
-
-          if (verificationKind && !params.signal?.aborted) {
-            await activePage
-              .goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
-              .catch(() => undefined);
-            verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, retryWaitMs);
-          }
-
+          const verificationKind = await waitForPassiveChallengeSettle(activePage, params.signal, challengeWaitMs);
           if (verificationKind) {
             hasSettledProblemPage = false;
             const title = await activePage.title().catch(() => '');
@@ -842,7 +648,7 @@ export async function submitViaGhostBrowser(
     state,
     {
       userAgent: params.userAgent,
-      proxyUrl: params.proxyUrl,
+      ...(params.proxyUrl !== undefined ? { proxyUrl: params.proxyUrl } : {}),
       onStorageState: params.onStorageState,
     },
     deps,

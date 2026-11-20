@@ -13,7 +13,7 @@ import { getSystemState, setSystemState } from '../database/models';
 import { checkSession, type SessionCheckResult } from '../browser/sessionCheck';
 import { extractSessionIdentity, type SessionIdentity } from '../browser/sessionIdentity';
 import { type StorageStateShape } from '../browser/cookiePayload';
-import { buildBrowserClientHeaders, cookieMatchesOrigin, deduplicateLeetCodeCookies, LeetCodeApi } from './apiClient';
+import { buildBrowserClientHeaders, cookieMatchesOrigin, deduplicateLeetCodeCookies, LeetCodeApi, selectBestCookieByName } from './apiClient';
 import { logger } from '../logger';
 import { resolveLeetCodeResidentialProxy } from '../codeforces/proxyManager';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
@@ -30,6 +30,11 @@ export interface LightweightLeetCodeSession {
   getStorageState(): Promise<StorageStateShape>;
   persistUpdatedCookiesIfChanged(): Promise<boolean>;
   close(): Promise<void>;
+}
+
+function hasValidSessionCookie(cookies?: StorageStateShape['cookies']): boolean {
+  const session = selectBestCookieByName(cookies ?? [], 'LEETCODE_SESSION', ORIGIN);
+  return Boolean(session && session.value.trim().length >= 10);
 }
 
 function cookieFingerprint(state: StorageStateShape): string {
@@ -64,6 +69,13 @@ export async function persistRotatedCookiesFromContext(
       cookies: deduplicateLeetCodeCookies(latest.cookies as StorageStateShape['cookies']),
       origins: Array.isArray(initialState.origins) ? initialState.origins : [],
     };
+    if (hasValidSessionCookie(initialState.cookies) && !hasValidSessionCookie(updatedState.cookies)) {
+      logger.warn(
+        { label: account.label },
+        'refusing to persist rotated cookies because LEETCODE_SESSION is missing or cleared',
+      );
+      return false;
+    }
     const prevFp = cookieFingerprint(initialState);
     const nextFp = cookieFingerprint(updatedState);
     if (!nextFp || nextFp === prevFp) {
@@ -108,7 +120,7 @@ export async function openLightweightLeetCodeSession(
 ): Promise<LightweightLeetCodeSession> {
   const initialFingerprint = cookieFingerprint(state);
   const preservedOrigins = Array.isArray(state.origins) ? state.origins : [];
-  const proxyUrl = state.transport?.proxyUrl ?? (await resolveLeetCodeResidentialProxy())?.url;
+  const proxyUrl = state.transport?.proxyUrl ?? (await resolveLeetCodeResidentialProxy({ fallbackToSharedPool: false }))?.url;
   const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
   if (proxyUrl && !proxy) throw new Error('LEETCODE_PROXY_INVALID');
 
@@ -141,7 +153,7 @@ export async function openLightweightLeetCodeSession(
   const getStorageState = async (): Promise<StorageStateShape> => {
     const latest = await ctx.storageState();
     return {
-      transport: state.transport ?? (proxyUrl ? { proxyUrl } : undefined),
+      transport: state.transport ?? (proxyUrl ? { proxyUrl, userAgent } : undefined),
       cookies: latest.cookies as unknown as StorageStateShape['cookies'],
       origins: preservedOrigins,
     };
@@ -151,6 +163,13 @@ export async function openLightweightLeetCodeSession(
     if (!account) return false;
     try {
       const updatedState = await getStorageState();
+      if (hasValidSessionCookie(state.cookies) && !hasValidSessionCookie(updatedState.cookies)) {
+        logger.warn(
+          { label: account.label },
+          'refusing to persist rotated cookies because LEETCODE_SESSION is missing or cleared',
+        );
+        return false;
+      }
       const nextFingerprint = cookieFingerprint(updatedState);
       if (!nextFingerprint || nextFingerprint === initialFingerprint) {
         return false;

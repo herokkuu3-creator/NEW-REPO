@@ -51,12 +51,15 @@ import {
   clearLeetCodeLoginCooldownsForTests,
   formatRemainingTtl,
   getLeetCodeLoginCooldown,
+  openLightweightLeetCodeSession,
   persistRotatedCookiesFromContext,
   recordLeetCodeLoginCooldown,
   verifyStoredLeetCodeAccount,
   withSingleFlightLogin,
   type LightweightLeetCodeSession,
 } from '../src/leetcode/sessionManager';
+import * as proxyManager from '../src/codeforces/proxyManager';
+import { request as playwrightRequest } from 'playwright';
 import {
   handleExecuteLogin,
   handleLeetCodeLoginCommand,
@@ -337,5 +340,51 @@ describe('Autonomous Server-Side LeetCode Session Manager & Orchestrator', () =>
     expect(replies.at(0)).toContain('Autonomous Server-Side LeetCode Authentication');
     expect(replies.at(-1)).toContain('watch_me_win');
     expect(replies.at(-1)).toContain('100% server-side via authenticated GraphQL/REST APIs');
+  });
+
+  it('refuses to persist rotated cookies when LEETCODE_SESSION is missing or cleared even if csrftoken changed', async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const validJwt = buildJwtCookie('scale5555', nowSec);
+
+    const initialState = {
+      cookies: [
+        { name: 'LEETCODE_SESSION', value: validJwt, domain: '.leetcode.com', path: '/' },
+        { name: 'csrftoken', value: 'csrf_old', domain: '.leetcode.com', path: '/' },
+      ],
+      origins: [],
+    };
+
+    const changed = await persistRotatedCookiesFromContext(
+      { id: 'acc-1', label: 'scale5555', username: 'scale5555', status: AccountStatus.ACTIVE },
+      initialState,
+      {
+        storageState: vi.fn(async () => ({
+          cookies: [{ name: 'csrftoken', value: 'csrf_rotated', domain: '.leetcode.com', path: '/' }],
+          origins: [],
+        })),
+      },
+    );
+
+    expect(changed).toBe(false);
+    expect(saveAccount).not.toHaveBeenCalled();
+  });
+
+  it('resolves proxy with fallbackToSharedPool: false in openLightweightLeetCodeSession', async () => {
+    const resolveSpy = vi.spyOn(proxyManager, 'resolveLeetCodeResidentialProxy').mockResolvedValue(null);
+    const disposeMock = vi.fn(async () => undefined);
+    const newCtxSpy = vi.spyOn(playwrightRequest, 'newContext').mockResolvedValue({
+      storageState: vi.fn(async () => ({ cookies: [], origins: [] })),
+      dispose: disposeMock,
+    } as any);
+
+    const session = await openLightweightLeetCodeSession({ cookies: [], origins: [] });
+    try {
+      expect(resolveSpy).toHaveBeenCalledWith({ fallbackToSharedPool: false });
+      expect(newCtxSpy).toHaveBeenCalledWith(expect.objectContaining({ proxy: undefined }));
+    } finally {
+      await session.close();
+      resolveSpy.mockRestore();
+      newCtxSpy.mockRestore();
+    }
   });
 });

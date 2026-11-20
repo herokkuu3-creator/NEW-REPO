@@ -6,6 +6,9 @@ import { readFileSync } from 'node:fs';
 import { chromium, request as playwrightRequest } from 'playwright';
 import { AccountStatus } from '@prisma/client';
 import { blockNonEssentialProblemAssets, openGhostBrowserSession } from '../src/leetcode/ghostSubmit';
+import { detectVerificationPage } from '../src/browser/cloudflareDetector';
+import * as captchaSolver from '../src/codeforces/captchaSolver';
+import * as proxyManager from '../src/codeforces/proxyManager';
 import { openRequestSession } from '../src/scheduler/rangeSubmission';
 import { RangeRequestGate } from '../src/scheduler/rangeRequestGate';
 import { LeetCodeHttpError } from '../src/leetcode/apiClient';
@@ -243,25 +246,22 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
     }
   }, 30_000);
 
-  it('invokes orchestrated Cloudflare solver on persistent challenge pages, injects clearance cookies, and auto-recovers from renderer crashes', async () => {
+  it('auto-recovers from renderer crashes and does not falsely flag passive Cloudflare scripts on normal HTTP 200 problem pages', async () => {
     const sockets = new Set<net.Socket>();
-    let cleared = false;
     const fixture = https.createServer(
       {
         key: readFileSync(new URL('./fixtures/auth/key.pem', import.meta.url)),
         cert: readFileSync(new URL('./fixtures/auth/cert.pem', import.meta.url)),
       },
       (req, res) => {
-        const cookie = req.headers.cookie ?? '';
         if (req.url === '/problems/friend-requests-ii/' && req.method === 'GET') {
-          if (!cookie.includes('cf_clearance=cf_solved_token_123') && !cleared) {
-            res.writeHead(403, { 'Content-Type': 'text/html' });
-            return res.end(
-              '<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><div class="challenge-page">Verify</div></body></html>',
-            );
-          }
           res.writeHead(200, { 'Content-Type': 'text/html' });
-          return res.end('<!DOCTYPE html><html><head><title>602. Friend Requests II - LeetCode</title></head><body>OK</body></html>');
+          return res.end(
+            '<!DOCTYPE html><html><head><title>602. Friend Requests II - LeetCode</title>' +
+              '<script>window._cf_chl_opt = { cvId: "3" };</script>' +
+              '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script>' +
+              '</head><body><div data-note="cf-turnstile">Problem content</div></body></html>',
+          );
         }
         if (req.url === '/problems/friend-requests-ii/submit/' && req.method === 'POST') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -320,15 +320,8 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
       return browser;
     });
 
-    const solveCloudflare = vi.fn(async () => {
-      cleared = true;
-      return {
-        cfClearance: 'cf_solved_token_123',
-        cookies: { cf_clearance: 'cf_solved_token_123' },
-        source: 'cpsolver' as const,
-        durationMs: 50,
-      };
-    });
+    const solveSpy = vi.spyOn(captchaSolver, 'solveCloudflareOrchestrated');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
 
     const ghost = await openGhostBrowserSession(
       {
@@ -340,12 +333,7 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
         origins: [],
       },
       {},
-      {
-        solveCloudflare,
-        challengeWaitMs: 50,
-        retryWaitMs: 50,
-        postSolveWaitMs: 50,
-      },
+      { challengeWaitMs: 50 },
     );
 
     try {
@@ -357,7 +345,8 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
       });
       expect(res.submissionId).toBe('777602');
       expect(launchCount).toBe(2); // relaunched once after simulated Page crashed
-      expect(solveCloudflare).toHaveBeenCalledTimes(1);
+      expect(solveSpy).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
     } finally {
       await ghost.close();
       for (const s of sockets) s.destroy();
@@ -365,6 +354,169 @@ describe('Ghost-mode LeetCode submission & cookie rotation', () => {
         new Promise<void>((r) => proxy.close(() => r())),
         new Promise<void>((r) => fixture.close(() => r())),
       ]);
+    }
+  }, 30_000);
+
+  it('never invokes CPSolver or CapSolver on persistent post-login interstitials and fails fast with HTTP 403', async () => {
+    const sockets = new Set<net.Socket>();
+    const fixture = https.createServer(
+      {
+        key: readFileSync(new URL('./fixtures/auth/key.pem', import.meta.url)),
+        cert: readFileSync(new URL('./fixtures/auth/cert.pem', import.meta.url)),
+      },
+      (req, res) => {
+        if (req.url === '/problems/two-sum/' && req.method === 'GET') {
+          res.writeHead(403, { 'Content-Type': 'text/html' });
+          return res.end(
+            '<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><div class="challenge-page">Verify</div></body></html>',
+          );
+        }
+        res.writeHead(404).end();
+      },
+    );
+    await new Promise<void>((resolve) => fixture.listen(0, '127.0.0.1', resolve));
+    const port = (fixture.address() as net.AddressInfo).port;
+    const proxy = net.createServer((clientSocket) => {
+      sockets.add(clientSocket);
+      clientSocket.once('data', (chunk) => {
+        const firstLine = chunk.toString('utf8').split('\r\n')[0] ?? '';
+        if (!firstLine.startsWith('CONNECT ')) {
+          clientSocket.destroy();
+          return;
+        }
+        const upstream = net.connect(port, '127.0.0.1', () => {
+          clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          upstream.pipe(clientSocket);
+          clientSocket.pipe(upstream);
+        });
+        sockets.add(upstream);
+        upstream.on('error', () => clientSocket.destroy());
+      });
+      clientSocket.on('error', () => undefined);
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const proxyUrl = `http://127.0.0.1:${(proxy.address() as net.AddressInfo).port}`;
+
+    const origLaunch = chromium.launch.bind(chromium);
+    vi.spyOn(chromium, 'launch').mockImplementation(async (opts) => {
+      const browser = await origLaunch(opts);
+      const origNewContext = browser.newContext.bind(browser);
+      browser.newContext = async (ctxOpts) => origNewContext({ ...ctxOpts, ignoreHTTPSErrors: true });
+      return browser;
+    });
+
+    const solveSpy = vi.spyOn(captchaSolver, 'solveCloudflareOrchestrated');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const ghost = await openGhostBrowserSession(
+      {
+        transport: { proxyUrl },
+        cookies: [
+          { name: 'LEETCODE_SESSION', value: 'valid_session_token_123', domain: '.leetcode.com', path: '/', expires: -1, httpOnly: true, secure: true, sameSite: 'Lax' },
+          { name: 'csrftoken', value: 'csrf_123', domain: '.leetcode.com', path: '/', expires: -1, httpOnly: false, secure: true, sameSite: 'Lax' },
+        ],
+        origins: [],
+      },
+      {},
+      { challengeWaitMs: 100 },
+    );
+
+    try {
+      await expect(
+        ghost.submit({
+          slug: 'two-sum',
+          questionId: '1',
+          lang: 'cpp',
+          code: 'class Solution {};',
+        }),
+      ).rejects.toMatchObject({
+        status: 403,
+        message: expect.stringContaining('Cloudflare verification required'),
+      });
+      expect(solveSpy).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      await ghost.close();
+      for (const s of sockets) s.destroy();
+      await Promise.all([
+        new Promise<void>((r) => proxy.close(() => r())),
+        new Promise<void>((r) => fixture.close(() => r())),
+      ]);
+    }
+  }, 30_000);
+
+  it('resolves ghost browser proxy with fallbackToSharedPool: false when no LeetCode proxy is configured', async () => {
+    const resolveSpy = vi.spyOn(proxyManager, 'resolveLeetCodeResidentialProxy').mockResolvedValue(null);
+    const launchSpy = vi.spyOn(chromium, 'launch').mockRejectedValueOnce(new Error('stop after proxy check'));
+
+    const ghost = await openGhostBrowserSession(
+      {
+        cookies: [
+          { name: 'LEETCODE_SESSION', value: 'valid_session_token_123', domain: '.leetcode.com', path: '/', expires: -1, httpOnly: true, secure: true, sameSite: 'Lax' },
+          { name: 'csrftoken', value: 'csrf_123', domain: '.leetcode.com', path: '/', expires: -1, httpOnly: false, secure: true, sameSite: 'Lax' },
+        ],
+        origins: [],
+      },
+      {},
+    );
+
+    try {
+      await expect(
+        ghost.submit({
+          slug: 'two-sum',
+          questionId: '1',
+          lang: 'cpp',
+          code: 'class Solution {};',
+        }),
+      ).rejects.toThrow('stop after proxy check');
+
+      expect(resolveSpy).toHaveBeenCalledWith({ fallbackToSharedPool: false });
+      expect(launchSpy).toHaveBeenCalledWith(expect.objectContaining({ proxy: undefined }));
+    } finally {
+      await ghost.close();
+    }
+  });
+
+  it('detectVerificationPage ignores passive Cloudflare strings in raw HTML and only flags active challenge elements', async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const ctx = await browser.newContext();
+      const page = await ctx.newPage();
+
+      // Normal LeetCode HTML referencing Cloudflare script / config text without active challenge DOM
+      await page.setContent(
+        '<!DOCTYPE html><html><head><title>1. Two Sum - LeetCode</title>' +
+          '<script>window._cf_chl_opt = { cvId: "3" };</script>' +
+          '<script type="application/json">{"cdn":"/cdn-cgi/challenge-platform/scripts/jsd/main.js","widget":"cf-turnstile"}</script>' +
+          '</head><body><div data-note="cf-turnstile">Given an array of integers nums and an integer target...</div></body></html>',
+      );
+      expect(await detectVerificationPage(page)).toBeNull();
+
+      // Active challenge interstitial container
+      await page.setContent(
+        '<!DOCTYPE html><html><head><title>Loading</title></head><body><div id="challenge-running">Checking</div></body></html>',
+      );
+      expect(await detectVerificationPage(page)).toBe('challenge-page');
+
+      // Active Turnstile widget
+      await page.setContent(
+        '<!DOCTYPE html><html><head><title>LeetCode</title></head><body><div class="cf-turnstile" data-sitekey="0x4AAAAAA"></div></body></html>',
+      );
+      expect(await detectVerificationPage(page)).toBe('turnstile');
+
+      // Active human verification prompt in visible body text
+      await page.setContent(
+        '<!DOCTYPE html><html><head><title>LeetCode</title></head><body><p>Please verify you are a human to proceed.</p></body></html>',
+      );
+      expect(await detectVerificationPage(page)).toBe('verify-page');
+
+      // Title-based challenge page
+      await page.setContent('<!DOCTYPE html><html><head><title>Just a moment...</title></head><body></body></html>');
+      expect(await detectVerificationPage(page)).toBe('challenge-page');
+
+      await ctx.close();
+    } finally {
+      await browser.close();
     }
   }, 30_000);
 

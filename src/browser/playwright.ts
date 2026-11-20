@@ -6,6 +6,7 @@ import {
 } from '../codeforces/browserForm';
 import { applyStealthScripts } from './stealth';
 import { toPlaywrightProxy } from '../codeforces/proxyRotator';
+import { deduplicateLeetCodeCookies } from '../leetcode/apiClient';
 import { chromium, firefox, Browser, BrowserContext, Page } from 'playwright';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -267,18 +268,22 @@ export async function launchWithStorageStateObject(
 ): Promise<BrowserSession | null> {
   let browser: Browser | null = null;
   let context: BrowserContext | null = null;
+  const proxyUrl = state.transport?.proxyUrl;
+  const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
+  const userAgent = state.transport?.userAgent || DEFAULT_DESKTOP_CHROME_USER_AGENT;
   try {
     const isHeadless = config.browser.headless;
     const activeBrowser = (browser = await chromium.launch({
       headless: isHeadless,
       args: buildLaunchArgs(isHeadless),
+      ...(proxy ? { proxy } : {}),
     }));
     const activeContext = (context = await activeBrowser.newContext({
       storageState: {
-        cookies: state.cookies,
-        origins: state.origins,
+        cookies: deduplicateLeetCodeCookies(state.cookies ?? []) as never,
+        origins: (state.origins ?? []) as never,
       },
-      userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
+      userAgent,
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
       serviceWorkers: 'allow',
@@ -293,6 +298,7 @@ export async function launchWithStorageStateObject(
       page,
       mode: 'storage-state',
       browserLogs,
+      ...(proxyUrl ? { proxyUrl } : {}),
       close: async () => {
         await activeContext.close().catch(() => undefined);
         await activeBrowser.close().catch(() => undefined);

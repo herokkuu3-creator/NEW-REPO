@@ -24,12 +24,6 @@ const TITLE_PATTERNS: RegExp[] = [
   /are you a robot/i,
 ];
 
-const BODY_MARKERS: { kind: Exclude<DetectionKind, null>; pattern: RegExp }[] = [
-  { kind: 'turnstile', pattern: /cf-turnstile/i },
-  { kind: 'challenge-page', pattern: /challenge-platform|cf_chl_|challenge-form/i },
-  { kind: 'verify-page', pattern: /verify you are (a )?human/i },
-];
-
 /**
  * Returns the kind of verification page detected, or null if the page looks
  * normal. Safe to call on any loaded page; never throws.
@@ -48,13 +42,29 @@ export async function detectVerificationPage(page: Page): Promise<DetectionKind>
       return title.match(/just a moment/i) ? 'challenge-page' : 'verify-page';
     }
 
-    // Cheap DOM probe, bounded timeout so a healthy page never stalls.
+    // Cheap DOM probe checking active challenge elements and visible text rather
+    // than raw HTML so passive Cloudflare script tags on normal HTTP 200 pages
+    // never trigger false positives.
     const marker = await page
       .evaluate(() => {
-        const html = document.documentElement?.innerHTML ?? '';
-        if (/cf-turnstile/i.test(html)) return 'turnstile';
-        if (/challenge-platform|cf_chl_|challenge-form/i.test(html)) return 'challenge-page';
-        if (/verify you are (a )?human/i.test(document.body?.innerText ?? '')) return 'verify-page';
+        if (
+          document.querySelector(
+            '#challenge-running, #challenge-form, #cf-challenge-running, form[action*="__cf_chl"], .challenge-page, #cf-wrapper',
+          )
+        ) {
+          return 'challenge-page';
+        }
+        if (
+          document.querySelector(
+            '.cf-turnstile, iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"]',
+          )
+        ) {
+          return 'turnstile';
+        }
+        const bodyText = document.body?.innerText ?? '';
+        if (/verify you are (a )?human|verifying (?:that )?you are human|checking your browser before accessing/i.test(bodyText)) {
+          return 'verify-page';
+        }
         return null;
       })
       .catch(() => null);

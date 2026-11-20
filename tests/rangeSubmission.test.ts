@@ -5,6 +5,7 @@ import { WalkcccError, WalkcccPage } from '../src/solutions/walkccc';
 import type { CommunitySolution } from '../src/solutions/communitySolutions';
 import { createMemoryQuestionFailureStore } from '../src/scheduler/questionFailureCounter';
 import { config } from '../src/config';
+import * as sessionCheckModule from '../src/browser/sessionCheck';
 import {
   calculateSafeRangeConcurrency,
   countResults,
@@ -21,6 +22,7 @@ import {
   rangeQueueLength,
   cancelRangeJob,
   isRangeJobActive,
+  openRequestSession,
   submitSingleQuestionDirectly,
   __resetRangeJobForTests,
 } from '../src/scheduler/rangeSubmission';
@@ -1382,5 +1384,153 @@ describe('parallel range submission', () => {
     expect(res[0]!.results.length).toBe(4);
     expect(res[0]!.notAttempted).toEqual([5, 6]);
     expect(sleeps).toContain(600_000);
+  });
+
+  it('prioritizes pythondata (Pandas) over mysql on Database questions to avoid SQLi WAF and falls back cleanly to mysql', async () => {
+    const requestedFirst: string[] = [];
+    const submittedFirst: Array<{ lang: string; code: string }> = [];
+    const makeDbSession = (submitSink: Array<{ lang: string; code: string }>): RangeSession => ({
+      api: {
+        checkSession: async () => ({ authenticated: true, username: 'userX' }),
+        question: async () => ({
+          questionId: '175',
+          isPaidOnly: false,
+          frontendId: '175',
+          title: 'Combine Two Tables',
+          slug: 'combine-two-tables',
+          difficulty: 'Easy',
+          contentHtml: '<p>Combine Person and Address.</p>',
+          exampleTestcases: '',
+          metaData: null,
+          codeSnippets: [
+            { lang: 'MySQL', langSlug: 'mysql', code: '# Write your MySQL query statement below' },
+            { lang: 'PostgreSQL', langSlug: 'postgresql', code: '-- Write your PostgreSQL query statement below' },
+            { lang: 'MS SQL Server', langSlug: 'mssql', code: '/* Write your T-SQL query statement below */' },
+            { lang: 'Oracle', langSlug: 'oraclesql', code: '/* Write your PL/SQL query statement below */' },
+            { lang: 'Pandas', langSlug: 'pythondata', code: 'import pandas as pd\ndef combine_two_tables(person: pd.DataFrame, address: pd.DataFrame) -> pd.DataFrame:\n    pass' },
+          ],
+        }),
+        submit: async (p) => {
+          submitSink.push({ lang: p.lang, code: p.code });
+          return 'sub-db-1';
+        },
+        awaitResult: async (id) => ({
+          submissionId: id,
+          classification: 'ACCEPTED',
+          statusDisplay: 'Accepted',
+          runtime: '250 ms',
+          memory: '60 MB',
+          rawStatusMsg: 'Accepted',
+        }),
+      },
+      close: async () => undefined,
+    });
+
+    const { deps: pandasDeps } = makeDeps(makeDbSession(submittedFirst), [acc('a1')], {
+      getPage: async () => { throw new WalkcccError('no walkccc page for problem 175'); },
+      resolveSlug: async () => 'combine-two-tables',
+      fetchCommunity: async (_slug, _problem, options) => {
+        const lang = options?.language ?? 'unknown';
+        requestedFirst.push(lang);
+        if (lang === 'pythondata') {
+          return {
+            code: 'import pandas as pd\ndef combine_two_tables(person: pd.DataFrame, address: pd.DataFrame) -> pd.DataFrame:\n    return person.merge(address, on="personId", how="left")[["firstName","lastName","city","state"]]',
+            sourceUrl: 'https://leetcode.com/problems/combine-two-tables/solutions/1/pandas/',
+            title: 'Pandas Merge',
+            uuid: 'pandas-uuid-1',
+            language: 'pythondata',
+          };
+        }
+        return null;
+      },
+    });
+
+    const firstRes = await (await startRangeJob({ from: 175, to: 175 }, 'a1', pandasDeps)).done;
+    expect(requestedFirst).toEqual(['pythondata']);
+    expect(submittedFirst[0]?.lang).toBe('pythondata');
+    expect(firstRes[0]!.results[0]).toMatchObject({ status: 'accepted', capture: { language: 'pythondata' } });
+
+    const requestedFallback: string[] = [];
+    const submittedFallback: Array<{ lang: string; code: string }> = [];
+    const { deps: fallbackDeps } = makeDeps(makeDbSession(submittedFallback), [acc('a1')], {
+      getPage: async () => { throw new WalkcccError('no walkccc page for problem 175'); },
+      resolveSlug: async () => 'combine-two-tables',
+      fetchCommunity: async (_slug, _problem, options) => {
+        const lang = options?.language ?? 'unknown';
+        requestedFallback.push(lang);
+        if (lang === 'mysql') {
+          return {
+            code: 'SELECT firstName, lastName, city, state FROM Person LEFT JOIN Address USING (personId);',
+            sourceUrl: 'https://leetcode.com/problems/combine-two-tables/solutions/2/sql/',
+            title: 'MySQL Join',
+            uuid: 'mysql-uuid-2',
+            language: 'mysql',
+          };
+        }
+        return null;
+      },
+    });
+
+    const fallbackRes = await (await startRangeJob({ from: 175, to: 175 }, 'a1', fallbackDeps)).done;
+    expect(requestedFallback).toEqual(['pythondata', 'mysql']);
+    expect(submittedFallback[0]?.lang).toBe('mysql');
+    expect(fallbackRes[0]!.results[0]).toMatchObject({ status: 'accepted', capture: { language: 'mysql' } });
+  });
+
+  it('recovers and completes when checkSession reports signed-out initially and refreshAccount returns valid', async () => {
+    const oldSession = makeSession(() => 'accepted', []);
+    oldSession.api.checkSession = async () => ({ authenticated: false, cause: 'signed-out' });
+    const nextSession = makeSession(() => 'accepted', []);
+    const refreshAccount = vi.fn(async () => ({
+      site: 'leetcode' as const,
+      label: 'a1',
+      username: 'userX',
+      status: 'valid' as const,
+    }));
+
+    const { deps } = makeDeps(oldSession, [acc('a1')], {
+      refreshAccount,
+      openSession: vi.fn().mockResolvedValueOnce(oldSession).mockResolvedValue(nextSession),
+    });
+
+    const res = await (await startRangeJob({ from: 1, to: 1 }, 'a1', deps)).done;
+    expect(refreshAccount).toHaveBeenCalledTimes(1);
+    expect(res[0]!.fatal).toBeUndefined();
+    expect(res[0]!.results[0]).toMatchObject({ number: 1, status: 'accepted' });
+  });
+
+  it('does not call persistCookies in openRequestSession.close() when checkSession reports signed-out', async () => {
+    const persistCookies = vi.fn(async () => true);
+    const checkSpy = vi.spyOn(sessionCheckModule, 'checkSession').mockResolvedValueOnce({
+      authenticated: false,
+      cause: 'signed-out',
+    });
+    const validAccount = {
+      id: 'acc-unauth',
+      label: 'unauth_acc',
+      username: 'unauth_acc',
+      status: 'ACTIVE',
+      storageState: JSON.stringify({
+        cookies: [
+          { name: 'LEETCODE_SESSION', value: 'valid_session_cookie_123', domain: '.leetcode.com', path: '/', expires: -1, httpOnly: true, secure: true, sameSite: 'Lax' },
+          { name: 'csrftoken', value: 'csrf_123', domain: '.leetcode.com', path: '/', expires: -1, httpOnly: false, secure: true, sameSite: 'Lax' },
+        ],
+        origins: [],
+      }),
+    } as unknown as AccountRecord;
+
+    const session = await openRequestSession(validAccount, undefined, {
+      resolveProxy: async () => null,
+      persistCookies,
+    });
+    try {
+      const check = await session.api.checkSession();
+      expect(check).toEqual({ authenticated: false, cause: 'signed-out' });
+      await session.close();
+      expect(persistCookies).not.toHaveBeenCalled();
+    } finally {
+      await session.close();
+      checkSpy.mockRestore();
+    }
   });
 });

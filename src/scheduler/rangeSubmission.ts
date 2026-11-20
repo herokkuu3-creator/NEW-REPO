@@ -800,7 +800,7 @@ async function runAccountRange(
     if (!check.authenticated && check.cause === 'signed-out' && deps.refreshAccount) {
       logger.warn({ account: account.label }, 'LeetCode range check reported signed-out; attempting auto-refresh via credentials');
       const refreshOutcome = await deps.refreshAccount(account).catch(() => null);
-      if (refreshOutcome?.status === 'refreshed') {
+      if (refreshOutcome?.status === 'refreshed' || refreshOutcome?.status === 'valid') {
         logger.info({ account: account.label }, 'LeetCode session auto-refreshed via credentials for range job — retrying session check');
         const updated = await deps.getAccount(account.id);
         if (updated) {
@@ -1106,11 +1106,11 @@ function isMissingWalkcccPage(error: unknown): boolean {
 
 const PREFERRED_LANGUAGE_ORDER = [
   'cpp',
+  'pythondata',
   'mysql',
   'postgresql',
   'mssql',
   'oraclesql',
-  'pythondata',
   'python3',
   'python',
   'java',
@@ -1130,7 +1130,7 @@ const PREFERRED_LANGUAGE_ORDER = [
 ] as const;
 
 const LANGUAGE_RANK = new Map<string, number>(PREFERRED_LANGUAGE_ORDER.map((l, i) => [l, i]));
-const MAX_COMMUNITY_LANGUAGE_PROBES = 4;
+const MAX_COMMUNITY_LANGUAGE_PROBES = 5;
 
 function pickCandidateSnippets(
   codeSnippets?: RawQuestionData['codeSnippets'],
@@ -2024,6 +2024,7 @@ export async function openRequestSession(
   let ghostSession: GhostBrowserSession | null = null;
   let preferGhostSubmit = false;
   let ghostSyncedDuringSubmit = false;
+  let sessionRejected = false;
 
   const ensureGhostSession = async (): Promise<GhostBrowserSession> => {
     if (closed) throw new Error('Request session closed');
@@ -2058,7 +2059,12 @@ export async function openRequestSession(
 
   return {
     api: {
-      checkSession: () => checkSession(api),
+      checkSession: async () => {
+        const res = await checkSession(api);
+        if (res.authenticated) sessionRejected = false;
+        else if (res.cause === 'signed-out') sessionRejected = true;
+        return res;
+      },
       question: (slug) => fetchQuestionData(api, slug),
       submit: async (p, progress) => {
         if (!customGhostSubmit && preferGhostSubmit && ghostSession) {
@@ -2073,6 +2079,7 @@ export async function openRequestSession(
               code: p.code,
               signal: requestSignal,
             });
+            sessionRejected = false;
             if (!ghostSyncedDuringSubmit) {
               await syncContextFromStorage(res.storageState);
             }
@@ -2089,10 +2096,12 @@ export async function openRequestSession(
             throw err;
           }
         }
-        return api.submitSolution(p, async () => {
+        const submissionId = await api.submitSolution(p, async () => {
           await gate.wait(true, abortableSleep, requestSignal, progress?.onWait);
           progress?.onSend();
         });
+        sessionRejected = false;
+        return submissionId;
       },
       submitWithBrowserFallback: async (p, fallbackSignal) => {
         const effectiveSignal = fallbackSignal ?? requestSignal;
@@ -2121,6 +2130,7 @@ export async function openRequestSession(
             },
             effectiveSignal,
           );
+          sessionRejected = false;
           if (!synced) {
             await syncContextFromStorage(ghostResult.storageState);
           }
@@ -2144,6 +2154,7 @@ export async function openRequestSession(
             signal: effectiveSignal,
             forceNavigate: true,
           });
+          sessionRejected = false;
           preferGhostSubmit = true;
           if (!ghostSyncedDuringSubmit) {
             await syncContextFromStorage(ghostResult.storageState);
@@ -2167,7 +2178,9 @@ export async function openRequestSession(
       const activeGhost = ghostSession;
       ghostSession = null;
       await activeGhost?.close().catch(() => undefined);
-      await persistCookies(account, baselineState, activeCtx).catch(() => false);
+      if (!sessionRejected) {
+        await persistCookies(account, baselineState, activeCtx).catch(() => false);
+      }
       await activeCtx.dispose().catch(() => undefined);
     },
   };
@@ -2329,7 +2342,7 @@ export async function submitSingleQuestionDirectly(
     let check = await session.api.checkSession();
     if (!check.authenticated && check.cause === 'signed-out' && deps.refreshAccount && !options?.signal.aborted) {
       const refreshOutcome = await deps.refreshAccount(account).catch(() => null);
-      if (refreshOutcome?.status === 'refreshed') {
+      if (refreshOutcome?.status === 'refreshed' || refreshOutcome?.status === 'valid') {
         const updated = await deps.getAccount(account.id);
         if (updated) {
           account = updated;
