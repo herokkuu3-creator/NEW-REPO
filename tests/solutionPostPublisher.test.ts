@@ -1,19 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ row: null as any, page: null as any, api: null as any, click: vi.fn(),
+  upload: vi.fn(), readGif: vi.fn(),
   clicked: false, duplicate: false, verifyFailure: false, text: '', title: '',
   original: '# Code\n```cpp []\nclass Solution {};\n```', url: 'https://leetcode.com/problems/example/solutions/123/teach-with-sets/' }));
 vi.mock('../src/database/prisma', () => ({ prisma: {
   solutionPost: { findUniqueOrThrow: vi.fn(async () => ({ ...h.row })),
     update: vi.fn(async ({ data }: any) => { Object.assign(h.row, data); return { ...h.row }; }),
     updateMany: vi.fn(async ({ where, data }: any) => {
-      if (where.status !== h.row.status || where.updatedAt !== h.row.updatedAt) return { count: 0 };
+      if (where.status !== h.row.status || (where.updatedAt && where.updatedAt !== h.row.updatedAt)) return { count: 0 };
       Object.assign(h.row, data, { updatedAt: new Date() }); return { count: 1 };
     }) },
   account: { findUniqueOrThrow: vi.fn(async () => ({ id: 'a' })), findMany: vi.fn(async () => []) },
-  systemState: { upsert: vi.fn(), updateMany: vi.fn(), findUnique: vi.fn() },
+  systemState: { upsert: vi.fn(), updateMany: vi.fn(), findUnique: h.readGif },
 } }));
-vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error { constructor(code: string) { super(code); } },
+vi.mock('../src/solutionPosts/service', () => ({ PostError: class extends Error { constructor(public readonly code: string) { super(code); } },
   withAccount: vi.fn(async (_account, action) => action(h.api, h.page, 'alice')) }));
+vi.mock('../src/solutionPosts/nativeVisuals', async original => ({ ...await original<object>(), uploadArticleGif: h.upload }));
 import { hash } from '../src/solutionPosts/article';
 import { config } from '../src/config';
 import { LeetCodeHttpError } from '../src/leetcode/apiClient';
@@ -23,6 +25,29 @@ const context = { accountId: 'a', username: 'alice', problemId: '1', slug: 'exam
   problem: 'Example problem', submissionId: '456', language: 'cpp', code: 'class Solution {};', challengeDate: '2026-10-15',
   presentation: postPresentationVariant(0, 0), articleImplementation: { code: 'class Solution { public: int count() { return 0; } };', approach: 'Return the only count.' } };
 const markdown = `## Teach with sets\n\nAn educational explanation.\n\n\`\`\`cpp\n${context.articleImplementation.code}\n\`\`\`\n`;
+const images = [Buffer.from('GIF89a-first-fixture'), Buffer.from('GIF89a-second-fixture')];
+const nativeUrls = ['https://assets.leetcode.com/users/images/first.gif', 'https://assets.leetcode.com/users/images/second.gif'] as const;
+
+function useStoredGifDraft() {
+  const digests = images.map(image => hash(image.toString()));
+  const sourceUrls = digests.map(digest => `https://bot.example.test/solution-assets/${digest}.gif`);
+  const withImages = (urls: readonly string[]) => markdown + `\n![First \\] step](${urls[0]})\n\n![Second step](${urls[1]})\n`;
+  const draft = withImages(sourceUrls);
+  const attached = withImages(nativeUrls);
+  const contentHash = hash(h.row.title + '\n' + draft);
+  Object.assign(h.row, { markdown: draft, contentHash, approvedHash: contentHash });
+  h.readGif.mockImplementation(async ({ where }: any) => {
+    const index = digests.indexOf(where.key.replace('solution-visual:', ''));
+    return index < 0 ? null : { value: images[index]!.toString('base64') };
+  });
+  h.upload.mockImplementation(async (_page, _gif, index: number) => nativeUrls[index]);
+  const cdn = vi.fn(async (url: string) => new Response(Uint8Array.from(images[nativeUrls.indexOf(url as typeof nativeUrls[number])]!),
+    { headers: { 'Content-Type': 'image/gif' } }));
+  vi.stubGlobal('fetch', cdn);
+  return { draft, attached, contentHash, cdn };
+}
+
+afterEach(() => vi.unstubAllGlobals());
 beforeEach(() => {
   config.solutionPosts.publishTransport = 'browser';
   vi.clearAllMocks(); h.text = h.original; h.title = ''; h.clicked = false; h.duplicate = false; h.verifyFailure = false;
@@ -50,6 +75,69 @@ beforeEach(() => {
 });
 
 describe('authorized solution publishing', () => {
+  it('uploads both stored GIFs for API publication and saves the exact attached payload before dispatch', async () => {
+    const { draft, attached, contentHash, cdn } = useStoredGifDraft();
+    config.solutionPosts.publishTransport = 'api';
+    h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [] } })
+      .mockImplementationOnce(async (_query, variables) => {
+        expect(h.row).toMatchObject({ status: 'PUBLISHING', publicationMarkdown: attached, markdown: draft, approvedHash: contentHash });
+        expect(variables.data.content).toBe(attached);
+        h.clicked = true;
+        throw new Error('response lost after creation');
+      })
+      .mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [
+        { node: { topicId: 123, title: h.row.title, slug: 'teach-with-sets', author: { userName: 'alice' } } },
+      ] } })
+      .mockResolvedValueOnce({ ugcArticleSolutionArticle: { topicId: 123, title: h.row.title, content: attached } });
+    expect(await publishPost('post1')).toMatchObject({ status: 'PUBLISHED', publicationMarkdown: attached, markdown: draft });
+    expect(h.upload.mock.calls.map(call => call[1].bytes)).toEqual(images);
+    expect(cdn.mock.calls.map(call => call[0])).toEqual(nativeUrls);
+    expect(h.page.goto).toHaveBeenCalledTimes(1);
+    expect(h.click).not.toHaveBeenCalled();
+  });
+
+  it('keeps the draft ready if the uploaded bytes differ', async () => {
+    const { draft, cdn } = useStoredGifDraft();
+    cdn.mockResolvedValueOnce(new Response('GIF89a-wrong-fixture', { headers: { 'Content-Type': 'image/gif' } }));
+    await expect(publishPost('post1')).rejects.toThrow('ARTICLE_GIF_UPLOAD_UNVERIFIED');
+    expect(h.row).toMatchObject({ status: 'DRAFT_READY', markdown: draft, lastError: 'ARTICLE_GIF_UPLOAD_UNVERIFIED' });
+    expect(h.click).not.toHaveBeenCalled();
+    expect(h.api.graphql.mock.calls.some(([query]: [string]) => query.includes('mutation '))).toBe(false);
+  });
+
+  it('fills the browser editor with both verified attachments and clicks Post once', async () => {
+    const { draft, attached } = useStoredGifDraft();
+    h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [] } })
+      .mockResolvedValueOnce({ ugcArticleSolutionArticle: { topicId: 123, title: h.row.title, content: attached } });
+    expect(await publishPost('post1')).toMatchObject({ status: 'PUBLISHED', publicationMarkdown: attached, markdown: draft });
+    expect(h.text).toBe(attached);
+    expect(h.page.goto).toHaveBeenCalledTimes(2); // Editor, then published article.
+    expect(h.click).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads both original files before starting an upload and refuses foreign CDN URLs', async () => {
+    const { cdn } = useStoredGifDraft();
+    h.readGif.mockResolvedValueOnce(null);
+    await expect(publishPost('post1')).rejects.toThrow('ARTICLE_GIF_MISSING_OR_INVALID');
+    expect(h.upload).not.toHaveBeenCalled();
+    h.upload.mockResolvedValueOnce('https://assets.leetcode.com.other.test/users/images/file.gif');
+    await expect(publishPost('post1')).rejects.toThrow('ARTICLE_GIF_UPLOAD_UNVERIFIED');
+    expect(cdn).not.toHaveBeenCalled();
+    expect(h.click).not.toHaveBeenCalled();
+  });
+
+  it('reserves the exact attached draft for local browser publication without opening a remote editor', async () => {
+    const { attached, contentHash } = useStoredGifDraft();
+    await expect(reserveBrowserPublication('post1', contentHash)).rejects.toThrow('LEETCODE_IMAGE_ATTACHMENTS_REQUIRED');
+    expect(h.row.status).toBe('DRAFT_READY');
+    expect(await reserveBrowserPublication('post1', contentHash, nativeUrls)).toMatchObject({ status: 'PUBLISHING', publicationMarkdown: attached });
+    expect(h.upload).not.toHaveBeenCalled();
+    expect(h.page.goto).not.toHaveBeenCalled();
+    h.duplicate = true;
+    h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticle: { topicId: 123, title: h.row.title, content: attached } });
+    expect(await reconcilePost('post1', h.url)).toMatchObject({ status: 'PUBLISHED', publicationMarkdown: attached });
+  });
+
   it('publishes through the authenticated API and verifies exact content and author without page navigation', async () => {
     config.solutionPosts.publishTransport = 'api';
     h.api.graphql.mockResolvedValueOnce({ ugcArticleSolutionArticles: { pageInfo: { hasNextPage: false }, edges: [] } })

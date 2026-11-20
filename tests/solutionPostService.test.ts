@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-const h = vi.hoisted(() => ({ row: null as any, rows: [] as any[], generation: vi.fn(), implementation: vi.fn(), verifyVisuals: vi.fn(),
+const h = vi.hoisted(() => ({ row: null as any, rows: [] as any[], generation: vi.fn(), implementation: vi.fn(),
   pool: vi.fn(), checkSession: vi.fn(), launch: vi.fn(), browser: { newContext: vi.fn(), close: vi.fn() },
   question: vi.fn(), verdict: vi.fn(), daily: vi.fn(), refresh: vi.fn(), run: null as any, account: null as any }));
 vi.mock('../src/database/prisma', () => ({ prisma: {
@@ -27,7 +27,7 @@ vi.mock('../src/solutionPosts/implementation', async orig => ({ ...(await orig()
 vi.mock('../src/solutionPosts/presentation', async orig => ({ ...(await orig() as object),
   reservePostPresentation: vi.fn(async () => ({ layout: 'notebook', diagrams: ['timeline', 'rail'], themes: ['paper', 'coral'], visualVersion: 7,
     scenes: ['orbit', 'film'], directions: ['forward', 'forward'], motions: ['scan', 'slide'], format: { index: 0, optimization: true } })) }));
-vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn(), verifyHostedVisualAssets: h.verifyVisuals }));
+vi.mock('../src/solutionPosts/visualStore', () => ({ storeVisualAssets: vi.fn() }));
 vi.mock('playwright', () => ({ chromium: { launch: h.launch } }));
 vi.mock('../src/browser/sessionCheck', () => ({ checkSession: h.checkSession }));
 vi.mock('../src/leetcode/apiClient', () => ({ LeetCodeApi: class { awaitSubmission = h.verdict; } }));
@@ -46,7 +46,9 @@ const context = contextSchema.parse({ accountId: 'a', username: 'alice', problem
   title: 'Example', difficulty: 'Easy', problem: 'An example problem', submissionId: '123', language: 'cpp', code: 'source\r\n', challengeDate: '2026-10-15' });
 const implementation = { code: 'class Solution { public: int count() { return 1; } };', approach: 'Return the only possible count.' };
 const output = { title: 'Example title', markdown: 'verified exact source\r\n', model: 'terra', reviewModel: 'luna', style: 'visual storytelling',
-  attempts: [], visuals: [{ id: 'visual-1' }, { id: 'visual-2' }], assets: [{ id: 'visual-1' }, { id: 'visual-2' }], visualFallback: false };
+  attempts: [], visuals: [{ id: 'visual-1' }, { id: 'visual-2' }], assets: [
+    { id: 'visual-1', url: 'https://draft.example.test/a.gif' }, { id: 'visual-2', url: 'https://draft.example.test/b.gif' },
+  ], visualFallback: false };
 it('uses the Firecrawl Agent directly without reading the BazaarLink pool', async () => {
   const settings = config.solutionPosts as { aiProvider: 'firecrawl' | 'bazaarlink'; firecrawlApiKey: string };
   const previous = { ...settings };
@@ -68,7 +70,6 @@ beforeEach(() => {
   h.implementation.mockResolvedValue({ value: implementation, model: 'terra', attempts: [] });
   h.generation.mockResolvedValue(output);
   h.pool.mockResolvedValue({ keys: [], activeIndex: 0, stored: false });
-  h.verifyVisuals.mockResolvedValue(true);
   h.account = { id: 'a', username: 'alice', status: 'ACTIVE', storageState: '{"cookies":[{"name":"fake"}],"origins":[]}' };
   h.run = { id: 'run1', accountId: 'a', state: 'SUCCESS', solution: context.code, submissionId: '123', submissionStatus: 'Accepted',
     problemSlug: 'example', title: 'Example', difficulty: 'Easy', language: 'cpp', date: '2026-10-15' };
@@ -192,10 +193,10 @@ describe('solution workflow and persistence', () => {
     expect(await generatePost(context, {} as never)).toMatchObject({ status: 'FAILED', lastError: 'AI_RATE_LIMITED', markdown: output.markdown });
     expect(h.run).toMatchObject({ state: 'SUCCESS', submissionId: '123' });
   });
-  it('refuses a public post when either mandatory GIF cannot be verified', async () => {
-    h.verifyVisuals.mockResolvedValue(false);
+  it('refuses a draft when either mandatory GIF is missing', async () => {
+    h.generation.mockResolvedValueOnce({ ...output, assets: output.assets.slice(0, 1) });
     const post = await generatePost(context, {} as never);
-    expect(post.status).toBe('FAILED'); expect(post.lastError).toBe('TWO_PUBLIC_GIFS_REQUIRED');
+    expect(post.status).toBe('FAILED'); expect(post.lastError).toBe('TWO_ARTICLE_GIFS_REQUIRED');
   });
   it('persists missing AI configuration as a retryable failure with source context', async () => {
     const post = await generatePost(context);

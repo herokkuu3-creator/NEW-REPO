@@ -81,6 +81,7 @@ model SolutionPost {
   status String @default("PENDING")
   title String?
   markdown String? @db.Text
+  publicationMarkdown String? @db.Text
   style String?
   model String?
   reviewModel String?

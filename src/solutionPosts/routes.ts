@@ -263,9 +263,9 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       const { id } = z.object({ id: z.string() }).parse(req.params);
       const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
       // The context contains source/problem only, but keep it internal rather than exposing it unnecessarily.
-      const { context: _context, leaseUntil: _lease, ...preview } = post;
+      const { context: _context, leaseUntil: _lease, publicationMarkdown, ...preview } = post;
       const stored = JSON.parse(post.context);
-      return { ...preview, presentation: stored.presentation ?? null };
+      return { ...preview, markdown: publicationMarkdown ?? preview.markdown, presentation: stored.presentation ?? null };
     });
     scoped.post('/admin/solutions/:id/recover-generation', async req => {
       const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
@@ -299,9 +299,12 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     });
     scoped.post('/admin/solutions/:id/reserve-browser', async req => {
       const { id } = z.object({ id: z.string() }).parse(req.params);
-      const { approvedHash } = z.object({ approvedHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(req.body);
-      const post = await reserveBrowserPublication(id, approvedHash);
-      return { id, status: post.status, url: post.publishedUrl };
+      const { approvedHash, attachmentUrls } = z.object({ approvedHash: z.string().regex(/^[a-f0-9]{64}$/),
+        attachmentUrls: z.tuple([z.string().url().max(300), z.string().url().max(300)]).optional(),
+      }).strict().parse(req.body);
+      const post = attachmentUrls ? await reserveBrowserPublication(id, approvedHash, attachmentUrls) : await reserveBrowserPublication(id, approvedHash);
+      return { id, status: post.status, url: post.publishedUrl,
+        ...(post.publicationMarkdown ? { markdown: post.publicationMarkdown } : {}) };
     });
   });
 }

@@ -10,6 +10,7 @@ import { PostError, withAccount } from './service';
 import { UGC_SOLUTION_ARTICLE_QUERY } from '../solutions/communitySolutions';
 import { logger } from '../logger';
 import { config } from '../config';
+import { attachArticleVisuals, readEditorMarkdown, uploadArticleGif } from './nativeVisuals';
 
 // LeetCode's authenticated mutation. Request shape was validated against its
 // live GraphQL schema without executing a publication during discovery.
@@ -66,8 +67,7 @@ export async function checkEligibility(api: LeetCodeApi, context: SubmissionCont
   return result;
 }
 
-/** Uses only the visible post-solution UI, with exact source comparison before replacing the template. */
-export async function prepareEditor(page: Page, context: SubmissionContext, title: string, markdown: string) {
+async function openSolutionEditor(page: Page, context: SubmissionContext) {
   const navigation = await page.goto(`https://leetcode.com/problems/${context.slug}/post-solution/?submissionId=${context.submissionId}`,
     { waitUntil: 'domcontentloaded', timeout: 30000 });
   const titleInput = page.getByPlaceholder('Enter your title', { exact: true });
@@ -85,25 +85,24 @@ export async function prepareEditor(page: Page, context: SubmissionContext, titl
   const editor = page.getByRole('textbox', { name: 'Editor content', exact: true });
   await editor.waitFor({ state: 'visible', timeout: 15000 });
   // Read the model behind this observed editor, not an unrelated global editor.
-  const original = await page.evaluate(() => {
-    const m = (window as unknown as { monaco?: { editor: { getModels(): Array<{ getValue(): string }> } } }).monaco;
-    const models = m?.editor.getModels() ?? [];
-    return models.length === 1 ? models[0]!.getValue() : null;
-  });
+  const original = await readEditorMarkdown(page);
   if (!original) throw new PostError('EDITOR_SOURCE_UNAVAILABLE');
   const blocks = [...original.matchAll(/^(`{3,})[^\n]*\r?\n([\s\S]*?)\r?\n\1\s*$/gm)];
   if (blocks.length !== 1 || blocks[0]![2] !== context.code) throw new PostError('EDITOR_SOURCE_MISMATCH');
+  return { titleInput, editor };
+}
+
+/** Uses only the visible post-solution UI, with exact source comparison before replacing the template. */
+export async function prepareEditor(page: Page, context: SubmissionContext, title: string, markdown: string,
+  opened?: Awaited<ReturnType<typeof openSolutionEditor>>) {
+  const { titleInput, editor } = opened ?? await openSolutionEditor(page, context);
   await titleInput.fill(title);
   // Monaco's textarea is an input surface rather than its full document: fill() alone can
   // insert before the existing template. Clear the actual editor selection first.
   await editor.press('ControlOrMeta+A');
   await editor.press('Backspace');
   await editor.fill(markdown);
-  const saved = await page.evaluate(() => {
-    const m = (window as unknown as { monaco?: { editor: { getModels(): Array<{ getValue(): string }> } } }).monaco;
-    const models = m?.editor.getModels() ?? [];
-    return models.length === 1 ? models[0]!.getValue() : null;
-  });
+  const saved = await readEditorMarkdown(page);
   if (saved !== markdown || await titleInput.inputValue() !== title) throw new PostError('EDITOR_CONTENT_MISMATCH');
   try {
     const tagBtn = page.getByRole('button', { name: /tag/i }).first();
@@ -163,7 +162,7 @@ async function verifyPublishedContent(api: LeetCodeApi, url: string, context: Su
 }
 
 /** Reserve an approved draft before the operator posts it in an authenticated local browser. */
-export async function reserveBrowserPublication(id: string, approvedHash: string) {
+export async function reserveBrowserPublication(id: string, approvedHash: string, attachmentUrls?: readonly [string, string]) {
   const post = await prisma.solutionPost.findUniqueOrThrow({ where: { id } });
   if (post.status !== 'DRAFT_READY' || !post.title || !post.markdown || !post.approvedHash ||
     approvedHash !== post.approvedHash || approvedHash !== hash(`${post.title}\n${post.markdown}`)) throw new PostError('REVIEW_REQUIRED');
@@ -172,12 +171,19 @@ export async function reserveBrowserPublication(id: string, approvedHash: string
     context.submissionId !== post.submissionId) throw new PostError('SOURCE_INTEGRITY_FAILED');
   if (articleNeedsRefresh(context)) throw new PostError('ARTICLE_LAYOUT_REFRESH_REQUIRED');
   verifyArticleCode(post.markdown, context);
+  const markdown = post.markdown;
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
   return withAccount(account, async (api, _page, username) => {
     await checkEligibility(api, context, username);
     const duplicate = await existingPost(api, context);
     if (duplicate) return move(post, 'SKIPPED', { lastError: 'EXISTING_ACCOUNT_SOLUTION', publishedUrl: duplicate });
-    return move(post, 'PUBLISHING', { lastError: 'LOCAL_BROWSER_PUBLICATION_PENDING' });
+    const attached = await attachArticleVisuals(markdown, async (_gif, index) => {
+      const url = attachmentUrls?.[index];
+      if (!url) throw new PostError('LEETCODE_IMAGE_ATTACHMENTS_REQUIRED');
+      return url;
+    });
+    return move(post, 'PUBLISHING', { lastError: 'LOCAL_BROWSER_PUBLICATION_PENDING',
+      ...(attached !== markdown ? { publicationMarkdown: attached } : {}) });
   });
 }
 
@@ -211,25 +217,39 @@ export async function publishPost(id: string, options: { beforePublish?: () => P
     context.submissionId !== post.submissionId) throw new PostError('SOURCE_INTEGRITY_FAILED');
   if (articleNeedsRefresh(context)) throw new PostError('ARTICLE_LAYOUT_REFRESH_REQUIRED');
   verifyArticleCode(post.markdown, context);
+  const markdown = post.markdown;
   const account = await prisma.account.findUniqueOrThrow({ where: { id: post.accountId } });
-  const publicationData = options.automaticEngagement === false ? { automaticEngagement: false } : undefined;
   return withAccount(account, async (api, page, username) => {
     preparationStage = 'eligibility';
     await checkEligibility(api, context, username);
     preparationStage = 'duplicate-check';
     const duplicate = await existingPost(api, context);
     if (duplicate) return move(post, 'SKIPPED', { lastError: 'EXISTING_ACCOUNT_SOLUTION', publishedUrl: duplicate });
+    preparationStage = 'gif-attachments';
+    let opened: Awaited<ReturnType<typeof openSolutionEditor>> | undefined;
+    const attached = await attachArticleVisuals(markdown, async (gif, index) => {
+      opened ??= await openSolutionEditor(page, context);
+      if (options.beforePublish) await options.beforePublish();
+      return uploadArticleGif(page, gif, index);
+    });
+    // Preserve the reviewed draft and its approval hash. Persist the exact
+    // payload atomically with the claim so a lost response can be reconciled.
+    const publicationData = {
+      ...(options.automaticEngagement === false ? { automaticEngagement: false } : {}),
+      ...(attached !== markdown ? { publicationMarkdown: attached } : {}),
+    };
+    const claimPublication = () => Object.keys(publicationData).length ? move(post, 'PUBLISHING', publicationData) : move(post, 'PUBLISHING');
     if (config.solutionPosts.publishTransport === 'api') {
       preparationStage = 'publication-api';
       if (options.beforePublish) await options.beforePublish();
       // Claim BEFORE the sole irreversible request. An error never causes an
       // automatic repeat or a second attempt through the browser transport.
-      post = publicationData ? await move(post, 'PUBLISHING', publicationData) : await move(post, 'PUBLISHING');
+      post = await claimPublication();
       try {
-        const tags = buildArticleTags(context, post.markdown!);
+        const tags = buildArticleTags(context, attached);
         logger.info({ postId: id, tags }, 'publishing solution article with tags');
         const result = await api.graphql(PUBLISH_SOLUTION_MUTATION, { data: {
-          questionSlug: context.slug, title: post.title!, content: post.markdown!,
+          questionSlug: context.slug, title: post.title!, content: attached,
           summary: post.title!, thumbnail: '', tags,
         } }, publishSchema);
         const response = result.ugcArticlePublishSolution;
@@ -244,7 +264,7 @@ export async function publishPost(id: string, options: { beforePublish?: () => P
         const url = `https://leetcode.com/problems/${context.slug}/solutions/${response.article.topicId}/${response.article.slug}/`;
         if (!validSolutionUrl(url, context.slug)) throw new PostError('POST_URL_UNVERIFIED');
         post = await prisma.solutionPost.update({ where: { id }, data: { publishedUrl: url } });
-        await verifyPublishedContent(api, url, context, post.title!, post.markdown!);
+        await verifyPublishedContent(api, url, context, post.title!, attached);
         post = await move(post, 'PUBLISHED', { publishedAt: new Date(), lastError: null });
         logger.info({ postId: id, url, transport: 'api', executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
           revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication verified');
@@ -266,7 +286,7 @@ export async function publishPost(id: string, options: { beforePublish?: () => P
         try {
           const candidate = uncertain.publishedUrl ?? await existingPost(api, context, post.title!);
           if (candidate) {
-            await verifyPublishedContent(api, candidate, context, post.title!, post.markdown!);
+            await verifyPublishedContent(api, candidate, context, post.title!, attached);
             const reconciled = await move(uncertain, 'PUBLISHED', { publishedUrl: candidate, publishedAt: new Date(), lastError: null });
             logger.info({ postId: id, url: candidate, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
               revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication reconciled after response failure');
@@ -278,15 +298,15 @@ export async function publishPost(id: string, options: { beforePublish?: () => P
       }
     }
     preparationStage = 'editor';
-    await prepareEditor(page, context, post.title!, post.markdown!);
+    await prepareEditor(page, context, post.title!, attached, opened);
     if (options.beforePublish) await options.beforePublish();
     // CAS before the sole irreversible click. A crash after this point never repeats the click.
-    post = publicationData ? await move(post, 'PUBLISHING', publicationData) : await move(post, 'PUBLISHING');
+    post = await claimPublication();
     try {
       await page.getByRole('button', { name: 'Post', exact: true }).click({ timeout: 10000 });
       await page.waitForURL(url => validSolutionUrl(url.toString(), context.slug), { timeout: 30000 });
       post = await prisma.solutionPost.update({ where: { id }, data: { publishedUrl: page.url() } });
-      await verifyPublished(api, page, post.publishedUrl!, context, post.title!, post.markdown!);
+      await verifyPublished(api, page, post.publishedUrl!, context, post.title!, attached);
       post = await move(post, 'PUBLISHED', { publishedAt: new Date(), lastError: null });
       queuePublicationUpvotes(post);
       return post;
@@ -324,7 +344,7 @@ export async function reconcilePost(id: string, url?: string, postingRestricted 
       }
       throw new PostError('PUBLICATION_NOT_FOUND_RECONCILE_LATER');
     }
-    await verifyPublishedContent(api, candidate, context, post.title!, post.markdown!);
+    await verifyPublishedContent(api, candidate, context, post.title!, (post.publicationMarkdown ?? post.markdown)!);
     logger.info({ postId: id, url: candidate, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',
       revision: process.env.RENDER_GIT_COMMIT ?? null }, 'solution article publication reconciled');
     const reconciled = await move(post, 'PUBLISHED', { publishedUrl: candidate, publishedAt: new Date(), lastError: null });

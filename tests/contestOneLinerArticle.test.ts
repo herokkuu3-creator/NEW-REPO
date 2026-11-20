@@ -62,7 +62,6 @@ const mocks = vi.hoisted(() => {
       state.systemState.clear();
       state.seq = 0;
       this.storeVisualAssets.mockReset();
-      this.verifyHostedVisualAssets.mockReset();
       this.awaitSubmission.mockReset();
       this.fetchQuestionData.mockReset();
       this.loadCoarenaKey.mockReset();
@@ -70,7 +69,6 @@ const mocks = vi.hoisted(() => {
       this.checkSession.mockReset();
     },
     storeVisualAssets: vi.fn(),
-    verifyHostedVisualAssets: vi.fn(),
     awaitSubmission: vi.fn(),
     fetchQuestionData: vi.fn(),
     loadCoarenaKey: vi.fn(),
@@ -247,7 +245,6 @@ vi.mock('../src/leetcode/dailyChallenge', () => ({
 }));
 vi.mock('../src/solutionPosts/visualStore', () => ({
   storeVisualAssets: mocks.storeVisualAssets,
-  verifyHostedVisualAssets: mocks.verifyHostedVisualAssets,
 }));
 vi.mock('../src/solutionPosts/coarena', async importOriginal => {
   const original = await importOriginal<typeof import('../src/solutionPosts/coarena')>();
@@ -436,7 +433,6 @@ describe('Contest one-liner article pipeline', () => {
       topicTags: [{ name: 'Array', slug: 'array' }],
     });
     mocks.storeVisualAssets.mockImplementation(async () => makeFakeGifAssets());
-    mocks.verifyHostedVisualAssets.mockResolvedValue(true);
   });
 
   it('keeps contextSchema backward-compatible without new default keys and parses contest one-liner fields', () => {
@@ -637,15 +633,13 @@ describe('Contest one-liner article pipeline', () => {
 
     expect(post1.status).toBe('AWAITING_APPROVAL');
     expect(mocks.storeVisualAssets).toHaveBeenCalledTimes(1);
-    expect(mocks.verifyHostedVisualAssets).toHaveBeenCalledTimes(1);
     const savedPrimaryCtx = contextSchema.parse(JSON.parse(post1.context));
     expect(savedPrimaryCtx.articleImplementation).toBeUndefined();
     expect(post1.markdown).toContain(primaryCtx.code);
     expect(() => verifyArticleCode(post1.markdown!, savedPrimaryCtx)).not.toThrow();
     expect(mockPrimary.calls.some(c => c.label.includes('implementation'))).toBe(false);
 
-    // Enforcing TWO_PUBLIC_GIFS_REQUIRED when GIF verification fails on a one-liner contest post
-    mocks.verifyHostedVisualAssets.mockResolvedValueOnce(false);
+    mocks.storeVisualAssets.mockResolvedValueOnce(makeFakeGifAssets().slice(0, 1));
     const failGifCtx = baseContext({
       accountId: 'acc-gif-fail',
       username: 'charlie',
@@ -656,7 +650,7 @@ describe('Contest one-liner article pipeline', () => {
     });
     const postFail = await generatePost(failGifCtx, createMockStagedRouter().router);
     expect(postFail.status).toBe('FAILED');
-    expect(postFail.lastError).toBe('TWO_PUBLIC_GIFS_REQUIRED');
+    expect(postFail.lastError).toBe('TWO_ARTICLE_GIFS_REQUIRED');
 
     // Second account on the same contest problem: runs generateImplementation(..., { oneLiner: true }) & sees primary's title in recent
     const secondaryPayload = humanOneLinerArticlePayload({

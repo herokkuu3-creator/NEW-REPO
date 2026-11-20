@@ -56,9 +56,21 @@ export function publicVisualOrigin(value: string): string | null {
   } catch { return null; }
 }
 
+export async function readStoredVisualGif(digest: string, useCache = defaultCacheEnabled()): Promise<Buffer | null> {
+  if (!/^[a-f0-9]{64}$/.test(digest)) return null;
+  const cached = useCache ? getCachedVisual(digest) : undefined;
+  if (cached) return cached;
+  const record = await prisma.systemState.findUnique({ where: { key: `solution-visual:${digest}` }, select: { value: true } });
+  if (!record || record.value.length > MAX_VISUAL_BASE64_LENGTH) return null;
+  const bytes = Buffer.from(record.value, 'base64');
+  if (bytes.subarray(0, 6).toString() !== 'GIF89a' || createHash('sha256').update(bytes).digest('hex') !== digest) return null;
+  if (useCache) setCachedVisual(digest, bytes);
+  return bytes;
+}
+
 /** Durable generated media lives in the existing DB, not ephemeral Render disk. */
-export async function storeVisualAssets(plans: VisualPlan[], baseUrl: string): Promise<VisualAsset[]> {
-  const origin = publicVisualOrigin(baseUrl);
+export async function storeVisualAssets(plans: VisualPlan[], baseUrl: string, options?: { allowInternalReference?: boolean }): Promise<VisualAsset[]> {
+  const origin = publicVisualOrigin(baseUrl) ?? (options?.allowInternalReference ? 'https://solution-assets.invalid' : null);
   if (!origin) return [];
   const assets: VisualAsset[] = [];
   for (const plan of plans) {
@@ -201,18 +213,8 @@ export function registerVisualAssetRoutes(app: FastifyInstance, options?: { enab
         headOnly: req.method === 'HEAD',
         rangeHeader: typeof req.headers.range === 'string' ? req.headers.range : undefined,
       };
-      if (useCache) {
-        const cached = getCachedVisual(digest);
-        if (cached) return sendGifReply(reply, etag, cached, replyOpts);
-      }
-      const record = await prisma.systemState.findUnique({
-        where: { key: `solution-visual:${digest}` },
-        select: { value: true },
-      });
-      if (!record || record.value.length > MAX_VISUAL_BASE64_LENGTH) return reply.code(404).send();
-      const bytes = Buffer.from(record.value, 'base64');
-      if (bytes.subarray(0, 6).toString() !== 'GIF89a' || createHash('sha256').update(bytes).digest('hex') !== digest) return reply.code(404).send();
-      if (useCache) setCachedVisual(digest, bytes);
+      const bytes = await readStoredVisualGif(digest, useCache);
+      if (!bytes) return reply.code(404).send();
       return sendGifReply(reply, etag, bytes, replyOpts);
     },
   });

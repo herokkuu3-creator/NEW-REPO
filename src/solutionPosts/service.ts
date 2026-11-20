@@ -20,7 +20,7 @@ import { FIRECRAWL_STAGE_BUDGET_MS } from './firecrawlRateGate';
 import { articleNeedsRefresh, ArticleReviewError, contextSchema, generateArticle, hash, SubmissionContext, StageCallback } from './article';
 import { OutputValidationError } from './router';
 import { ensurePost, move } from './store';
-import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
+import { storeVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, maskSolutionApiKey, resetSolutionApiKeyPool, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 import { startArticleWorkKeepAlive } from './keepAlive';
 import { generateImplementation, IMPLEMENTATION_STAGE_BUDGET } from './implementation';
@@ -344,13 +344,12 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     const visualBaseUrl = process.env.VISUAL_ASSET_BASE_URL?.trim() || config.api.visualAssetBaseUrl || config.api.publicUrl;
     const article = await generateArticle(activeRouter, articleContext,
       [...recentStyles].map(([title, style]) => ({ title, style })),
-      plans => storeVisualAssets(plans, visualBaseUrl), priorFailure, onStage);
-    // Public posts must contain the two independently generated, durable GIFs.
-    // Never degrade a scheduled post to trace tables: that makes a successful
-    // generation look complete while silently dropping the required visuals.
+      plans => storeVisualAssets(plans, visualBaseUrl, { allowInternalReference: true }), priorFailure, onStage);
+    // Generation stores the reviewed bytes. Publication verifies both files
+    // after LeetCode's uploader has copied them to its CDN.
     if (article.visualFallback || article.visuals.length !== 2 || article.assets.length !== 2 ||
-      !await verifyHostedVisualAssets(article.assets, visualBaseUrl)) {
-      throw new PostError('TWO_PUBLIC_GIFS_REQUIRED');
+      new Set(article.assets.map(asset => asset.id)).size !== 2 || new Set(article.assets.map(asset => asset.url)).size !== 2) {
+      throw new PostError('TWO_ARTICLE_GIFS_REQUIRED');
     }
     post = await move(post, 'VALIDATING', { title: article.title, markdown: article.markdown,
       style: article.style, model: article.model, reviewModel: article.reviewModel, context: JSON.stringify(articleContext),
@@ -358,7 +357,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
       contentHash: hash(`${article.title}\n${article.markdown}`), approvedHash: null });
     post = await move(post, 'DRAFT_READY', { leaseUntil: null, lastError: null });
     post = await move(post, 'AWAITING_APPROVAL');
-    await onStage?.('draft_ready', 'Article ready with both GIFs verified');
+    await onStage?.('draft_ready', 'Article ready with both GIFs prepared for upload');
     return post;
   } catch (error) {
     if (error instanceof CoarenaPause || (error instanceof RoutingError && error.lastFailure === 'ARTICLE_TIME_BUDGET_EXCEEDED')) {
