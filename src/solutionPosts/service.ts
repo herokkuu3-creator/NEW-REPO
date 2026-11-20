@@ -24,6 +24,7 @@ import { storeVisualAssets, verifyHostedVisualAssets } from './visualStore';
 import { loadSolutionKeyPool, maskSolutionApiKey, resetSolutionApiKeyPool, rotateSolutionApiKey, type SolutionKeyPool } from './keyPool';
 import { startArticleWorkKeepAlive } from './keepAlive';
 import { generateImplementation, IMPLEMENTATION_STAGE_BUDGET } from './implementation';
+import { extractRelevantCodeSnippets, generateMultiLanguageCode, supportsMultiLanguage } from './multiLanguage';
 import { CoarenaRouter, loadCoarenaKey, loadCoarenaModelOrder, maskCoarenaKey, type CoarenaReply } from './coarena';
 import { CoarenaPause, isCoarenaPauseCode, isCoarenaPaused } from './coarenaLimits';
 import { notifySolutionPostSchedulerWork } from './schedulerGate';
@@ -147,10 +148,12 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
     if (!question.questionId || question.slug !== run.problemSlug || question.isPaidOnly) {
       throw new PostError('PROBLEM_UNAVAILABLE');
     }
+    const codeSnippets = extractRelevantCodeSnippets(question.codeSnippets, run.language);
     return contextSchema.parse({ accountId, username, problemId: question.questionId, slug: run.problemSlug,
       title: run.title, difficulty: run.difficulty, problem: htmlToText(question.contentHtml) || question.contentHtml,
       submissionId: run.submissionId, language: run.language, code: run.solution,
-      challengeDate: contextDate, topicTags: question.topicTags ?? [] });
+      challengeDate: contextDate, topicTags: question.topicTags ?? [],
+      ...(codeSnippets ? { codeSnippets } : {}) });
   });
 }
 
@@ -318,9 +321,16 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
             fingerprint => reserveImplementation(post, savedContext, fingerprint));
     }
     implementationAttempts = implementation.attempts;
-    const articleContext = implementation.value
+    let articleContext = implementation.value
       ? { ...savedContext, articleImplementation: implementation.value }
       : savedContext;
+    if (!articleContext.multiLanguageCode && supportsMultiLanguage(articleContext.language)) {
+      const multiLang = await generateMultiLanguageCode(activeRouter, articleContext);
+      if (multiLang?.value.length) {
+        articleContext = { ...articleContext, multiLanguageCode: multiLang.value };
+        implementationAttempts = [...implementationAttempts, ...multiLang.attempts];
+      }
+    }
     let priorFailure: { markdown: string; issues: string[] } | undefined;
     try {
       const feedback = (JSON.parse(post.attempts ?? '[]') as Array<{ reviewIssues?: string[] }>).reverse().find(a => a.reviewIssues?.length);

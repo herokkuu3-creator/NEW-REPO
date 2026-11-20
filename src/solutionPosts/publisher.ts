@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../database/prisma';
 import { LeetCodeApi, LeetCodeHttpError } from '../leetcode/apiClient';
 import { articleNeedsRefresh, contextSchema, hash, SubmissionContext, titleIncludesQuestionName, buildArticleTags } from './article';
+import { buildOrderedCodeBlocks, MULTI_LANGUAGE_META, type MultiLanguageSlug } from './multiLanguage';
 import { scheduleSolutionArticleUpvotes } from './upvote';
 import { move } from './store';
 import { PostError, withAccount } from './service';
@@ -110,9 +111,16 @@ export async function prepareEditor(page: Page, context: SubmissionContext, titl
       await tagBtn.click();
       await page.waitForTimeout(400);
       const tagOptions = page.locator('div[role="option"], div[role="menuitem"], li, button');
-      const langOption = tagOptions.filter({ hasText: /^c\+\+$/i }).first();
-      if (await langOption.isVisible({ timeout: 1000 })) {
-        await langOption.click();
+      const codeBlocks = buildOrderedCodeBlocks(context);
+      const langPatterns = codeBlocks
+        .map(b => MULTI_LANGUAGE_META[b.language as MultiLanguageSlug]?.browserTagPattern)
+        .filter((p): p is RegExp => Boolean(p));
+      if (!langPatterns.length) langPatterns.push(/^c\+\+$/i);
+      for (const pattern of langPatterns) {
+        const langOption = tagOptions.filter({ hasText: pattern }).first();
+        if (await langOption.isVisible({ timeout: 1000 }).catch(() => false)) {
+          await langOption.click().catch(() => undefined);
+        }
       }
       const relatedOptions = tagOptions.filter({ hasText: /related/i });
       const count = await relatedOptions.count();
@@ -176,7 +184,14 @@ export async function reserveBrowserPublication(id: string, approvedHash: string
 export function verifyArticleCode(markdown: string, context: SubmissionContext): void {
   const blocks = [...markdown.matchAll(/^(`{3,})[^\r\n]*\n([\s\S]*?)\n\1[ \t]*$/gm)];
   const reviewedCode = context.articleImplementation?.code ?? context.code;
-  if (blocks.length !== 1 || blocks[0]?.[2] !== reviewedCode) throw new PostError('SOURCE_INTEGRITY_FAILED');
+  const expected = buildOrderedCodeBlocks(context);
+  if (
+    blocks.length !== expected.length ||
+    !expected.some(entry => entry.isPrimary && entry.code === reviewedCode) ||
+    expected.some((entry, index) => blocks[index]?.[2] !== entry.code)
+  ) {
+    throw new PostError('SOURCE_INTEGRITY_FAILED');
+  }
 }
 
 function isContestPostingRestriction(reason: unknown): boolean {

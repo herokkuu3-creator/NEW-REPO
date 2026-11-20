@@ -10,6 +10,7 @@ import { gridFrame, questionIllustration, questionStoryboard } from './questionV
 import { CURRENT_VISUAL_VERSION, articleBlockOrder, articleVisualGuidance, presentationSchema, layoutGuidance, usesAnimatedPresentation } from './presentation';
 import { LLMMessage } from '../ai/provider';
 import { implementationSchema } from './implementation';
+import { buildOrderedCodeBlocks, multiLanguageCodeSchema, MULTI_LANGUAGE_META, type MultiLanguageSlug } from './multiLanguage';
 import { CoarenaRouter, COARENA_WRITER } from './coarena';
 
 // Some models represent requested action bullets as a JSON string array. This
@@ -31,6 +32,8 @@ export const contextSchema = z.object({
   code: z.string().min(1).max(100000), challengeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   presentation: presentationSchema.optional(),
   articleImplementation: implementationSchema.optional(),
+  codeSnippets: z.record(z.string(), z.string().max(10000)).optional(),
+  multiLanguageCode: multiLanguageCodeSchema.optional(),
   resumePublication: z.enum(['daily', 'manual']).optional(),
   intent: z.enum(['community-solution', 'contest-solution']).optional(),
   articleStyle: z.enum(['standard', 'one-liner']).optional(),
@@ -200,19 +203,13 @@ function formatProse(markdown: string, templates: string[]): string {
 export function renderArticle(article: Article, context: SubmissionContext, assets: VisualAsset[] = []): string {
   const code = context.articleImplementation?.code ?? context.code;
   const templates = sourceTemplates(code);
-  const language = ({
-    python3: 'python',
-    pythondata: 'python',
-    javascript: 'javascript',
-    typescript: 'typescript',
-    mysql: 'sql',
-    postgresql: 'sql',
-    mssql: 'sql',
-    oraclesql: 'sql',
-  } as Record<string, string>)[context.language] ?? context.language;
+  const codeBlocks = buildOrderedCodeBlocks(context);
   // Choose a fence longer than any run in source; the code bytes themselves are unchanged.
-  const longest = Math.max(2, ...(code.match(/`+/g) ?? []).map(s => s.length));
+  const longest = Math.max(2, ...codeBlocks.flatMap(b => (b.code.match(/`+/g) ?? []).map(s => s.length)));
   const fence = '`'.repeat(longest + 1);
+  const renderedCode = codeBlocks.length > 1
+    ? codeBlocks.map(b => `${fence}${b.fence} []\n${b.code}\n${fence}`).join('\n')
+    : `${fence}${codeBlocks[0]!.fence}\n${codeBlocks[0]!.code}\n${fence}`;
   const safeCell = (s: string) => formatProse(s, templates).replace(/\|/g, '\\|').replace(/\n/g, ' ');
   const layout = context.presentation?.layout;
   const orders: Record<string, readonly string[]> = {
@@ -275,7 +272,7 @@ export function renderArticle(article: Article, context: SubmissionContext, asse
     const codeHeading = (context.articleStyle === 'one-liner'
       ? ['One-Liner Code', 'Clean Solution', 'Compact Code', 'Short & Sweet']
       : ['Implementation', 'Working code', 'Reference implementation', 'Code in full'])[format.index % 4];
-    blocks.set('code', `## ${codeHeading}\n\n${fence}${language}\n${code}\n${fence}`);
+    blocks.set('code', `## ${codeHeading}\n\n${renderedCode}`);
     blocks.set('costs', costs.trim());
     for (const plan of article.visuals) blocks.set(plan.id, renderVisual(plan));
     const order = articleBlockOrder(format.index);
@@ -289,7 +286,7 @@ export function renderArticle(article: Article, context: SubmissionContext, asse
     return chunks.join(format.index % 3 === 2 && !animated ? '\n\n---\n\n' : '\n\n') + '\n';
   }
   if (context.articleImplementation) {
-    const codeBlock = `## Implementation\n\n${fence}${language}\n${code}\n${fence}`;
+    const codeBlock = `## Implementation\n\n${renderedCode}`;
     const anchorByLayout = { notebook: 'takeaways', questions: 'approach', 'example-first': 'correctness',
       recipe: 'approach', interview: 'dryRun', 'field-guide': 'approach' };
     const anchor = layout ? anchorByLayout[layout] : 'takeaways';
@@ -299,7 +296,7 @@ export function renderArticle(article: Article, context: SubmissionContext, asse
     return sections.join(separator) + costs + '\n';
   }
   const fallbackHeading = context.articleStyle === 'one-liner' ? '💻 Clean 1-liner' : '💻 Accepted code';
-  const codeBlock = `\n\n## ${fallbackHeading}\n\n${fence}${language}\n${code}\n${fence}\n`;
+  const codeBlock = `\n\n## ${fallbackHeading}\n\n${renderedCode}\n`;
   if (context.presentation?.codePlacement === 'after-approach') {
     sections.splice(ordered.findIndex(s => s.kind === 'approach') + 1, 0, costs + codeBlock);
     return sections.join(separator);
@@ -356,6 +353,20 @@ export function buildArticleTags(context: SubmissionContext, markdown?: string):
   const lang = (context.language || 'cpp').toLowerCase();
   const langSlug = lang === 'cpp' ? 'cpp' : lang === 'python3' ? 'python3' : lang;
   tags.push(langSlug);
+
+  if (context.multiLanguageCode?.length) {
+    for (const entry of context.multiLanguageCode) {
+      const meta = MULTI_LANGUAGE_META[entry.language as MultiLanguageSlug];
+      if (meta?.tag) tags.push(meta.tag);
+    }
+  }
+  if (markdown) {
+    for (const match of markdown.matchAll(/^`{3,}(python3|cpp|java|golang|javascript|typescript)[ \t]+\[\][ \t]*$/gm)) {
+      const slug = match[1] as MultiLanguageSlug;
+      const meta = MULTI_LANGUAGE_META[slug];
+      if (meta?.tag) tags.push(meta.tag);
+    }
+  }
 
   for (const t of context.topicTags ?? []) {
     if (t?.slug) tags.push(t.slug.toLowerCase().trim());
