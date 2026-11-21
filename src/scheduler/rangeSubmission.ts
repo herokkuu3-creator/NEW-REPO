@@ -80,6 +80,9 @@ import { solveQuestionWithConfiguredAi } from '../ai/codeSolver';
 
 export const MAX_QUESTION_NUMBER = 9999;
 export const MAX_RANGE_SIZE = 1000;
+const RANGE_FALLBACK_MAX_ARTICLES = 50;
+const MAX_RANGE_JUDGE_FALLBACK_ATTEMPTS = 8;
+const RANGE_FALLBACK_PACING_MS = 2_000;
 
 export interface QuestionRange {
   from: number;
@@ -1621,6 +1624,7 @@ async function solveOne(
           const commSol = await deps.fetchCommunity(slug, langProblem, {
             language: snippet.langSlug,
             excludeUuids,
+            ...(failureState.failedUuids.length > 0 && { strictExcludeUuids: failureState.failedUuids }),
             randomize: true,
             ...(graphql && { graphql }),
           });
@@ -1667,12 +1671,145 @@ async function solveOne(
     }
 
     let { verdict, submissionId, code: acceptedCode } = await submitCode(solutionCode, chosenLang, communityUuid);
+    let lastCommunityUuid = communityUuid;
 
-    if (communityCode && verdict.classification !== 'ACCEPTED' && verdict.classification !== 'UNKNOWN') {
-      const fallbackCode = await getWalkcccForLang(chosenLang, chosenProblem);
-      if (fallbackCode && fallbackCode !== solutionCode) {
-        logger.warn({ question: n, slug, language: chosenLang, verdict: verdict.statusDisplay }, 'judge rejected the solution; trying the alternate source');
-        ({ verdict, submissionId, code: acceptedCode } = await submitCode(fallbackCode, chosenLang));
+    if (verdict.classification !== 'ACCEPTED' && verdict.classification !== 'UNKNOWN') {
+      const triedCodes = new Set<string>([solutionCode]);
+      const rejectedUuids = new Set<string>([
+        ...failureState.failedUuids,
+        ...(communityUuid ? [communityUuid] : []),
+      ]);
+      const triedWalkcccLangs = new Set<string>(walkcccOnlyCode ? [chosenLang] : []);
+      const exhaustedCommunityLangs = new Set<string>();
+
+      for (let attempt = 1; attempt <= MAX_RANGE_JUDGE_FALLBACK_ATTEMPTS; attempt++) {
+        if (verdict.classification === 'ACCEPTED' || verdict.classification === 'UNKNOWN') break;
+        if (signal?.aborted) throw Error('Range cancelled during fallback');
+
+        let nextCode: string | null = null;
+        let nextLang = chosenLang;
+        let nextProblem = chosenProblem;
+        let nextUuid: string | undefined;
+
+        // 1. Walkccc for the currently chosen language
+        if (!triedWalkcccLangs.has(chosenLang)) {
+          triedWalkcccLangs.add(chosenLang);
+          const walkCode = await getWalkcccForLang(chosenLang, chosenProblem);
+          if (walkCode && !triedCodes.has(walkCode)) {
+            nextCode = walkCode;
+          }
+        }
+
+        // 2. Alternative community solutions for the currently chosen language (up to 50 articles)
+        if (!nextCode && deps.fetchCommunity && !exhaustedCommunityLangs.has(chosenLang)) {
+          while (!exhaustedCommunityLangs.has(chosenLang)) {
+            try {
+              const commSol = await deps.fetchCommunity(slug, chosenProblem, {
+                language: chosenLang,
+                maxArticles: RANGE_FALLBACK_MAX_ARTICLES,
+                excludeUuids,
+                strictExcludeUuids: rejectedUuids,
+                randomize: false,
+                ...(graphql && { graphql }),
+              });
+              if (!commSol?.code || triedCodes.has(commSol.code)) {
+                if (commSol?.uuid && !rejectedUuids.has(commSol.uuid)) {
+                  rejectedUuids.add(commSol.uuid);
+                  excludeUuids.add(commSol.uuid);
+                  continue;
+                }
+                exhaustedCommunityLangs.add(chosenLang);
+                break;
+              }
+              excludeUuids.add(commSol.uuid);
+              nextCode = commSol.code;
+              nextUuid = commSol.uuid;
+              break;
+            } catch (commErr) {
+              if (looksLikeChallenge(commErr)) throw commErr;
+              exhaustedCommunityLangs.add(chosenLang);
+            }
+          }
+        }
+
+        // 3. Other candidate languages (community up to 50 articles, then walkccc)
+        if (!nextCode) {
+          for (const snippet of languagesToTry) {
+            if (snippet.langSlug === chosenLang) continue;
+            const altProblem = buildProblemForLanguage(n, slug, questionTitle, q, snippet);
+
+            if (deps.fetchCommunity && !exhaustedCommunityLangs.has(snippet.langSlug)) {
+              while (!exhaustedCommunityLangs.has(snippet.langSlug)) {
+                try {
+                  const commSol = await deps.fetchCommunity(slug, altProblem, {
+                    language: snippet.langSlug,
+                    maxArticles: RANGE_FALLBACK_MAX_ARTICLES,
+                    excludeUuids,
+                    strictExcludeUuids: rejectedUuids,
+                    randomize: false,
+                    ...(graphql && { graphql }),
+                  });
+                  if (!commSol?.code || triedCodes.has(commSol.code)) {
+                    if (commSol?.uuid && !rejectedUuids.has(commSol.uuid)) {
+                      rejectedUuids.add(commSol.uuid);
+                      excludeUuids.add(commSol.uuid);
+                      continue;
+                    }
+                    exhaustedCommunityLangs.add(snippet.langSlug);
+                    break;
+                  }
+                  excludeUuids.add(commSol.uuid);
+                  nextCode = commSol.code;
+                  nextLang = snippet.langSlug;
+                  nextProblem = altProblem;
+                  nextUuid = commSol.uuid;
+                  break;
+                } catch (commErr) {
+                  if (looksLikeChallenge(commErr)) throw commErr;
+                  exhaustedCommunityLangs.add(snippet.langSlug);
+                }
+              }
+              if (nextCode) break;
+            }
+
+            if (!triedWalkcccLangs.has(snippet.langSlug)) {
+              triedWalkcccLangs.add(snippet.langSlug);
+              const walkCode = await getWalkcccForLang(snippet.langSlug, altProblem);
+              if (walkCode && !triedCodes.has(walkCode)) {
+                nextCode = walkCode;
+                nextLang = snippet.langSlug;
+                nextProblem = altProblem;
+                break;
+              }
+            }
+          }
+        }
+
+        if (!nextCode) {
+          logger.warn(
+            { question: n, slug, attempt, verdict: verdict.statusDisplay },
+            'range judge backup: no more untried solutions available',
+          );
+          break;
+        }
+
+        logger.warn(
+          { question: n, slug, attempt, language: nextLang, prevVerdict: verdict.statusDisplay, source: nextUuid ? 'community' : 'walkccc' },
+          'judge rejected the solution; trying backup candidate',
+        );
+        triedCodes.add(nextCode);
+        await deps.sleep(RANGE_FALLBACK_PACING_MS, signal ?? new AbortController().signal);
+        if (signal?.aborted) throw Error('Range cancelled during fallback');
+
+        chosenLang = nextLang;
+        chosenProblem = nextProblem;
+        communityUuid = nextUuid;
+        if (nextUuid) lastCommunityUuid = nextUuid;
+
+        ({ verdict, submissionId, code: acceptedCode } = await submitCode(nextCode, chosenLang, communityUuid));
+        if (verdict.classification !== 'ACCEPTED' && verdict.classification !== 'UNKNOWN' && communityUuid) {
+          rejectedUuids.add(communityUuid);
+        }
       }
     }
 
@@ -1682,7 +1819,7 @@ async function solveOne(
     if (verdict.classification === 'UNKNOWN') {
       return emitJudgeTimeout(submissionId);
     }
-    return emitJudgeFailed(verdict.statusDisplay, submissionId, chosenLang, communityUuid);
+    return emitJudgeFailed(verdict.statusDisplay, submissionId, chosenLang, lastCommunityUuid);
   } catch (e) {
     const failure = leetCodeRequestFailure(e);
     logger.warn({

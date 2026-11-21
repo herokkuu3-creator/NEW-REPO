@@ -617,4 +617,94 @@ def big_countries(world: pd.DataFrame) -> pd.DataFrame:
     expect(sol.code).toBe('SELECT 1 AS num;');
     expect(sol.language).toBe('mysql');
   });
+
+  it('strictExcludeUuids strictly skips rejected UUIDs and throws when all are excluded', async () => {
+    clearCommunitySolutionsCache();
+    const mockGraphql = vi.fn(async (_query: string, vars: Record<string, unknown>) => {
+      if (Array.isArray(vars.tagSlugs)) {
+        return {
+          ugcArticleSolutionArticles: {
+            edges: [
+              { node: { uuid: 'bad-1', title: 'Bad 1', slug: 'b1', topicId: 1 } },
+              { node: { uuid: 'good-2', title: 'Good 2', slug: 'g2', topicId: 2 } },
+            ],
+          },
+        };
+      }
+      const artId = String(vars.articleId);
+      return {
+        ugcArticleSolutionArticle: {
+          uuid: artId,
+          title: artId,
+          slug: artId,
+          content: '```cpp\nclass Solution {\npublic:\n  long long maxAlternatingSum(vector<int>& nums) { return 42; }\n};\n```',
+        },
+      };
+    });
+
+    const sol = await fetchCommunitySolution('maximum-alternating-sum-of-squares', mockProblem3727, {
+      graphql: mockGraphql as never,
+      strictExcludeUuids: ['bad-1'],
+      randomize: false,
+    });
+    expect(sol.uuid).toBe('good-2');
+    expect(sol.rankIndex).toBe(2);
+
+    await expect(
+      fetchCommunitySolution('maximum-alternating-sum-of-squares', mockProblem3727, {
+        graphql: mockGraphql as never,
+        strictExcludeUuids: ['bad-1', 'good-2'],
+        randomize: false,
+      }),
+    ).rejects.toThrow(CommunitySolutionError);
+  });
+
+  it('paginates when maxArticles is 50 (skip: 0, 25) and returns a solution from the second page', async () => {
+    clearCommunitySolutionsCache();
+    const pageCalls: Array<{ skip: number; first: number }> = [];
+    const page1 = Array.from({ length: 25 }, (_, i) => ({
+      node: { uuid: `p1-${i}`, title: `P1 ${i}`, slug: `p1-${i}`, topicId: i + 1 },
+    }));
+    const page2 = [
+      { node: { uuid: 'p2-valid', title: 'Page 2 Valid', slug: 'p2-valid', topicId: 26 } },
+    ];
+
+    const mockGraphql = vi.fn(async (_query: string, vars: Record<string, unknown>) => {
+      if (Array.isArray(vars.tagSlugs)) {
+        const skip = Number(vars.skip ?? 0);
+        const first = Number(vars.first ?? 25);
+        pageCalls.push({ skip, first });
+        return {
+          ugcArticleSolutionArticles: {
+            edges: skip === 0 ? page1 : page2,
+          },
+        };
+      }
+      const artId = String(vars.articleId);
+      const isSecondPage = artId === 'p2-valid';
+      return {
+        ugcArticleSolutionArticle: {
+          uuid: artId,
+          title: artId,
+          slug: artId,
+          content: isSecondPage
+            ? '```cpp\nclass Solution {\npublic:\n  long long maxAlternatingSum(vector<int>& nums) { return 7; }\n};\n```'
+            : 'No cpp code here',
+        },
+      };
+    });
+
+    const sol = await fetchCommunitySolution('maximum-alternating-sum-of-squares', mockProblem3727, {
+      graphql: mockGraphql as never,
+      maxArticles: 50,
+      randomize: false,
+    });
+
+    expect(pageCalls).toEqual([
+      { skip: 0, first: 25 },
+      { skip: 25, first: 25 },
+    ]);
+    expect(sol.uuid).toBe('p2-valid');
+    expect(sol.rankIndex).toBe(26);
+  });
 });

@@ -59,6 +59,7 @@ import {
 import {
   fetchCommunitySolution,
   CommunitySolution,
+  CommunitySolutionError,
 } from '../solutions/communitySolutions';
 import { SolutionCache } from '../solutions/solutionCache';
 import { ensureLanguage, openProblemPage, setEditorCode } from '../leetcode/editor';
@@ -73,6 +74,10 @@ import {
   setDailyRetryCompletedDate,
   setDailyRetryNextPollAt,
 } from './dailyRetryGate';
+
+const DAILY_FALLBACK_MAX_ARTICLES = 50;
+const MAX_DAILY_JUDGE_FALLBACK_ATTEMPTS = 8;
+const DAILY_FALLBACK_PACING_MS = 2_500;
 
 export { resetDailyRetryPollGate };
 
@@ -426,6 +431,7 @@ export async function executeDailyRun(
     const outcomes: AccountOutcome[] = [];
     const renewalTriggered = reason === 'session-renewal';
     const usedCommunityUuids = new Set<string>();
+    const rejectedCommunityUuids = new Set<string>();
     const batchCtx = createDailyBatchContext(options);
     for (const account of accounts) {
       const before = outcomes.length;
@@ -440,6 +446,7 @@ export async function executeDailyRun(
             options.expectedChallengeDate,
             true,
             batchCtx,
+            rejectedCommunityUuids,
           ),
         );
       } catch (err) {
@@ -522,6 +529,7 @@ async function runForAccount(
   expectedChallengeDate?: string,
   allowAutoRefresh = true,
   batchCtx: DailyBatchContext = createDailyBatchContext(),
+  rejectedCommunityUuids: Set<string> = new Set(),
 ): Promise<AccountOutcome> {
   const label = account.label;
 
@@ -573,6 +581,7 @@ async function runForAccount(
               expectedChallengeDate,
               false,
               batchCtx,
+              rejectedCommunityUuids,
             );
           }
         }
@@ -761,7 +770,7 @@ async function runForAccount(
     }
 
     // --- 5) Obtain the solution (community solution by default; walkccc fallback) --
-    const solution = await obtainSolution(problem, run, account, username, usedCommunityUuids);
+    const solution = await obtainSolution(problem, run, account, username, usedCommunityUuids, rejectedCommunityUuids);
     if (!solution.ok) return solution.outcome;
     run = await updateRun(run.id, { solution: solution.code });
 
@@ -787,62 +796,127 @@ async function runForAccount(
       problem.slug,
     );
 
-    // If solution was submitted but rejected at judge (wrong answer, compile error, runtime error),
-    // retry with fallback: if community failed, try walkccc; if walkccc failed, try community!
-    if (
-      outcome.state === RunState.SUBMISSION_REJECTED &&
-      !/judge polling timed out/i.test(outcome.error ?? '')
-    ) {
-      if (solution.source === 'community') {
-        logger.warn(
-          { label, problem: problem.slug, verdict: outcome.submissionStatus, err: outcome.error },
-          'community solution was rejected by judge; attempting walkccc fallback',
-        );
-        try {
-          const walkKey = {
-            date: run.date,
-            questionId: `${problem.frontendId}:${problem.slug}`,
-            language: config.llm.language,
-            source: 'walkccc',
-          };
-          const walkSol = await walkcccCache.get(walkKey, () => fetchWalkcccSolution(problem.frontendId));
-          if (signatureMatchesStarter(walkSol.code, problem) && walkSol.code !== solution.code) {
-            logger.info({ label, sourceUrl: walkSol.sourceUrl }, 'submitting walkccc fallback');
-            run = await updateRun(run.id, { solution: walkSol.code });
-            outcome = await submitDailySolutionWithCommentFallback(
-              walkSol.code,
-              submitForSolution,
-              label,
-              problem.slug,
+    const isRetryableJudgeRejection = (o: AccountOutcome) =>
+      o.state === RunState.SUBMISSION_REJECTED &&
+      !/judge polling timed out/i.test(o.error ?? '');
+
+    if (isRetryableJudgeRejection(outcome)) {
+      const triedCodes = new Set<string>([solution.code]);
+      if (solution.uuid) {
+        rejectedCommunityUuids.add(solution.uuid);
+      }
+      let triedWalkccc = solution.source === 'walkccc';
+      let triedLlm = solution.source === 'llm';
+      let communityExhausted = false;
+
+      for (let attempt = 1; attempt <= MAX_DAILY_JUDGE_FALLBACK_ATTEMPTS; attempt++) {
+        if (!isRetryableJudgeRejection(outcome)) break;
+
+        let nextCode: string | null = null;
+        let nextSource: 'walkccc' | 'community' | 'llm' | null = null;
+        let nextUuid: string | undefined;
+
+        if (!triedWalkccc) {
+          triedWalkccc = true;
+          try {
+            const walkKey = {
+              date: run.date,
+              questionId: `${problem.frontendId}:${problem.slug}`,
+              language: config.llm.language,
+              source: 'walkccc',
+            };
+            const walkSol = await walkcccCache.get(walkKey, () => fetchWalkcccSolution(problem.frontendId));
+            if (signatureMatchesStarter(walkSol.code, problem) && !triedCodes.has(walkSol.code)) {
+              nextCode = walkSol.code;
+              nextSource = 'walkccc';
+              logger.info({ label, attempt, sourceUrl: walkSol.sourceUrl }, 'daily judge backup: trying walkccc');
+            }
+          } catch (walkErr) {
+            logger.warn(
+              { label, attempt, err: walkErr instanceof Error ? walkErr.message : String(walkErr) },
+              'daily judge backup: walkccc fetch failed',
             );
           }
-        } catch (walkErr) {
-          logger.warn({ label, err: walkErr instanceof Error ? walkErr.message : String(walkErr) }, 'walkccc fallback attempt failed');
         }
-      } else if (solution.source === 'walkccc') {
-        logger.warn(
-          { label, problem: problem.slug, verdict: outcome.submissionStatus, err: outcome.error },
-          'walkccc solution was rejected by judge; attempting community solution fallback',
-        );
-        try {
-          const commSol = await fetchCommunitySolution(problem.slug, problem, {
-            language: config.llm.language,
-            excludeUuids: usedCommunityUuids,
-            randomize: true,
-          });
-          if (commSol.code && commSol.code !== solution.code) {
-            usedCommunityUuids.add(commSol.uuid);
-            logger.info({ label, sourceUrl: commSol.sourceUrl, rank: commSol.rankIndex }, 'submitting community fallback');
-            run = await updateRun(run.id, { solution: commSol.code });
-            outcome = await submitDailySolutionWithCommentFallback(
-              commSol.code,
-              submitForSolution,
-              label,
-              problem.slug,
+
+        if (!nextCode && !communityExhausted) {
+          while (!communityExhausted) {
+            try {
+              const commSol = await fetchCommunitySolution(problem.slug, problem, {
+                language: config.llm.language,
+                maxArticles: DAILY_FALLBACK_MAX_ARTICLES,
+                excludeUuids: usedCommunityUuids,
+                strictExcludeUuids: rejectedCommunityUuids,
+                randomize: false,
+              });
+              if (triedCodes.has(commSol.code)) {
+                rejectedCommunityUuids.add(commSol.uuid);
+                continue;
+              }
+              usedCommunityUuids.add(commSol.uuid);
+              nextCode = commSol.code;
+              nextSource = 'community';
+              nextUuid = commSol.uuid;
+              logger.info(
+                { label, attempt, sourceUrl: commSol.sourceUrl, rank: commSol.rankIndex, uuid: commSol.uuid },
+                'daily judge backup: trying alternative community solution',
+              );
+              break;
+            } catch (commErr) {
+              if (commErr instanceof CommunitySolutionError) {
+                communityExhausted = true;
+              } else {
+                logger.warn(
+                  { label, attempt, err: commErr instanceof Error ? commErr.message : String(commErr) },
+                  'daily judge backup: community fetch failed',
+                );
+                communityExhausted = true;
+              }
+            }
+          }
+        }
+
+        if (!nextCode && !triedLlm && config.llm.apiKey) {
+          triedLlm = true;
+          try {
+            const llm = createLLMProvider();
+            const r = await solveProblem(llm, problem, config.llm.language, config.llm.maxSolutionRetries);
+            if (r.ok && !triedCodes.has(r.code)) {
+              nextCode = r.code;
+              nextSource = 'llm';
+              logger.info({ label, attempt }, 'daily judge backup: trying LLM fallback solution');
+            }
+          } catch (llmErr) {
+            logger.warn(
+              { label, attempt, err: llmErr instanceof Error ? llmErr.message : String(llmErr) },
+              'daily judge backup: LLM fallback failed',
             );
           }
-        } catch (commErr) {
-          logger.warn({ label, err: commErr instanceof Error ? commErr.message : String(commErr) }, 'community fallback attempt failed');
+        }
+
+        if (!nextCode || !nextSource) {
+          logger.warn(
+            { label, problem: problem.slug, attempt, verdict: outcome.submissionStatus },
+            'daily judge backup: no more untried solutions available',
+          );
+          break;
+        }
+
+        triedCodes.add(nextCode);
+        await new Promise<void>((resolve) => setTimeout(resolve, DAILY_FALLBACK_PACING_MS));
+        run = await updateRun(run.id, { solution: nextCode });
+        outcome = await submitDailySolutionWithCommentFallback(
+          nextCode,
+          submitForSolution,
+          label,
+          problem.slug,
+        );
+
+        if (isRetryableJudgeRejection(outcome) && nextUuid) {
+          rejectedCommunityUuids.add(nextUuid);
+        }
+        if (outcome.kind === 'solved' || outcome.state !== RunState.SUBMISSION_REJECTED) {
+          break;
         }
       }
     }
@@ -919,6 +993,7 @@ async function obtainSolution(
   account: AccountRecord,
   username: string,
   usedCommunityUuids: Set<string> = new Set(),
+  rejectedCommunityUuids: Set<string> = new Set(),
 ): Promise<SolutionResult> {
   const cacheKey = {
     date: run.date,
@@ -928,34 +1003,42 @@ async function obtainSolution(
   };
 
   if (config.solution.source !== 'llm') {
-    // 1. PRIMARY: LeetCode Community Solutions with random 1..10 selection per account
+    // 1. PRIMARY: LeetCode Community Solutions with random 1..10 selection per account,
+    // expanding up to 50 articles if the top 10 yield no usable candidate.
     let communityFailedReason: string | null = null;
-    try {
-      const commSol = await fetchCommunitySolution(problem.slug, problem, {
-        language: config.llm.language,
-        excludeUuids: usedCommunityUuids,
-        randomize: true,
-      });
-      usedCommunityUuids.add(commSol.uuid);
-      logger.info(
-        {
-          label: account.label,
-          rank: commSol.rankIndex,
-          sourceUrl: commSol.sourceUrl,
-          title: commSol.title,
+    for (const maxArticles of [10, DAILY_FALLBACK_MAX_ARTICLES]) {
+      try {
+        const commSol = await fetchCommunitySolution(problem.slug, problem, {
+          language: config.llm.language,
+          maxArticles,
+          excludeUuids: usedCommunityUuids,
+          strictExcludeUuids: rejectedCommunityUuids,
+          randomize: maxArticles === 10,
+        });
+        usedCommunityUuids.add(commSol.uuid);
+        logger.info(
+          {
+            label: account.label,
+            rank: commSol.rankIndex,
+            sourceUrl: commSol.sourceUrl,
+            title: commSol.title,
+            uuid: commSol.uuid,
+            maxArticles,
+          },
+          'solution obtained from LeetCode community solutions',
+        );
+        return {
+          ok: true,
+          code: commSol.code,
+          source: 'community',
           uuid: commSol.uuid,
-        },
-        'solution obtained from LeetCode community solutions (random candidate)',
-      );
-      return {
-        ok: true,
-        code: commSol.code,
-        source: 'community',
-        uuid: commSol.uuid,
-        rankIndex: commSol.rankIndex,
-      };
-    } catch (commErr) {
-      communityFailedReason = commErr instanceof Error ? commErr.message : String(commErr);
+          rankIndex: commSol.rankIndex,
+        };
+      } catch (commErr) {
+        communityFailedReason = commErr instanceof Error ? commErr.message : String(commErr);
+      }
+    }
+    if (communityFailedReason) {
       logger.warn(
         { label: account.label, err: communityFailedReason },
         'LeetCode community solution unavailable — falling back to walkccc',

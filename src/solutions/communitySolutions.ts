@@ -30,6 +30,8 @@ export interface FetchCommunitySolutionOptions {
   randomize?: boolean;
   targetIndex?: number;
   excludeUuids?: string[] | Set<string>;
+  /** UUIDs that must never be returned (e.g. solutions already rejected by the judge). */
+  strictExcludeUuids?: Iterable<string>;
 }
 
 export interface CommunityArticleNode {
@@ -600,6 +602,73 @@ function communityTagCandidates(language: string): string[] {
   return [lang];
 }
 
+const COMMUNITY_PAGE_SIZE = 25;
+
+async function fetchArticlePages(
+  questionSlug: string,
+  tagSlugs: string[],
+  maxArticles: number,
+  options?: FetchCommunitySolutionOptions,
+): Promise<{ edges: Array<{ node: CommunityArticleNode }>; confirmedEmpty: boolean }> {
+  if (maxArticles <= COMMUNITY_PAGE_SIZE) {
+    const data = await executeLeetCodeGraphQL<UgcArticlesResponse>(
+      UGC_SOLUTION_ARTICLES_QUERY,
+      {
+        questionSlug,
+        orderBy: 'HOT',
+        userInput: '',
+        tagSlugs,
+        skip: 0,
+        first: maxArticles,
+      },
+      options,
+    );
+    const list = data.ugcArticleSolutionArticles?.edges;
+    return {
+      edges: list ?? [],
+      confirmedEmpty: Array.isArray(list) && list.length === 0,
+    };
+  }
+
+  const edges: Array<{ node: CommunityArticleNode }> = [];
+  const seenUuids = new Set<string>();
+  let confirmedEmpty = false;
+
+  for (let skip = 0; skip < maxArticles; skip += COMMUNITY_PAGE_SIZE) {
+    const first = Math.min(COMMUNITY_PAGE_SIZE, maxArticles - skip);
+    const data = await executeLeetCodeGraphQL<UgcArticlesResponse>(
+      UGC_SOLUTION_ARTICLES_QUERY,
+      {
+        questionSlug,
+        orderBy: 'HOT',
+        userInput: '',
+        tagSlugs,
+        skip,
+        first,
+      },
+      options,
+    );
+    const pageEdges = data.ugcArticleSolutionArticles?.edges;
+    if (!Array.isArray(pageEdges) || pageEdges.length === 0) {
+      if (skip === 0 && Array.isArray(pageEdges) && pageEdges.length === 0) {
+        confirmedEmpty = true;
+      }
+      break;
+    }
+
+    for (const edge of pageEdges) {
+      if (edge?.node?.uuid && !seenUuids.has(edge.node.uuid)) {
+        seenUuids.add(edge.node.uuid);
+        edges.push(edge);
+      }
+    }
+
+    if (pageEdges.length < first) break;
+  }
+
+  return { edges, confirmedEmpty };
+}
+
 export async function fetchCommunityArticleList(
   questionSlug: string,
   options?: FetchCommunitySolutionOptions,
@@ -627,21 +696,9 @@ export async function fetchCommunityArticleList(
   let confirmedEmpty = false;
   for (const candidateTag of communityTagCandidates(langTag)) {
     try {
-      const listData = await executeLeetCodeGraphQL<UgcArticlesResponse>(
-        UGC_SOLUTION_ARTICLES_QUERY,
-        {
-          questionSlug,
-          orderBy: 'HOT',
-          userInput: '',
-          tagSlugs: [candidateTag],
-          skip: 0,
-          first: maxArticles,
-        },
-        options,
-      );
-      const tagged = listData.ugcArticleSolutionArticles?.edges;
-      edges = tagged ?? [];
-      confirmedEmpty = Array.isArray(tagged) && tagged.length === 0;
+      const res = await fetchArticlePages(questionSlug, [candidateTag], maxArticles, options);
+      edges = res.edges;
+      confirmedEmpty = res.confirmedEmpty;
       logger.info({ questionSlug, langTag: candidateTag, count: edges.length }, 'community solution articles found with language tag');
       if (edges.length > 0) break;
     } catch (err) {
@@ -652,21 +709,9 @@ export async function fetchCommunityArticleList(
 
   // 2. Fallback to untagged if 0 tagged articles found
   if (edges.length === 0) {
-    const untaggedData = await executeLeetCodeGraphQL<UgcArticlesResponse>(
-      UGC_SOLUTION_ARTICLES_QUERY,
-      {
-        questionSlug,
-        orderBy: 'HOT',
-        userInput: '',
-        tagSlugs: [],
-        skip: 0,
-        first: maxArticles,
-      },
-      options,
-    );
-    const untagged = untaggedData.ugcArticleSolutionArticles?.edges;
-    edges = untagged ?? [];
-    confirmedEmpty = confirmedEmpty && Array.isArray(untagged) && untagged.length === 0;
+    const res = await fetchArticlePages(questionSlug, [], maxArticles, options);
+    edges = res.edges;
+    confirmedEmpty = confirmedEmpty && res.confirmedEmpty;
     logger.info({ questionSlug, count: edges.length }, 'community solution articles found without language tag');
   }
 
@@ -729,12 +774,23 @@ export async function fetchCommunitySolution(
   const maxArticles = options?.maxArticles ?? 10;
   logger.info({ questionSlug, language, maxArticles }, 'fetching LeetCode community solutions');
 
-  const edges = await fetchCommunityArticleList(questionSlug, options);
-  if (edges.length === 0) {
+  const allEdges = await fetchCommunityArticleList(questionSlug, options);
+  if (allEdges.length === 0) {
     throw new CommunitySolutionError(`no community solution articles found for problem ${questionSlug}`);
   }
 
-  const N = edges.length;
+  const strictExcluded = new Set<string>(options?.strictExcludeUuids ?? []);
+  const indexedEdges = allEdges
+    .map((edge, originalIdx) => ({ edge, rank1Based: originalIdx + 1 }))
+    .filter(({ edge }) => !strictExcluded.has(edge.node.uuid));
+
+  if (indexedEdges.length === 0) {
+    throw new CommunitySolutionError(
+      `all ${allEdges.length} community solution articles for ${questionSlug} were strictly excluded`,
+    );
+  }
+
+  const N = indexedEdges.length;
   const excluded = new Set<string>();
   if (options?.excludeUuids) {
     for (const u of options.excludeUuids) excluded.add(u);
@@ -748,19 +804,19 @@ export async function fetchCommunitySolution(
     for (let i = 0; i < N; i++) {
       cycle.push((start + i) % N);
     }
-    const unused = cycle.filter((idx) => !excluded.has(edges[idx]!.node.uuid));
-    const used = cycle.filter((idx) => excluded.has(edges[idx]!.node.uuid));
+    const unused = cycle.filter((idx) => !excluded.has(indexedEdges[idx]!.edge.node.uuid));
+    const used = cycle.filter((idx) => excluded.has(indexedEdges[idx]!.edge.node.uuid));
     inspectionOrder = [...unused, ...used];
   } else if (options?.randomize === false) {
     const seq = Array.from({ length: N }, (_, i) => i);
-    const unused = seq.filter((idx) => !excluded.has(edges[idx]!.node.uuid));
-    const used = seq.filter((idx) => excluded.has(edges[idx]!.node.uuid));
+    const unused = seq.filter((idx) => !excluded.has(indexedEdges[idx]!.edge.node.uuid));
+    const used = seq.filter((idx) => excluded.has(indexedEdges[idx]!.edge.node.uuid));
     inspectionOrder = [...unused, ...used];
   } else {
     // Randomized variation per account from 1..N
     const allIndices = Array.from({ length: N }, (_, i) => i);
-    const unusedIndices = allIndices.filter((idx) => !excluded.has(edges[idx]!.node.uuid));
-    const usedIndices = allIndices.filter((idx) => excluded.has(edges[idx]!.node.uuid));
+    const unusedIndices = allIndices.filter((idx) => !excluded.has(indexedEdges[idx]!.edge.node.uuid));
+    const usedIndices = allIndices.filter((idx) => excluded.has(indexedEdges[idx]!.edge.node.uuid));
 
     const shuffle = (arr: number[]) => {
       const copy = [...arr];
@@ -778,15 +834,21 @@ export async function fetchCommunitySolution(
     }
   }
 
-  const targetChoice = (inspectionOrder[0] ?? 0) + 1;
+  const targetChoice = indexedEdges[inspectionOrder[0] ?? 0]?.rank1Based ?? 1;
   logger.info(
-    { questionSlug, targetResultRank: targetChoice, totalArticles: N, excludedCount: excluded.size },
+    {
+      questionSlug,
+      targetResultRank: targetChoice,
+      totalArticles: N,
+      excludedCount: excluded.size,
+      strictExcludedCount: strictExcluded.size,
+    },
     'evaluating community solution articles with randomized target rank',
   );
 
   for (const candidateIndex of inspectionOrder) {
-    const node = edges[candidateIndex]!.node;
-    const rank1Based = candidateIndex + 1;
+    const { edge, rank1Based } = indexedEdges[candidateIndex]!;
+    const node = edge.node;
 
     try {
       const content = await fetchArticleContent(node.uuid, options);

@@ -1533,4 +1533,81 @@ describe('parallel range submission', () => {
       checkSpy.mockRestore();
     }
   });
+
+  it('retries backup solutions with maxArticles: 50 and strictExcludeUuids when judge rejects with TLE and Runtime Error until Accepted', async () => {
+    const submittedCodes: string[] = [];
+    const fetchCalls: Array<{ maxArticles?: number; strictExcludeUuids: string[] }> = [];
+    const session: RangeSession = {
+      api: {
+        checkSession: async () => ({ authenticated: true, username: 'userX' }),
+        question: async () => ({
+          questionId: '500',
+          isPaidOnly: false,
+          frontendId: '500',
+          title: 'Two Sum Backup',
+          slug: 'two-sum-backup',
+          difficulty: 'Medium',
+          contentHtml: '<p>Problem statement with sufficient text for parser validation.</p>',
+          exampleTestcases: '',
+          metaData: null,
+          codeSnippets: [{ lang: 'C++', langSlug: 'cpp', code: 'class Solution { public: int solve(int x) {} };' }],
+        }),
+        submit: async (p) => {
+          submittedCodes.push(p.code);
+          return `sub-${submittedCodes.length}`;
+        },
+        awaitResult: async (id) => {
+          if (id === 'sub-1') {
+            return { submissionId: id, classification: 'TIME_LIMIT_EXCEEDED', statusDisplay: 'Time Limit Exceeded', runtime: null, memory: null, rawStatusMsg: 'Time Limit Exceeded' };
+          }
+          if (id === 'sub-2') {
+            return { submissionId: id, classification: 'RUNTIME_ERROR', statusDisplay: 'Runtime Error', runtime: null, memory: null, rawStatusMsg: 'Runtime Error' };
+          }
+          return { submissionId: id, classification: 'ACCEPTED', statusDisplay: 'Accepted', runtime: '12 ms', memory: '14 MB', rawStatusMsg: 'Accepted' };
+        },
+      },
+      close: async () => undefined,
+    };
+
+    const { deps } = makeDeps(session, [acc('a1')], {
+      getPage: async () => ({
+        code: 'class Solution { public: int solve(int x) { return x / 0; } };',
+        sourceUrl: 'https://walkccc.me/LeetCode/problems/500/',
+        slug: 'two-sum-backup',
+        title: 'Two Sum Backup',
+      }),
+      fetchCommunity: async (_slug, _problem, options) => {
+        const strict = [...(options?.strictExcludeUuids ?? [])];
+        fetchCalls.push({ maxArticles: options?.maxArticles, strictExcludeUuids: strict });
+        if (!strict.includes('uuid-tle')) {
+          return {
+            code: 'class Solution { public: int solve(int x) { while (true) {} return 0; } };',
+            sourceUrl: 'u1',
+            title: 'TLE Sol',
+            uuid: 'uuid-tle',
+          };
+        }
+        return {
+          code: 'class Solution { public: int solve(int x) { return x; } };',
+          sourceUrl: 'u2',
+          title: 'Fast Sol',
+          uuid: 'uuid-fast',
+        };
+      },
+    });
+
+    const r = await startRangeJob({ from: 500, to: 500 }, 'a1', deps);
+    const results = await r.done;
+
+    expect(results[0]!.results[0]).toMatchObject({
+      number: 500,
+      status: 'accepted',
+      submissionId: 'sub-3',
+    });
+    expect(submittedCodes).toHaveLength(3);
+    expect(fetchCalls).toEqual([
+      { maxArticles: undefined, strictExcludeUuids: [] },
+      { maxArticles: 50, strictExcludeUuids: ['uuid-tle'] },
+    ]);
+  });
 });
