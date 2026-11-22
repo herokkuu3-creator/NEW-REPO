@@ -299,6 +299,29 @@ export async function editTelegramMessage(messageId: number, text: string, optio
   }
 }
 
+export async function deleteTelegramMessage(messageId: number): Promise<boolean> {
+  const { botToken, chatId, enabled } = config.telegram;
+  if (!enabled) return false;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (res.ok) return true;
+    const desc = await readTelegramErrorDescription(res);
+    if (/message to delete not found|message can't be deleted/i.test(desc)) {
+      return true;
+    }
+    logger.warn({ status: res.status, description: desc, messageId }, 'telegram deleteMessage failed');
+    return false;
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err), messageId }, 'telegram deleteMessage error');
+    return false;
+  }
+}
+
 /**
  * Sends a photo (e.g. a Cloudflare diagnostics screenshot). Important on
  * Render's free tier, where the filesystem is ephemeral and the on-disk

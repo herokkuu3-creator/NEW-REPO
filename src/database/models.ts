@@ -130,6 +130,7 @@ export const SystemKeys = {
   capzyActiveKeyIndex: 'capzyActiveKeyIndex', // string of active key index ('0', '1', ...)
   questionSolutionFailures: 'questionSolutionFailures:v1', // JSON map of per-question solution-section failure counts & failed UUIDs
   recoveryTunnelToken: 'recoveryTunnelToken', // secret bearer token for Mobile/Home IP reverse tunnel WebSocket
+  recoveryTelegramMessage: 'recoveryTelegramMessage', // JSON { messageId, expiresAtMs } of the active Telegram recovery prompt
   forecastJobPrefix: 'daily-forecast:job:',
 } as const;
 

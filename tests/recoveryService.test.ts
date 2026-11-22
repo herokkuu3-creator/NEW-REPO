@@ -887,5 +887,72 @@ describe('RecoveryService', () => {
       expect(getAccountsByIdsSpy).toHaveBeenCalledTimes(2);
       expect(getAccountSpy).not.toHaveBeenCalled();
     });
+
+    it('deletes expired recovery messages and ensures only 1 recovery message is shown at a time', async () => {
+      let nextMsgId = 100;
+      const deletedIds: number[] = [];
+      let persistedState: { messageId: number; expiresAtMs: number | null } | null = null;
+
+      const svc = new RecoveryService({
+        store,
+        now: () => currentTime,
+        chatId: () => '123456789',
+        baseUrl: () => 'https://solver.example.com',
+        listAccounts: async () => [...accountsMap.values()].map((a) => ({ ...a })),
+        getAccount: async (id) => {
+          const found = accountsMap.get(id);
+          return found ? { ...found } : null;
+        },
+        markAccount: async () => undefined,
+        verifyStoredSession: async () => ({ authenticated: false, cause: 'signed-out' }),
+        verifyCapturedSession: async () => ({ authenticated: true }),
+        getCredentials: async () => null,
+        openBrowser: async () => fakeBrowser,
+        sendTelegram: async () => true,
+        sendTelegramWithId: async (text, markup) => {
+          telegramMessages.push({ text, markup });
+          return ++nextMsgId;
+        },
+        deleteTelegramMessage: async (messageId) => {
+          deletedIds.push(messageId);
+          return true;
+        },
+        getTrackedTelegramMessage: async () => persistedState,
+        setTrackedTelegramMessage: async (state) => {
+          persistedState = state;
+        },
+        limits,
+      });
+
+      // 1) First account opens recovery -> message 101 sent
+      accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
+      await svc.openRecovery({ id: 'acc-1', label: 'account_one', username: 'test_user_1', status: AccountStatus.EXPIRED }, 'EXPIRED');
+      await svc.tick();
+      expect(telegramMessages).toHaveLength(1);
+      expect(deletedIds).toEqual([]);
+      expect(persistedState?.messageId).toBe(101);
+
+      // 2) 45 minutes later, link expires (before the 60-min reminder) -> tick deletes 101 immediately
+      currentTime = new Date(currentTime.getTime() + 45 * 60_000);
+      await svc.tick();
+      expect(telegramMessages).toHaveLength(1);
+      expect(deletedIds).toEqual([101]);
+      expect(persistedState).toBeNull();
+
+      // 3) At 60 minutes, hourly reminder fires -> message 102 sent
+      currentTime = new Date(currentTime.getTime() + 15 * 60_000);
+      await svc.tick();
+      expect(telegramMessages).toHaveLength(2);
+      expect(persistedState?.messageId).toBe(102);
+
+      // 4) 5 minutes later, second account opens recovery -> message 103 sent and 102 deleted so only 1 message shows
+      currentTime = new Date(currentTime.getTime() + 5 * 60_000);
+      accountsMap.get('acc-2')!.status = AccountStatus.EXPIRED;
+      await svc.openRecovery({ id: 'acc-2', label: 'account_two', username: 'test_user_2', status: AccountStatus.EXPIRED }, 'EXPIRED');
+      await svc.tick();
+      expect(telegramMessages).toHaveLength(3);
+      expect(deletedIds).toEqual([101, 102]);
+      expect(persistedState?.messageId).toBe(103);
+    });
   });
 });

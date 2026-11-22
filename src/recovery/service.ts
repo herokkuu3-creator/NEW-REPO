@@ -83,6 +83,11 @@ export interface TelegramMarkup {
   inline_keyboard: { text: string; url: string }[][];
 }
 
+export interface TrackedRecoveryTelegramMessage {
+  messageId: number;
+  expiresAtMs: number | null;
+}
+
 export interface EgressStatus {
   mode: 'mobile_tunnel' | 'residential_proxy' | 'datacenter';
   label: string;
@@ -109,6 +114,10 @@ export interface RecoveryDeps {
   openBrowser(opts?: { viewport?: { width: number; height: number } }): Promise<RemoteBrowser>;
   getEgressStatus?(): Promise<EgressStatus>;
   sendTelegram(text: string, markup?: TelegramMarkup): Promise<boolean>;
+  sendTelegramWithId?(text: string, markup?: TelegramMarkup): Promise<number | null>;
+  deleteTelegramMessage?(messageId: number): Promise<boolean>;
+  getTrackedTelegramMessage?(): Promise<TrackedRecoveryTelegramMessage | null>;
+  setTrackedTelegramMessage?(state: TrackedRecoveryTelegramMessage | null): Promise<void>;
   onRecovered?(account: RecoveryAccount): Promise<void> | void;
   limits: RecoveryLimits;
 }
@@ -313,8 +322,35 @@ export class RecoveryService {
   private readonly lockedAccounts = new Set<string>();
   private tickRunning = false;
   private nextIdleDbCheckAt = 0;
+  private trackedTelegramMessage: TrackedRecoveryTelegramMessage | null | undefined = undefined;
 
   constructor(private readonly deps: RecoveryDeps) {}
+
+  private async loadTrackedTelegramMessage(): Promise<TrackedRecoveryTelegramMessage | null> {
+    if (this.trackedTelegramMessage !== undefined) return this.trackedTelegramMessage;
+    if (this.deps.getTrackedTelegramMessage) {
+      this.trackedTelegramMessage = await this.deps.getTrackedTelegramMessage().catch(() => null);
+    } else {
+      this.trackedTelegramMessage = null;
+    }
+    return this.trackedTelegramMessage;
+  }
+
+  private async saveTrackedTelegramMessage(state: TrackedRecoveryTelegramMessage | null): Promise<void> {
+    this.trackedTelegramMessage = state;
+    if (this.deps.setTrackedTelegramMessage) {
+      await this.deps.setTrackedTelegramMessage(state).catch(() => undefined);
+    }
+  }
+
+  private async deleteTrackedTelegramMessage(): Promise<void> {
+    const tracked = await this.loadTrackedTelegramMessage();
+    if (!tracked) return;
+    if (this.deps.deleteTelegramMessage) {
+      await this.deps.deleteTelegramMessage(tracked.messageId).catch(() => false);
+    }
+    await this.saveTrackedTelegramMessage(null);
+  }
 
   invalidateIdleCache(): void {
     this.nextIdleDbCheckAt = 0;
@@ -403,6 +439,14 @@ export class RecoveryService {
   async tick(): Promise<{ notified: number }> {
     if (this.tickRunning) return { notified: 0 };
     const now = this.deps.now();
+    const trackedBefore = await this.loadTrackedTelegramMessage();
+    if (
+      trackedBefore &&
+      trackedBefore.expiresAtMs !== null &&
+      trackedBefore.expiresAtMs <= now.getTime()
+    ) {
+      await this.deleteTrackedTelegramMessage();
+    }
     if (process.env.NODE_ENV !== 'test' && this.sessions.size === 0 && now.getTime() < this.nextIdleDbCheckAt) {
       return { notified: 0 };
     }
@@ -415,6 +459,7 @@ export class RecoveryService {
         ? await storeWithMeta.listOpenMeta()
         : await this.deps.store.listOpen();
       if (open.length === 0) {
+        await this.deleteTrackedTelegramMessage();
         this.nextIdleDbCheckAt = now.getTime() + 60 * 60_000;
         return { notified: 0 };
       }
@@ -434,6 +479,10 @@ export class RecoveryService {
           if (REMINDABLE_STATUSES.includes(r.status) && r.nextReminderAt !== null) {
             earliestMs = Math.min(earliestMs, r.nextReminderAt.getTime());
           }
+        }
+        const activeTracked = await this.loadTrackedTelegramMessage();
+        if (activeTracked?.expiresAtMs !== null && activeTracked?.expiresAtMs !== undefined) {
+          earliestMs = Math.min(earliestMs, activeTracked.expiresAtMs);
         }
         this.nextIdleDbCheckAt = Math.max(now.getTime(), Math.min(earliestMs, now.getTime() + 60 * 60_000));
         return { notified: 0 };
@@ -542,16 +591,39 @@ export class RecoveryService {
     if (buttons.length > 0) lines.push('', `<i>Links are single-use and expire in ${ttlMin} minutes. A new one is sent hourly until recovered.</i>`);
 
     const https = this.deps.baseUrl().startsWith('https://');
-    let sent = await this.deps.sendTelegram(lines.join('\n'), https && buttons.length > 0 ? { inline_keyboard: buttons } : undefined);
-    if (!sent && https && buttons.length > 0) {
+    const sendWithOptionalId = async (
+      text: string,
+      markup?: TelegramMarkup,
+    ): Promise<{ ok: boolean; messageId: number | null }> => {
+      if (this.deps.sendTelegramWithId) {
+        const messageId = await this.deps.sendTelegramWithId(text, markup);
+        return { ok: messageId !== null, messageId };
+      }
+      const ok = await this.deps.sendTelegram(text, markup);
+      return { ok, messageId: null };
+    };
+
+    let sendOutcome = await sendWithOptionalId(
+      lines.join('\n'),
+      https && buttons.length > 0 ? { inline_keyboard: buttons } : undefined,
+    );
+    if (!sendOutcome.ok && https && buttons.length > 0) {
       // Fall back to plain-text links if Telegram rejected the inline keyboard.
       const plain = entries.filter((e) => e.link).map((e) => `${esc(e.account.label)}: ${e.link}`);
-      sent = await this.deps.sendTelegram([...lines, '', ...plain].join('\n'));
+      sendOutcome = await sendWithOptionalId([...lines, '', ...plain].join('\n'));
     }
-    if (!sent) {
+    if (!sendOutcome.ok) {
       const retryAt = new Date(this.deps.now().getTime() + 5 * 60_000);
       for (const e of entries) await this.deps.store.rescheduleReminder(e.recovery.id, retryAt);
       return 0;
+    }
+
+    await this.deleteTrackedTelegramMessage();
+    if (sendOutcome.messageId !== null) {
+      await this.saveTrackedTelegramMessage({
+        messageId: sendOutcome.messageId,
+        expiresAtMs: buttons.length > 0 ? this.deps.now().getTime() + this.deps.limits.tokenTtlMs : null,
+      });
     }
     return entries.length;
   }

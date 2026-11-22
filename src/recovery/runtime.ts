@@ -12,7 +12,12 @@ import {
   type AccountIdentity,
 } from '../database/accounts';
 import { findCredentialsForAccount } from '../security/credentialStore';
-import { sendTelegramMessage } from '../notifications/telegram';
+import { getSystemState, setSystemState, SystemKeys } from '../database/models';
+import {
+  deleteTelegramMessage,
+  sendTelegramMessage,
+  sendTelegramMessageWithId,
+} from '../notifications/telegram';
 import { checkSession } from '../browser/sessionCheck';
 import { resolvePublicBaseUrl } from '../leetcode/loginHandoff';
 import { clearLeetCodeLoginCooldown, openLightweightLeetCodeSession, verifyStoredLeetCodeAccount } from '../leetcode/sessionManager';
@@ -134,6 +139,27 @@ export function createProductionRecoveryService(hooks: RecoveryRuntimeHooks = {}
     },
     sendTelegram: (text, markup) =>
       sendTelegramMessage(text, { parseMode: 'HTML', disableWebPagePreview: true, replyMarkup: markup }),
+    sendTelegramWithId: (text, markup) =>
+      sendTelegramMessageWithId(text, { parseMode: 'HTML', disableWebPagePreview: true, replyMarkup: markup }),
+    deleteTelegramMessage: (messageId) => deleteTelegramMessage(messageId),
+    getTrackedTelegramMessage: async () => {
+      const raw = await getSystemState(SystemKeys.recoveryTelegramMessage);
+      if (!raw) return null;
+      try {
+        const parsed = JSON.parse(raw) as { messageId?: unknown; expiresAtMs?: unknown };
+        if (typeof parsed.messageId !== 'number' || !Number.isFinite(parsed.messageId)) return null;
+        const expiresAtMs =
+          typeof parsed.expiresAtMs === 'number' && Number.isFinite(parsed.expiresAtMs)
+            ? parsed.expiresAtMs
+            : null;
+        return { messageId: parsed.messageId, expiresAtMs };
+      } catch {
+        return null;
+      }
+    },
+    setTrackedTelegramMessage: async (state) => {
+      await setSystemState(SystemKeys.recoveryTelegramMessage, state ? JSON.stringify(state) : '');
+    },
     onRecovered: async (account) => {
       await clearLeetCodeLoginCooldown(account.label).catch(() => undefined);
       invalidateHealthCache();
