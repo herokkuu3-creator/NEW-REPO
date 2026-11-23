@@ -6,7 +6,7 @@ export { askSage, probeSageApi } from '../ai/sageProbe';
 
 /** Do not forward recognizable credentials or session data to an AI provider. */
 export function isSensitiveChatText(text: string): boolean {
-  return /(?:\b(?:fc-|sk-|cc_|xpl_|gsk_|coa_|capzy_|CAP-)[A-Za-z0-9_-]{12,}|\b(?:LEETCODE_SESSION|csrftoken|cf_clearance|JSESSIONID|39ce7|password|authorization|api[_ -]?key)\s*[:=]\s*\S+|"(?:LEETCODE_SESSION|csrftoken|cf_clearance|JSESSIONID|39ce7)"|"httpOnly"\s*:)/i.test(text);
+  return /(?:\b(?:fc-|sk-|cc_|xpl_|gsk_|coa_|cfut_|capzy_|CAP-)[A-Za-z0-9_-]{12,}|\b(?:LEETCODE_SESSION|csrftoken|cf_clearance|JSESSIONID|39ce7|password|authorization|api[_ -]?key)\s*[:=]\s*\S+|"(?:LEETCODE_SESSION|csrftoken|cf_clearance|JSESSIONID|39ce7)"|"httpOnly"\s*:)/i.test(text);
 }
 
 export async function answerChat(text: string): Promise<string> {

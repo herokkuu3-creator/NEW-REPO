@@ -4,6 +4,7 @@ import { createDecipheriv, createHash } from 'node:crypto';
 import type { LLMMessage } from '../ai/provider';
 import { config } from '../config';
 import { getSystemState, setSystemState } from '../database/models';
+import { logger } from '../logger';
 import { decryptText, encryptText } from '../security/credentialStore';
 import { CoarenaPause, coarenaPauseForAttempt, isCoarenaSharedLimit, retryAfterMs } from './coarenaLimits';
 import { AIModelRouter, ModelAttempt, OutputValidationError, parseJSON, RoutingError } from './router';
@@ -15,7 +16,20 @@ const BOOTSTRAP_KEY = 'jeYQeXLvzbbbmZpa:XOWp1wC4OfzANW5McLJPTw:wtaRTks1XsSn_04OQ
 export const COARENA_WRITER = 'claude-sonnet-5-5';
 export const COARENA_REVIEWER = 'gemini-4-argon';
 export const COARENA_WRITERS = [COARENA_WRITER, 'gemini-3-8-flash', 'kimi-k3-1-pro'] as const;
-export const COARENA_REVIEWERS = [COARENA_REVIEWER, 'claude-opus-5-5', 'qwen3-8-2-4t-a95b'] as const;
+export const COARENA_REVIEWERS = [COARENA_REVIEWER, 'claude-opus-5-5', 'gpt-6-2-sol'] as const;
+export const COARENA_FALLBACK_MODELS = [
+  'deepseek-v4-1-flash-1017',
+  'gemini-3-8-flash',
+  'mimo-v2-6-pro',
+  'claude-haiku-5-5',
+  'gpt-6-luna',
+  'gpt-6-1-terra',
+  'hy4',
+  'kimi-k3-1-pro',
+  'gpt-6-2-sol',
+  'gpt-6-1-sol',
+  'grok-4-7',
+] as const;
 const MODEL_STATE = 'solution-post-coarena-models:v1';
 const modelPreference = z.object({ writer: z.enum(COARENA_WRITERS), reviewer: z.enum(COARENA_REVIEWERS) }).strict();
 type ModelPreference = z.infer<typeof modelPreference>;
@@ -39,10 +53,36 @@ export async function setCoarenaModelPreference(input: unknown) {
   await setSystemState(MODEL_STATE, JSON.stringify(selected));
   return loadCoarenaModelOrder();
 }
-const DAILY_LIMIT = 5;
-const limitsSchema = z.object({ data: z.object({ free: z.boolean(), usd_per_day: z.number(), today: z.object({
-  used_usd: z.number(), left_usd: z.number(), held_usd: z.number().optional(), resets_at: z.number(), requests_left: z.number().nullable(),
-}) }) });
+const resetTimestamp = z.union([z.number(), z.string(), z.null(), z.undefined()]).transform(val => {
+  if (val == null) return undefined;
+  if (typeof val === 'number') {
+    if (!Number.isFinite(val) || val <= 0) return undefined;
+    return val < 1e12 ? Math.round(val * 1000) : val;
+  }
+  const trimmed = val.trim();
+  if (!trimmed) return undefined;
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const num = Number(trimmed);
+    if (!Number.isFinite(num) || num <= 0) return undefined;
+    return num < 1e12 ? Math.round(num * 1000) : num;
+  }
+  const parsed = Date.parse(trimmed);
+  return Number.isFinite(parsed) ? parsed : undefined;
+});
+
+const limitsSchema = z.object({
+  data: z.object({
+    free: z.boolean().optional().default(true),
+    usd_per_day: z.number().nullable().optional().default(null),
+    today: z.object({
+      used_usd: z.number().nullable().optional().default(0),
+      left_usd: z.number().nullable().optional().default(null),
+      held_usd: z.number().nullable().optional().default(0),
+      resets_at: resetTimestamp,
+      requests_left: z.number().nullable().optional().default(null),
+    }).passthrough(),
+  }).passthrough(),
+});
 
 export async function loadCoarenaKey(): Promise<string | null> {
   const environment = process.env.COARENA_API_KEY?.trim();
@@ -62,8 +102,17 @@ export async function loadCoarenaKey(): Promise<string | null> {
 export function maskCoarenaKey(key: string): string { return `coa_…${key.slice(-4)}`; }
 
 async function readLimits(key: string) {
-  const response = await fetch(`${BASE_URL}/limits`, { headers: { Authorization: `Bearer ${key}` },
-    redirect: 'error', signal: AbortSignal.timeout(8_000) });
+  let response: Response;
+  try {
+    response = await fetch(`${BASE_URL}/limits`, {
+      headers: { Authorization: `Bearer ${key}` },
+      redirect: 'error',
+      signal: AbortSignal.timeout(12_000),
+    });
+  } catch (error) {
+    logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'Coarena /limits request failed; pausing before retry');
+    throw new CoarenaPause('COARENA_CAPACITY', new Date(Date.now() + 60_000));
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     const pause = coarenaPauseForAttempt({
@@ -73,18 +122,67 @@ async function readLimits(key: string) {
       retryAfterMs: retryAfterMs(response.headers.get('retry-after')),
     });
     if (pause) throw pause;
+    if (response.status === 502 || response.status === 504) {
+      throw new CoarenaPause('COARENA_CAPACITY', new Date(Date.now() + 60_000));
+    }
     throw new RoutingError([], 'COARENA_LIMITS_HTTP_' + response.status);
   }
-  return limitsSchema.parse(await response.json()).data;
+  const raw = await response.json().catch(() => null);
+  const parsed = limitsSchema.safeParse(raw);
+  if (!parsed.success) {
+    logger.warn({ issues: parsed.error.issues.map(issue => issue.path.join('.')) }, 'Coarena /limits schema mismatch; continuing with chat inference');
+    return null;
+  }
+  return parsed.data.data;
+}
+
+const MODEL_ACCESS_TTL_MS = 15 * 60_000;
+const modelAccessCache = new Map<string, { paidModels: Set<string>; freeModels: string[]; expiresAt: number }>();
+
+export function clearCoarenaModelAccessCache(): void {
+  modelAccessCache.clear();
+}
+
+function getModelAccess(quotaKey: string) {
+  const entry = modelAccessCache.get(quotaKey);
+  if (!entry) return undefined;
+  if (entry.expiresAt <= Date.now()) {
+    modelAccessCache.delete(quotaKey);
+    return undefined;
+  }
+  return entry;
+}
+
+function recordPaymentRequired(quotaKey: string, model: string, discoveredFreeModels: string[]): void {
+  const existing = getModelAccess(quotaKey);
+  const paidModels = existing ? new Set(existing.paidModels) : new Set<string>();
+  paidModels.add(model);
+  const freeModels = existing ? existing.freeModels.filter(item => !paidModels.has(item)) : [];
+  for (const candidate of discoveredFreeModels) {
+    if (!paidModels.has(candidate) && !freeModels.includes(candidate)) {
+      freeModels.push(candidate);
+    }
+  }
+  modelAccessCache.set(quotaKey, { paidModels, freeModels, expiresAt: Date.now() + MODEL_ACCESS_TTL_MS });
 }
 
 export async function coarenaStatus() {
   const key = await loadCoarenaKey();
   if (!key) return { enabled: false };
   const [limits, order] = await Promise.all([readLimits(key), loadCoarenaModelOrder()]);
-  return { enabled: true, keyMasked: maskCoarenaKey(key), writer: order.writers[0], reviewer: order.reviewers[0],
-    automaticFailover: true, ...order,
-    dailyLimitUsd: limits.usd_per_day, ...limits.today };
+  const access = getModelAccess(createHash('sha256').update(key).digest('hex'));
+  return {
+    enabled: true,
+    keyMasked: maskCoarenaKey(key),
+    writer: order.writers[0],
+    reviewer: order.reviewers[0],
+    automaticFailover: true,
+    ...order,
+    free: limits?.free ?? null,
+    dailyLimitUsd: limits?.usd_per_day ?? null,
+    ...(limits?.today ?? {}),
+    ...(access?.freeModels.length ? { discoveredFreeModels: [...access.freeModels] } : {}),
+  };
 }
 
 // Coarena enforces the daily account cap, including costs held by in-flight calls.
@@ -109,19 +207,23 @@ export class CoarenaRouter extends AIModelRouter {
   private primaryUnavailable = false;
   private readonly quotaKey: string;
   private resetAt?: number;
+  private lastWriterModel?: string;
+  private lastPrimaryFailure?: string;
 
-  constructor(private readonly key: string, private readonly createFallback: () => Promise<AIModelRouter>,
+  constructor(private readonly key: string, private readonly createFallback: (reason?: string) => Promise<AIModelRouter>,
     onAttempt?: (attempt: ModelAttempt) => void, private readonly deadlineAt?: number,
     private readonly checkpoint?: CoarenaCheckpoint,
     private readonly modelOrder: { writers: readonly string[]; reviewers: readonly string[] } =
       { writers: COARENA_WRITERS, reviewers: COARENA_REVIEWERS }, client?: OpenAI) {
+    const quotaKey = createHash('sha256').update(key).digest('hex');
     super({ apiKey: key, baseUrl: BASE_URL, models: [...modelOrder.writers, ...modelOrder.reviewers],
       writingModels: modelOrder.writers, reviewModels: modelOrder.reviewers,
-      timeoutMs: 40_000, retries: 0, maxTokens: 4096, deadlineAt,
+      fallbackModels: COARENA_FALLBACK_MODELS,
+      timeoutMs: 90_000, retries: 0, maxTokens: 4096, deadlineAt,
       beforeInference: async attempts => {
         // The first inference already has a fresh allowance check. Every physical
         // fallback call rechecks the budget before it spends another token.
-        if (attempts.some(attempt => attempt.attempt > 0 && attempt.model !== 'discovery')) {
+        if (attempts.some(attempt => attempt.attempt > 0 && attempt.model !== 'discovery' && attempt.httpStatus !== 402)) {
           try { await this.checkAllowance(); }
           catch (error) {
             if (error instanceof CoarenaPause) throw error.withAttempts(attempts);
@@ -133,27 +235,44 @@ export class CoarenaRouter extends AIModelRouter {
         if (delay > 0) await new Promise<void>(resolve => setTimeout(resolve, delay));
         nextStart = Date.now() + 2100;
       },
-      stopAfterAttempt: attempt => isCoarenaSharedLimit(attempt) || attempt.httpStatus === 403 ||
-        ['content_filtered', 'model_api_disabled', 'model_api_off'].includes(attempt.providerCode ?? ''),
+      stopAfterAttempt: attempt => isCoarenaSharedLimit(attempt) ||
+        (attempt.httpStatus === 403 && attempt.providerCode !== 'region_not_supported') ||
+        ['model_api_disabled', 'model_api_off'].includes(attempt.providerCode ?? ''),
+      getCoarenaPrioritizedModels: stage => {
+        const access = getModelAccess(quotaKey);
+        if (!access) return { skip: new Set<string>(), prefer: [] };
+        if (stage?.startsWith('technical review') && this.lastWriterModel && access.freeModels.length > 1) {
+          const others = access.freeModels.filter(m => m !== this.lastWriterModel);
+          return { skip: access.paidModels, prefer: [...others, this.lastWriterModel] };
+        }
+        return { skip: access.paidModels, prefer: [...access.freeModels] };
+      },
+      onCoarenaPaymentRequired: (model, discovered) => {
+        recordPaymentRequired(quotaKey, model, discovered);
+        logger.info({ model, discoveredFreeModels: discovered }, 'Coarena model requires credits; switching to free model');
+      },
+      onCoarenaModelSuccess: (model, stage) => {
+        if (!stage?.startsWith('technical review')) this.lastWriterModel = model;
+      },
     }, client, undefined, attempt => { attempt.provider = 'coarena'; onAttempt?.(attempt); });
-    this.quotaKey = createHash('sha256').update(key).digest('hex');
+    this.quotaKey = quotaKey;
   }
 
   private async checkAllowance(): Promise<void> {
     const limits = await readLimits(this.key);
-    if (!limits.free || limits.usd_per_day > DAILY_LIMIT) throw new RoutingError([], 'COARENA_FREE_LIMIT_REQUIRED');
+    if (!limits) return;
     const { left_usd, requests_left, resets_at, held_usd } = limits.today;
     this.resetAt = resets_at;
-    if (requests_left !== 0 && left_usd > 0) return;
+    if (requests_left !== 0 && (left_usd == null || left_usd > 0)) return;
     if (requests_left !== 0 && held_usd && held_usd > 0) throw new CoarenaPause('COARENA_CAPACITY', new Date(Date.now() + 60_000));
     const nextDay = (Math.floor(Date.now() / 86_400_000) + 1) * 86_400_000;
-    throw new CoarenaPause('COARENA_DAILY_LIMIT', new Date(resets_at > Date.now() ? resets_at : nextDay));
+    throw new CoarenaPause('COARENA_DAILY_LIMIT', new Date(resets_at && resets_at > Date.now() ? resets_at : nextDay));
   }
 
   get canUsePrimary(): boolean { return !this.primaryUnavailable; }
 
   fallback(): Promise<AIModelRouter> {
-    this.fallbackRouter ??= this.createFallback();
+    this.fallbackRouter ??= this.createFallback(this.lastPrimaryFailure);
     return this.fallbackRouter;
   }
 
@@ -193,6 +312,10 @@ export class CoarenaRouter extends AIModelRouter {
           if (!pause && error.lastFailure === 'ARTICLE_TIME_BUDGET_EXCEEDED') {
             throw capacityPause().withAttempts(error.attempts);
           }
+          if (!pause && error.attempts.at(-1)?.model === 'discovery' &&
+            ['TIMEOUT', 'CONNECTION_ERROR'].includes(error.lastFailure ?? '')) {
+            throw capacityPause().withAttempts(error.attempts);
+          }
         }
         if (pause) {
           cooldowns.set(this.quotaKey, pause);
@@ -212,10 +335,25 @@ export class CoarenaRouter extends AIModelRouter {
       if (error instanceof CoarenaPause) throw error;
       if (error instanceof RoutingError) {
         const last = error.attempts.at(-1);
-        this.primaryUnavailable = !last || last.model === 'discovery' || [401, 402, 403].includes(last.httpStatus ?? 0) ||
-          ['model_api_disabled', 'model_api_off'].includes(last.providerCode ?? '');
+        const modelAttempts = error.attempts.filter(a => a.attempt > 0 && a.model !== 'discovery');
+        const allPaymentRequired = modelAttempts.length > 0 && modelAttempts.every(a => a.httpStatus === 402);
+        this.lastPrimaryFailure = error.lastFailure ?? last?.providerCode ?? last?.outcome ?? 'COARENA_UNAVAILABLE';
+        this.primaryUnavailable = !last || last.httpStatus === 401 ||
+          (last.httpStatus === 403 && last.providerCode !== 'region_not_supported') ||
+          ['model_api_disabled', 'model_api_off'].includes(last.providerCode ?? '') ||
+          ['COARENA_LIMITS_HTTP_401', 'COARENA_LIMITS_HTTP_403'].includes(error.lastFailure ?? '') ||
+          allPaymentRequired;
+        logger.warn({
+          outcome: this.lastPrimaryFailure,
+          httpStatus: last?.httpStatus,
+          providerCode: last?.providerCode,
+          model: last?.model,
+          primaryUnavailable: this.primaryUnavailable,
+        }, 'Coarena primary inference failed');
         throw error;
       }
+      logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'Coarena primary request threw unexpected error');
+      this.lastPrimaryFailure = 'COARENA_UNAVAILABLE';
       this.primaryUnavailable = true;
       throw new RoutingError([], 'COARENA_UNAVAILABLE');
     } finally {

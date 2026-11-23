@@ -320,7 +320,7 @@ export async function testSolutionApiKey(candidateKey?: string, model?: string):
     return { ok: false, keyMasked: masked, modelsStatus: 0, modelsCount: 0, error: 'MODEL_NOT_ALLOWED', executionHost };
   }
   const redact = (value: string) => value.split(key!).join('[REDACTED]')
-    .replace(/(?:(?:cc|gsk)_|sk-bl-)[A-Za-z0-9_-]+/g, '[REDACTED]').slice(0, 300);
+    .replace(/(?:(?:cc|gsk|cfut)_|sk-bl-)[A-Za-z0-9_-]+/g, '[REDACTED]').slice(0, 300);
   try {
     const baseUrl = config.solutionPosts.baseUrl || DEFAULT_SOLUTION_POST_BASE_URL;
     const modelsUrl = new URL('models', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);

@@ -2,9 +2,9 @@ import OpenAI from 'openai';
 import { afterEach, expect, it, vi } from 'vitest';
 import { AIModelRouter, RoutingError } from '../src/solutionPosts/router';
 import * as state from '../src/database/models';
-import { CoarenaRouter, COARENA_WRITER, loadCoarenaModelOrder, setCoarenaModelPreference, type CoarenaReply } from '../src/solutionPosts/coarena';
+import { CoarenaRouter, COARENA_WRITER, clearCoarenaModelAccessCache, loadCoarenaModelOrder, setCoarenaModelPreference, type CoarenaReply } from '../src/solutionPosts/coarena';
 
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(() => { clearCoarenaModelAccessCache(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 const request = [{ role: 'user' as const, content: 'Write an article.' }];
 const validate = (output: string) => output.trim();
@@ -178,7 +178,7 @@ it('saves a preferred pair, keeps the alternate models, and restores automatic o
   vi.spyOn(state, 'setSystemState').mockImplementation(async (_key, value) => { stored = value; });
   await expect(setCoarenaModelPreference({ writer: 'gemini-3-8-flash', reviewer: 'claude-opus-5-5' })).resolves.toMatchObject({
     mode: 'preferred', writers: ['gemini-3-8-flash', 'claude-sonnet-5-5', 'kimi-k3-1-pro'],
-    reviewers: ['claude-opus-5-5', 'gemini-4-argon', 'qwen3-8-2-4t-a95b'],
+    reviewers: ['claude-opus-5-5', 'gemini-4-argon', 'gpt-6-2-sol'],
   });
   await expect(setCoarenaModelPreference({ writer: 'unknown', reviewer: 'claude-opus-5-5' })).rejects.toThrow();
   await expect(setCoarenaModelPreference('auto')).resolves.toMatchObject({ mode: 'auto' });
@@ -202,3 +202,119 @@ it('converts ARTICLE_TIME_BUDGET_EXCEEDED from fallback into a CoarenaPause capa
   });
   expect(fallback).toHaveBeenCalledOnce();
 });
+
+it('switches to named free models on HTTP 402 payment_required, caches access per key, and picks an independent reviewer', async () => {
+  const models = { writers: ['writer-a', 'writer-b'], reviewers: ['review-a', 'review-b'] };
+  const available = [...models.writers, ...models.reviewers, 'free-1', 'free-2'];
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ data: { free: true, usd_per_day: 5, today: {
+    used_usd: 0, left_usd: 5, resets_at: Date.now() + 60_000, requests_left: null,
+  } } })));
+  const calls: string[] = [];
+  const createClient = () => new OpenAI({ apiKey: 'test', baseURL: 'https://coarena.ai/api/v1', maxRetries: 0,
+    fetch: (async (url: URL, options?: { body?: string }) => {
+      if (url.toString().endsWith('/models')) return Response.json({ data: available.map(id => ({ id })) });
+      const model = JSON.parse(options!.body!).model as string;
+      calls.push(model);
+      if (model === 'writer-a') {
+        return Response.json({ error: { code: 'payment_required', message: 'Credits needed. Free models: free-1, free-2.' } }, { status: 402 });
+      }
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: `ok:${model}` } }] });
+    }) as never });
+  const fallback = vi.fn(async () => { throw new Error('unexpected Discovery fallback'); });
+  const key = 'coa_402_named_' + Math.random();
+  const r1 = new CoarenaRouter(key, fallback, undefined, undefined, undefined, models, createClient());
+  expect(await r1.generate(request, validate, 128, true, 'article and GIF storyboards')).toMatchObject({
+    model: 'free-1', value: 'ok:free-1',
+  });
+  expect(calls).toEqual(['writer-a', 'free-1']);
+
+  const r2 = new CoarenaRouter(key, fallback, undefined, undefined, undefined, models, createClient());
+  expect(await r2.generate(request, validate, 128, true, 'article and GIF storyboards')).toMatchObject({
+    model: 'free-1', value: 'ok:free-1',
+  });
+  expect(await r2.generate(request, validate, 128, true, 'technical review article')).toMatchObject({
+    model: 'free-2', value: 'ok:free-2',
+  });
+  expect(calls).toEqual(['writer-a', 'free-1', 'free-1', 'free-2']);
+  expect(fallback).not.toHaveBeenCalled();
+}, 25000);
+
+it('falls over to active COARENA_FALLBACK_MODELS on HTTP 402 without named models', async () => {
+  const models = { writers: ['writer-a'], reviewers: ['review-a'] };
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ data: { free: true, usd_per_day: 5, today: {
+    used_usd: 0, left_usd: 5, resets_at: Date.now() + 60_000, requests_left: null,
+  } } })));
+  const calls: string[] = [];
+  const client = new OpenAI({ apiKey: 'test', baseURL: 'https://coarena.ai/api/v1', maxRetries: 0,
+    fetch: (async (url: URL, options?: { body?: string }) => {
+      if (url.toString().endsWith('/models')) return Response.json({ data: [{ id: 'writer-a' }, { id: 'deepseek-v4-1-flash-1017' }] });
+      const model = JSON.parse(options!.body!).model as string;
+      calls.push(model);
+      if (model === 'writer-a') {
+        return Response.json({ error: { code: 'payment_required', message: 'Credits required for this model.' } }, { status: 402 });
+      }
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: 'fallback-ok' } }] });
+    }) as never });
+  const fallback = vi.fn(async () => { throw new Error('unexpected Discovery fallback'); });
+  const router = new CoarenaRouter('coa_402_unnamed_' + Math.random(), fallback, undefined, undefined, undefined, models, client);
+  expect(await router.generate(request, validate, 128, true, 'article')).toMatchObject({
+    model: 'deepseek-v4-1-flash-1017', value: 'fallback-ok',
+  });
+  expect(calls).toEqual(['writer-a', 'deepseek-v4-1-flash-1017']);
+  expect(fallback).not.toHaveBeenCalled();
+}, 15000);
+
+it('accepts higher granted daily limits, paid credit accounts, ISO resets_at, and pauses on /limits timeout', async () => {
+  const models = { writers: ['writer-a'], reviewers: ['review-a'] };
+  const makeClient = () => new OpenAI({ apiKey: 'test', baseURL: 'https://coarena.ai/api/v1', maxRetries: 0,
+    fetch: (async (url: URL) => {
+      if (url.toString().endsWith('/models')) return Response.json({ data: [{ id: 'writer-a' }] });
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: 'ok' } }] });
+    }) as never });
+  const fallback = vi.fn(async () => { throw new Error('unexpected Discovery fallback'); });
+
+  // 1. Granted higher daily limit (usd_per_day: 25) + ISO string resets_at
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ data: { free: true, usd_per_day: 25, today: {
+    used_usd: 1, left_usd: 24, resets_at: new Date(Date.now() + 60_000).toISOString(), requests_left: null,
+  } } })));
+  const rGranted = new CoarenaRouter('coa_granted_' + Math.random(), fallback, undefined, undefined, undefined, models, makeClient());
+  expect((await rGranted.generate(request, validate)).value).toBe('ok');
+
+  // 2. Paid credits account (free: false, usd_per_day: null, left_usd: null)
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ data: { free: false, usd_per_day: null, today: {
+    used_usd: 0.5, left_usd: null, resets_at: Math.floor((Date.now() + 60_000) / 1000), requests_left: null,
+  } } })));
+  const rPaid = new CoarenaRouter('coa_paid_' + Math.random(), fallback, undefined, undefined, undefined, models, makeClient());
+  expect((await rPaid.generate(request, validate)).value).toBe('ok');
+
+  // 3. Transient /limits timeout pauses with COARENA_CAPACITY instead of calling Discovery
+  vi.stubGlobal('fetch', vi.fn(async () => { throw new DOMException('The operation timed out.', 'TimeoutError'); }));
+  const rTimeout = new CoarenaRouter('coa_limits_timeout_' + Math.random(), fallback, undefined, undefined, undefined, models, makeClient());
+  await expect(rTimeout.generate(request, validate)).rejects.toMatchObject({ code: 'COARENA_CAPACITY' });
+  expect(fallback).not.toHaveBeenCalled();
+}, 20000);
+
+it('retries once with bumped max_tokens on Coarena INCOMPLETE_OUTPUT before failing over', async () => {
+  const models = { writers: ['writer-a'], reviewers: ['review-a'] };
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ data: { free: true, usd_per_day: 5, today: {
+    used_usd: 0, left_usd: 5, resets_at: Date.now() + 60_000, requests_left: null,
+  } } })));
+  const seenTokens: number[] = [];
+  const client = new OpenAI({ apiKey: 'test', baseURL: 'https://coarena.ai/api/v1', maxRetries: 0,
+    fetch: (async (url: URL, options?: { body?: string }) => {
+      if (url.toString().endsWith('/models')) return Response.json({ data: [{ id: 'writer-a' }] });
+      const body = JSON.parse(options!.body!) as { max_tokens: number };
+      seenTokens.push(body.max_tokens);
+      if (seenTokens.length === 1) {
+        return Response.json({ choices: [{ finish_reason: 'length', message: { content: '{"partial":' } }] });
+      }
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: 'completed' } }] });
+    }) as never });
+  const fallback = vi.fn(async () => { throw new Error('unexpected Discovery fallback'); });
+  const router = new CoarenaRouter('coa_incomplete_' + Math.random(), fallback, undefined, undefined, undefined, models, client);
+  expect(await router.generate(request, validate, 1024, true, 'article')).toMatchObject({
+    model: 'writer-a', value: 'completed',
+  });
+  expect(seenTokens).toEqual([1024, 2048]);
+  expect(fallback).not.toHaveBeenCalled();
+}, 15000);

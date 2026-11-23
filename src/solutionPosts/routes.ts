@@ -31,6 +31,7 @@ import { configureServerTest, readServerTest, startServerTest } from './serverTe
 import { dailyPublicationStatus } from './dailyPublication';
 import { createAccountVisualPreview } from './visualPreview';
 import { coarenaStatus, enableCoarena } from './coarena';
+import { cloudflareAiStatus, probeCloudflareAi } from './cloudflareAi';
 import { isCoarenaPaused } from './coarenaLimits';
 import { RoutingError } from './router';
 
@@ -70,6 +71,11 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
       return createAccountVisualPreview(accountId);
     });
     scoped.get('/admin/solutions/coarena', async () => coarenaStatus());
+    scoped.get('/admin/solutions/cloudflare', async () => cloudflareAiStatus());
+    scoped.post('/admin/solutions/cloudflare/test', async req => {
+      const body = z.object({ model: z.string().regex(/^@cf\/[A-Za-z0-9._/-]{1,120}$/).optional() }).strict().parse(req.body ?? {});
+      return probeCloudflareAi({ model: body.model });
+    });
     scoped.post('/admin/solutions/coarena', async (req, reply) => {
       const { apiKey } = z.object({ apiKey: z.string().trim().regex(/^coa_[A-Za-z0-9_-]{16,128}$/) }).strict().parse(req.body);
       try { return await enableCoarena(apiKey); }

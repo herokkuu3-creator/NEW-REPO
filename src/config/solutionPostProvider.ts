@@ -21,6 +21,17 @@ export function isSageProvider(baseUrl: string): boolean {
   }
 }
 
+export function isCloudflareAiProvider(baseUrl: string): boolean {
+  try {
+    const url = new URL(baseUrl);
+    return url.protocol === 'https:' &&
+      url.hostname === 'api.cloudflare.com' &&
+      /\/client\/v4\/accounts\/[^/]+\/ai\/v1\/?$/.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
 /** Keep free model requests from automatically falling back to paid usage. */
 export function solutionPostProviderHeaders(baseUrl: string): Record<string, string> {
   return isBazaarLinkProvider(baseUrl) ? { 'X-Free-Fallback': 'false' } : {};

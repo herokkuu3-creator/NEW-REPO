@@ -26,6 +26,7 @@ import { startArticleWorkKeepAlive } from './keepAlive';
 import { generateImplementation, IMPLEMENTATION_STAGE_BUDGET } from './implementation';
 import { extractRelevantCodeSnippets, generateMultiLanguageCode, supportsMultiLanguage } from './multiLanguage';
 import { CoarenaRouter, loadCoarenaKey, loadCoarenaModelOrder, maskCoarenaKey, type CoarenaReply } from './coarena';
+import { CloudflareAiRouter, loadCloudflareAiConfig, maskCloudflareToken } from './cloudflareAi';
 import { CoarenaPause, isCoarenaPauseCode, isCoarenaPaused } from './coarenaLimits';
 import { notifySolutionPostSchedulerWork } from './schedulerGate';
 
@@ -157,12 +158,47 @@ export async function loadContext(accountId: string, runId: string): Promise<Sub
   });
 }
 
+async function createSecondaryRouter(
+  correlation: { postId?: string; accountId?: string },
+  reportKey?: (label: string) => void,
+  deadlineAt?: number,
+  coarenaFallbackReason?: string,
+): Promise<AIModelRouter> {
+  const cf = loadCloudflareAiConfig();
+  if (cf) {
+    const cfLabel = 'Cloudflare AI · ' + maskCloudflareToken(cf.apiToken);
+    reportKey?.(coarenaFallbackReason ? `${cfLabel} (Coarena fallback: ${coarenaFallbackReason})` : cfLabel);
+    return new CloudflareAiRouter(
+      cf,
+      cfReason => createDiscoveryRouter(
+        correlation,
+        label => reportKey?.(cfReason ? `${label} (Cloudflare fallback: ${cfReason})` : label),
+        deadlineAt,
+      ),
+      attempt => {
+        if (attempt.outcome === 'SUCCESS') {
+          reportKey?.(coarenaFallbackReason
+            ? `${cfLabel} · ${attempt.model} (Coarena fallback: ${coarenaFallbackReason})`
+            : `${cfLabel} · ${attempt.model}`);
+        }
+        logger.info({ ...correlation, attempt }, 'solution article AI attempt finished');
+      },
+      deadlineAt,
+    );
+  }
+  return createDiscoveryRouter(
+    correlation,
+    label => reportKey?.(coarenaFallbackReason ? `${label} (Coarena fallback: ${coarenaFallbackReason})` : label),
+    deadlineAt,
+  );
+}
+
 export async function createPostRouter(correlation: { postId?: string; accountId?: string } = {},
   providerOverride?: 'firecrawl' | 'bazaarlink', reportKey?: (label: string) => void): Promise<AIModelRouter> {
   const deadlineAt = providerOverride ? undefined : Date.now() + SOLUTION_ARTICLE_WORK_MS;
   const key = providerOverride ? null : await loadCoarenaKey().catch(() => null);
   if (key) reportKey?.('Coarena · ' + maskCoarenaKey(key));
-  if (key) return new CoarenaRouter(key, () => createDiscoveryRouter(correlation, reportKey, deadlineAt), attempt => {
+  if (key) return new CoarenaRouter(key, reason => createSecondaryRouter(correlation, reportKey, deadlineAt, reason), attempt => {
     if (attempt.outcome === 'SUCCESS') reportKey?.('Coarena · ' + maskCoarenaKey(key) + ' · ' + attempt.model);
     logger.info({ ...correlation, attempt }, 'solution article AI attempt finished');
   }, deadlineAt, correlation.postId ? {
@@ -172,17 +208,20 @@ export async function createPostRouter(correlation: { postId?: string; accountId
     },
     save: (id, reply) => setSystemState(checkpointPrefix(correlation.postId!) + id, JSON.stringify(reply)),
   } : undefined, await loadCoarenaModelOrder());
+  if (!providerOverride) {
+    logger.warn({ ...correlation }, 'Coarena key unavailable; falling back directly to Cloudflare/Discovery');
+  }
   if ((providerOverride ?? config.solutionPosts.aiProvider) === 'firecrawl') {
     if (!config.solutionPosts.firecrawlApiKey) throw new PostError('FIRECRAWL_KEY_REQUIRED');
     return new FirecrawlAgentRouter(config.solutionPosts.firecrawlApiKey, config.solutionPosts.agentMaxCredits,
       attempt => logger.info({ ...correlation, attempt }, 'solution article AI attempt finished'));
   }
-  return createDiscoveryRouter(correlation, reportKey, deadlineAt);
+  return createSecondaryRouter(correlation, reportKey, deadlineAt);
 }
 
 /**
  * Builds an AI router for solving failed LeetCode questions using configured
- * Coarena / Discovery / Sage keys (never Firecrawl web-research agent).
+ * Coarena / Cloudflare / Discovery / Sage keys (never Firecrawl web-research agent).
  */
 export async function createCodeSolverRouter(
   correlation: { postId?: string; accountId?: string } = {},
@@ -194,7 +233,7 @@ export async function createCodeSolverRouter(
     reportKey?.('Coarena · ' + maskCoarenaKey(key));
     return new CoarenaRouter(
       key,
-      () => createDiscoveryRouter(correlation, reportKey, deadlineAt),
+      reason => createSecondaryRouter(correlation, reportKey, deadlineAt, reason),
       (attempt) => {
         if (attempt.outcome === 'SUCCESS') {
           reportKey?.('Coarena · ' + maskCoarenaKey(key) + ' · ' + attempt.model);
@@ -202,9 +241,11 @@ export async function createCodeSolverRouter(
         logger.info({ ...correlation, attempt }, 'question AI solver attempt finished');
       },
       deadlineAt,
+      undefined,
+      await loadCoarenaModelOrder(),
     );
   }
-  return createDiscoveryRouter(correlation, reportKey, deadlineAt);
+  return createSecondaryRouter(correlation, reportKey, deadlineAt);
 }
 
 async function createDiscoveryRouter(correlation: { postId?: string; accountId?: string }, reportKey?: (label: string) => void,
@@ -377,7 +418,8 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
     // A CAS failure must not overwrite the current owner's result.
     if (['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING'].includes(post.status)) {
       post = await move(post, 'FAILED', { leaseUntil: null,
-        lastError: error instanceof RoutingError && error.lastFailure === 'HTTP_429' ? 'AI_RATE_LIMITED' :
+        lastError: error instanceof RoutingError && error.lastFailure === 'AI_QUOTA_EXCEEDED' ? 'AI_QUOTA_EXCEEDED' :
+          error instanceof RoutingError && error.lastFailure === 'HTTP_429' ? 'AI_RATE_LIMITED' :
           error instanceof ArticleReviewError ?
             error.lastFailure && error.lastFailure !== 'TECHNICAL_REVIEW_REJECTED' ? `AI_ERROR: ${error.lastFailure}` : 'TECHNICAL_REVIEW_FAILED' :
           error instanceof RoutingError ? (error.lastFailure === 'HTTP_401' ? 'AI_AUTHENTICATION_FAILED' :
@@ -564,6 +606,8 @@ export async function resetFailedSolutionPostRetries(): Promise<number> {
         { lastError: 'AI_KEYS_EXHAUSTED' },
         { lastError: 'AI_PROVIDER_ACCESS_BLOCKED' },
         { lastError: 'AI_AUTHENTICATION_FAILED' },
+        { lastError: 'AI_RATE_LIMITED' },
+        { lastError: 'AI_QUOTA_EXCEEDED' },
         { lastError: { startsWith: 'AI_ERROR:' } },
         { lastError: 'TECHNICAL_REVIEW_FAILED' },
       ],

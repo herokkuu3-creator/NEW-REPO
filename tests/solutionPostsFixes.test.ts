@@ -1285,3 +1285,133 @@ describe('serverTest.ts and providerDiagnostics.ts fixes', () => {
     expect(JSON.stringify(warn.mock.calls)).not.toContain('fc-secret-credit-key-123456');
   });
 });
+
+describe('Discovery quota_exceeded per-key rotation and recovery', () => {
+  it('rotates immediately to backup Discovery key on 429 quota_exceeded without per-key cooldown blocking key #2', async () => {
+    const { AIModelRouter } = await import('../src/solutionPosts/router');
+    const makeClient = (key: string) => ({
+      models: { list: vi.fn(async () => ({ data: [{ id: 'deepseek-v4.1-flash-1017' }, { id: 'qwen3.8-27b' }] })) },
+      chat: {
+        completions: {
+          create: vi.fn(async () => {
+            if (key === 'sk-quota-1') {
+              throw new OpenAI.RateLimitError(
+                429,
+                { error: { code: 'quota_exceeded', type: 'quota_exceeded', message: 'quota exceeded' } },
+                'quota exceeded',
+                undefined,
+              );
+            }
+            return { choices: [{ finish_reason: 'stop', message: { content: 'backup-ok' } }] };
+          }),
+        },
+      },
+    });
+    const onRotate = vi.fn(async () => {});
+    const router = new AIModelRouter(
+      {
+        apiKey: 'sk-quota-1',
+        apiKeys: ['sk-quota-1', 'sk-quota-2'],
+        baseUrl: 'https://discovery-api.intern-ai.org.cn/v1',
+        models: ['deepseek-v4.1-flash-1017', 'qwen3.8-27b'],
+        timeoutMs: 1000,
+        retries: 0,
+        maxTokens: 100,
+        deferOnRateLimit: true,
+        minRequestIntervalMs: 0,
+      },
+      undefined,
+      async () => {},
+      undefined,
+      onRotate,
+      key => makeClient(key) as never,
+    );
+
+    const result = await router.generate([{ role: 'user', content: 'hi' }], t => t);
+    expect(result.value).toBe('backup-ok');
+    expect(onRotate).toHaveBeenCalledWith('sk-quota-1', 'HTTP_429');
+  });
+
+  it('fails immediately with AI_QUOTA_EXCEEDED on the only/last Discovery key without looping models', async () => {
+    const { AIModelRouter } = await import('../src/solutionPosts/router');
+    const create = vi.fn(async () => {
+      throw new OpenAI.RateLimitError(
+        429,
+        { error: { code: 'quota_exceeded', type: 'quota_exceeded', message: 'quota exceeded' } },
+        'quota exceeded',
+        undefined,
+      );
+    });
+    const api = {
+      models: { list: vi.fn(async () => ({ data: [{ id: 'deepseek-v4.1-flash-1017' }, { id: 'qwen3.8-27b' }, { id: 'Sage-A1.5' }] })) },
+      chat: { completions: { create } },
+    };
+    const router = new AIModelRouter(
+      {
+        apiKey: 'sk-quota-only',
+        baseUrl: 'https://discovery-api.intern-ai.org.cn/v1',
+        models: ['deepseek-v4.1-flash-1017', 'qwen3.8-27b', 'Sage-A1.5'],
+        timeoutMs: 1000,
+        retries: 0,
+        maxTokens: 100,
+        deferOnRateLimit: true,
+        minRequestIntervalMs: 0,
+      },
+      api as never,
+      async () => {},
+    );
+
+    await expect(router.generate([{ role: 'user', content: 'hi' }], t => t)).rejects.toMatchObject({
+      lastFailure: 'AI_QUOTA_EXCEEDED',
+    });
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it('resetFailedSolutionPostRetries unlocks AI_QUOTA_EXCEEDED and AI_RATE_LIMITED posts', async () => {
+    vi.resetModules();
+    const posts = [
+      { id: 'p1', status: 'FAILED', lastError: 'AI_QUOTA_EXCEEDED', retryCount: 2 },
+      { id: 'p2', status: 'FAILED', lastError: 'AI_RATE_LIMITED', retryCount: 1 },
+      { id: 'p3', status: 'FAILED', lastError: 'OTHER_ERROR', retryCount: 1 },
+    ];
+    const notify = vi.fn();
+    mockModule('../src/database/prisma', () => ({
+      prisma: {
+        solutionPost: {
+          updateMany: vi.fn(async ({ where, data }: any) => {
+            const orList = (where?.OR ?? []) as Array<{ lastError?: string | { startsWith?: string } }>;
+            let count = 0;
+            for (const row of posts) {
+              if (row.status !== where?.status) continue;
+              const matches = orList.some(cond => {
+                if (typeof cond.lastError === 'string') return row.lastError === cond.lastError;
+                if (cond.lastError && typeof cond.lastError.startsWith === 'string') {
+                  return row.lastError.startsWith(cond.lastError.startsWith);
+                }
+                return false;
+              });
+              if (matches) {
+                row.status = data.status;
+                row.retryCount = data.retryCount;
+                count++;
+              }
+            }
+            return { count };
+          }),
+        },
+        systemState: {
+          deleteMany: vi.fn(async () => ({ count: 0 })),
+        },
+      },
+    }));
+    mockModule('../src/solutionPosts/schedulerGate', () => ({ notifySolutionPostSchedulerWork: notify }));
+
+    const { resetFailedSolutionPostRetries } = await import('../src/solutionPosts/service');
+    const unlocked = await resetFailedSolutionPostRetries();
+    expect(unlocked).toBe(2);
+    expect(posts.find(p => p.id === 'p1')).toMatchObject({ status: 'RETRY_PENDING', retryCount: 0 });
+    expect(posts.find(p => p.id === 'p2')).toMatchObject({ status: 'RETRY_PENDING', retryCount: 0 });
+    expect(posts.find(p => p.id === 'p3')).toMatchObject({ status: 'FAILED', retryCount: 1 });
+    expect(notify).toHaveBeenCalledOnce();
+  });
+});

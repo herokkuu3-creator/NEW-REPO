@@ -125,6 +125,7 @@ import { disableForecastSchedule, formatForecastPicks, getForecastScheduleStatus
   saveForecastSchedule } from '../solutionPosts/forecastScheduler';
 import { resetFailedSolutionPostRetries } from '../solutionPosts/service';
 import { loadCoarenaKey, loadCoarenaModelOrder, maskCoarenaKey, setCoarenaModelPreference } from '../solutionPosts/coarena';
+import { CLOUDFLARE_WRITERS, loadCloudflareAiConfig, maskCloudflareToken } from '../solutionPosts/cloudflareAi';
 import { boostSolutionArticleViews, extractTopicIdFromUrl, fetchLiveSolutionMetrics } from '../solutionPosts/upvote';
 import { prisma } from '../database/prisma';
 import { firecrawlProbeRequest, probeFirecrawl } from '../solutionPosts/firecrawlProbe';
@@ -2475,10 +2476,13 @@ function solutionStageText(stage: string, error?: string, previousError?: string
       if (error === 'AI_PROVIDER_ACCESS_BLOCKED') return '❌ The AI provider blocked this server (HTTP 403). Check /testsolkey; provider access must be restored.';
       if (error === 'AI_CONFIGURATION_REQUIRED') return '❌ No active AI keys. Use /setsolutionkeys to add a key for the configured article provider.';
       if (error === 'AI_KEY_INPUT_INVALID') return '❌ The configured article key contains invalid formatting. Run /testsolkey to identify the variable.';
+      if (error === 'AI_QUOTA_EXCEEDED') {
+        return '❌ Intern-AI (discovery-api) quota exceeded (HTTP 429 quota_exceeded). Add a fresh key with /addsolkey or check /solutionkeystatus.';
+      }
       if (error === 'AI_RATE_LIMITED' || error === 'AI_ERROR: HTTP_429') return config.solutionPosts.aiProvider === 'firecrawl'
         ? '⏳ Firecrawl Agent returned HTTP 429. Retry after its rate or allowance limit resets.'
         : isSageProvider(config.solutionPosts.baseUrl)
-          ? '⏳ Intern-AI (discovery-api) returned a rate limit (HTTP 429). The system will back off and retry automatically.'
+          ? '⏳ Intern-AI (discovery-api) returned a rate limit (HTTP 429). Retry later or check /solutionkeystatus.'
           : '⏳ AI provider returned a rate limit (HTTP 429). Key retained; retry after the provider limit resets.';
       if (error === 'FIRECRAWL_KEY_REQUIRED') return '❌ Firecrawl Agent requires FIRECRAWL_API_KEY in the server environment.';
       if (error === 'AI_ERROR: FIRECRAWL_CREDIT_LIMIT') return '❌ Firecrawl Agent reached the per-job credit limit; no article was published.';
@@ -4914,12 +4918,15 @@ async function handleCoarenaModels(argument?: string): Promise<void> {
 
 export async function formatSolutionKeyStatus(): Promise<string> {
   const [status, primary, models] = await Promise.all([solutionKeyPoolStatus(), loadCoarenaKey(), loadCoarenaModelOrder()]);
+  const cf = loadCloudflareAiConfig();
   const lines = [
     '✨ <b>Article AI Providers</b>',
     '<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>',
     primary ? `Primary: <b>Coarena</b> · <code>${escapeHtml(maskCoarenaKey(primary))}</code> · ${escapeHtml(models.writers[0]!)}` :
-      'Primary: <b>Discovery</b>',
-    primary ? '<b>Discovery fallback keys</b>' : '<b>Discovery keys</b>',
+      cf ? `Primary: <b>Cloudflare AI</b> · <code>${escapeHtml(maskCloudflareToken(cf.apiToken))}</code> · ${escapeHtml(CLOUDFLARE_WRITERS[0])}` :
+        'Primary: <b>Discovery</b>',
+    ...(primary && cf ? [`Fallback #1: <b>Cloudflare AI</b> · <code>${escapeHtml(maskCloudflareToken(cf.apiToken))}</code> · ${escapeHtml(CLOUDFLARE_WRITERS[0])}`] : []),
+    primary || cf ? '<b>Discovery fallback keys</b>' : '<b>Discovery keys</b>',
     `Stored keys: <b>${status.total}</b>`,
     `Active key: <b>${status.active ? `#${status.active}` : 'none'}</b>`,
     `Source: <b>${escapeHtml(status.source)}</b>`,

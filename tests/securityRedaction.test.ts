@@ -15,12 +15,15 @@ describe('Security & Secret Redaction', () => {
       'proxy=http://proxy_user:SuperSecretPass99@proxy.example.test:10000',
       'tg=https://api.telegram.org/bot123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd/sendMessage',
       'auth=Bearer secret-bearer-token-value-12345',
+      'cf=cfut_testSecretTokenValue1234567890abcdef',
       'cookie=LEETCODE_SESSION=jwt.part1.part2; csrftoken=csrfval123',
     ].join(' | ');
 
     const scrubbed = redactSecrets(raw);
     expect(scrubbed).not.toContain('capzy_abcdef0123456789');
     expect(scrubbed).toContain('capzy_[REDACTED]');
+    expect(scrubbed).not.toContain('cfut_testSecretTokenValue1234567890abcdef');
+    expect(scrubbed).toContain('cfut_[REDACTED]');
     expect(scrubbed).not.toContain('SuperSecretPass99');
     expect(scrubbed).toContain('http://proxy_user:****@proxy.example.test:10000');
     expect(scrubbed).not.toContain('ABCDEFGHIJKLMNOPQRSTUVWXYZabcd');
