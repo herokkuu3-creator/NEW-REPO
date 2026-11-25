@@ -5,7 +5,6 @@ import { redactSecrets } from '../security/redact';
 import { AIModelRouter, ModelAttempt, parseJSON, RoutingError } from './router';
 
 export const DEFAULT_CLOUDFLARE_ACCOUNT_ID = '68c3dd9664c8d0ea78405d66417f9fb0';
-export const DEFAULT_CLOUDFLARE_AI_TOKEN = 'cfut_3m3y3QFFe4EHMlfsptfLHQ5ieVLiBrahu8pOvMxJ40b81eab';
 
 export const CLOUDFLARE_WRITERS = [
   '@cf/openai/gpt-oss-120b',
@@ -29,7 +28,7 @@ export interface CloudflareAiConfig {
   accountId: string;
   apiToken: string;
   baseUrl: string;
-  source: 'environment' | 'hardcoded';
+  source: 'environment';
 }
 
 export function cloudflareAiBaseUrl(accountId: string): string {
@@ -44,31 +43,17 @@ export function maskCloudflareAccountId(accountId: string): string {
   return `${accountId.slice(0, 6)}…${accountId.slice(-4)}`;
 }
 
-export function getHardcodedCloudflareAiConfig(): CloudflareAiConfig {
-  return {
-    accountId: DEFAULT_CLOUDFLARE_ACCOUNT_ID,
-    apiToken: DEFAULT_CLOUDFLARE_AI_TOKEN,
-    baseUrl: cloudflareAiBaseUrl(DEFAULT_CLOUDFLARE_ACCOUNT_ID),
-    source: 'hardcoded',
-  };
-}
-
 export function loadCloudflareAiConfig(): CloudflareAiConfig | null {
   if (process.env.CLOUDFLARE_AI_DISABLED === 'true') return null;
   const envToken = process.env.CLOUDFLARE_AI_API_TOKEN?.trim();
-  if (envToken) {
-    const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim() || DEFAULT_CLOUDFLARE_ACCOUNT_ID;
-    return {
-      accountId,
-      apiToken: envToken,
-      baseUrl: cloudflareAiBaseUrl(accountId),
-      source: 'environment',
-    };
-  }
-  if (process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST)) {
-    return null;
-  }
-  return getHardcodedCloudflareAiConfig();
+  if (!envToken) return null;
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim() || DEFAULT_CLOUDFLARE_ACCOUNT_ID;
+  return {
+    accountId,
+    apiToken: envToken,
+    baseUrl: cloudflareAiBaseUrl(accountId),
+    source: 'environment',
+  };
 }
 
 export class CloudflareAiRouter extends AIModelRouter {
@@ -167,7 +152,15 @@ export function cloudflareAiStatus() {
   if (process.env.CLOUDFLARE_AI_DISABLED === 'true') {
     return { enabled: false, reason: 'CLOUDFLARE_AI_DISABLED' as const };
   }
-  const cfg = loadCloudflareAiConfig() ?? getHardcodedCloudflareAiConfig();
+  const cfg = loadCloudflareAiConfig();
+  if (!cfg) {
+    const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim() || DEFAULT_CLOUDFLARE_ACCOUNT_ID;
+    return {
+      enabled: false,
+      reason: 'CLOUDFLARE_TOKEN_MISSING' as const,
+      accountIdMasked: maskCloudflareAccountId(accountId),
+    };
+  }
   return {
     enabled: true,
     source: cfg.source,
@@ -195,12 +188,21 @@ export async function probeCloudflareAi(options?: {
   apiToken?: string;
   model?: string;
 }) {
-  const baseCfg = loadCloudflareAiConfig() ?? getHardcodedCloudflareAiConfig();
-  const accountId = options?.accountId?.trim() || baseCfg.accountId;
-  const apiToken = options?.apiToken?.trim() || baseCfg.apiToken;
+  const envCfg = loadCloudflareAiConfig();
+  const accountId = options?.accountId?.trim() || envCfg?.accountId || process.env.CLOUDFLARE_ACCOUNT_ID?.trim() || DEFAULT_CLOUDFLARE_ACCOUNT_ID;
+  const apiToken = options?.apiToken?.trim() || envCfg?.apiToken || '';
   const baseUrl = cloudflareAiBaseUrl(accountId);
   const executionHost = process.env.RENDER_INSTANCE_ID ? 'render' : 'local';
   const revision = process.env.RENDER_GIT_COMMIT ?? null;
+  if (!apiToken) {
+    return {
+      ok: false,
+      executionHost,
+      revision,
+      error: 'CLOUDFLARE_TOKEN_MISSING',
+      accountIdMasked: maskCloudflareAccountId(accountId),
+    };
+  }
   const safeText = (value: string) =>
     redactSecrets(
       value
@@ -286,7 +288,7 @@ export async function probeCloudflareAi(options?: {
     ok: writer.ok && (!reviewer || reviewer.ok),
     executionHost,
     revision,
-    source: options?.apiToken?.trim() ? 'override' : baseCfg.source,
+    source: options?.apiToken?.trim() ? 'override' : 'environment',
     accountIdMasked: maskCloudflareAccountId(accountId),
     tokenMasked: maskCloudflareToken(apiToken),
     catalogStatus,

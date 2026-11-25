@@ -7,14 +7,21 @@ import { AIModelRouter, isKeyExhausted, RoutingError } from '../src/solutionPost
 import {
   CLOUDFLARE_REVIEWERS,
   CLOUDFLARE_WRITERS,
+  type CloudflareAiConfig,
   CloudflareAiRouter,
   cloudflareAiBaseUrl,
   DEFAULT_CLOUDFLARE_ACCOUNT_ID,
-  DEFAULT_CLOUDFLARE_AI_TOKEN,
-  getHardcodedCloudflareAiConfig,
   loadCloudflareAiConfig,
   maskCloudflareToken,
 } from '../src/solutionPosts/cloudflareAi';
+
+const TEST_CF_TOKEN = 'cfut_testCloudflareTokenValue1234567890abcd';
+const testCfConfig = (): CloudflareAiConfig => ({
+  accountId: DEFAULT_CLOUDFLARE_ACCOUNT_ID,
+  apiToken: TEST_CF_TOKEN,
+  baseUrl: cloudflareAiBaseUrl(DEFAULT_CLOUDFLARE_ACCOUNT_ID),
+  source: 'environment',
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -34,18 +41,20 @@ describe('Cloudflare Workers AI integration', () => {
     expect(isCloudflareAiProvider('https://coarena.ai/api/v1')).toBe(false);
   });
 
-  it('provides hardcoded defaults, respects env overrides/disable flag, and stays off by default under VITEST', () => {
-    const hardcoded = getHardcodedCloudflareAiConfig();
-    expect(hardcoded.accountId).toBe(DEFAULT_CLOUDFLARE_ACCOUNT_ID);
-    expect(hardcoded.apiToken).toBe(DEFAULT_CLOUDFLARE_AI_TOKEN);
-    expect(hardcoded.baseUrl).toBe(`https://api.cloudflare.com/client/v4/accounts/${DEFAULT_CLOUDFLARE_ACCOUNT_ID}/ai/v1`);
-    expect(hardcoded.source).toBe('hardcoded');
-    expect(maskCloudflareToken(hardcoded.apiToken)).toBe('cfut_…1eab');
-
-    // In VITEST without env token, loadCloudflareAiConfig() stays null so existing tests retain Discovery behavior.
+  it('uses hardcoded account ID with env token, respects disable flag, and stays off when token is unset', () => {
     vi.stubEnv('CLOUDFLARE_AI_API_TOKEN', '');
     vi.stubEnv('CLOUDFLARE_AI_DISABLED', '');
     expect(loadCloudflareAiConfig()).toBeNull();
+
+    vi.stubEnv('CLOUDFLARE_AI_API_TOKEN', TEST_CF_TOKEN);
+    vi.stubEnv('CLOUDFLARE_ACCOUNT_ID', '');
+    expect(loadCloudflareAiConfig()).toEqual({
+      accountId: DEFAULT_CLOUDFLARE_ACCOUNT_ID,
+      apiToken: TEST_CF_TOKEN,
+      baseUrl: `https://api.cloudflare.com/client/v4/accounts/${DEFAULT_CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
+      source: 'environment',
+    });
+    expect(maskCloudflareToken(TEST_CF_TOKEN)).toBe('cfut_…abcd');
 
     vi.stubEnv('CLOUDFLARE_AI_API_TOKEN', 'cfut_custom_env_token_123456');
     vi.stubEnv('CLOUDFLARE_ACCOUNT_ID', 'custom_acct_9999');
@@ -61,7 +70,7 @@ describe('Cloudflare Workers AI integration', () => {
   });
 
   it('skips GET /models (405), normalizes object content, enforces >=4096 max_tokens, and fails over on 403/410', async () => {
-    const cf = getHardcodedCloudflareAiConfig();
+    const cf = testCfConfig();
     const seen: Array<{ url: string; model: string; maxTokens: number }> = [];
     const client = new OpenAI({
       apiKey: cf.apiToken,
@@ -99,7 +108,7 @@ describe('Cloudflare Workers AI integration', () => {
   });
 
   it('uses CLOUDFLARE_REVIEWERS for technical review stages and retries once with doubled max_tokens on INCOMPLETE_OUTPUT', async () => {
-    const cf = getHardcodedCloudflareAiConfig();
+    const cf = testCfConfig();
     const seen: Array<{ model: string; maxTokens: number }> = [];
     const client = new OpenAI({
       apiKey: cf.apiToken,
@@ -126,7 +135,7 @@ describe('Cloudflare Workers AI integration', () => {
   });
 
   it('does not retire Cloudflare key on HTTP 429 and falls back to Discovery when all Cloudflare models fail', async () => {
-    const cf = getHardcodedCloudflareAiConfig();
+    const cf = testCfConfig();
     expect(isKeyExhausted(new OpenAI.RateLimitError(429, {}, 'daily neurons limit', undefined), cf.baseUrl)).toBe(false);
     expect(isKeyExhausted(new OpenAI.AuthenticationError(401, {}, 'invalid token', undefined), cf.baseUrl)).toBe(true);
 
@@ -190,6 +199,7 @@ describe('Cloudflare Workers AI integration', () => {
       });
     }));
 
+    vi.stubEnv('CLOUDFLARE_AI_API_TOKEN', TEST_CF_TOKEN);
     const { registerSolutionPostRoutes } = await import('../src/solutionPosts/routes');
     const app = Fastify();
     registerSolutionPostRoutes(app, header => header === 'Bearer admin-test');
@@ -203,10 +213,10 @@ describe('Cloudflare Workers AI integration', () => {
       headers: { authorization: 'Bearer admin-test' },
     });
     expect(statusRes.statusCode).toBe(200);
-    expect(statusRes.body).not.toContain(DEFAULT_CLOUDFLARE_AI_TOKEN);
+    expect(statusRes.body).not.toContain(TEST_CF_TOKEN);
     expect(statusRes.json()).toMatchObject({
       enabled: true,
-      tokenMasked: 'cfut_…1eab',
+      tokenMasked: 'cfut_…abcd',
       writer: CLOUDFLARE_WRITERS[0],
       reviewer: CLOUDFLARE_REVIEWERS[0],
     });
@@ -218,7 +228,7 @@ describe('Cloudflare Workers AI integration', () => {
       payload: {},
     });
     expect(testRes.statusCode).toBe(200);
-    expect(testRes.body).not.toContain(DEFAULT_CLOUDFLARE_AI_TOKEN);
+    expect(testRes.body).not.toContain(TEST_CF_TOKEN);
     expect(testRes.json()).toMatchObject({
       ok: true,
       catalogStatus: 200,

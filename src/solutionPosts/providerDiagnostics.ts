@@ -2,6 +2,7 @@ import { config } from '../config';
 import { setSystemState } from '../database/models';
 import { logger } from '../logger';
 import { testSolutionApiKey } from './keyPool';
+import { CLOUDFLARE_WRITERS, loadCloudflareAiConfig, probeCloudflareAi } from './cloudflareAi';
 import { createHash } from 'node:crypto';
 import { FIRECRAWL_START_INTERVAL_MS, FIRECRAWL_QUEUE_WAIT_MS } from './firecrawlRateGate';
 
@@ -46,4 +47,9 @@ export async function verifySolutionProviderOnBoot(): Promise<void> {
     logger.info({ provider: new URL(config.solutionPosts.baseUrl).hostname, diagnostic: result }, 'solution provider server startup probe');
   }
   await setSystemState(PROVIDER_CHECK_STATE_KEY, JSON.stringify({ checkedAt: new Date().toISOString(), results }));
+  const cf = loadCloudflareAiConfig();
+  if (cf) {
+    const cfDiagnostic = await probeCloudflareAi({ model: CLOUDFLARE_WRITERS[0] }).catch(() => null);
+    logger.info({ provider: 'cloudflare-ai', diagnostic: cfDiagnostic }, 'Cloudflare Workers AI server startup probe');
+  }
 }
