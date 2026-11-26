@@ -31,23 +31,35 @@ import type { EgressStatus, RecoveryService } from './service';
 
 export const RECOVERY_COOKIE = 'rcv_session';
 
-/** Small fixed-window limiter keyed by caller IP (in-memory is enough for one instance). */
+/** Small fixed-window limiter keyed by caller IP (bounded in-memory for one instance). */
 export class WindowLimiter {
   private readonly hits = new Map<string, { count: number; resetAt: number }>();
   constructor(
     private readonly max: number,
     private readonly windowMs: number,
     private readonly now: () => number = Date.now,
+    private readonly maxKeys = 2048,
   ) {}
   allow(key: string): boolean {
     const t = this.now();
     const entry = this.hits.get(key);
     if (!entry || entry.resetAt <= t) {
+      this.hits.delete(key);
+      if (this.hits.size >= this.maxKeys) {
+        this.prune(t);
+        while (this.hits.size >= this.maxKeys) {
+          const oldest = this.hits.keys().next().value;
+          if (oldest === undefined) break;
+          this.hits.delete(oldest);
+        }
+      }
       this.hits.set(key, { count: 1, resetAt: t + this.windowMs });
-      if (this.hits.size > 5000) this.prune(t);
       return true;
     }
     entry.count += 1;
+    // Refresh recency for bounded LRU eviction.
+    this.hits.delete(key);
+    this.hits.set(key, entry);
     return entry.count <= this.max;
   }
   private prune(t: number): void {
@@ -104,6 +116,13 @@ const esc = (v: string): string => v.replace(/&/g, '&amp;').replace(/</g, '&lt;'
 const SAFE_TOKEN_RE = /^[A-Za-z0-9_-]{16,128}$/;
 
 function requestOrigin(req: FastifyRequest): string {
+  if (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL) {
+    try {
+      return new URL(resolvePublicBaseUrl()).origin;
+    } catch {
+      // Fall through to header inspection if env URL is malformed.
+    }
+  }
   const protoRaw = req.headers['x-forwarded-proto'];
   const proto = (typeof protoRaw === 'string' ? protoRaw.split(',')[0]?.trim() : '') || req.protocol || 'https';
   const hostRaw = req.headers['x-forwarded-host'] ?? req.headers.host;

@@ -14,10 +14,10 @@ it('an active HTTP cancellation closes the real solver context and stops navigat
   } as unknown as BrowserManager);
   const controller = new AbortController();
   const work = solveTurnstile({ siteurl: 'http://localhost/owned-fixture', mode: 'navigate', proxy: 'direct' }, controller.signal);
-  const rejection = expect(work).rejects.toThrow('aborted during execution');
+  work.catch(() => undefined);
   await vi.waitFor(() => expect(goto).toHaveBeenCalledOnce());
   controller.abort();
-  await rejection;
+  await expect(work).rejects.toThrow('aborted during execution');
   await vi.waitFor(() => expect(solverQueue.active).toBe(0));
   expect(close).toHaveBeenCalled();
   expect(page.screenshot).not.toHaveBeenCalled();

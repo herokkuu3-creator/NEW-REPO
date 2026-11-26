@@ -44,16 +44,23 @@ export interface BrowserSession {
 const MAX_LOG_LINES = 500;
 
 function attachLogCapture(page: Page, sink: string[]): void {
+  const pushBounded = (line: string) => {
+    if (sink.length >= MAX_LOG_LINES) sink.shift();
+    sink.push(line);
+  };
   page.on('console', (msg) => {
-    if (sink.length < MAX_LOG_LINES) {
-      sink.push(`[console:${msg.type()}] ${msg.text()}`.slice(0, 1000));
-    }
+    pushBounded(`[console:${msg.type()}] ${msg.text()}`.slice(0, 1000));
   });
   page.on('pageerror', (err) => {
-    if (sink.length < MAX_LOG_LINES) {
-      sink.push(`[pageerror] ${String(err).slice(0, 1000)}`);
-    }
+    pushBounded(`[pageerror] ${String(err).slice(0, 1000)}`);
   });
+}
+
+function writeFileSecureSync(targetPath: string, data: string): void {
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true, mode: 0o700 });
+  const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmpPath, data, { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmpPath, targetPath);
 }
 
 /**
@@ -190,7 +197,10 @@ export async function launchWithPersistentProfile(): Promise<BrowserSession | nu
       page,
       mode: 'profile',
       browserLogs,
-      close: () => activeContext.close().catch(() => undefined),
+      close: async () => {
+        await activeContext.unrouteAll?.({ behavior: 'ignoreErrors' }).catch(() => undefined);
+        await activeContext.close().catch(() => undefined);
+      },
     };
   } catch (err) {
     await context?.close().catch(() => undefined);
@@ -222,8 +232,21 @@ export async function launchWithStorageState(): Promise<BrowserSession | null> {
       headless: isHeadless,
       args: buildLaunchArgs(isHeadless),
     }));
+    let storageStateArg: string | { cookies: never; origins: never } = statePath;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8')) as StorageStateShape;
+      if (parsed && Array.isArray(parsed.cookies)) {
+        storageStateArg = {
+          ...parsed,
+          cookies: deduplicateLeetCodeCookies(parsed.cookies) as never,
+          origins: (parsed.origins ?? []) as never,
+        };
+      }
+    } catch {
+      // Fall back to passing path directly (e.g. unit test mocks or custom file format).
+    }
     const activeContext = (context = await activeBrowser.newContext({
-      storageState: statePath,
+      storageState: storageStateArg,
       userAgent: DEFAULT_DESKTOP_CHROME_USER_AGENT,
       viewport: { width: 1366, height: 900 },
       locale: 'en-US',
@@ -241,6 +264,7 @@ export async function launchWithStorageState(): Promise<BrowserSession | null> {
       browserLogs,
 
       close: async () => {
+        await activeContext.unrouteAll?.({ behavior: 'ignoreErrors' }).catch(() => undefined);
         await activeContext.close().catch(() => undefined);
         await activeBrowser.close().catch(() => undefined);
       },
@@ -300,6 +324,7 @@ export async function launchWithStorageStateObject(
       browserLogs,
       ...(proxyUrl ? { proxyUrl } : {}),
       close: async () => {
+        await activeContext.unrouteAll?.({ behavior: 'ignoreErrors' }).catch(() => undefined);
         await activeContext.close().catch(() => undefined);
         await activeBrowser.close().catch(() => undefined);
       },
@@ -367,12 +392,16 @@ export async function launchFirefoxWithStorageStateObject(
 
     // Omit decorative assets while preserving CSS and verification resources.
     await activeContext.route('**/*', async (route) => {
-      const type = route.request().resourceType();
-      if (blockCodeforcesResource(route.request().url(), type)) {
-        await route.abort();
-        return;
+      try {
+        const type = route.request().resourceType();
+        if (blockCodeforcesResource(route.request().url(), type)) {
+          await route.abort().catch(() => undefined);
+          return;
+        }
+        await route.continue().catch(() => undefined);
+      } catch {
+        await route.continue().catch(() => undefined);
       }
-      await route.continue();
     });
 
     const browserLogs: string[] = [];
@@ -384,6 +413,7 @@ export async function launchFirefoxWithStorageStateObject(
       mode: 'storage-state',
       browserLogs,
       close: async () => {
+        await activeContext.unrouteAll?.({ behavior: 'ignoreErrors' }).catch(() => undefined);
         await activeContext.close().catch(() => undefined);
         await activeBrowser.close().catch(() => undefined);
       },
@@ -413,7 +443,7 @@ async function resolveStorageStatePath(): Promise<string | null> {
     const fromDb = await loadStorageStateFromDb();
     if (!fromDb) return null;
     const tmp = path.join(os.tmpdir(), 'storage-state.json');
-    fs.writeFileSync(tmp, fromDb);
+    writeFileSecureSync(tmp, fromDb);
     logger.info('storageState hydrated from database (ephemeral filesystem)');
     return tmp;
   } catch (err) {
@@ -441,8 +471,7 @@ export async function backupStorageState(context: BrowserContext): Promise<void>
 
     try {
       const target = config.browser.storageStatePath;
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, json);
+      writeFileSecureSync(target, json);
       logger.info({ target }, 'storageState file backup refreshed');
     } catch (err) {
       logger.warn(

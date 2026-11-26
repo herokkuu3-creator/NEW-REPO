@@ -333,7 +333,7 @@ export async function generatePost(context: SubmissionContext, router?: AIModelR
       prisma.solutionPost.findMany({ where: { OR: [{ accountId: post.accountId }, { problemSlug: post.problemSlug }],
         id: { not: post.id }, title: { not: null } }, select: { style: true, title: true }, orderBy: { createdAt: 'desc' }, take: 8 }),
       prisma.solutionPost.findMany({ where: { problemSlug: post.problemSlug, id: { not: post.id }, title: { not: null } },
-        select: { context: true, title: true }, orderBy: { createdAt: 'desc' }, take: 100 }),
+        select: { context: true, title: true }, orderBy: { createdAt: 'desc' }, take: 25 }),
     ]);
     const previous = sameProblem.flatMap(row => {
       try {

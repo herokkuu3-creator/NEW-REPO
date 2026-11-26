@@ -58,7 +58,26 @@ function trimIncompleteHtmlBoundary(html: string): string {
   if (lastLt > lastGt) {
     out = out.slice(0, lastLt);
   }
-  return out.replace(/&[a-zA-Z0-9#]*$/, '');
+  out = out.replace(/&[a-zA-Z0-9#]*$/, '');
+  if (out.length > 0) {
+    const lastCode = out.charCodeAt(out.length - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+      out = out.slice(0, -1);
+    }
+  }
+  return out;
+}
+
+function sliceSafeBoundary(text: string, maxSliceLen: number, isHtml: boolean): string {
+  if (text.length <= maxSliceLen) return text;
+  let end = Math.max(1, maxSliceLen);
+  const tailCode = text.charCodeAt(end - 1);
+  if (tailCode >= 0xd800 && tailCode <= 0xdbff && end > 1) {
+    end -= 1;
+  }
+  if (!isHtml) return text.slice(0, end);
+  const trimmed = trimIncompleteHtmlBoundary(text.slice(0, end));
+  return trimmed.length > 0 ? trimmed : text.slice(0, end);
 }
 
 export function truncateTelegramText(
@@ -98,56 +117,94 @@ export function splitTelegramMessage(
   parseMode?: 'HTML' | 'MarkdownV2',
 ): string[] {
   if (text.length <= maxLen) return [text];
-  const targetLen = parseMode === 'HTML' ? Math.max(128, maxLen - 128) : maxLen;
-  const rawChunks: string[] = [];
-  let current = '';
-
-  const pushLongSegment = (segment: string): void => {
-    let remaining = segment;
-    while (remaining.length > targetLen) {
-      let cut = targetLen;
-      if (parseMode === 'HTML') {
-        const trimmed = trimIncompleteHtmlBoundary(remaining.slice(0, cut));
-        if (trimmed.length > 0) cut = trimmed.length;
+  const isHtml = parseMode === 'HTML';
+  const lines = text.split('\n');
+  if (!isHtml) {
+    const rawChunks: string[] = [];
+    let current = '';
+    const pushLongSegment = (segment: string): void => {
+      let remaining = segment;
+      while (remaining.length > maxLen) {
+        const piece = sliceSafeBoundary(remaining, maxLen, false);
+        rawChunks.push(piece);
+        remaining = remaining.slice(piece.length);
       }
-      rawChunks.push(remaining.slice(0, cut));
-      remaining = remaining.slice(cut);
-    }
-    current = remaining;
-  };
-
-  for (const line of text.split('\n')) {
-    const next = current ? `${current}\n${line}` : line;
-    if (next.length <= targetLen) {
-      current = next;
-    } else {
-      if (current) {
-        rawChunks.push(current);
-        current = '';
-      }
-      if (line.length <= targetLen) {
-        current = line;
+      current = remaining;
+    };
+    for (const line of lines) {
+      const next = current ? `${current}\n${line}` : line;
+      if (next.length <= maxLen) {
+        current = next;
       } else {
-        pushLongSegment(line);
+        if (current) {
+          rawChunks.push(current);
+          current = '';
+        }
+        if (line.length <= maxLen) current = line;
+        else pushLongSegment(line);
       }
     }
-  }
-  if (current) rawChunks.push(current);
-
-  if (parseMode !== 'HTML') {
+    if (current) rawChunks.push(current);
     return rawChunks.map((chunk) => truncateTelegramText(chunk, maxLen, parseMode));
   }
 
   const balanced: string[] = [];
   let carried: Array<{ name: string; openTag: string }> = [];
-  for (const raw of rawChunks) {
+  let current = '';
+
+  const flushChunk = (chunkBody: string): void => {
     const prefix = carried.map((t) => t.openTag).join('');
-    const withPrefix = `${prefix}${raw}`;
-    const openAfter = trackOpenHtmlTags(withPrefix);
-    const closers = openAfter.slice().reverse().map((t) => `</${t.name}>`).join('');
-    balanced.push(truncateTelegramText(`${withPrefix}${closers}`, maxLen, 'HTML'));
+    let body = chunkBody;
+    let combined = `${prefix}${body}`;
+    let openAfter = trackOpenHtmlTags(combined);
+    let closers = openAfter.slice().reverse().map((t) => `</${t.name}>`).join('');
+    if (combined.length + closers.length > maxLen) {
+      // Shrink body until prefix + body + closers fits cleanly without truncating content.
+      let limit = Math.max(1, maxLen - prefix.length - closers.length);
+      for (let attempt = 0; attempt < 4 && combined.length + closers.length > maxLen; attempt += 1) {
+        body = sliceSafeBoundary(chunkBody, limit, true);
+        combined = `${prefix}${body}`;
+        openAfter = trackOpenHtmlTags(combined);
+        closers = openAfter.slice().reverse().map((t) => `</${t.name}>`).join('');
+        limit = Math.max(1, maxLen - prefix.length - closers.length - 8);
+      }
+      const overflow = chunkBody.slice(body.length).replace(/^\n/, '');
+      balanced.push(`${combined}${closers}`);
+      carried = openAfter;
+      if (overflow) flushChunk(overflow);
+      return;
+    }
+    balanced.push(`${combined}${closers}`);
     carried = openAfter;
+  };
+
+  const reserveLen = () => Math.max(128, maxLen - carried.reduce((sum, t) => sum + t.openTag.length + t.name.length + 3, 0));
+
+  for (const line of lines) {
+    const budget = reserveLen();
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length <= budget) {
+      current = next;
+    } else {
+      if (current) {
+        flushChunk(current);
+        current = '';
+      }
+      const nextBudget = reserveLen();
+      if (line.length <= nextBudget) {
+        current = line;
+      } else {
+        let remaining = line;
+        while (remaining.length > reserveLen()) {
+          const piece = sliceSafeBoundary(remaining, reserveLen(), true);
+          flushChunk(piece);
+          remaining = remaining.slice(piece.length);
+        }
+        current = remaining;
+      }
+    }
   }
+  if (current) flushChunk(current);
   return balanced;
 }
 

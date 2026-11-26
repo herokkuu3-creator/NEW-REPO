@@ -466,6 +466,10 @@ export async function runScheduledSolutionPosts(now = new Date()) {
       if (['DRAFT_READY', 'AWAITING_APPROVAL'].includes(post.status)) return config.solutionPosts.autoPublish;
       if (!['PENDING', 'RETRY_PENDING', 'FAILED'].includes(post.status)) return false;
       if (post.status === 'FAILED' && post.lastError === 'AI_KEYS_EXHAUSTED') {
+        if (post.updatedAt) {
+          const elapsed = now.getTime() - new Date(post.updatedAt).getTime();
+          if (elapsed < SOLUTION_POST_RETRY_GAP_MS) return false;
+        }
         keysExhaustedIds.add(id);
         return true;
       }
@@ -570,7 +574,10 @@ export function startSolutionPostScheduler(): () => void {
     void recoverUnverifiedArticleUpvotes().catch(() => undefined);
   };
   // The recovery timer also catches up after a restart; uniqueness and leases arbitrate multiple processes.
-  const daily = cron.schedule(POST_CRON, tick, { timezone: POST_TIMEZONE });
+  const daily = cron.schedule(POST_CRON, () => {
+    notifySolutionPostSchedulerWork();
+    tick();
+  }, { timezone: POST_TIMEZONE });
   const recovery = cron.schedule('*/10 * * * *', tick, { timezone: POST_TIMEZONE });
   const queueTick = () => {
     void processDailyPublicationQueue().catch(error => logger.warn({ errorName: error?.name }, 'daily publication queue unavailable'));

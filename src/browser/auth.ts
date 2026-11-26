@@ -81,9 +81,11 @@ export async function establishAuthenticatedSession(): Promise<AuthOutcome> {
   }
   if (primary) {
     await backupStorageState(primary.session.context);
-    await setSystemState(SystemKeys.authStatus, 'ok');
-    await setSystemState(SystemKeys.authUsername, primary.username);
-    await setSystemState(SystemKeys.authNotifiedAt, ''); // re-arm the expiry alert
+    await Promise.all([
+      setSystemState(SystemKeys.authStatus, 'ok'),
+      setSystemState(SystemKeys.authUsername, primary.username),
+      setSystemState(SystemKeys.authNotifiedAt, ''), // re-arm the expiry alert
+    ]);
     return { ok: true, ...primary };
   }
 
@@ -107,9 +109,11 @@ export async function establishAuthenticatedSession(): Promise<AuthOutcome> {
     // Refresh the durable DB copy — on free tier this IS the credential store,
     // and rolling cookies forward keeps the session alive without a re-upload.
     await backupStorageState(fallback.session.context);
-    await setSystemState(SystemKeys.authStatus, 'ok');
-    await setSystemState(SystemKeys.authUsername, fallback.username);
-    await setSystemState(SystemKeys.authNotifiedAt, ''); // re-arm the expiry alert
+    await Promise.all([
+      setSystemState(SystemKeys.authStatus, 'ok'),
+      setSystemState(SystemKeys.authUsername, fallback.username),
+      setSystemState(SystemKeys.authNotifiedAt, ''), // re-arm the expiry alert
+    ]);
     logger.warn(
       'authenticated via storageState — re-run `npm run auth:setup` when the session eventually expires',
     );

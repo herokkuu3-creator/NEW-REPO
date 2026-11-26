@@ -190,7 +190,6 @@ vi.mock('../src/notifications/telegram', () => ({
 
 import { startHealthServer } from '../src/api/health';
 import { PinGate } from '../src/api/pinGate';
-import { DEFAULT_SAGE_API_KEY } from '../src/ai/sageProbe';
 import { validateSolutionPostModels } from '../src/config/solutionPostModels';
 import { isBazaarLinkProvider } from '../src/config/solutionPostProvider';
 import { parseSolutionApiKeys } from '../src/config/solutionPostKeys';
@@ -284,7 +283,7 @@ describe('Core & Security Regression Fixes', () => {
         expect(unauthHtml.statusCode).toBe(200);
         expect(unauthHtml.body).toContain('Enter PIN');
         expect(unauthHtml.body).toContain(`value="${pathUrl}"`);
-        expect(unauthHtml.body).not.toContain(DEFAULT_SAGE_API_KEY);
+        expect(unauthHtml.body).not.toContain('id="testApiKey"');
         expect(unauthHtml.body).not.toContain('sensitive log probe entry');
 
         const withPin = await app.inject({ method: 'GET', url: pathUrl, headers: PIN_AUTH });
@@ -826,7 +825,7 @@ describe('Core & Security Regression Fixes', () => {
       );
       const parsed = JSON.parse(out.trim().split('\n').pop()!);
       expect(parsed.postKeys).toEqual(['pool_key_one', 'pool_key_two']);
-      expect(parsed.sageKey).toContain('sk-0c521134');
+      expect(parsed.sageKey).toBe('');
 
       expect(() =>
         execFileSync(

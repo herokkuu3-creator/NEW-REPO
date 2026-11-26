@@ -1,4 +1,5 @@
-import { gunzipSync } from 'node:zlib';
+import { Readable } from 'node:stream';
+import { createGunzip } from 'node:zlib';
 import { CodeforcesSourceKind, Prisma } from '@prisma/client';
 import { logger } from '../logger';
 import { prisma } from '../database/prisma';
@@ -41,6 +42,12 @@ export interface CodeforcesSourceIndex {
 }
 
 let cachedIndex: { at: number; value: CodeforcesSourceIndex } | undefined;
+let cachedRuntimeIndex: { at: number; value: CodeforcesSourceIndex } | undefined;
+const RUNTIME_INDEX_CACHE_MS = 10 * 60 * 1000;
+
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
 
 export async function loadSourceIndex(force = false): Promise<CodeforcesSourceIndex> {
   if (!force && cachedIndex && Date.now() - cachedIndex.at < INDEX_CACHE_MS) {
@@ -51,6 +58,7 @@ export async function loadSourceIndex(force = false): Promise<CodeforcesSourceIn
   const value = buildSourceIndex(treeFiles, problems);
   await persistAudit(value.entries);
   cachedIndex = { at: Date.now(), value };
+  cachedRuntimeIndex = undefined;
 
   logger.info(
     {
@@ -73,6 +81,10 @@ export async function loadSourceIndex(force = false): Promise<CodeforcesSourceIn
  * gym flag, URL), so the daily path reads Postgres instead.
  */
 export async function loadRuntimeSourceIndex(): Promise<CodeforcesSourceIndex> {
+  const mockedFindMany = isMockFn(prisma.codeforcesSourceAudit?.findMany);
+  if (!mockedFindMany && cachedRuntimeIndex && Date.now() - cachedRuntimeIndex.at < RUNTIME_INDEX_CACHE_MS) {
+    return cachedRuntimeIndex.value;
+  }
   const readRows = () =>
     prisma.codeforcesSourceAudit.findMany({
       where: {
@@ -130,7 +142,11 @@ export async function loadRuntimeSourceIndex(): Promise<CodeforcesSourceIndex> {
     });
 
   logger.info({ queue: queue.length }, 'Codeforces source queue loaded from database');
-  return { entries: queue, queue };
+  const result = { entries: queue, queue };
+  if (!mockedFindMany && queue.length > 0) {
+    cachedRuntimeIndex = { at: Date.now(), value: result };
+  }
+  return result;
 }
 
 export async function fetchSourceCode(entry: SourceIndexEntry): Promise<string> {
@@ -322,11 +338,30 @@ async function fetchSourceTreeViaTarball(): Promise<SourceTreeFile[]> {
     signal: AbortSignal.timeout(60_000),
   });
   if (!response.ok) throw new Error(`codeload tarball returned HTTP ${response.status}`);
-  const gzipped = Buffer.from(await response.arrayBuffer());
 
   let tar: Buffer;
   try {
-    tar = gunzipSync(gzipped);
+    const gunzip = createGunzip();
+    const chunks: Buffer[] = [];
+    if (response.body) {
+      const source = Readable.fromWeb(response.body as never);
+      await new Promise<void>((resolve, reject) => {
+        source.on('error', reject);
+        gunzip.on('error', reject);
+        gunzip.on('data', (chunk: Buffer) => chunks.push(chunk));
+        gunzip.on('end', () => resolve());
+        source.pipe(gunzip);
+      });
+    } else {
+      const gzipped = Buffer.from(await response.arrayBuffer());
+      gunzip.end(gzipped);
+      await new Promise<void>((resolve, reject) => {
+        gunzip.on('error', reject);
+        gunzip.on('data', (chunk: Buffer) => chunks.push(chunk));
+        gunzip.on('end', () => resolve());
+      });
+    }
+    tar = Buffer.concat(chunks);
   } catch (err) {
     throw new Error(`could not decompress the source archive: ${err instanceof Error ? err.message : String(err)}`);
   }

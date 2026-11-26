@@ -275,7 +275,7 @@ export async function fetchRecentContestsByType(
   // even though contest(titleSlug: "<prefix><N+1>") is already queryable.
   const nowSec = Math.floor((options?.now ?? new Date()).getTime() / 1000);
   const newest = collected[0];
-  if (newest && newest.endTimeSec <= nowSec - 3600) {
+  if (newest && newest.endTimeSec <= nowSec - 5 * 86_400) {
     const suffixMatch = newest.titleSlug.slice(prefix.length).match(/^(\d+)$/);
     if (suffixMatch) {
       const nextSlug = `${prefix}${Number(suffixMatch[1]) + 1}`;

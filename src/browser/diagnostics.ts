@@ -30,26 +30,31 @@ export async function captureDiagnostics(
 ): Promise<DiagnosticsBundle | null> {
   try {
     const stamp = fileStampLocal();
-    const dir = path.join(config.browser.diagnosticsDir, `${stamp}-${reason}`);
-    fs.mkdirSync(dir, { recursive: true });
+    const safeReason =
+      reason
+        .replace(/[^a-zA-Z0-9._-]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 48) || 'diagnostic';
+    const dir = path.join(config.browser.diagnosticsDir, `${stamp}-${safeReason}`);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 
     const meta = {
       timestamp: isoLocal(),
-      reason,
+      reason: safeReason,
       url: page ? safeUrl(page) : null,
       title: page ? await page.title().catch(() => null) : null,
     };
     const metaPath = path.join(dir, 'meta.json');
-    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), { mode: 0o600 });
 
     const logsPath = path.join(dir, 'browser-logs.txt');
-    fs.writeFileSync(logsPath, browserLogs.join('\n'));
+    fs.writeFileSync(logsPath, browserLogs.join('\n'), { mode: 0o600 });
 
     let screenshotPath: string | null = null;
     if (page) {
       try {
         screenshotPath = path.join(dir, 'screenshot.png');
-        await page.screenshot({ path: screenshotPath, fullPage: true, timeout: 15_000 });
+        await page.screenshot({ path: screenshotPath, fullPage: false, timeout: 15_000 });
       } catch (err) {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
@@ -59,7 +64,7 @@ export async function captureDiagnostics(
       }
     }
 
-    logger.warn({ dir, reason }, 'diagnostics bundle captured');
+    logger.warn({ dir, reason: safeReason }, 'diagnostics bundle captured');
     return { dir, screenshotPath, metaPath, logsPath };
   } catch (err) {
     logger.error(
@@ -72,7 +77,16 @@ export async function captureDiagnostics(
 
 function safeUrl(page: Page): string | null {
   try {
-    return page.url();
+    const raw = page.url();
+    if (!raw) return null;
+    try {
+      const u = new URL(raw);
+      u.search = '';
+      u.hash = '';
+      return u.toString();
+    } catch {
+      return raw.split(/[?#]/)[0] ?? raw;
+    }
   } catch {
     return null;
   }

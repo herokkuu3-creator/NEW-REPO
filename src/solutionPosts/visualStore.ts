@@ -4,10 +4,11 @@ import { prisma } from '../database/prisma';
 import { VisualAsset, VisualPlan, renderVisualGif } from './visuals';
 
 export const MAX_VISUAL_CACHE_ENTRIES = 32;
-export const MAX_VISUAL_CACHE_BYTES = 16 * 1024 * 1024;
+export const MAX_VISUAL_CACHE_BYTES = 4 * 1024 * 1024;
 const MAX_VISUAL_BASE64_LENGTH = 700_000;
 
 const visualCache = new Map<string, Buffer>();
+const pendingVisualReads = new Map<string, Promise<Buffer | null>>();
 let visualCacheBytes = 0;
 
 function defaultCacheEnabled(): boolean {
@@ -44,6 +45,7 @@ function setCachedVisual(digest: string, bytes: Buffer): void {
 /** Clears the bounded in-memory visual LRU cache (intended for tests). */
 export function clearVisualAssetCache(): void {
   visualCache.clear();
+  pendingVisualReads.clear();
   visualCacheBytes = 0;
 }
 
@@ -56,16 +58,41 @@ export function publicVisualOrigin(value: string): string | null {
   } catch { return null; }
 }
 
-export async function readStoredVisualGif(digest: string, useCache = defaultCacheEnabled()): Promise<Buffer | null> {
-  if (!/^[a-f0-9]{64}$/.test(digest)) return null;
-  const cached = useCache ? getCachedVisual(digest) : undefined;
-  if (cached) return cached;
+async function loadStoredVisualGif(digest: string): Promise<Buffer | null> {
   const record = await prisma.systemState.findUnique({ where: { key: `solution-visual:${digest}` }, select: { value: true } });
   if (!record || record.value.length > MAX_VISUAL_BASE64_LENGTH) return null;
   const bytes = Buffer.from(record.value, 'base64');
   if (bytes.subarray(0, 6).toString() !== 'GIF89a' || createHash('sha256').update(bytes).digest('hex') !== digest) return null;
-  if (useCache) setCachedVisual(digest, bytes);
   return bytes;
+}
+
+export async function readStoredVisualGif(digest: string, useCache = defaultCacheEnabled()): Promise<Buffer | null> {
+  if (!/^[a-f0-9]{64}$/.test(digest)) return null;
+  if (!useCache) return loadStoredVisualGif(digest);
+
+  const cached = getCachedVisual(digest);
+  if (cached) return cached;
+  const pending = pendingVisualReads.get(digest);
+  if (pending) return pending;
+
+  const read = loadStoredVisualGif(digest);
+  pendingVisualReads.set(digest, read);
+  try {
+    const bytes = await read;
+    if (bytes && pendingVisualReads.get(digest) === read) setCachedVisual(digest, bytes);
+    return bytes;
+  } finally {
+    if (pendingVisualReads.get(digest) === read) pendingVisualReads.delete(digest);
+  }
+}
+
+/** Deletes old cached GIF blobs from SystemState so database size stays bounded. */
+export async function pruneExpiredVisualAssets(maxAgeDays = 14): Promise<number> {
+  const cutoff = new Date(Date.now() - Math.max(1, maxAgeDays) * 86_400_000);
+  const res = await prisma.systemState.deleteMany({
+    where: { key: { startsWith: 'solution-visual:' }, updatedAt: { lt: cutoff } },
+  });
+  return res.count;
 }
 
 /** Durable generated media lives in the existing DB, not ephemeral Render disk. */
@@ -120,7 +147,10 @@ export async function verifyHostedVisualAssets(assets: VisualAsset[], baseUrl: s
         });
         statusCode = response.status;
         if (!response.ok || (statusCode !== 200 && statusCode !== 206) ||
-            !response.headers.get('content-type')?.toLowerCase().includes('image/gif')) return false;
+            !response.headers.get('content-type')?.toLowerCase().includes('image/gif')) {
+          await response.body?.cancel?.().catch(() => undefined);
+          return false;
+        }
         contentRange = response.headers.get('content-range');
         bytes = Buffer.from(await response.arrayBuffer());
       } catch {
@@ -195,11 +225,14 @@ export function registerVisualAssetRoutes(app: FastifyInstance, options?: { enab
       const { file } = req.params as { file: string };
       if (!/^[a-f0-9]{64}\.gif$/.test(file)) return reply.code(404).send();
       const digest = file.slice(0, -4);
+      const bytes = await readStoredVisualGif(digest, useCache);
+      if (!bytes) return reply.code(404).send();
+
       const etag = `"${digest}"`;
       const ifNoneMatch = req.headers['if-none-match'];
       if (typeof ifNoneMatch === 'string' && ifNoneMatch.split(',').some(tag => {
         const trimmed = tag.trim();
-        return trimmed === etag || trimmed === `W/${etag}` || trimmed === digest;
+        return trimmed === '*' || trimmed === etag || trimmed === `W/${etag}` || trimmed === digest;
       })) {
         return reply
           .code(304)
@@ -213,8 +246,6 @@ export function registerVisualAssetRoutes(app: FastifyInstance, options?: { enab
         headOnly: req.method === 'HEAD',
         rangeHeader: typeof req.headers.range === 'string' ? req.headers.range : undefined,
       };
-      const bytes = await readStoredVisualGif(digest, useCache);
-      if (!bytes) return reply.code(404).send();
       return sendGifReply(reply, etag, bytes, replyOpts);
     },
   });

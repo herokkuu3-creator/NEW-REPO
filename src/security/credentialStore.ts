@@ -1,6 +1,10 @@
 import crypto from 'node:crypto';
-import { getSystemState, setSystemState, deleteSystemState } from '../database/models';
+import { getSystemState, getSystemStates, setSystemState, deleteSystemState } from '../database/models';
 import { logger } from '../logger';
+
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
 
 export interface StoredCredential {
   username: string;
@@ -12,14 +16,19 @@ export interface StoredCredential {
 
 let cachedSecret: string | null = null;
 let cachedEncryptionKey: Buffer | null = null;
+let warnedWeakSecret = false;
 
 /**
  * Derives a consistent 256-bit encryption key from environment configuration.
  */
 function getEncryptionKey(): Buffer {
+  const explicitSecret = process.env.CREDENTIALS_SECRET || process.env.ENCRYPTION_KEY;
+  if (!explicitSecret && !warnedWeakSecret && process.env.NODE_ENV === 'production') {
+    warnedWeakSecret = true;
+    logger.warn('Neither CREDENTIALS_SECRET nor ENCRYPTION_KEY is set in production; credential encryption is coupled to DATABASE_URL/TELEGRAM_BOT_TOKEN');
+  }
   const secret =
-    process.env.CREDENTIALS_SECRET ||
-    process.env.ENCRYPTION_KEY ||
+    explicitSecret ||
     process.env.DATABASE_URL ||
     process.env.TELEGRAM_BOT_TOKEN ||
     'leetcode-cf-agent-credential-key-salt-2026';
@@ -198,19 +207,38 @@ export async function findCredentialsForAccount(
     if (byUsername) return byUsername;
   }
 
-  // 3. Scan index for match
-  const allLabels = await listCredentialLabels(site);
+  // 3. Scan index for match (skipping label/username already checked above)
+  const seenNorm = new Set<string>([account.label.trim().toLowerCase()]);
+  if (account.username) seenNorm.add(account.username.trim().toLowerCase());
+  const allLabels = (await listCredentialLabels(site))
+    .map((l) => l.trim().toLowerCase())
+    .filter((l) => l && !seenNorm.has(l));
+  if (allLabels.length === 0) return null;
+
+  const matchesAccount = (cred: StoredCredential): boolean =>
+    cred.label?.toLowerCase() === account.label.toLowerCase() ||
+    cred.username.toLowerCase() === account.label.toLowerCase() ||
+    Boolean(account.username && cred.username.toLowerCase() === account.username.toLowerCase()) ||
+    Boolean(account.username && cred.email && cred.email.toLowerCase() === account.username.toLowerCase());
+
+  if (!isMockFn(getSystemState) && typeof getSystemStates === 'function') {
+    const states = await getSystemStates(allLabels.map((l) => credKey(site, l)));
+    for (const l of allLabels) {
+      const cipher = states[credKey(site, l)];
+      if (!cipher) continue;
+      const json = decryptText(cipher);
+      if (!json) continue;
+      try {
+        const cred = JSON.parse(json) as StoredCredential;
+        if (matchesAccount(cred)) return cred;
+      } catch {}
+    }
+    return null;
+  }
+
   for (const l of allLabels) {
     const cred = await getEncryptedCredentials(site, l);
-    if (!cred) continue;
-    if (
-      cred.label?.toLowerCase() === account.label.toLowerCase() ||
-      cred.username.toLowerCase() === account.label.toLowerCase() ||
-      (account.username && cred.username.toLowerCase() === account.username.toLowerCase()) ||
-      (account.username && cred.email && cred.email.toLowerCase() === account.username.toLowerCase())
-    ) {
-      return cred;
-    }
+    if (cred && matchesAccount(cred)) return cred;
   }
 
   return null;

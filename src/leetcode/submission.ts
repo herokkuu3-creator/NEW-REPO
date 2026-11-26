@@ -64,15 +64,22 @@ const SUBMISSION_DETAILS_QUERY = `
   }
 `;
 
-/** LeetCode judge status codes â†’ our classification. */
+/** LeetCode judge status codes → our classification. */
 const STATUS_CODE_MAP: Record<number, SubmissionClassification> = {
   10: 'ACCEPTED',
   11: 'WRONG_ANSWER',
   12: 'MEMORY_LIMIT_EXCEEDED',
-  13: 'TIME_LIMIT_EXCEEDED',
-  14: 'RUNTIME_ERROR',
+  14: 'TIME_LIMIT_EXCEEDED',
+  15: 'RUNTIME_ERROR',
   20: 'COMPILE_ERROR',
 };
+
+/** Normalizes LeetCode runtime/memory strings without appending duplicate or bogus units. */
+export function formatJudgeMetric(value: string | null | undefined, unit: 'ms' | 'MB'): string | null {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!trimmed || /^n\/?a$/i.test(trimmed)) return null;
+  return /^\d+(?:\.\d+)?$/.test(trimmed) ? `${trimmed} ${unit}` : trimmed;
+}
 
 const JUDGE_PENDING_CODES = new Set([0, 1, 2, 3, 5]); // waiting / judging states
 
@@ -226,6 +233,7 @@ async function pollSubmissionResult(page: Page, submissionId: string): Promise<S
               method: 'GET',
               credentials: 'include',
               headers: { Accept: 'application/json' },
+              signal: AbortSignal.timeout(15_000),
             },
           );
           if (!res.ok) return null;
@@ -284,13 +292,15 @@ async function pollSubmissionResult(page: Page, submissionId: string): Promise<S
             continue;
           }
 
-          const classification = STATUS_CODE_MAP[d.statusCode] ?? 'UNKNOWN';
+          const statusDisplay = d.statusDisplay ?? lastStatus;
+          const textClass = d.statusDisplay ? classifyStatusText(d.statusDisplay) : 'UNKNOWN';
+          const classification = textClass !== 'UNKNOWN' ? textClass : classifyStatusCode(d.statusCode);
           const result: SubmissionResult = {
             submissionId,
             classification,
-            statusDisplay: d.statusDisplay ?? lastStatus,
-            runtime: d.runtimeDisplay ?? (d.runtime != null ? `${d.runtime} ms` : null),
-            memory: d.memoryDisplay ?? (d.memory != null ? `${d.memory} MB` : null),
+            statusDisplay,
+            runtime: formatJudgeMetric(d.runtimeDisplay ?? d.runtime, 'ms'),
+            memory: formatJudgeMetric(d.memoryDisplay ?? d.memory, 'MB'),
             rawStatusMsg: d.statusDisplay ?? `statusCode=${d.statusCode}`,
           };
           logger.info(
@@ -396,7 +406,9 @@ async function scrapeNear(page: Page, selectors: readonly string[]): Promise<str
     const loc = page.locator(sel).first();
     if ((await loc.count().catch(() => 0)) > 0) {
       const text = ((await loc.innerText().catch(() => '')) ?? '').trim();
-      if (text) return text;
+      if (!text) continue;
+      const match = /\b\d+(?:\.\d+)?\s*(?:ms|s|MB|KB)\b/i.exec(text);
+      return match ? match[0].replace(/\s+/, ' ') : text;
     }
   }
   return null;

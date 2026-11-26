@@ -1,9 +1,15 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const send = vi.hoisted(() => vi.fn(async (_text: string, _opts?: any) => true));
 vi.mock('../src/notifications/telegram', () => ({ sendTelegramMessage: send }));
 import { handleTestSage, handleAskSage } from '../src/notifications/telegramBot';
 
+const sageTestKey = 'sk-fixture_sage_test_key_001';
+beforeEach(() => {
+  vi.stubEnv('SAGE_API_KEY', sageTestKey);
+});
+
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
 });
@@ -42,7 +48,7 @@ describe('Telegram Sage Inkstone Commands', () => {
       expect(calls).toContain('GET /v1/models:');
       expect(calls).toContain('POST /v1/chat/completions:');
       expect(calls).toContain('Sage Inkstone API is fully operational');
-      expect(calls).not.toContain('sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056');
+      expect(calls).not.toContain(sageTestKey);
     });
   });
 

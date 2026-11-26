@@ -71,6 +71,7 @@ export class SolutionCache<T> {
 
   private pruneOtherDays(date: string): void {
     if (this.currentDate === date) return;
+    if (this.currentDate && date < this.currentDate) return;
     for (const k of [...this.entries.keys()]) {
       if (!k.startsWith(`${date}|`)) this.entries.delete(k);
     }

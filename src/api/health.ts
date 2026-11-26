@@ -189,9 +189,10 @@ export async function startHealthServer(
   hooks: ApiHooks,
   opts: { pinCode?: string; healthCacheTtlMs?: number } = {},
 ): Promise<FastifyInstance> {
+  const trustProxyHops = Number.parseInt(process.env.TRUST_PROXY_HOPS ?? '1', 10);
   const app = Fastify({
     logger: false, // pino is our logger; fastify's would double-log
-    trustProxy: true,
+    trustProxy: Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 1,
     bodyLimit: 16 * 1024 * 1024, // storageState uploads can exceed the 1MB default
   });
 
@@ -231,9 +232,24 @@ export async function startHealthServer(
   const defaultCacheTtlMs = process.env.VITEST ? 0 : 10_000;
   const healthCacheTtlMs = Math.max(0, opts.healthCacheTtlMs ?? defaultCacheTtlMs);
   interface HealthSnapshot {
-    sys: Record<string, string>;
-    last: DailyRunSummary | null;
-    accounts: AccountViewInput[];
+    authStatus: string;
+    authUsername: string | null;
+    accountTotal: number;
+    accountActive: number;
+    accountExpired: number;
+    accountItems: ReturnType<typeof safeAccountView>[];
+    lastReport: unknown;
+    lastRun: {
+      date: string;
+      problemSlug: string;
+      title: string;
+      state: DailyRunSummary['state'];
+      submissionStatus: string | null;
+      runtime: string | null;
+      memory: string | null;
+      createdAt: string;
+    } | null;
+    lastError: string | null;
   }
   let cacheEpoch = 0;
   let cachedHealth: { snapshot: HealthSnapshot; expiresAt: number } | null = null;
@@ -262,7 +278,28 @@ export async function startHealthServer(
       fetchAccountSummaries(),
     ])
       .then(([sys, last, accounts]) => {
-        const snapshot: HealthSnapshot = { sys, last, accounts };
+        const snapshot: HealthSnapshot = {
+          authStatus: sys['authStatus'] ?? 'unknown',
+          authUsername: sys['authUsername'] ?? null,
+          accountTotal: accounts.length,
+          accountActive: accounts.filter((a) => a.status === AccountStatus.ACTIVE).length,
+          accountExpired: accounts.filter((a) => a.status === AccountStatus.EXPIRED).length,
+          accountItems: accounts.map(safeAccountView),
+          lastReport: safeJson(sys[SystemKeys.lastReport]),
+          lastRun: last
+            ? {
+                date: last.date,
+                problemSlug: last.problemSlug,
+                title: last.title,
+                state: last.state,
+                submissionStatus: last.submissionStatus,
+                runtime: last.runtime,
+                memory: last.memory,
+                createdAt: isoLocal(toDate(last.createdAt)),
+              }
+            : null,
+          lastError: sys['lastError'] ?? null,
+        };
         if (healthCacheTtlMs > 0 && cacheEpoch === startEpoch) {
           cachedHealth = { snapshot, expiresAt: Date.now() + healthCacheTtlMs };
         }
@@ -509,28 +546,42 @@ export async function startHealthServer(
     return reply.type('text/html; charset=utf-8').send(sageConsoleHtml(hostLabel));
   });
 
+  const sageTestSchema = z.object({
+    apiKey: z.string().max(512).optional(),
+    model: z.string().max(160).optional(),
+  });
+  const sageAskSchema = z.object({
+    question: z.string().max(10_000).optional(),
+    apiKey: z.string().max(512).optional(),
+    model: z.string().max(160).optional(),
+    maxTokens: z.number().int().positive().max(32768).optional(),
+  });
+
   app.post('/sage/test', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
     const authed = requireAdmin(req.headers.authorization) || pinGate.isUnlocked(req.ip, req.headers);
     if (!authed) return reply.code(401).send({ ok: false, error: 'unauthorized' });
-    const body = (req.body ?? {}) as { apiKey?: string; model?: string };
-    const result = await probeSageApi(body.apiKey, body.model);
+    const parsed = sageTestSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ ok: false, error: 'invalid request body' });
+    const result = await probeSageApi(parsed.data.apiKey, parsed.data.model);
     return reply.send(result);
   });
 
   app.get('/admin/sage/test', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
     if (!requireAdmin(req.headers.authorization)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
-    const query = (req.query ?? {}) as { apiKey?: string; model?: string };
-    const result = await probeSageApi(query.apiKey, query.model);
+    const parsed = sageTestSchema.safeParse(req.query ?? {});
+    if (!parsed.success) return reply.code(400).send({ ok: false, error: 'invalid query parameters' });
+    const result = await probeSageApi(parsed.data.apiKey, parsed.data.model);
     return reply.send(result);
   });
 
   app.post('/admin/sage/test', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
     if (!requireAdmin(req.headers.authorization)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
-    const body = (req.body ?? {}) as { apiKey?: string; model?: string };
-    const result = await probeSageApi(body.apiKey, body.model);
+    const parsed = sageTestSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ ok: false, error: 'invalid request body' });
+    const result = await probeSageApi(parsed.data.apiKey, parsed.data.model);
     return reply.send(result);
   });
 
@@ -538,16 +589,26 @@ export async function startHealthServer(
     reply.header('Cache-Control', 'no-store');
     const authed = requireAdmin(req.headers.authorization) || pinGate.isUnlocked(req.ip, req.headers);
     if (!authed) return reply.code(401).send({ ok: false, error: 'unauthorized' });
-    const body = (req.body ?? {}) as { question?: string; apiKey?: string; model?: string; maxTokens?: number };
-    const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
+    const parsed = sageAskSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ ok: false, error: 'invalid request body' });
+    const result = await askSage(parsed.data.question || '', {
+      apiKey: parsed.data.apiKey,
+      model: parsed.data.model,
+      maxTokens: parsed.data.maxTokens,
+    });
     return reply.send(result);
   });
 
   app.post('/admin/sage/ask', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
     if (!requireAdmin(req.headers.authorization)) return reply.code(401).send({ ok: false, error: 'unauthorized' });
-    const body = (req.body ?? {}) as { question?: string; apiKey?: string; model?: string; maxTokens?: number };
-    const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
+    const parsed = sageAskSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ ok: false, error: 'invalid request body' });
+    const result = await askSage(parsed.data.question || '', {
+      apiKey: parsed.data.apiKey,
+      model: parsed.data.model,
+      maxTokens: parsed.data.maxTokens,
+    });
     return reply.send(result);
   });
 
@@ -555,8 +616,13 @@ export async function startHealthServer(
     reply.header('Cache-Control', 'no-store');
     const authed = requireAdmin(req.headers.authorization) || pinGate.isUnlocked(req.ip, req.headers);
     if (!authed) return reply.code(401).send({ ok: false, error: 'unauthorized' });
-    const body = (req.body ?? {}) as { question?: string; apiKey?: string; model?: string; maxTokens?: number };
-    const result = await askSage(body.question || '', { apiKey: body.apiKey, model: body.model, maxTokens: body.maxTokens });
+    const parsed = sageAskSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ ok: false, error: 'invalid request body' });
+    const result = await askSage(parsed.data.question || '', {
+      apiKey: parsed.data.apiKey,
+      model: parsed.data.model,
+      maxTokens: parsed.data.maxTokens,
+    });
     return reply.send(result);
   });
 
@@ -579,36 +645,25 @@ export async function startHealthServer(
       }
       return { status: 'ok' };
     }
-    const { sys, last, accounts } = await loadHealthSnapshot();
+    const snap = await loadHealthSnapshot();
     return {
       status: 'ok',
       service: 'leetcode-daily-agent',
       now: isoLocal(),
       runInProgress: hooks.isRunInProgress(),
       authentication: {
-        status: sys['authStatus'] ?? 'unknown',
-        username: sys['authUsername'] ?? null,
+        status: snap.authStatus,
+        username: snap.authUsername,
       },
       accounts: {
-        total: accounts.length,
-        active: accounts.filter((a) => a.status === AccountStatus.ACTIVE).length,
-        expired: accounts.filter((a) => a.status === AccountStatus.EXPIRED).length,
-        items: accounts.map(safeAccountView),
+        total: snap.accountTotal,
+        active: snap.accountActive,
+        expired: snap.accountExpired,
+        items: snap.accountItems,
       },
-      lastReport: safeJson(sys[SystemKeys.lastReport]),
-      lastRun: last
-        ? {
-            date: last.date,
-            problemSlug: last.problemSlug,
-            title: last.title,
-            state: last.state,
-            submissionStatus: last.submissionStatus,
-            runtime: last.runtime,
-            memory: last.memory,
-            createdAt: isoLocal(toDate(last.createdAt)),
-          }
-        : null,
-      lastError: sys['lastError'] ?? null,
+      lastReport: snap.lastReport,
+      lastRun: snap.lastRun,
+      lastError: snap.lastError,
     };
   });
 
@@ -703,8 +758,10 @@ export async function startHealthServer(
     resetDailyRetryPollGate();
     try {
       const target = config.browser.storageStatePath;
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, json);
+      await fs.promises.mkdir(path.dirname(target), { recursive: true });
+      const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+      await fs.promises.writeFile(tmp, json, { mode: 0o600 });
+      await fs.promises.rename(tmp, target);
     } catch {
       // Ephemeral/read-only filesystem is fine — the DB copy is authoritative.
     }

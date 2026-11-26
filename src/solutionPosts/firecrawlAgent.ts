@@ -69,6 +69,7 @@ export class FirecrawlAgentRouter extends AIModelRouter {
           phase: init.method === 'POST' ? 'start' : 'poll' }, 'Firecrawl Agent provider rate limit');
         if (init.method === 'POST') this.rateGate.defer(delay);
         if (waits >= 2 || this.now() + delay >= deadline) return response;
+        await response.body?.cancel?.().catch(() => undefined);
         waits++;
         if (init.method !== 'POST') await this.agentSleep(delay);
       }
@@ -77,7 +78,11 @@ export class FirecrawlAgentRouter extends AIModelRouter {
       const response = await request(origin, { method: 'POST', headers, redirect: 'error',
         body: JSON.stringify({ prompt, schema, model: 'spark-2', maxCredits: this.maxCredits,
           urls: ['https://walkccc.me/LeetCode/'], strictConstrainToURLs: true }) });
-      if (!response.ok) { record.httpStatus = response.status; return fail(`HTTP_${response.status}`); }
+      if (!response.ok) {
+        record.httpStatus = response.status;
+        await response.body?.cancel?.().catch(() => undefined);
+        return fail(`HTTP_${response.status}`);
+      }
       const startedJob: any = await response.json();
       if (startedJob?.success !== true || typeof startedJob.id !== 'string' ||
           !/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(startedJob.id)) return fail('FIRECRAWL_INVALID_JOB');
@@ -86,7 +91,11 @@ export class FirecrawlAgentRouter extends AIModelRouter {
       while (this.now() - jobStarted < this.timeoutMs) {
         await this.agentSleep(3000);
         const poll = await request(`${origin}/${id}`, { headers, redirect: 'error' });
-        if (!poll.ok) { record.httpStatus = poll.status; return fail(`HTTP_${poll.status}`); }
+        if (!poll.ok) {
+          record.httpStatus = poll.status;
+          await poll.body?.cancel?.().catch(() => undefined);
+          return fail(`HTTP_${poll.status}`);
+        }
         const result: any = await poll.json();
         if (result?.status === 'processing' || result?.status === 'pending') continue;
         finished = true;

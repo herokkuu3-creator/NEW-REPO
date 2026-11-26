@@ -53,8 +53,10 @@ export async function approvePost(id: string, contentHash: string): Promise<Solu
 /** Only generation is safely recoverable by lease. PUBLISHING always requires reconciliation. */
 export async function recoverGeneration(now = new Date()): Promise<void> {
   const expired = { status: { in: ['CHECKING_ELIGIBILITY', 'GENERATING', 'VALIDATING'] }, leaseUntil: { lt: now } };
-  await prisma.solutionPost.updateMany({ where: { ...expired, lastError: { in: [...COARENA_PAUSE_CODES] } },
+  await prisma.solutionPost.updateMany({ where: { ...expired, lastError: { in: [...COARENA_PAUSE_CODES] }, retryCount: { gt: 0 } },
     data: { status: 'RETRY_PENDING', leaseUntil: now, retryCount: { decrement: 1 } } });
+  await prisma.solutionPost.updateMany({ where: { ...expired, lastError: { in: [...COARENA_PAUSE_CODES] }, retryCount: { lte: 0 } },
+    data: { status: 'RETRY_PENDING', leaseUntil: now } });
   await prisma.solutionPost.updateMany({ where: { ...expired,
     OR: [{ lastError: null }, { lastError: { notIn: [...COARENA_PAUSE_CODES] } }],
   }, data: { status: 'RETRY_PENDING', leaseUntil: null, lastError: 'GENERATION_INTERRUPTED' } });

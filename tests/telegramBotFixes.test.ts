@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AccountStatus } from '@prisma/client';
+import { freshLeetCodeCookie } from './fixtures';
 
 vi.mock('../src/config', async (orig) => {
   const real = (await orig()) as { config: Record<string, unknown> };
@@ -258,8 +259,7 @@ function makeAccount(id: string, label: string, username: string | null = label,
   } as any;
 }
 
-const SAMPLE_JWT_COOKIE =
-  'LEETCODE_SESSION=eyJhbGciOiJIUzI1NiJ9.eyJ1c2VybmFtZSI6ImFsaWNlIiwicmVmcmVzaGVkX2F0IjoxNzkzOTMwMDAwLCJfc2Vzc2lvbl9leHBpcnkiOjEyMDk2MDB9.sig; csrftoken=csrf12345';
+const SAMPLE_JWT_COOKIE = freshLeetCodeCookie('alice');
 
 describe('Telegram Bot & Notifications Regression Fixes', () => {
   beforeEach(() => {

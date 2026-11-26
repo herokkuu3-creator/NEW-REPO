@@ -1,14 +1,19 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   maskSageKey,
   sanitizeSageOutput,
   probeSageApi,
   askSage,
   sageConsoleHtml,
-  DEFAULT_SAGE_API_KEY,
 } from '../src/ai/sageProbe';
 
+const sageTestKey = 'sk-fixture_sage_test_key_001';
+beforeEach(() => {
+  vi.stubEnv('SAGE_API_KEY', sageTestKey);
+});
+
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
 });
@@ -16,9 +21,7 @@ afterEach(() => {
 describe('Sage Inkstone Probe & Ask', () => {
   describe('maskSageKey', () => {
     it('masks keys preserving only start and end', () => {
-      expect(maskSageKey('sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056')).toBe(
-        'sk-0c521…a056',
-      );
+      expect(maskSageKey(sageTestKey)).toBe('sk-fixtu…_001');
       expect(maskSageKey('')).toBe('(none)');
       expect(maskSageKey('short')).toBe('***');
     });
@@ -26,7 +29,7 @@ describe('Sage Inkstone Probe & Ask', () => {
 
   describe('sanitizeSageOutput', () => {
     it('removes raw api keys from error and output strings', () => {
-      const key = 'sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056';
+      const key = sageTestKey;
       const text = `Failed with key ${key} and token sk-abcdef1234567890abcdef1234567890`;
       const cleaned = sanitizeSageOutput(text, key);
       expect(cleaned).not.toContain(key);
@@ -35,6 +38,15 @@ describe('Sage Inkstone Probe & Ask', () => {
   });
 
   describe('probeSageApi', () => {
+    it('reports missing credentials without calling the provider', async () => {
+      vi.stubEnv('SAGE_API_KEY', '');
+      const fetcher = vi.fn();
+      vi.stubGlobal('fetch', fetcher);
+      await expect(probeSageApi()).resolves.toMatchObject({ ok: false, category: 'NO_KEY_CONFIGURED' });
+      await expect(askSage('What is quicksort?')).resolves.toMatchObject({ ok: false, error: 'NO_KEY_CONFIGURED' });
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+
     it('reports successful models and chat diagnostics from server', async () => {
       const mockFetch = vi.fn(async (url: string | URL | Request) => {
         const u = url.toString();
@@ -81,7 +93,7 @@ describe('Sage Inkstone Probe & Ask', () => {
       expect(result.chatStatus).toBe(200);
       expect(result.chatReply).toBe('SAGE_RENDER_OK');
       expect(result.markerMatched).toBe(true);
-      expect(result.keyMasked).toContain('sk-0c521…');
+      expect(result.keyMasked).toBe(maskSageKey(sageTestKey));
     });
 
     it('classifies HTTP 401 as INVALID_API_KEY', async () => {
@@ -200,7 +212,7 @@ describe('Sage Inkstone Probe & Ask', () => {
       expect(html).toContain('askQuestion()');
       expect(html).toContain('/sage/test');
       expect(html).toContain('/sage/ask');
-      expect(html).toContain(DEFAULT_SAGE_API_KEY);
+      expect(html).not.toContain(sageTestKey);
     });
   });
 });

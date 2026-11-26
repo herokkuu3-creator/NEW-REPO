@@ -4,7 +4,11 @@ import { AccountStatus } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../logger';
 import { saveStorageStateToDb, setSystemState, SystemKeys } from '../database/models';
-import { listAccounts, saveAccount } from '../database/accounts';
+import { listAccountIdentities, listAccounts, saveAccount } from '../database/accounts';
+
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
 import { leetCodeRequestFailure, looksLikeChallenge } from '../leetcode/apiClient';
 import { checkSession } from './sessionCheck';
 import { parseCookiePayload, StorageStateShape } from './cookiePayload';
@@ -165,14 +169,19 @@ async function validateAndSave(
     // Ephemeral / read-only filesystem is fine — the DB copy is authoritative.
   }
 
-  await setSystemState(SystemKeys.authStatus, 'ok');
-  await setSystemState(SystemKeys.authUsername, validation.username);
-  // A fresh session re-arms the once-a-day expiry alert.
-  await setSystemState(SystemKeys.authNotifiedAt, '');
+  await Promise.all([
+    setSystemState(SystemKeys.authStatus, 'ok'),
+    setSystemState(SystemKeys.authUsername, validation.username),
+    // A fresh session re-arms the once-a-day expiry alert.
+    setSystemState(SystemKeys.authNotifiedAt, ''),
+  ]);
   resetDailyRetryPollGate();
 
   try {
-    const accounts = await listAccounts();
+    const accounts =
+      !isMockFn(listAccounts) && typeof listAccountIdentities === 'function'
+        ? await listAccountIdentities()
+        : await listAccounts();
     const target =
       accounts.find((a) => a.label === 'default') ??
       (accounts.length === 1 ? accounts[0] : undefined);

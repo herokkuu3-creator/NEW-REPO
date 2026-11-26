@@ -148,11 +148,12 @@ export async function buildLocalIndex(root = SOLUTIONS_DIR): Promise<CodeChefSou
         const res = path.join(dir, file.name);
         if (file.isDirectory()) {
           await walk(res);
-        } else if (file.name.toLowerCase() === 'readme.md') {
+        } else if (file.isFile() && file.name.toLowerCase() === 'readme.md') {
           if (path.resolve(dir) === path.resolve(root)) continue;
-          // Check if there is a cpp file in this directory
-          const dirFiles = await fs.readdir(dir);
-          const cppFile = dirFiles.sort().find(f => f.toLowerCase().endsWith('.cpp'));
+          const cppFile = files
+            .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.cpp'))
+            .map(entry => entry.name)
+            .sort()[0];
           if (cppFile) {
             const readmeContent = await fs.readFile(res, 'utf8');
             const match = readmeContent.match(/https?:\/\/(?:www\.)?codechef\.com\/(?:[A-Za-z0-9_-]+\/)?problems\/([A-Za-z0-9_]+)/i);

@@ -46,8 +46,9 @@ export function extractCode(raw: string, language?: string): string | null {
 
   // Full fenced block(s): take the first complete fence body.
   const fence = /```[^\r\n]*\r?\n([\s\S]*?)```/.exec(text);
-  if (fence && fence[1]) {
-    text = fence[1].trim();
+  const hasCompleteFence = Boolean(fence && fence[1]);
+  if (hasCompleteFence) {
+    text = fence![1]!.trim();
   } else {
     // Stray fence markers without a pair — strip them.
     text = text.replace(/```(?:[^\r\n]*?(?=\r?\n)|[a-zA-Z0-9_+-]*)/g, '').trim();
@@ -82,9 +83,11 @@ export function extractCode(raw: string, language?: string): string | null {
     return text.trim();
   }
 
-  // Leading prose line(s) before the first code-ish line.
-  const codeStart = text.search(/^(?:class|function|var|let|const|def|import|from|export|\/\/|#|\/\*|public|interface|type|using|namespace|impl|pub\s+fn|fn|func|fun|package|object)\b/m);
-  if (codeStart > 0) text = text.slice(codeStart);
+  // Leading prose line(s) before the first code-ish line (unfenced responses only).
+  if (!hasCompleteFence) {
+    const codeStart = text.search(/^(?:class|function|var|let|const|def|import|from|export|\/\/|#|\/\*|public|interface|type|using|namespace|impl|pub\s+fn|fn|func|fun|package|object)\b/m);
+    if (codeStart > 0) text = text.slice(codeStart);
+  }
 
   if (!/(class\s+\w+|function\s*\w*\s*\(|def\s+\w+\s*\(|=>|\bvar\s+\w+\s*=|\bimpl\s+\w+|\bfunc\s+\w+\s*\(|\bfn\s+\w+\s*\(|\bfun\s+\w+\s*\(|\bobject\s+\w+|\b(?:int|long|void|bool|char|double|float|string|vector)\s+[A-Za-z_]\w*\s*\(|\b(?:SELECT|WITH)\b[\s\S]*\bFROM\b)/i.test(text)) {
     return null; // no recognizable code at all

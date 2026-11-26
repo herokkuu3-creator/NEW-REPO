@@ -47,18 +47,27 @@ describe('article credential input', () => {
     expect(result.keyEnvironment[1]).toMatchObject({ present: true, count: 0, invalid: true });
     expect(JSON.stringify(result)).not.toContain('bad value');
   });
-  it('falls back to default Sage Inkstone key when Sage provider is used without custom keys', () => {
+  it('leaves credentials empty when Sage is selected without a configured key', () => {
     const sageBaseUrl = 'https://discovery-api.intern-ai.org.cn/v1';
     const result = resolveArticleKeys({}, sageBaseUrl);
-    expect(result.apiKey).toBe('sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056');
-    expect(result.apiKeys).toEqual(['sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056']);
-    expect(result.keySource).toBe('DEFAULT_SAGE_KEY');
+    expect(result.apiKey).toBe('');
+    expect(result.apiKeys).toEqual([]);
+    expect(result.keySource).toBeUndefined();
   });
-  it('prefers explicit SAGE_API_KEY over default Sage key', () => {
+  it('prefers SAGE_API_KEY over generic article keys for the Sage endpoint', () => {
     const sageBaseUrl = 'https://discovery-api.intern-ai.org.cn/v1';
-    const result = resolveArticleKeys({ SAGE_API_KEY: 'sk-custom-sage-key-12345' }, sageBaseUrl);
+    const result = resolveArticleKeys({
+      SAGE_API_KEY: 'sk-custom-sage-key-12345', SOLUTION_POST_API_KEY: 'generic_fixture_key',
+    }, sageBaseUrl);
     expect(result.apiKey).toBe('sk-custom-sage-key-12345');
     expect(result.apiKeys).toEqual(['sk-custom-sage-key-12345']);
     expect(result.keySource).toBe('SAGE_API_KEY');
+  });
+  it.each([
+    'https://intern-ai.org.cn.example.test/v1',
+    'https://unrelated-intern-ai.org.cn/v1',
+    'http://discovery-api.intern-ai.org.cn/v1',
+  ])('limits Sage-specific credentials to HTTPS endpoints in its domain (%s)', baseUrl => {
+    expect(resolveArticleKeys({ SAGE_API_KEY: 'sk-custom-sage-key-12345' }, baseUrl).apiKeys).toEqual([]);
   });
 });

@@ -651,6 +651,7 @@ describe('scheduler & codechef regression fixes', () => {
 
         const page1 = await browser.newPage();
         try {
+          vi.spyOn(page1.context().request, 'get').mockRejectedValue(new Error('Browser fixture'));
           const postedBodies: Array<{ language?: string }> = [];
           await page1.route('https://www.codechef.com/**', async (route) => {
             const url = route.request().url();
@@ -714,10 +715,11 @@ describe('scheduler & codechef regression fixes', () => {
           });
           await page2.route('https://www.codechef.com/**', async (route) => {
             if (route.request().method() === 'POST') {
-              return route.fulfill({ status: 302, headers: { location: 'https://www.codechef.com/dashboard' } });
-            }
-            if (route.request().url().includes('/dashboard')) {
-              return route.fulfill({ contentType: 'text/html', body: '<a href="/logout">Logout</a>' });
+              return route.fulfill({
+                headers: { 'set-cookie': 'SESSfixture=owned; Secure; HttpOnly; Path=/' },
+                contentType: 'text/html',
+                body: '<a href="/logout">Logout</a>',
+              });
             }
             return route.fulfill({
               contentType: 'text/html',

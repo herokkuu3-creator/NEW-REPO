@@ -48,12 +48,14 @@ function buildImportedCookie(
   expires: number,
 ): StorageCookie {
   const sameSite = normalizeSameSite(c.sameSite);
+  const normalizedExpires =
+    Number.isFinite(expires) && expires > 1e11 ? Math.floor(expires / 1000) : expires;
   return {
     name: c.name as string,
     value: c.value as string,
-    domain: stringOr(c.domain, LEETCODE_DOMAIN),
+    domain: stringOr(c.domain, LEETCODE_DOMAIN).trim().toLowerCase(),
     path: stringOr(c.path, '/'),
-    expires,
+    expires: normalizedExpires,
     httpOnly: c.httpOnly === true,
     secure: sameSite === 'None' ? true : c.secure !== false,
     sameSite,

@@ -7,14 +7,25 @@ import { CodeRunner, RunReport, TestCase, TestResult } from './types';
 
 const execFileAsync = promisify(execFile);
 const TIMEOUT_MS = 10_000;
+const HARNESS_RESULT_PREFIX = '__LC_HARNESS_RESULT__:';
+const resolvedPythonCache = new Map<string, string>();
 
 export function resolvePython3Command(candidates: readonly string[] = ['python3', 'python']): string {
+  const cacheKey = `${process.env.PATH ?? ''}\0${candidates.join(',')}`;
+  const cached = resolvedPythonCache.get(cacheKey);
+  if (cached) return cached;
+
   for (const cmd of candidates) {
     const res = spawnSync(cmd, ['--version'], {
       encoding: 'utf8',
       timeout: 5_000,
     });
     if (!res.error && res.status === 0 && /\bPython\s+3\./i.test(`${res.stdout ?? ''}\n${res.stderr ?? ''}`)) {
+      if (resolvedPythonCache.size >= 16) {
+        const oldest = resolvedPythonCache.keys().next().value;
+        if (oldest !== undefined) resolvedPythonCache.delete(oldest);
+      }
+      resolvedPythonCache.set(cacheKey, cmd);
       return cmd;
     }
   }
@@ -64,11 +75,12 @@ export class PythonRunner implements CodeRunner {
 
       const results: TestResult[] = [];
       for (const line of stdout.split('\n')) {
-        if (!line.trim()) continue;
+        const trimmed = line.trim();
+        if (!trimmed.startsWith(HARNESS_RESULT_PREFIX)) continue;
         try {
-          results.push(JSON.parse(line) as TestResult);
+          results.push(JSON.parse(trimmed.slice(HARNESS_RESULT_PREFIX.length)) as TestResult);
         } catch {
-          // ignore non-JSON prints from the solution
+          // ignore malformed result line
         }
       }
       const ok = results.length === tests.length && results.every((r) => r.passed);
@@ -128,13 +140,13 @@ for t in __tests:
         passed = True
         if t['expected'] is not None:
             passed = __norm(actual) == __norm(json.loads(t['expected']))
-        print(json.dumps({
+        print(${JSON.stringify(HARNESS_RESULT_PREFIX)} + json.dumps({
             'label': t['label'], 'passed': bool(passed),
             'actual': actual_str, 'expected': t['expected'],
             'durationMs': int((time.time() - started) * 1000),
         }))
     except Exception as e:
-        print(json.dumps({
+        print(${JSON.stringify(HARNESS_RESULT_PREFIX)} + json.dumps({
             'label': t['label'], 'passed': False,
             'error': str(e)[:500],
             'durationMs': int((time.time() - started) * 1000),

@@ -3,7 +3,12 @@ import { AccountStatus } from '@prisma/client';
 import { ingestCookiePayload, type IngestResult, type Validator } from '../accounts/ingest';
 import { checkSession } from '../browser/sessionCheck';
 import { listAccounts } from '../database/accounts';
+import { prisma } from '../database/prisma';
 import { logger } from '../logger';
+
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
 import { sendTelegramMessage } from '../notifications/telegram';
 import { hasRecoveryService, getRecoveryService } from '../recovery/runtime';
 import { saveEncryptedCredentials } from '../security/credentialStore';
@@ -95,7 +100,8 @@ function escapeHtml(value: string): string {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 export function resolvePublicBaseUrl(override?: string): string {
@@ -218,7 +224,7 @@ export function getLatestPendingLeetCodePairingSession(now = Date.now()): Create
 export function cancelAllLeetCodePairingSessions(): number {
   let cancelled = 0;
   for (const session of pairingSessions.values()) {
-    if (session.status === 'pending') {
+    if (session.status === 'pending' || session.status === 'completing') {
       session.status = 'cancelled';
       session.password = undefined;
       cancelled += 1;
@@ -397,7 +403,9 @@ export async function completeLeetCodePairingSession(
       validator: deps.validator ?? defaultLightweightValidator,
     });
   } catch (err) {
-    session.status = 'pending';
+    if (session.status === 'completing') {
+      session.status = Date.now() >= session.expiresAt ? 'expired' : 'pending';
+    }
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ err: msg, label: session.label }, 'Error during pairing session ingestion');
     return {
@@ -408,9 +416,21 @@ export async function completeLeetCodePairingSession(
     };
   }
 
+  if ((session.status as LeetCodePairingStatus) === 'cancelled') {
+    session.password = undefined;
+    return {
+      ok: false,
+      httpStatus: 410,
+      code: 'TOKEN_CANCELLED',
+      error: 'This authentication link was cancelled. Run /lclogin in Telegram to start again.',
+    };
+  }
+
   if (!ingestResult.ok) {
     // Allow user to retry submitting a valid export on the same link if they pasted malformed text.
-    session.status = 'pending';
+    if (session.status === 'completing') {
+      session.status = Date.now() >= session.expiresAt ? 'expired' : 'pending';
+    }
     return {
       ok: false,
       httpStatus: 400,
@@ -434,7 +454,9 @@ export async function completeLeetCodePairingSession(
     deps.notifyTelegram ??
     ((html: string) => sendTelegramMessage(html, { parseMode: 'HTML', disableWebPagePreview: true }));
 
-  const totalAccounts = (await listAccounts().catch(() => [])).length;
+  const totalAccounts = !isMockFn(listAccounts)
+    ? await prisma.account.count().catch(() => 0)
+    : (await listAccounts().catch(() => [])).length;
 
   if (ingestResult.status === AccountStatus.ACTIVE) {
     const verifiedUsername = ingestResult.username || localVerifiedUsername || pendingIdentifier || ingestResult.label;

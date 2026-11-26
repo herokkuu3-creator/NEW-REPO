@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AccountStatus } from '@prisma/client';
+import { freshLeetCodeCookie } from './fixtures';
 
 vi.mock('../src/database/accounts', async (original) => ({
   ...((await original()) as object),
@@ -30,8 +31,7 @@ import {
   pushSessionToPairingEndpoint,
 } from '../scripts/auth-setup';
 
-const SAMPLE_JWT_COOKIE =
-  'LEETCODE_SESSION=eyJhbGciOiJIUzI1NiJ9.eyJ1c2VybmFtZSI6ImJsYWNrX3NoZWVwXzciLCJyZWZyZXNoZWRfYXQiOjE3OTM5MzAwMDAsIl9zZXNzaW9uX2V4cGlyeSI6MTIwOTYwMH0.sig; csrftoken=csrf12345';
+const SAMPLE_JWT_COOKIE = freshLeetCodeCookie('black_sheep_7');
 
 describe('Telegram-Initiated LeetCode Interactive Pairing & Companion Flow', () => {
   beforeEach(() => {

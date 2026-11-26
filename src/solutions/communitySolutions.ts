@@ -145,6 +145,7 @@ export async function executeLeetCodeGraphQL<T>(
             headers,
             credentials: 'include',
             body: JSON.stringify({ query, variables }),
+            signal: AbortSignal.timeout(20_000),
           });
           const text = await res.text();
           return { status: res.status, body: text };
@@ -180,6 +181,7 @@ export async function executeLeetCodeGraphQL<T>(
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     },
     body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(20_000),
   });
 
   if (!res.ok) {
@@ -251,7 +253,7 @@ function starterIdentifierForLanguage(starterCode: string, language: string): st
     const cleaned = starterCode
       .replace(/\/\*[\s\S]*?\*\//g, ' ')
       .replace(/\/\/[^\n]*/g, ' ');
-    const m = /\b(?:(?:[\w<>\[\],]|::)+(?:\s+|[\s*&]+))+[\s*&]*([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(cleaned);
+    const m = /\b(?:[\w:<>\[\],]|::)+[\s*&]+([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(cleaned);
     return m?.[1] ?? null;
   }
   if (language === 'python3' || language === 'python' || language === 'pythondata') {
@@ -260,7 +262,7 @@ function starterIdentifierForLanguage(starterCode: string, language: string): st
   }
   if (language === 'java' || language === 'csharp') {
     const ignored = new Set(['class', 'interface', 'if', 'for', 'while', 'switch', 'return', 'new', 'Solution']);
-    for (const m of starterCode.matchAll(/(?:\b(?:public|private|protected|static|final)\s+)*[\w<>\[\], ?]+\s+([A-Za-z_]\w*)\s*\(/g)) {
+    for (const m of starterCode.matchAll(/(?:\b(?:public|private|protected|static|final)\s+)*(?:[\w.<>\[\]?]+(?:<[^>()\n]{1,80}>)?)\s+([A-Za-z_]\w*)\s*\(/g)) {
       if (m[1] && !ignored.has(m[1])) return m[1];
     }
     return null;
@@ -438,14 +440,14 @@ function parseMarkdownCodeBlocks(content: string): ParsedFenceBlock[] {
   for (const rawLine of lines) {
     const trimmed = rawLine.trim();
     if (!inFence) {
-      if (trimmed.startsWith('```')) {
+      if (/^`{3,}/.test(trimmed)) {
         inFence = true;
-        fenceTag = trimmed.slice(3).trim().toLowerCase();
+        fenceTag = trimmed.replace(/^`{3,}/, '').trim().toLowerCase();
         fenceLines = [];
       } else if (/^(?:#{1,6}\s+|\*\*|__)/.test(trimmed) || /^(?:c\+\+|cpp|java|python3?|mysql|postgresql|sql|javascript|typescript|bash|shell|pandas|golang|rust|csharp)\b[:\s]*$/i.test(trimmed)) {
         currentHeading = trimmed.toLowerCase();
       }
-    } else if (trimmed.startsWith('```')) {
+    } else if (/^`{3,}\s*$/.test(trimmed)) {
       blocks.push({
         tag: fenceTag,
         code: fenceLines.join('\n').trim(),
@@ -561,7 +563,7 @@ const articleContentCache = new Map<string, CachedArticleContent>();
 
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 const EMPTY_LIST_CACHE_TTL_MS = 5 * 60 * 1000;
-const MAX_ARTICLE_CONTENT_CACHE = 250;
+const MAX_ARTICLE_CONTENT_CACHE = 64;
 const MAX_ARTICLE_LIST_CACHE = 500;
 const MAX_SLUG_BY_NUMBER_CACHE = 2000;
 
@@ -675,7 +677,7 @@ export async function fetchCommunityArticleList(
 ): Promise<Array<{ node: CommunityArticleNode }>> {
   const language = options?.language ?? 'cpp';
   const maxArticles = options?.maxArticles ?? 10;
-  const langTag = language === 'cpp' ? 'cpp' : language === 'python3' ? 'python3' : language;
+  const langTag = communityTagCandidates(language)[0] ?? language;
   const cacheKey = `${questionSlug}:${langTag}:${maxArticles}`;
 
   const now = Date.now();
@@ -955,7 +957,7 @@ export async function resolveLeetCodeSlugByNumber(
       {
         categorySlug: '',
         skip: 0,
-        limit: 10,
+        limit: 50,
         filters: { searchKeywords: targetStr },
       },
       options,

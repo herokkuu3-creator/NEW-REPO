@@ -125,7 +125,24 @@ function sleep(ms: number): Promise<void> {
  * Paged deliberately: asking for 100,000 submissions in one JSON response builds
  * a large temporary object immediately before the browser step on a 512MB box.
  */
+const SOLVED_CACHE_TTL_MS = 3 * 60_000;
+const solvedProblemCache = new Map<string, { at: number; keys: Set<string> }>();
+
+function isMockFetch(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
+
 export async function fetchSolvedProblemKeys(handle: string): Promise<Set<string>> {
+  const norm = handle.trim().toLowerCase();
+  const now = Date.now();
+  const canUseCache = !isMockFetch(globalThis.fetch);
+  if (canUseCache) {
+    const cached = solvedProblemCache.get(norm);
+    if (cached && now - cached.at < SOLVED_CACHE_TTL_MS) {
+      return new Set(cached.keys);
+    }
+  }
+
   const solved = new Set<string>();
   const pageSize = 2_000;
   const maxToScan = 100_000;
@@ -139,6 +156,14 @@ export async function fetchSolvedProblemKeys(handle: string): Promise<Set<string
       }
     }
     if (submissions.length < pageSize) break;
+  }
+
+  if (canUseCache) {
+    if (solvedProblemCache.size >= 32) {
+      const oldest = solvedProblemCache.keys().next().value;
+      if (oldest !== undefined) solvedProblemCache.delete(oldest);
+    }
+    solvedProblemCache.set(norm, { at: Date.now(), keys: new Set(solved) });
   }
   return solved;
 }

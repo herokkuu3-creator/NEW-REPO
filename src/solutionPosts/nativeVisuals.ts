@@ -96,7 +96,9 @@ export function readEditorMarkdown(page: Page) {
 
 async function dropImageFile(page: Page, file: GifFile) {
   const transfer = await page.evaluateHandle(({ name, type, encoded }) => {
-    const bytes = Uint8Array.from(atob(encoded), byte => byte.charCodeAt(0));
+    const bin = atob(encoded);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     const data = new DataTransfer();
     data.items.add(new File([bytes], name, { type }));
     return data;

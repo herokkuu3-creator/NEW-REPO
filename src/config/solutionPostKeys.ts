@@ -1,6 +1,5 @@
 import { isBazaarLinkProvider, isSageProvider } from './solutionPostProvider';
 
-export const DEFAULT_SAGE_ARTICLE_KEY = 'sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056';
 export const ARTICLE_KEY_VARIABLES = ['BAZAARLINK_API_KEYS', 'BAZAARLINK_API_KEY',
   'SOLUTION_POST_API_KEYS', 'SOLUTION_POST_API_KEY', 'SAGE_API_KEY'] as const;
 type KeyVariable = typeof ARTICLE_KEY_VARIABLES[number];
@@ -12,8 +11,12 @@ export interface ArticleKeyInput {
  * the selected provider determines whether the credential is valid. */
 export function parseSolutionApiKeys(input: string | string[]): string[] {
   const tokens = (Array.isArray(input) ? input : [input]).flatMap(raw => {
-    let value = raw.trim().replace(/^```(?:env|dotenv|text)?\s*\n([\s\S]*?)\n```$/, '$1');
-    value = value.replace(/^(?:export\s+)?(?:BAZAARLINK|SOLUTION_POST|SAGE)_API_KEYS?\s*=\s*/i, '');
+    let value = raw.trim().replace(/^```(?:env|dotenv|text)?\s*\r?\n([\s\S]*?)\r?\n```$/, '$1');
+    value = value
+      .split(/\r?\n/)
+      .map(line => line.trim().replace(/^(?:export\s+)?(?:BAZAARLINK|SOLUTION_POST|SAGE)_API_KEYS?\s*=\s*/i, ''))
+      .filter(line => line && !line.startsWith('#'))
+      .join('\n');
     if (value.startsWith('[')) {
       try {
         const decoded: unknown = JSON.parse(value);
@@ -27,7 +30,7 @@ export function parseSolutionApiKeys(input: string | string[]): string[] {
     const value = token.trim().replace(/^["'`<[(\{]+|["'`>\])}\s]+$/g, '')
       .replace(/^Bearer\s+/i, '');
     if (!value || /^(?:none|null|undefined|test|fixture)$/i.test(value)) continue;
-    if (value.length < 8 || value.length > 512 || /\s/.test(value)) {
+    if (value.length < 8 || value.length > 512 || /[\s\x00-\x1f\x7f]/.test(value)) {
       throw new Error('Each API key must be 8–512 non-whitespace characters');
     }
     if (!keys.includes(value)) keys.push(value);
@@ -48,17 +51,10 @@ export function resolveArticleKeys(env: Partial<Record<KeyVariable, string>>, ba
   const selected = order.map(name => inputs.find(input => input.name === name)!)
     .find(input => input?.keys.length > 0 || input?.invalid);
 
-  let apiKey = selected?.keys[0] ?? '';
-  let apiKeys = selected?.keys ?? [];
-  let keySource = selected?.name;
-  if (!apiKeys.length && !selected?.invalid && isSageProvider(baseUrl)) {
-    apiKey = DEFAULT_SAGE_ARTICLE_KEY;
-    apiKeys = [DEFAULT_SAGE_ARTICLE_KEY];
-    keySource = 'DEFAULT_SAGE_KEY' as any;
-  }
-
   return {
-    apiKey, apiKeys, keySource,
+    apiKey: selected?.keys[0] ?? '',
+    apiKeys: selected?.keys ?? [],
+    keySource: selected?.name,
     keyError: selected?.invalid ? 'AI_KEY_INPUT_INVALID' : undefined,
     // This is the only form suitable for logs and diagnostic responses.
     keyEnvironment: inputs.map(({ name, present, keys, invalid }): ArticleKeyInput =>

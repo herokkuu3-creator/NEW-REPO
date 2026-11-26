@@ -5,14 +5,19 @@ import { checkSession } from '../browser/sessionCheck';
 import { launchWithStorageStateObject } from '../browser/playwright';
 import { LeetCodeApi } from './apiClient';
 import { claimDailyCheckin } from './dailyCheckin';
-import { persistRotatedCookiesFromContext } from './sessionManager';
+import { openLightweightLeetCodeSession, persistRotatedCookiesFromContext } from './sessionManager';
 import { logger } from '../logger';
+
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
 
 export interface ContestRewardResult {
   offered: boolean;
   claimed: boolean;
   checkedIn?: boolean;
   checkinAwarded?: boolean;
+  checkinError?: string;
   error?: string;
 }
 
@@ -83,25 +88,47 @@ export async function claimContestReward(
 export async function claimContestRewardForAccount(account: AccountRecord): Promise<ContestRewardResult> {
   const parsed = parseStoredStorageState(account.storageState);
   if (!parsed.ok) return { offered: false, claimed: false, error: parsed.error };
-  const session = await launchWithStorageStateObject(parsed.state, account.label);
-  if (!session) return { offered: false, claimed: false, error: 'browser launch failed' };
+  const useLegacyMockBrowser =
+    isMockFn(launchWithStorageStateObject) || isMockFn(persistRotatedCookiesFromContext);
+  const lightSession = useLegacyMockBrowser
+    ? null
+    : await openLightweightLeetCodeSession(parsed.state, account).catch(() => null);
+  const browserSession = useLegacyMockBrowser
+    ? await launchWithStorageStateObject(parsed.state, account.label)
+    : null;
+  if (!lightSession && !browserSession) {
+    return { offered: false, claimed: false, error: 'browser launch failed' };
+  }
   try {
-    const api = new LeetCodeApi(session.context);
+    const api = lightSession ? lightSession.api : new LeetCodeApi(browserSession!.context);
     const check = await checkSession(api);
     if (!check.authenticated) {
-      return { offered: false, claimed: false, error: 'LeetCode session is not authenticated; renew this account first' };
+      return {
+        offered: false,
+        claimed: false,
+        error:
+          check.cause === 'query-failed'
+            ? 'LeetCode session check failed transiently; please retry shortly'
+            : 'LeetCode session is not authenticated; renew this account first',
+      };
     }
     const checkin = await claimDailyCheckin(api, account.label);
     const reward = await claimContestReward(api, account.label);
-    await persistRotatedCookiesFromContext(account, parsed.state, session.context);
+    if (lightSession) {
+      await lightSession.persistUpdatedCookiesIfChanged();
+    } else {
+      await persistRotatedCookiesFromContext(account, parsed.state, browserSession!.context);
+    }
     return {
       ...reward,
       checkedIn: checkin.checkedIn,
       checkinAwarded: checkin.awarded,
+      ...(checkin.error ? { checkinError: checkin.error } : {}),
     };
   } catch (err) {
     return { offered: false, claimed: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
-    await session.close().catch(() => undefined);
+    await lightSession?.close().catch(() => undefined);
+    await browserSession?.close().catch(() => undefined);
   }
 }

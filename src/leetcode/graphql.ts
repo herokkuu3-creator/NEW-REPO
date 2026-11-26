@@ -44,6 +44,7 @@ export async function leetcodeGraphQL<T>(
         headers,
         credentials: 'include',
         body: JSON.stringify({ query, variables }),
+        signal: AbortSignal.timeout(15_000),
       });
       const text = await res.text();
       return { status: res.status, body: text };

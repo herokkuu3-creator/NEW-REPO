@@ -290,6 +290,6 @@ function extractMethodName(starterCode: string): string | null {
   const cleaned = starterCode
     .replace(/\/\*[\s\S]*?\*\//g, ' ')
     .replace(/\/\/[^\n]*/g, ' ');
-  const m = /\b(?:(?:[\w<>\[\],]|::)+(?:\s+|[\s*&]+))+[\s*&]*([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(cleaned);
+  const m = /\b(?:[\w:<>\[\],]|::)+[\s*&]+([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(cleaned);
   return m?.[1] ?? null;
 }

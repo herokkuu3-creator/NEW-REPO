@@ -40,6 +40,7 @@ async function main() {
       'user-agent': 'node',
       accept: 'application/vnd.github.v3+json',
     },
+    signal: AbortSignal.timeout(30_000),
   });
   if (!keyRes.ok) throw new Error(`Failed to get public key: ${keyRes.status} ${await keyRes.text()}`);
   const { key_id, key } = (await keyRes.json()) as { key_id: string; key: string };
@@ -64,6 +65,7 @@ async function main() {
       encrypted_value,
       key_id,
     }),
+    signal: AbortSignal.timeout(30_000),
   });
 
   if (putRes.status === 201 || putRes.status === 204) {

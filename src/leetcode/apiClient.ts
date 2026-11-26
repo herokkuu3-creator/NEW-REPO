@@ -2,7 +2,7 @@ import { APIRequestContext, APIResponse, BrowserContext } from 'playwright';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { z } from 'zod';
 import { logger } from '../logger';
-import { classifyStatusCode, classifyStatusText, SubmissionClassification } from './submission';
+import { classifyStatusCode, classifyStatusText, formatJudgeMetric, SubmissionClassification } from './submission';
 
 /**
  * LeetCode API client — same-origin requests through the browser context's
@@ -491,21 +491,32 @@ export class LeetCodeApi {
     schema: z.ZodType<T>,
     deadline?: number,
   ): Promise<T> {
+    const sendGraphqlPost = async (csrf: string | null) =>
+      this.request.post(`${ORIGIN}/graphql`, {
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Origin: ORIGIN,
+          Referer: `${ORIGIN}/`,
+          ...(csrf ? { 'x-csrftoken': csrf } : {}),
+        },
+        data: { query, variables },
+        ...await this.requestOptions(deadline),
+      });
+
     const token = await this.csrfToken();
-    const res = await this.request.post(`${ORIGIN}/graphql`, {
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        Origin: ORIGIN,
-        Referer: `${ORIGIN}/`,
-        ...(token ? { 'x-csrftoken': token } : {}),
-      },
-      data: { query, variables },
-      ...await this.requestOptions(deadline),
-    });
-    const { status, text: body, retryAfterMs } = await readResponse(res);
+    let res = await sendGraphqlPost(token);
+    let { status, text: body, retryAfterMs } = await readResponse(res);
+    if (status === 403 && isCsrfRejectionBody(body)) {
+      const refreshed = await this.refreshCsrfToken(undefined, token);
+      if (refreshed) {
+        res = await sendGraphqlPost(refreshed);
+        ({ status, text: body, retryAfterMs } = await readResponse(res));
+      }
+    }
     if (status !== 200) {
-      this.fail(new LeetCodeHttpError(`GraphQL HTTP ${status}`, status, retryAfterMs));
+      const detail = summarizeHttpErrorBody(body);
+      this.fail(new LeetCodeHttpError(`GraphQL HTTP ${status}${detail ? `: ${detail}` : ''}`, status, retryAfterMs));
     }
 
     let json: unknown;
@@ -547,20 +558,21 @@ export class LeetCodeApi {
     }
     if (typeof this.request.get !== 'function') return null;
 
+    const safeSlug = slug ? encodeURIComponent(slug) : undefined;
     const endpoints: Array<{ url: string; headers: Record<string, string> }> = [
       {
         url: `${ORIGIN}/api/problems/algorithms/`,
         headers: {
           Accept: 'application/json, text/plain, */*',
-          Referer: slug ? `${ORIGIN}/problems/${slug}/` : `${ORIGIN}/`,
+          Referer: safeSlug ? `${ORIGIN}/problems/${safeSlug}/` : `${ORIGIN}/`,
           'Sec-Fetch-Dest': 'empty',
           'Sec-Fetch-Mode': 'cors',
           'Sec-Fetch-Site': 'same-origin',
         },
       },
-      ...(slug
+      ...(safeSlug
         ? [{
-            url: `${ORIGIN}/problems/${slug}/`,
+            url: `${ORIGIN}/problems/${safeSlug}/`,
             headers: {
               Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
               Referer: `${ORIGIN}/problemset/`,
@@ -606,14 +618,15 @@ export class LeetCodeApi {
       );
     }
 
+    const safeSlug = encodeURIComponent(params.slug);
     const sendSubmitPost = async (csrf: string, waitBeforeSend?: () => Promise<void>) =>
-      this.request.post(`${ORIGIN}/problems/${params.slug}/submit/`, {
+      this.request.post(`${ORIGIN}/problems/${safeSlug}/submit/`, {
         headers: {
           'x-csrftoken': csrf,
           'Content-Type': 'application/json',
           Accept: 'application/json, text/plain, */*',
           Origin: ORIGIN,
-          Referer: `${ORIGIN}/problems/${params.slug}/`,
+          Referer: `${ORIGIN}/problems/${safeSlug}/`,
           'Sec-Fetch-Dest': 'empty',
           'Sec-Fetch-Mode': 'cors',
           'Sec-Fetch-Site': 'same-origin',
@@ -673,16 +686,18 @@ export class LeetCodeApi {
    * Returns null on any transport/parse problem so the caller can fall back.
    */
   async checkSubmission(submissionId: string, slug: string, deadline?: number): Promise<JudgeCheckResult | null> {
+    const safeId = encodeURIComponent(submissionId);
+    const safeSlug = encodeURIComponent(slug);
     const paths = [
-      `${ORIGIN}/submissions/detail/${submissionId}/v2/check/`,
-      `${ORIGIN}/submissions/detail/${submissionId}/check/`,
+      `${ORIGIN}/submissions/detail/${safeId}/v2/check/`,
+      `${ORIGIN}/submissions/detail/${safeId}/check/`,
     ];
     for (const url of paths) {
       try {
         const res = await this.request.get(url, {
           headers: {
             Accept: 'application/json',
-            Referer: `${ORIGIN}/problems/${slug}/`,
+            Referer: `${ORIGIN}/problems/${safeSlug}/`,
           },
           ...await this.requestOptions(deadline),
         });
@@ -738,7 +753,7 @@ export class LeetCodeApi {
 
     while (Date.now() < deadline) {
       await sleep(Math.min(firstPoll ? firstDelay : interval, deadline - Date.now()), undefined, { signal: this.policy?.signal });
-      if (this.policy && Date.now() >= deadline) break;
+      if (Date.now() >= deadline) break;
       firstPoll = false;
 
       // Primary source: the check endpoint LeetCode's own UI polls.
@@ -786,7 +801,10 @@ export class LeetCodeApi {
       }
 
       const statusDisplay = d?.statusDisplay ?? lastStatus;
-      const classification = d ? classifyStatusCode(d.statusCode) : 'UNKNOWN';
+      const textClass = d?.statusDisplay ? classifyStatusText(d.statusDisplay) : 'UNKNOWN';
+      const classification = d
+        ? (textClass !== 'UNKNOWN' ? textClass : classifyStatusCode(d.statusCode))
+        : 'UNKNOWN';
 
       // LeetCode may temporarily report "Internal Error" from
       // submissionDetails even though the submission has already completed.
@@ -806,8 +824,8 @@ export class LeetCodeApi {
         submissionId,
         classification,
         statusDisplay,
-        runtime: d.runtimeDisplay ?? (d.runtime != null ? `${d.runtime} ms` : null),
-        memory: d.memoryDisplay ?? (d.memory != null ? `${d.memory} MB` : null),
+        runtime: formatJudgeMetric(d.runtimeDisplay ?? d.runtime, 'ms'),
+        memory: formatJudgeMetric(d.memoryDisplay ?? d.memory, 'MB'),
         rawStatusMsg: statusDisplay,
       };
 
@@ -882,8 +900,8 @@ export class LeetCodeApi {
         submissionId,
         classification,
         statusDisplay: row.statusDisplay,
-        runtime: row.runtime != null ? `${row.runtime} ms` : null,
-        memory: row.memory != null ? `${row.memory} MB` : null,
+        runtime: formatJudgeMetric(row.runtime, 'ms'),
+        memory: formatJudgeMetric(row.memory, 'MB'),
         rawStatusMsg: row.statusDisplay,
       };
     } catch (err) {

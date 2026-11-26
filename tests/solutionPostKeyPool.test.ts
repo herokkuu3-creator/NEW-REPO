@@ -173,7 +173,7 @@ describe('solution article API key pool', () => {
     });
     expect(JSON.parse(fetcher.mock.calls[1]![1].body).model).toBe('qwen/qwen3.7-flash:free');
   });
-  it('uses default Sage Inkstone key for Sage provider when no keys configured in environment', async () => {
+  it('reports missing Sage credentials before calling the provider', async () => {
     Object.assign(config.solutionPosts, {
       baseUrl: 'https://discovery-api.intern-ai.org.cn/v1',
       apiKeys: [],
@@ -181,16 +181,13 @@ describe('solution article API key pool', () => {
       keyError: undefined,
     });
     const pool = await loadSolutionKeyPool();
-    expect(pool.keys).toContain('sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056');
+    expect(pool.keys).toEqual([]);
 
-    const fetcher = vi.fn().mockResolvedValueOnce(new Response('{"data":[]}'))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: 'SAGE_OK' } }] })));
+    const fetcher = vi.fn();
     vi.stubGlobal('fetch', fetcher);
     const result = await testSolutionApiKey();
-    expect(result.ok).toBe(true);
-    expect(fetcher.mock.calls[1]![1].headers.Authorization).toBe(
-      'Bearer sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056',
-    );
+    expect(result).toMatchObject({ ok: false, error: 'NO_KEY_CONFIGURED' });
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it('never retires Sage Inkstone keys on HTTP 429 and automatically recovers a wrongly retired Sage slot', async () => {
@@ -199,7 +196,7 @@ describe('solution article API key pool', () => {
 
     Object.assign(config.solutionPosts, {
       baseUrl: 'https://discovery-api.intern-ai.org.cn/v1',
-      apiKeys: [],
+      apiKeys: ['sk-fixture_sage_test_key_001'],
       models: ['minimax-m3'],
       keyError: undefined,
     });

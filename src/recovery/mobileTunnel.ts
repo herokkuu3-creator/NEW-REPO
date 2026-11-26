@@ -256,6 +256,14 @@ export class MobileTunnelServer {
     let fragBytes = 0;
     let closed = false;
     let authedHere = false;
+    let msgQueue = Promise.resolve();
+    const enqueueMessage = (opcode: number, payload: Buffer) => {
+      msgQueue = msgQueue
+        .then(() => onMessage(opcode, payload))
+        .catch((err) => {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'mobile tunnel message error');
+        });
+    };
 
     const closeWs = (code = 1000, reason = '') => {
       if (closed) return;
@@ -403,7 +411,7 @@ export class MobileTunnelServer {
             return;
           }
           if (f.fin) {
-            void onMessage(f.opcode, f.payload);
+            enqueueMessage(f.opcode, f.payload);
           } else {
             fragOpcode = f.opcode;
             fragChunks = [f.payload];
@@ -429,7 +437,7 @@ export class MobileTunnelServer {
             fragOpcode = 0;
             fragChunks = [];
             fragBytes = 0;
-            void onMessage(op, full);
+            enqueueMessage(op, full);
           }
         }
       }
@@ -577,6 +585,12 @@ export class MobileTunnelServer {
       socket.on('data', (data: Buffer) => {
         if (stream.opened) {
           this.sendStreamData(id, data);
+          if (this.activeClient && !this.activeClient.destroyed && this.activeClient.writableLength > 512 * 1024) {
+            socket.pause();
+            this.activeClient.once('drain', () => {
+              if (!socket.destroyed) socket.resume();
+            });
+          }
         } else {
           stream.leftover = Buffer.concat([stream.leftover, data]);
         }

@@ -194,7 +194,7 @@ function sourceTemplates(code: string): string[] {
 function formatProse(markdown: string, templates: string[]): string {
   const sorted = [...templates].filter(Boolean).sort((a, b) => b.length - a.length);
   if (!sorted.length) return markdown;
-  const pattern = new RegExp(sorted.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g');
+  const pattern = new RegExp(`(?<![\\w:])(?:${sorted.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'g');
   return markdown.split(/(`+[^`\n]*`+)/g).map((part, index) =>
     index % 2 ? part : part.replace(pattern, match => '`' + match + '`'),
   ).join('');

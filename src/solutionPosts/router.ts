@@ -73,7 +73,9 @@ export class OutputValidationError extends Error {
 }
 
 export function parseJSON(text: string): unknown {
-  return JSON.parse(text.trim().replace(/^```(?:json)?\s*\r?\n/, '').replace(/\r?\n```$/, ''));
+  const trimmed = text.trim();
+  const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*$/i.exec(trimmed);
+  return JSON.parse(fenced ? fenced[1]! : trimmed);
 }
 
 /** Uses the existing OpenAI SDK/protocol, with one bounded retry owner. Never logs provider bodies. */
@@ -351,9 +353,19 @@ export class AIModelRouter {
             const rawContent: unknown = response.choices[0]?.message.content;
             const text = typeof rawContent === 'string'
               ? rawContent
-              : rawContent && typeof rawContent === 'object'
-                ? JSON.stringify(rawContent)
-                : '';
+              : Array.isArray(rawContent)
+                ? rawContent
+                    .map((part) =>
+                      typeof part === 'string'
+                        ? part
+                        : part && typeof part === 'object' && 'text' in part && typeof (part as { text?: unknown }).text === 'string'
+                          ? (part as { text: string }).text
+                          : '',
+                    )
+                    .join('')
+                : rawContent && typeof rawContent === 'object'
+                  ? JSON.stringify(rawContent)
+                  : '';
             if (!text.trim()) throw new Error('EMPTY_OUTPUT');
             const value = validate(text);
             record.outcome = 'SUCCESS'; record.elapsedMs = Date.now() - started;
@@ -474,8 +486,12 @@ export class AIModelRouter {
 }
 
 function isCoarenaUrl(baseUrl: string): boolean {
-  try { return new URL(baseUrl).hostname === 'coarena.ai'; }
-  catch { return false; }
+  try {
+    const url = new URL(baseUrl);
+    return url.protocol === 'https:' && url.hostname === 'coarena.ai';
+  } catch {
+    return false;
+  }
 }
 
 function coarenaErrorStatus(code: string): number {

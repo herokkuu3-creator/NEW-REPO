@@ -330,7 +330,8 @@ describe('multi-account run shares one solution', () => {
 
     expect(report.totals.solved).toBe(3);
     expect(report.accounts.map((a) => a.kind)).toEqual(['solved', 'solved', 'solved']);
-    expect(h.fetchCommunity).toHaveBeenCalledTimes(3);
+    expect(h.fetchCommunity.mock.calls.map(([, , options]) => options.maxArticles))
+      .toEqual([10, 50, 10, 50, 10, 50]);
     expect(h.fetchWalkccc).toHaveBeenCalledTimes(1); // Cached by walkcccCache!
     expect(h.submit).toHaveBeenCalledTimes(3);
   });

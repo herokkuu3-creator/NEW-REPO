@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config';
+import { redactSecrets } from '../security/redact';
 import { validateSolutionPostModels } from '../config/solutionPostModels';
 import { prisma } from '../database/prisma';
 import { generateForRun, retryPost, requeueInterruptedGeneration, PostError, resetFailedSolutionPostRetries } from './service';
@@ -166,9 +167,18 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
     });
     // Keys are write-only: callers receive only masked slots and the active position.
     scoped.get('/admin/solutions/api-keys', async () => solutionKeyPoolStatus());
-    scoped.post('/admin/solutions/api-keys', async req => {
+    scoped.post('/admin/solutions/api-keys', async (req, reply) => {
       const { apiKeys } = z.object({ apiKeys: z.string().min(1).max(52000) }).strict().parse(req.body);
-      const result = await appendSolutionApiKeys(apiKeys);
+      let result: Awaited<ReturnType<typeof appendSolutionApiKeys>>;
+      try {
+        result = await appendSolutionApiKeys(apiKeys);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '';
+        if (/API key/i.test(msg)) {
+          return reply.code(400).send({ error: 'INVALID_REQUEST' });
+        }
+        throw err;
+      }
       const status = await solutionKeyPoolStatus();
       if (status.active) await resetFailedSolutionPostRetries();
       return { added: result.added, duplicates: result.duplicates, ...status };
@@ -217,7 +227,7 @@ export function registerSolutionPostRoutes(app: FastifyInstance, authorize: (hea
           provider: data.provider ?? null, finishReason: data.choices?.[0]?.finish_reason ?? null,
           replyReceived: typeof content === 'string' && content.trim().length > 0,
           reportedCostUsd: cost,
-          ...(response.ok ? {} : { error: String(data.error?.message ?? `HTTP_${response.status}`).replaceAll(apiKey, '[REDACTED]').slice(0, 300) }),
+          ...(response.ok ? {} : { error: redactSecrets(String(data.error?.message ?? `HTTP_${response.status}`).replaceAll(apiKey, '[REDACTED]').slice(0, 300)) }),
         };
       } catch {
         return { ok: false, executionHost: process.env.RENDER_INSTANCE_ID ? 'render' : 'local',

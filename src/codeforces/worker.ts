@@ -888,28 +888,32 @@ async function runForAccount(
         verdict: duplicateSubmission ? 'DUPLICATE_CODE' : verdictCode,
       });
     }
+    let sessionRefreshed = false;
     if (result.kind === 'signed-out') {
       const refreshed = await refreshCodeforcesAccount(account).catch(() => null);
       if (refreshed?.status === 'refreshed') {
+        sessionRefreshed = true;
         logger.info({ label }, 'Codeforces session auto-refreshed via credentials');
       }
     }
     await patchCodeforcesAccount(account.id, {
       status:
-        result.kind === 'signed-out'
-          ? CodeforcesAccountStatus.REJECTED
-          : result.kind === 'blocked'
-            ? CodeforcesAccountStatus.UNKNOWN
-            : CodeforcesAccountStatus.ACTIVE,
+        sessionRefreshed
+          ? CodeforcesAccountStatus.ACTIVE
+          : result.kind === 'signed-out'
+            ? CodeforcesAccountStatus.REJECTED
+            : result.kind === 'blocked'
+              ? CodeforcesAccountStatus.UNKNOWN
+              : CodeforcesAccountStatus.ACTIVE,
       username,
       lastError: result.error,
       checked: true,
       lastSubmissionDate: today,
       lastSubmissionId: result.submissionId ?? null,
       lastVerdict: verdictCode,
-      ...(stateDirty ? { state: stored.state } : {}),
+      ...(!sessionRefreshed && stateDirty ? { state: stored.state } : {}),
     });
-    if (stateDirty) account.storageState = JSON.stringify(stored.state);
+    if (!sessionRefreshed && stateDirty) account.storageState = JSON.stringify(stored.state);
     return {
       accountId: account.id,
       label,
@@ -1151,6 +1155,7 @@ async function postViaLocalBrowser(
   });
   watch.start();
 
+  let watchResult: { peakMb: number; tripped: boolean } | null = null;
   try {
     submittedAt = Math.floor(Date.now() / 1000);
     posted = await postSubmitForm(session, entry, code);
@@ -1163,8 +1168,8 @@ async function postViaLocalBrowser(
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const { peakMb, tripped } = watch.stop();
-    logMemory('codeforces browser step finished', { peakMb, tripped, pressured });
+    watchResult = watch.stop();
+    logMemory('codeforces browser step finished', { ...watchResult, pressured });
     return {
       ok: false,
       kind: pressured ? 'blocked' : 'error',
@@ -1180,6 +1185,7 @@ async function postViaLocalBrowser(
       transport: 'Firefox transport',
     };
   } finally {
+    watchResult ??= watch.stop();
     clearTimeout(attemptTimer);
     const closing = session.close().catch(() => undefined);
     const bail = new Promise<void>((resolve) => {
@@ -1190,8 +1196,7 @@ async function postViaLocalBrowser(
     releaseHeap();
   }
 
-  const { peakMb, tripped } = watch.stop();
-  logMemory('codeforces browser step finished', { peakMb, tripped, pressured });
+  logMemory('codeforces browser step finished', { ...watchResult, pressured });
   if (pressured && !posted.ok) {
     posted.kind = 'blocked';
     posted.error = `the local browser step was stopped at the instance's memory ceiling: ${posted.error}`;

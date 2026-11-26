@@ -282,7 +282,13 @@ export class CoarenaRouter extends AIModelRouter {
     const checkpointId = createHash('sha256').update(JSON.stringify([this.modelOrder.writers, this.modelOrder.reviewers,
       stage, input, tokens, jsonMode])).digest('hex');
     const saved = await this.checkpoint?.read(checkpointId);
-    if (saved) return { value: validate(saved.raw), model: saved.model, attempts: saved.attempts };
+    if (saved) {
+      try {
+        return { value: validate(saved.raw), model: saved.model, attempts: saved.attempts };
+      } catch {
+        // Ignore invalid or schema-drifted cached checkpoint and regenerate freshly.
+      }
+    }
 
     const deadline = this.deadlineAt ?? Infinity;
     const capacityPause = () => new CoarenaPause('COARENA_CAPACITY', new Date(Date.now() + 60_000));

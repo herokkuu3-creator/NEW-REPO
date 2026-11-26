@@ -15,7 +15,9 @@ export function startArticleWorkKeepAlive(): () => void {
     }
     const ping = () => {
       try {
-        void Promise.resolve(fetch(url, { signal: AbortSignal.timeout(20000) })).catch(() => undefined);
+        void Promise.resolve(fetch(url, { signal: AbortSignal.timeout(20000) }))
+          .then((res) => res?.body?.cancel?.().catch(() => undefined))
+          .catch(() => undefined);
       } catch {
         // Ignore synchronous fetch/AbortSignal errors in keep-alive timer
       }

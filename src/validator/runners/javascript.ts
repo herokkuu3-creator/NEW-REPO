@@ -7,6 +7,7 @@ import { CodeRunner, RunReport, TestCase, TestResult } from './types';
 
 const execFileAsync = promisify(execFile);
 const TIMEOUT_MS = 10_000;
+const HARNESS_RESULT_PREFIX = '__LC_HARNESS_RESULT__:';
 
 /**
  * JavaScript runner: executes the candidate inside a Node child process.
@@ -24,7 +25,7 @@ export class JavaScriptRunner implements CodeRunner {
     try {
       const file = path.join(dir, 'check.js');
       fs.writeFileSync(file, code);
-      await execFileAsync(process.execPath, ['--check', file], { timeout: TIMEOUT_MS });
+      await execFileAsync(process.execPath, ['--max-old-space-size=128', '--check', file], { timeout: TIMEOUT_MS });
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message.slice(0, 2000) : String(err) };
@@ -44,18 +45,23 @@ export class JavaScriptRunner implements CodeRunner {
       const file = path.join(dir, 'harness.js');
       fs.writeFileSync(file, harness);
 
-      const { stdout, stderr } = await execFileAsync(process.execPath, [file], {
-        timeout: TIMEOUT_MS,
-        maxBuffer: 4 * 1024 * 1024,
-      });
+      const { stdout, stderr } = await execFileAsync(
+        process.execPath,
+        ['--max-old-space-size=128', file],
+        {
+          timeout: TIMEOUT_MS,
+          maxBuffer: 4 * 1024 * 1024,
+        },
+      );
 
       const results: TestResult[] = [];
       for (const line of stdout.split('\n')) {
-        if (!line.trim()) continue;
+        const trimmed = line.trim();
+        if (!trimmed.startsWith(HARNESS_RESULT_PREFIX)) continue;
         try {
-          results.push(JSON.parse(line) as TestResult);
+          results.push(JSON.parse(trimmed.slice(HARNESS_RESULT_PREFIX.length)) as TestResult);
         } catch {
-          // Non-JSON output (e.g. stray console.log in the solution) — ignore.
+          // Malformed marker line — ignore.
         }
       }
 
@@ -122,22 +128,28 @@ function __norm(v) {
       const args = t.args.map((a) => JSON.parse(a));
       let actual = fn(...args);
       if (actual instanceof Promise) actual = await actual;
-      const actualStr = JSON.stringify(__norm(actual === undefined ? null : actual));
+      const actualStr = actual === undefined ? 'undefined' : JSON.stringify(__norm(actual));
       let passed = true;
       if (t.expected !== null) {
-        passed = __deepEqual(actual, JSON.parse(t.expected));
+        passed = actual !== undefined && __deepEqual(actual, JSON.parse(t.expected));
       }
-      console.log(JSON.stringify({
-        label: t.label, passed,
-        actual: actualStr === undefined ? null : actualStr,
-        expected: t.expected, durationMs: Date.now() - started,
-      }));
+      console.log(
+        ${JSON.stringify(HARNESS_RESULT_PREFIX)} +
+          JSON.stringify({
+            label: t.label, passed,
+            actual: actualStr ?? 'undefined',
+            expected: t.expected, durationMs: Date.now() - started,
+          }),
+      );
     } catch (e) {
-      console.log(JSON.stringify({
-        label: t.label, passed: false,
-        error: String(e && e.message ? e.message : e).slice(0, 500),
-        durationMs: Date.now() - started,
-      }));
+      console.log(
+        ${JSON.stringify(HARNESS_RESULT_PREFIX)} +
+          JSON.stringify({
+            label: t.label, passed: false,
+            error: String(e && e.message ? e.message : e).slice(0, 500),
+            durationMs: Date.now() - started,
+          }),
+      );
     }
   }
 })();

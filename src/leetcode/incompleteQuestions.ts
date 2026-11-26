@@ -63,7 +63,7 @@ export async function fetchIncompleteQuestions(
   categorySlug = '',
 ): Promise<IncompleteQuestion[]> {
   const result: IncompleteQuestion[] = [];
-  const targetCount = Math.max(1, count);
+  const targetCount = Number.isFinite(count) ? Math.max(1, Math.floor(count)) : 1;
   const safePageSize = Number.isFinite(pageSize) ? Math.max(1, Math.floor(pageSize)) : 50;
   let skip = 0;
 
@@ -104,8 +104,6 @@ export async function fetchIncompleteQuestions(
         title: q.title || `Question #${num}`,
         status: q.status ?? null,
       });
-
-      if (result.length >= targetCount) break;
     }
 
     if (questions.length < safePageSize) break;

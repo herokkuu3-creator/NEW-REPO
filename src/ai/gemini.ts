@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { LLMError, LLMGenerateOptions, LLMMessage, LLMProvider } from './provider';
 import { logger } from '../logger';
+import { redactSecrets } from '../security/redact';
 
 /**
  * Google Gemini, reached through its OpenAI-compatible endpoint:
@@ -113,7 +114,7 @@ export class GeminiProvider implements LLMProvider {
         if (err instanceof LLMError) throw err;
 
         const msg = err instanceof Error ? err.message : String(err);
-        throw new LLMError(`gemini request failed: ${msg}`, this.name, err);
+        throw new LLMError(`gemini request failed: ${redactSecrets(msg)}`, this.name, err);
       }
     }
   }
@@ -134,8 +135,11 @@ function isRateLimit(err: unknown): boolean {
 /** Honour Gemini's Retry-After header when present, capped to stay responsive. */
 function retryAfterMs(err: unknown): number | null {
   if (typeof err !== 'object' || err === null) return null;
-  const headers = (err as { headers?: Record<string, string> }).headers;
-  const raw = headers?.['retry-after'];
+  const headers = (err as { headers?: Record<string, string> | { get?: (name: string) => string | null } }).headers;
+  const raw =
+    headers && typeof (headers as { get?: unknown }).get === 'function'
+      ? (headers as { get: (name: string) => string | null }).get('retry-after') ?? undefined
+      : (headers as Record<string, string> | undefined)?.['retry-after'];
   if (!raw) return null;
   const seconds = Number.parseInt(raw, 10);
   if (!Number.isFinite(seconds) || seconds <= 0) return null;

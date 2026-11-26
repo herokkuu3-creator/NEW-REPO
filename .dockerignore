@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+dist
+coverage
+tests
+docs
+temp-turnstile
+diagnostics
+local-auth
+.planning
+.env
+.env.*
+*.log
+*.tsbuildinfo

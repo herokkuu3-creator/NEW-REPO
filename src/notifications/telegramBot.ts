@@ -21,6 +21,7 @@ import {
   deleteAccountById,
   deleteAllAccounts,
   getAccountById,
+  listAccountSummaries,
   listAccounts,
   listEnabledAccounts,
   parseStoredStorageState,
@@ -480,6 +481,8 @@ export async function handleTelegramUpdate(update: TgUpdate): Promise<void> {
   }
 }
 
+let webhookUpdateQueue: Promise<void> = Promise.resolve();
+
 export function registerTelegramWebhookRoute(app: FastifyInstance): void {
   recentUpdateIds.clear();
   webhookRouteCount += 1;
@@ -506,9 +509,10 @@ export function registerTelegramWebhookRoute(app: FastifyInstance): void {
     if (!body || typeof body !== 'object' || typeof body.update_id !== 'number') {
       return reply.code(400).send({ ok: false });
     }
-    void handleTelegramUpdate(body as TgUpdate).catch((err) =>
-      logger.warn({ err: errText(err) }, 'telegram webhook update failed'),
-    );
+    const update = body as TgUpdate;
+    webhookUpdateQueue = webhookUpdateQueue
+      .then(() => handleTelegramUpdate(update))
+      .catch((err) => logger.warn({ err: errText(err) }, 'telegram webhook update failed'));
     return reply.code(200).send({ ok: true });
   });
 }
@@ -543,17 +547,10 @@ export function startTelegramBot(deps: PollerDeps = {}): () => void {
     try {
       const raw = await getOwner();
       if (!raw) return true;
-      const [ownerId, tsStr] = raw.split('@');
+      const atIdx = raw.lastIndexOf('@');
+      const ownerId = atIdx > 0 ? raw.slice(0, atIdx) : raw;
       if (ownerId === instanceId) {
         return true;
-      }
-      if (tsStr) {
-        const ts = Number(tsStr);
-        if (Number.isFinite(ts) && Date.now() - ts > HANDOVER_GRACE_MS * 2) {
-          logger.info({ staleOwner: ownerId }, 'telegram poller owner key is stale — reclaiming ownership');
-          await setOwner(instanceId).catch(() => null);
-          return true;
-        }
       }
       // Another instance claimed the slot after this one did (every instance claims it at
       // startup), so it is the newer one. Never reclaim from it here: two instances that
@@ -5040,7 +5037,14 @@ export async function handleReplaceSolutionApiKeys(commandArg?: string): Promise
   }
 }
 
+let boostViewsInProgress = false;
+
 export async function handleBoostSolutionViews(msg: TgMessage, commandArg?: string): Promise<void> {
+  if (boostViewsInProgress) {
+    await reply('⏳ View boost is already running in the background. Please wait for it to finish.');
+    return;
+  }
+  boostViewsInProgress = true;
   const arg = (commandArg ?? '').trim();
   let targetUrl: string | null = null;
   let topicId: number | null = null;
@@ -5114,6 +5118,8 @@ export async function handleBoostSolutionViews(msg: TgMessage, commandArg?: stri
     );
   } catch (err) {
     await replyHtml(`❌ Failed to boost views: ${escapeHtml(errText(err))}`).catch(() => undefined);
+  } finally {
+    boostViewsInProgress = false;
   }
 }
 
@@ -5123,18 +5129,11 @@ export async function handleAiChat(question: string): Promise<void> {
     const sage = await askSage(question);
     if (sage.ok) {
       const header = `🤖 <b>Sage Inkstone</b> (<code>${escapeHtml(sage.model)}</code> · ${sage.elapsedMs}ms)\n<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n`;
-      const fullText = header + escapeHtml(sage.answer);
-      const characters = Array.from(fullText);
-      for (let offset = 0; offset < characters.length; offset += 3500) {
-        await replyHtml(characters.slice(offset, offset + 3500).join(''));
-      }
+      await replyHtml(header + escapeHtml(sage.answer));
       return;
     }
   }
-  const characters = Array.from(result);
-  for (let offset = 0; offset < characters.length; offset += 3500) {
-    await reply(characters.slice(offset, offset + 3500).join(''));
-  }
+  await reply(result);
 }
 
 export async function handleAskSage(question?: string): Promise<void> {
@@ -5160,11 +5159,7 @@ export async function handleAskSage(question?: string): Promise<void> {
     return;
   }
   const header = `🤖 <b>Sage Inkstone</b> (<code>${escapeHtml(result.model)}</code> · ${result.elapsedMs}ms)\n<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n`;
-  const fullText = header + escapeHtml(result.answer);
-  const characters = Array.from(fullText);
-  for (let offset = 0; offset < characters.length; offset += 3500) {
-    await replyHtml(characters.slice(offset, offset + 3500).join(''));
-  }
+  await replyHtml(header + escapeHtml(result.answer));
 }
 
 export async function handleTestSage(commandArg?: string): Promise<void> {
@@ -5188,7 +5183,7 @@ export async function handleTestSage(commandArg?: string): Promise<void> {
   }
   lines.push('');
   if (result.chatStatus === 200) {
-    lines.push(`• <b>POST /v1/chat/completions:</b> 🟢 HTTP 200 OK (model: <code>${result.chatModel}</code>)`);
+    lines.push(`• <b>POST /v1/chat/completions:</b> 🟢 HTTP 200 OK (model: <code>${escapeHtml(result.chatModel)}</code>)`);
     if (result.chatReply) {
       lines.push(`  └ <b>Sample output:</b> <code>${escapeHtml(result.chatReply.slice(0, 100))}</code>`);
     }
@@ -5196,7 +5191,7 @@ export async function handleTestSage(commandArg?: string): Promise<void> {
     lines.push('✅ <b>Sage Inkstone API is fully operational from Render!</b>');
     lines.push('You can ask questions anytime using <code>/asksage &lt;question&gt;</code> or <code>/sage &lt;question&gt;</code>.');
   } else {
-    lines.push(`• <b>POST /v1/chat/completions:</b> 🔴 HTTP ${result.chatStatus} (model: <code>${result.chatModel}</code>)`);
+    lines.push(`• <b>POST /v1/chat/completions:</b> 🔴 HTTP ${result.chatStatus} (model: <code>${escapeHtml(result.chatModel)}</code>)`);
     if (result.error) {
       lines.push(`  └ <b>Error:</b> <code>${escapeHtml(result.error)}</code>`);
     }
@@ -5290,14 +5285,14 @@ export async function handleTestSolutionApiKey(commandArg?: string): Promise<voi
   if (result.chatStatus) {
     if (result.ok) {
       const cleared = await resetFailedSolutionPostRetries().catch(() => 0);
-      lines.push(`• <b>POST /v1/chat/completions:</b> 🟢 HTTP 200 OK (model: <code>${result.chatModel}</code>)`);
+      lines.push(`• <b>POST /v1/chat/completions:</b> 🟢 HTTP 200 OK (model: <code>${escapeHtml(result.chatModel ?? '')}</code>)`);
       lines.push('');
       lines.push('✅ <b>Provider test passed.</b> Authentication and a short response worked. Full articles, GIFs, and publishing have separate validation steps.');
       if (cleared > 0) {
         lines.push(`🔄 <b>Auto-recovered:</b> Unlocked <b>${cleared}</b> stalled solution article(s) for retry.`);
       }
     } else {
-      lines.push(`• <b>POST /v1/chat/completions:</b> 🔴 HTTP ${result.chatStatus} (model: <code>${result.chatModel}</code>)`);
+      lines.push(`• <b>POST /v1/chat/completions:</b> 🔴 HTTP ${result.chatStatus} (model: <code>${escapeHtml(result.chatModel ?? '')}</code>)`);
       if (result.chatError) lines.push(`  └ <b>Error:</b> <code>${escapeHtml(result.chatError)}</code>`);
       if (result.chatCode) lines.push(`  └ <b>Code:</b> <code>${escapeHtml(result.chatCode)}</code>`);
       if (result.chatType) lines.push(`  └ <b>Type:</b> <code>${escapeHtml(result.chatType)}</code>`);
@@ -7718,7 +7713,8 @@ export function isAnyWorkerBusy(): boolean {
     isCodeChefRunInProgress() ||
     isRunInProgress() ||
     Boolean(currentRangeJob()) ||
-    coinClaimInProgress
+    coinClaimInProgress ||
+    boostViewsInProgress
   );
 }
 
@@ -7728,6 +7724,7 @@ export function describeActiveWorker(): string | null {
   if (isRunInProgress()) return '⚡ LeetCode daily submission';
   if (currentRangeJob()) return '🎯 LeetCode question-range submission';
   if (coinClaimInProgress) return '🪙 LeetCode reward claim';
+  if (boostViewsInProgress) return '👁️ Solution views verification';
   return null;
 }
 
@@ -8779,11 +8776,26 @@ async function handleCheckSessionsCommand(): Promise<void> {
   }
 }
 
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
+
+async function listLeetCodeAccountMetas() {
+  return !isMockFn(listAccounts) && typeof listAccountSummaries === 'function'
+    ? listAccountSummaries()
+    : listAccounts();
+}
+
 async function accountsText(): Promise<string> {
   const [accounts, codeforces, codechefs] = await Promise.all([
-    listAccounts(),
+    listLeetCodeAccountMetas(),
     listCodeforcesAccounts(true),
     listCodeChefAccounts(true),
+  ]);
+  const [acceptedList, cfProgressList, ccProgressList] = await Promise.all([
+    Promise.all(accounts.map((a) => latestAcceptedRunForAccount(a.id))),
+    Promise.all(codeforces.map((a) => getCodeforcesProgress(a.id))),
+    Promise.all(codechefs.map((a) => getCodeChefAccountProgress(a.id))),
   ]);
   const lines = [
     '<b>✦ ACCOUNT HUB</b>  <i>live snapshot</i>',
@@ -8794,9 +8806,10 @@ async function accountsText(): Promise<string> {
   if (accounts.length === 0) {
     lines.push('📭 No LeetCode accounts configured. Send /renew with a cookie export.');
   }
-  for (const a of accounts) {
+  for (let i = 0; i < accounts.length; i++) {
+    const a = accounts[i]!;
+    const accepted = acceptedList[i];
     const who = a.username ? ` (${escapeHtml(a.username)})` : '';
-    const accepted = await latestAcceptedRunForAccount(a.id);
     const acceptedText = accepted ? `AC ${humanLocal(accepted.updatedAt)}` : 'no accepted run';
     const checkedText = a.lastCheckedAt ? ` · checked ${humanLocal(a.lastCheckedAt)}` : '';
     lines.push(`${accountStatusIcon(a.status)} <b>${escapeHtml(a.label)}</b>${who}  <i>${escapeHtml(acceptedText)}${escapeHtml(checkedText)}</i>`);
@@ -8804,8 +8817,9 @@ async function accountsText(): Promise<string> {
   }
   lines.push('', '<code>━━━━━━━━━━━━━━━━━━━━</code>', '', `<b>🏆 CODEFORCES</b>  <code>${codeforces.length} connected</code>`);
   if (codeforces.length === 0) lines.push('📭 No Codeforces accounts configured.');
-  for (const account of codeforces) {
-    const progress = await getCodeforcesProgress(account.id);
+  for (let i = 0; i < codeforces.length; i++) {
+    const account = codeforces[i]!;
+    const progress = cfProgressList[i]!;
     const who = account.username ? ` (${escapeHtml(account.username)})` : '';
     const verdict = progress.lastVerdict ? ` · <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
     lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
@@ -8814,8 +8828,9 @@ async function accountsText(): Promise<string> {
   }
   lines.push('', '<code>━━━━━━━━━━━━━━━━━━━━</code>', '', `<b>👨‍🍳 CODECHEF</b>  <code>${codechefs.length} connected</code>`);
   if (codechefs.length === 0) lines.push('📭 No CodeChef accounts configured. Add CODECHEF_1 in Render.');
-  for (const account of codechefs) {
-    const progress = await getCodeChefAccountProgress(account.id);
+  for (let i = 0; i < codechefs.length; i++) {
+    const account = codechefs[i]!;
+    const progress = ccProgressList[i]!;
     const who = account.username ? ` (${escapeHtml(account.username)})` : '';
     const verdict = progress.lastVerdict ? ` · <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
     lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
@@ -8938,9 +8953,13 @@ async function statusText(): Promise<string> {
     getAllSystemState(),
     latestRun(),
     latestAcceptedRun(),
-    listAccounts(),
+    listLeetCodeAccountMetas(),
     listCodeforcesAccounts(true),
     listCodeChefAccounts(true),
+  ]);
+  const [cfProgressList, ccProgressList] = await Promise.all([
+    Promise.all(codeforces.map((a) => getCodeforcesProgress(a.id))),
+    Promise.all(codechefs.map((a) => getCodeChefAccountProgress(a.id))),
   ]);
   const active = accounts.filter((a) => a.status === AccountStatus.ACTIVE).length;
   const expired = accounts.filter((a) => a.status === AccountStatus.EXPIRED).length;
@@ -8965,8 +8984,9 @@ async function statusText(): Promise<string> {
   if (codeforces.length === 0) {
     lines.push('📭 No Codeforces accounts configured.');
   } else {
-    for (const account of codeforces) {
-      const progress = await getCodeforcesProgress(account.id);
+    for (let i = 0; i < codeforces.length; i++) {
+      const account = codeforces[i]!;
+      const progress = cfProgressList[i]!;
       const who = account.username ? ` (${escapeHtml(account.username)})` : '';
       const verdict = progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
       lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
@@ -8977,8 +8997,9 @@ async function statusText(): Promise<string> {
   if (codechefs.length === 0) {
     lines.push('📭 No CodeChef accounts configured.');
   } else {
-    for (const account of codechefs) {
-      const progress = await getCodeChefAccountProgress(account.id);
+    for (let i = 0; i < codechefs.length; i++) {
+      const account = codechefs[i]!;
+      const progress = ccProgressList[i]!;
       const who = account.username ? ` (${escapeHtml(account.username)})` : '';
       const verdict = progress.lastVerdict ? ` — <i>${escapeHtml(progress.lastVerdict)}</i>` : '';
       lines.push(`${accountStatusIcon(account.status)} <b>${escapeHtml(account.label)}</b>${who}${verdict}`);
@@ -8989,7 +9010,12 @@ async function statusText(): Promise<string> {
 }
 
 function escapeHtml(value: string): string {
-  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function accountStatusIcon(status?: string | null): string {

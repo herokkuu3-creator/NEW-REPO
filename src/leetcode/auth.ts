@@ -703,7 +703,7 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
       if (hasDeferredTurnstile) {
         const waitUntil = Date.now() + Math.min(15_000, remaining());
         while (Date.now() < waitUntil && !await submit.isEnabled()) {
-          if (options.signal?.aborted) throw new LoginFailure('LOGIN_CANCELLED', 'Login cancelled.');
+          if (combinedSignal?.aborted) throw new LoginFailure('LOGIN_CANCELLED', 'Login cancelled.');
           const deferredDetail = await detectVerificationDetail(page);
           if (deferredDetail.required) {
             await attemptSolverVerification(deferredDetail, status);
@@ -713,7 +713,7 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
         }
         const enableWaitUntil = Date.now() + Math.min(2_000, remaining());
         while (Date.now() < enableWaitUntil && !await submit.isEnabled()) {
-          if (options.signal?.aborted) throw new LoginFailure('LOGIN_CANCELLED', 'Login cancelled.');
+          if (combinedSignal?.aborted) throw new LoginFailure('LOGIN_CANCELLED', 'Login cancelled.');
           await new Promise(resolve => setTimeout(resolve, 100));
         }
         if (!await submit.isEnabled() && diagnostic.solverAttempted && diagnostic.verificationCompleted) {
@@ -790,7 +790,7 @@ export async function loginOnLeetCodePage(page: Page, username: string, password
       combinedSignal,
     );
   } catch (error) {
-    const failure = options.signal?.aborted
+    const failure = combinedSignal?.aborted
       ? new LoginFailure('LOGIN_CANCELLED', 'Login cancelled.', undefined, 'LOGIN_FAILED')
       : error instanceof LoginFailure
         ? error
@@ -823,7 +823,7 @@ export async function loginToLeetCode(loginInput: string, password: string,
   const deadline = Date.now() + timeoutMs;
 
   if (hasRemoteSolver) {
-    await options.onProgress?.('🌐 Signing in via remote solver browser (single-IP session)…', 'LOGIN_PAGE_LOADING');
+    await Promise.resolve(options.onProgress?.('🌐 Signing in via remote solver browser (single-IP session)…', 'LOGIN_PAGE_LOADING')).catch(() => undefined);
     if (options.signal?.aborted) {
       return { ok: false, code: 'LOGIN_CANCELLED', error: 'Login cancelled.', state: 'LOGIN_FAILED' };
     }
@@ -838,21 +838,29 @@ export async function loginToLeetCode(loginInput: string, password: string,
     });
 
     if (remoteRes.ok && remoteRes.storageState && remoteRes.username) {
-      const normalizedCookies: StorageCookie[] = remoteRes.storageState.cookies.map((c) => ({
-        name: String(c.name ?? ''),
-        value: String(c.value ?? ''),
-        domain: String(c.domain || '.leetcode.com'),
-        path: String(c.path || '/'),
-        expires: typeof c.expires === 'number' && Number.isFinite(c.expires) ? c.expires : -1,
-        httpOnly: Boolean(c.httpOnly),
-        secure: Boolean(c.secure),
-        sameSite: c.sameSite === 'Strict' || c.sameSite === 'None' ? c.sameSite : 'Lax',
-      }));
-      await options.onProgress?.('✅ Remote single-IP browser login succeeded.', 'AUTHENTICATED');
+      const normalizedCookies: StorageCookie[] = remoteRes.storageState.cookies.map((c) => {
+        const sameSite: 'Strict' | 'None' | 'Lax' =
+          c.sameSite === 'Strict' || c.sameSite === 'None' ? c.sameSite : 'Lax';
+        return {
+          name: String(c.name ?? ''),
+          value: String(c.value ?? ''),
+          domain: String(c.domain || '.leetcode.com'),
+          path: String(c.path || '/'),
+          expires: typeof c.expires === 'number' && Number.isFinite(c.expires) ? c.expires : -1,
+          httpOnly: Boolean(c.httpOnly),
+          secure: sameSite === 'None' ? true : Boolean(c.secure),
+          sameSite,
+        };
+      });
+      const remoteTransport =
+        (remoteRes.storageState as StorageStateShape).transport ??
+        (options.proxyUrl ? { proxyUrl: options.proxyUrl } : undefined);
+      await Promise.resolve(options.onProgress?.('✅ Remote single-IP browser login succeeded.', 'AUTHENTICATED')).catch(() => undefined);
       return {
         ok: true,
         username: remoteRes.username,
         storageState: {
+          ...(remoteTransport ? { transport: remoteTransport } : {}),
           cookies: normalizedCookies,
           origins: remoteRes.storageState.origins ?? [],
         },

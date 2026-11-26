@@ -23,6 +23,9 @@ export const SELECTORS = {
 
   /** Options inside the open language dropdown */
   languageOption: (label: string) => [
+    `li[role="option"]:text-is("${label}")`,
+    `div[role="option"]:text-is("${label}")`,
+    `button:text-is("${label}")`,
     `li[role="option"]:has-text("${label}")`,
     `div[role="option"]:has-text("${label}")`,
     `button:has-text("${label}")`,
@@ -51,8 +54,18 @@ export const SELECTORS = {
   ],
 
   /** Runtime / memory beats lines in the result panel */
-  resultRuntime: ['span:has-text("Runtime")', 'div:has-text("Runtime")'],
-  resultMemory: ['span:has-text("Memory")', 'div:has-text("Memory")'],
+  resultRuntime: [
+    '[data-e2e-locator="submission-detail"] span:has-text("Runtime")',
+    'div[class*="result"] span:has-text("Runtime")',
+    'span:has-text("Runtime")',
+    'div:has-text("Runtime")',
+  ],
+  resultMemory: [
+    '[data-e2e-locator="submission-detail"] span:has-text("Memory")',
+    'div[class*="result"] span:has-text("Memory")',
+    'span:has-text("Memory")',
+    'div:has-text("Memory")',
+  ],
 } as const;
 
 /** Human labels LeetCode uses for each supported language slug. */
@@ -61,4 +74,12 @@ export const LANGUAGE_LABELS: Record<string, string> = {
   javascript: 'JavaScript',
   typescript: 'TypeScript',
   python3: 'Python3',
+  python: 'Python',
+  java: 'Java',
+  c: 'C',
+  csharp: 'C#',
+  golang: 'Go',
+  rust: 'Rust',
+  kotlin: 'Kotlin',
+  swift: 'Swift',
 };

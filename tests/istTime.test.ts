@@ -35,6 +35,16 @@ describe('IST time formatting', () => {
     expect(isoLocal(instant, 'UTC')).toBe('2026-09-27T07:33:10.439+00:00');
   });
 
+  it('uses the date-specific offset when reusing a timezone formatter', () => {
+    const timezone = 'America/New_York';
+    const winter = new Date('2026-01-15T12:00:00Z');
+    const summer = new Date('2026-07-15T12:00:00Z');
+    expect(humanLocal(winter, timezone)).toBe('15 Jan 2026, 07:00 GMT-05:00');
+    expect(isoLocal(summer, timezone)).toBe('2026-07-15T08:00:00.000-04:00');
+    expect(tzLabel(timezone, winter)).toBe('GMT-05:00');
+    expect(isoLocal(instant, 'Unknown/Timezone')).toBe(isoLocal(instant, 'Asia/Kolkata'));
+  });
+
   it('run reports are stamped in IST', () => {
     const r = buildReport({ date: '2026-09-27', reason: 'cron', startedAt: isoLocal(), outcomes: [] });
     expect(r.finishedAt).toMatch(/\+05:30$/);

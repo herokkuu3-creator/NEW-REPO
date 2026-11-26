@@ -9,7 +9,10 @@ import { visualPreviewPlans } from './visualSamples';
 
 export async function createAccountVisualPreview(accountId: string) {
   if (!process.env.RENDER_INSTANCE_ID) throw Error('RENDER_SERVER_REQUIRED');
-  const account = await prisma.account.findUniqueOrThrow({ where: { id: accountId } });
+  const account = await prisma.account.findUniqueOrThrow({
+    where: { id: accountId },
+    select: { id: true, username: true, status: true },
+  });
   if (account.status !== 'ACTIVE') throw Error('ACCOUNT_UNAVAILABLE');
   const assignment = await reserveArticlePresentation(accountId, 'visual-preview');
   const position = Math.max(0, accountDiagramLayouts.indexOf(assignment.diagrams[0] as typeof accountDiagramLayouts[number]));

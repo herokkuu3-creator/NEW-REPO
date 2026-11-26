@@ -2,6 +2,8 @@ import { request as playwrightRequest, type APIRequestContext, type Page, type R
 import { withCodeChefPage, type CodeChefState } from './browser';
 import { logger } from '../logger';
 
+const LOGIN_URL_PATTERN = /\/login(?:[/?#]|$)/;
+
 export interface CodeChefSubmitResult {
   ok: boolean;
   performed?: boolean;
@@ -261,7 +263,7 @@ export async function submitViaCodeChefApi(
   const base = 'https://www.codechef.com';
   try {
     const pageRes = await request.get(`${base}/problems/${problemCode}`, { timeout: 20000 });
-    if (/\/login(?:[/?#]|$)/.test(pageRes.url())) {
+    if (LOGIN_URL_PATTERN.test(pageRes.url())) {
       return { ok: false, clicked: false, kind: 'signed-out', error: 'CodeChef session redirected to login' };
     }
     if (!pageRes.ok()) return null;
@@ -502,7 +504,7 @@ export async function submitOnCodeChefPage(
         logger.info({ currentUrl: page.url() }, 'Navigation aborted due to client redirect, but reached problem page');
       } else if (msg.includes('ERR_ABORTED')) {
         await page.waitForTimeout(1000);
-        if (!page.url().toUpperCase().includes(problemCode)) {
+        if (!LOGIN_URL_PATTERN.test(page.url()) && !page.url().toUpperCase().includes(problemCode)) {
           logger.warn({ currentUrl: page.url() }, 'Page not on problem code after abort; retrying with commit wait...');
           await page.goto(targetUrl, { waitUntil: 'commit', timeout: 35000 }).catch(() => undefined);
         }
@@ -511,7 +513,7 @@ export async function submitOnCodeChefPage(
       }
     }
 
-    if (/\/login(?:[/?#]|$)/.test(page.url())) {
+    if (LOGIN_URL_PATTERN.test(page.url())) {
       return { ok: false, clicked: false, kind: 'signed-out', error: 'CodeChef session redirected to login' };
     }
 
@@ -519,7 +521,11 @@ export async function submitOnCodeChefPage(
     try {
       const ideTab = page.locator('[role="tab"], button, div').filter({ hasText: /^IDE$/i }).first();
       const editor = page.locator('.ace_editor, .monaco-editor, [class*="editor"]').first();
-      await ideTab.or(editor).waitFor({ state: 'visible', timeout: 25000 }).catch(() => undefined);
+      const loginForm = page.locator('form:has(input[name="name"]):has(input[name="pass"])').first();
+      await ideTab.or(editor).or(loginForm).waitFor({ state: 'visible', timeout: 25000 }).catch(() => undefined);
+      if (LOGIN_URL_PATTERN.test(page.url())) {
+        return { ok: false, clicked: false, kind: 'signed-out', error: 'CodeChef session redirected to login' };
+      }
       
       if (await ideTab.count() && await ideTab.isVisible().catch(() => false)) {
         const ariaSelected = await ideTab.getAttribute('aria-selected');

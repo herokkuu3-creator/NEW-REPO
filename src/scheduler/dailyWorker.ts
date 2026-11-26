@@ -69,6 +69,7 @@ import { sendTelegramMessage } from '../notifications/telegram';
 import { isoLocal } from '../time';
 import { shouldRetryWithOriginal, stripCppComments } from '../codeforces/codeSanitizer';
 import {
+  consumeDailyRetryRenewalOverride,
   getDailyRetryPollGate,
   resetDailyRetryPollGate,
   setDailyRetryCompletedDate,
@@ -145,9 +146,9 @@ export function isPastScheduledDailyTime(now: Date = new Date()): boolean {
     timeZone: config.schedule.timezone,
     hour: 'numeric',
     minute: 'numeric',
-    hour12: false,
+    hourCycle: 'h23',
   }).formatToParts(now);
-  const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? '0');
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? '0') % 24;
   const minute = Number(parts.find((p) => p.type === 'minute')?.value ?? '0');
 
   const currentMinutes = hour * 60 + minute;
@@ -903,7 +904,7 @@ async function runForAccount(
         }
 
         triedCodes.add(nextCode);
-        await new Promise<void>((resolve) => setTimeout(resolve, DAILY_FALLBACK_PACING_MS));
+        await batchCtx.sleep(DAILY_FALLBACK_PACING_MS);
         run = await updateRun(run.id, { solution: nextCode });
         outcome = await submitDailySolutionWithCommentFallback(
           nextCode,
@@ -1455,7 +1456,12 @@ export async function triggerDailyRetry(): Promise<void> {
   const today = leetcodeDayKey();
   const nowMs = Date.now();
   const gate = getDailyRetryPollGate();
-  if (process.env.NODE_ENV !== 'test' && (gate.completedDate === today || nowMs < gate.nextPollAt)) {
+  const hasRenewalOverride = consumeDailyRetryRenewalOverride();
+  if (
+    process.env.NODE_ENV !== 'test' &&
+    !hasRenewalOverride &&
+    (gate.completedDate === today || nowMs < gate.nextPollAt)
+  ) {
     return;
   }
   const accountRows = await prisma.account

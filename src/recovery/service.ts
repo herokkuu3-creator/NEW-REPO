@@ -320,7 +320,10 @@ export class RecoveryService {
   private readonly sessions = new Map<string, PortalSession>(); // by secretHash
   private readonly byRecovery = new Map<string, PortalSession>();
   private readonly lockedAccounts = new Set<string>();
+  private readonly localCompletions = new Set<string>();
+  private startingPortalSessions = 0;
   private tickRunning = false;
+  private idleCheckRevision = 0;
   private nextIdleDbCheckAt = 0;
   private trackedTelegramMessage: TrackedRecoveryTelegramMessage | null | undefined = undefined;
 
@@ -353,11 +356,16 @@ export class RecoveryService {
   }
 
   invalidateIdleCache(): void {
+    this.idleCheckRevision += 1;
     this.nextIdleDbCheckAt = 0;
   }
 
   get activeSessionCount(): number {
-    return [...this.byRecovery.values()].filter((s) => !s.finished).length;
+    let count = this.startingPortalSessions;
+    for (const session of this.byRecovery.values()) {
+      if (!session.finished) count += 1;
+    }
+    return count;
   }
 
   // -- creating recoveries ---------------------------------------------------
@@ -367,15 +375,16 @@ export class RecoveryService {
     account: RecoveryAccount,
     reason: 'EXPIRED' | 'REJECTED' | 'VERIFICATION_REQUIRED',
   ): Promise<{ recovery: RecoveryRecord; created: boolean }> {
-    this.nextIdleDbCheckAt = 0;
     const now = this.deps.now();
-    return this.deps.store.create({
+    const result = await this.deps.store.create({
       accountId: account.id,
       reason,
       telegramChatId: this.deps.chatId(),
       now,
       nextReminderAt: now,
     });
+    this.invalidateIdleCache();
+    return result;
   }
 
   // -- daily monitoring -------------------------------------------------------
@@ -386,7 +395,7 @@ export class RecoveryService {
    * (`query-failed`) are transient and never change an account.
    */
   async monitorAccounts(): Promise<MonitorSummary> {
-    this.nextIdleDbCheckAt = 0;
+    this.invalidateIdleCache();
     const summary: MonitorSummary = { checked: 0, active: [], transient: [], opened: [], alreadyOpen: [], resolved: [], errors: [] };
     const accounts = await this.deps.listAccounts();
     for (const account of accounts) {
@@ -438,20 +447,19 @@ export class RecoveryService {
   /** Called every minute. Idempotent and restart-safe: claims advance nextReminderAt first. */
   async tick(): Promise<{ notified: number }> {
     if (this.tickRunning) return { notified: 0 };
-    const now = this.deps.now();
-    const trackedBefore = await this.loadTrackedTelegramMessage();
-    if (
-      trackedBefore &&
-      trackedBefore.expiresAtMs !== null &&
-      trackedBefore.expiresAtMs <= now.getTime()
-    ) {
-      await this.deleteTrackedTelegramMessage();
-    }
-    if (process.env.NODE_ENV !== 'test' && this.sessions.size === 0 && now.getTime() < this.nextIdleDbCheckAt) {
-      return { notified: 0 };
-    }
     this.tickRunning = true;
     try {
+      const now = this.deps.now();
+      const nowMs = now.getTime();
+      const trackedBefore = await this.loadTrackedTelegramMessage();
+      if (trackedBefore?.expiresAtMs != null && trackedBefore.expiresAtMs <= nowMs) {
+        await this.deleteTrackedTelegramMessage();
+      }
+      if (process.env.NODE_ENV !== 'test' && this.activeSessionCount === 0 && nowMs < this.nextIdleDbCheckAt) {
+        return { notified: 0 };
+      }
+      const revision = this.idleCheckRevision;
+      const idleDeadline = nowMs + 60 * 60_000;
       const storeWithMeta = this.deps.store as RecoveryStore & {
         listOpenMeta?: () => Promise<Array<{ id: string; status: RecoveryStatus; nextReminderAt: Date | null }>>;
       };
@@ -460,7 +468,7 @@ export class RecoveryService {
         : await this.deps.store.listOpen();
       if (open.length === 0) {
         await this.deleteTrackedTelegramMessage();
-        this.nextIdleDbCheckAt = now.getTime() + 60 * 60_000;
+        if (revision === this.idleCheckRevision) this.nextIdleDbCheckAt = idleDeadline;
         return { notified: 0 };
       }
 
@@ -471,20 +479,20 @@ export class RecoveryService {
           (r) =>
             REMINDABLE_STATUSES.includes(r.status) &&
             r.nextReminderAt !== null &&
-            r.nextReminderAt.getTime() <= now.getTime(),
+            r.nextReminderAt.getTime() <= nowMs,
         );
       if (!hasDue) {
-        let earliestMs = now.getTime() + 60 * 60_000;
+        let earliestMs = idleDeadline;
         for (const r of open) {
           if (REMINDABLE_STATUSES.includes(r.status) && r.nextReminderAt !== null) {
             earliestMs = Math.min(earliestMs, r.nextReminderAt.getTime());
           }
         }
         const activeTracked = await this.loadTrackedTelegramMessage();
-        if (activeTracked?.expiresAtMs !== null && activeTracked?.expiresAtMs !== undefined) {
+        if (activeTracked?.expiresAtMs != null) {
           earliestMs = Math.min(earliestMs, activeTracked.expiresAtMs);
         }
-        this.nextIdleDbCheckAt = Math.max(now.getTime(), Math.min(earliestMs, now.getTime() + 60 * 60_000));
+        if (revision === this.idleCheckRevision) this.nextIdleDbCheckAt = Math.max(nowMs, earliestMs);
         return { notified: 0 };
       }
 
@@ -504,7 +512,8 @@ export class RecoveryService {
   ): Promise<boolean> {
     let reaped = false;
     for (const r of open) {
-      if (IN_SESSION_STATUSES.includes(r.status) && !this.byRecovery.has(r.id)) {
+      if (IN_SESSION_STATUSES.includes(r.status) && !this.byRecovery.has(r.id) &&
+        this.startingPortalSessions === 0 && !this.localCompletions.has(r.id)) {
         await this.deps.store.markFailed(r.id, 'SESSION_LOST', describeCategory('SESSION_LOST'), now);
         reaped = true;
       }
@@ -590,7 +599,14 @@ export class RecoveryService {
     }
     if (buttons.length > 0) lines.push('', `<i>Links are single-use and expire in ${ttlMin} minutes. A new one is sent hourly until recovered.</i>`);
 
-    const https = this.deps.baseUrl().startsWith('https://');
+    const markup = this.deps.baseUrl().startsWith('https://') && buttons.length > 0
+      ? { inline_keyboard: buttons }
+      : undefined;
+    const plainMessage = () => [
+      ...lines,
+      '',
+      ...entries.filter((e) => e.link).map((e) => `${esc(e.account.label)}: ${esc(e.link!)}`),
+    ].join('\n');
     const sendWithOptionalId = async (
       text: string,
       markup?: TelegramMarkup,
@@ -604,13 +620,12 @@ export class RecoveryService {
     };
 
     let sendOutcome = await sendWithOptionalId(
-      lines.join('\n'),
-      https && buttons.length > 0 ? { inline_keyboard: buttons } : undefined,
+      !markup && buttons.length > 0 ? plainMessage() : lines.join('\n'),
+      markup,
     );
-    if (!sendOutcome.ok && https && buttons.length > 0) {
+    if (!sendOutcome.ok && markup) {
       // Fall back to plain-text links if Telegram rejected the inline keyboard.
-      const plain = entries.filter((e) => e.link).map((e) => `${esc(e.account.label)}: ${e.link}`);
-      sendOutcome = await sendWithOptionalId([...lines, '', ...plain].join('\n'));
+      sendOutcome = await sendWithOptionalId(plainMessage());
     }
     if (!sendOutcome.ok) {
       const retryAt = new Date(this.deps.now().getTime() + 5 * 60_000);
@@ -780,8 +795,9 @@ export class RecoveryService {
       };
     }
 
-    this.nextIdleDbCheckAt = 0;
+    this.invalidateIdleCache();
     this.lockedAccounts.add(account.id);
+    this.localCompletions.add(row.id);
     try {
       const consumed = await this.deps.store.consumeToken(tokenHash, this.deps.now());
       if (!consumed.ok) {
@@ -954,6 +970,7 @@ export class RecoveryService {
         serverVerified,
       };
     } finally {
+      this.localCompletions.delete(row.id);
       this.lockedAccounts.delete(account.id);
     }
   }
@@ -962,8 +979,16 @@ export class RecoveryService {
   async openPortalSession(token: string, opts?: { mobile?: boolean }): Promise<OpenResult> {
     if (!isWellFormedToken(token)) return { ok: false, reason: 'invalid' };
     if (this.activeSessionCount >= this.deps.limits.maxConcurrency) return { ok: false, reason: 'busy' };
-    this.nextIdleDbCheckAt = 0;
+    this.invalidateIdleCache();
+    this.startingPortalSessions += 1;
+    try {
+      return await this.startPortalSession(token, opts);
+    } finally {
+      this.startingPortalSessions -= 1;
+    }
+  }
 
+  private async startPortalSession(token: string, opts?: { mobile?: boolean }): Promise<OpenResult> {
     const consumed = await this.deps.store.consumeToken(hashRecoveryToken(token), this.deps.now());
     if (!consumed.ok) {
       const reason = consumed.reason === 'wrong_state' ? 'used' : consumed.reason;
@@ -1160,13 +1185,16 @@ export class RecoveryService {
     message: string,
     opts: { notify: boolean },
   ): Promise<void> {
-    this.nextIdleDbCheckAt = 0;
+    this.invalidateIdleCache();
     const now = this.deps.now();
     const next = new Date(now.getTime() + this.deps.limits.reminderIntervalMs);
     await this.deps.store.markFailed(recovery.id, category, message, next).catch(() => undefined);
     if (s) this.setPhase(s, 'failed', `${PHASE_TEXT.failed} (${describeCategory(category)})`);
     logger.warn({ recoveryId: recovery.id, category }, 'LeetCode recovery failed');
-    if (!opts.notify) return;
+    if (!opts.notify) {
+      await this.deleteTrackedTelegramMessage().catch(() => undefined);
+      return;
+    }
 
     const account = await this.deps.getAccount(recovery.accountId).catch(() => null);
     const label = account?.label ?? 'account';
@@ -1178,6 +1206,7 @@ export class RecoveryService {
       'Your other accounts and their sessions were not touched.',
     ];
     let markup: TelegramMarkup | undefined;
+    let retryUrl: string | undefined;
     if (NON_RETRYABLE_CATEGORIES.has(category)) {
       lines.push('', `A new link would fail the same way. Re-save credentials with <code>/lclogin ${esc(label)}</code>.`);
     } else {
@@ -1187,13 +1216,18 @@ export class RecoveryService {
         .catch(() => null);
       if (issued) {
         lines.push('', 'You can retry with a fresh single-use link:');
-        const url = this.linkFor(token);
-        if (this.deps.baseUrl().startsWith('https://')) markup = { inline_keyboard: [[{ text: '🔁 Retry Recovery', url }]] };
-        else lines.push(url);
+        retryUrl = this.linkFor(token);
+        if (this.deps.baseUrl().startsWith('https://')) {
+          markup = { inline_keyboard: [[{ text: '🔁 Retry Recovery', url: retryUrl }]] };
+        } else {
+          lines.push(esc(retryUrl));
+        }
       }
     }
     const sent = await this.deps.sendTelegram(lines.join('\n'), markup);
-    if (!sent && markup) await this.deps.sendTelegram(lines.join('\n'));
+    if (!sent && markup && retryUrl) {
+      await this.deps.sendTelegram([...lines, esc(retryUrl)].join('\n'));
+    }
   }
 
   // -- portal session accessors (cookie secret authenticates every call) ----------
@@ -1244,9 +1278,14 @@ export class RecoveryService {
       await this.deps.store.cancel(recoveryId, 'CANCELLED_BY_USER');
       live.abort.abort();
       await live.done;
+      await this.deleteTrackedTelegramMessage().catch(() => undefined);
       return true;
     }
-    return (await this.deps.store.cancel(recoveryId, 'CANCELLED_BY_USER')) !== null;
+    const cancelled = (await this.deps.store.cancel(recoveryId, 'CANCELLED_BY_USER')) !== null;
+    if (cancelled) {
+      await this.deleteTrackedTelegramMessage().catch(() => undefined);
+    }
+    return cancelled;
   }
 
   async cancelByLabel(label: string): Promise<'cancelled' | 'none' | 'unknown_account'> {
@@ -1285,6 +1324,7 @@ export class RecoveryService {
     } else {
       await this.deps.store.rescheduleReminder(recovery.id, now);
     }
+    this.invalidateIdleCache();
     await this.tick();
     return 'sent';
   }

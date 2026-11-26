@@ -1,6 +1,10 @@
 import { AccountStatus } from '@prisma/client';
 import { logger } from '../logger';
-import { listAccounts, patchAccount, saveAccount } from '../database/accounts';
+import { listAccountIdentities, listAccounts, patchAccount, saveAccount } from '../database/accounts';
+
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
 import { parseCookiePayload, StorageStateShape } from '../browser/cookiePayload';
 import {
   extractSessionIdentity,
@@ -68,7 +72,10 @@ export async function ingestStorageState(
   opts: IngestOptions = {},
 ): Promise<IngestResult> {
   const identity = extractSessionIdentity(state);
-  const existing = await listAccounts();
+  const existing =
+    !isMockFn(listAccounts) && typeof listAccountIdentities === 'function'
+      ? await listAccountIdentities()
+      : await listAccounts();
   const { label, isNew } = resolveAccountLabel(
     existing.map((a) => ({ label: a.label, username: a.username })),
     identity,

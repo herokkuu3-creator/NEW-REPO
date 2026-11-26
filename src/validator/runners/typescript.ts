@@ -46,6 +46,7 @@ export class TypeScriptRunner implements CodeRunner {
   private readonly js = new JavaScriptRunner();
   private readonly ts: typeof import('typescript') | null;
   private readonly stripFn: StripTypeScriptTypesFn | null;
+  private transpileCache: { code: string; result: { ok: boolean; js?: string; error?: string } } | null = null;
 
   constructor(deps?: TypeScriptRunnerDeps) {
     this.ts = (deps?.loadTypescript ?? defaultLoadTypescript)();
@@ -58,6 +59,15 @@ export class TypeScriptRunner implements CodeRunner {
   }
 
   private transpile(code: string): { ok: boolean; js?: string; error?: string } {
+    if (this.transpileCache && this.transpileCache.code === code) {
+      return this.transpileCache.result;
+    }
+    const result = this.transpileUncached(code);
+    this.transpileCache = { code, result };
+    return result;
+  }
+
+  private transpileUncached(code: string): { ok: boolean; js?: string; error?: string } {
     if (this.ts) {
       try {
         const ts = this.ts;

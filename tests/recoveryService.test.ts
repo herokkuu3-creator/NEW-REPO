@@ -471,7 +471,7 @@ describe('RecoveryService', () => {
       expect(rows[0].status).toBe(RecoveryStatus.CANCELLED);
     });
 
-    it('enforces maximum concurrency limit', async () => {
+    it('enforces the concurrency limit when portal sessions open together', async () => {
       // Hold driver in pending state so sessions remain actively running
       let unblockDriver!: () => void;
       const driverWait = new Promise<any>((resolve) => {
@@ -490,12 +490,6 @@ describe('RecoveryService', () => {
       const token1 = telegramMessages[0].markup.inline_keyboard[0][0].url.split('/auth/recover/')[1];
       const token2 = telegramMessages[0].markup.inline_keyboard[1][0].url.split('/auth/recover/')[1];
 
-      const res1 = await svc.openPortalSession(token1);
-      expect(res1.ok).toBe(true);
-
-      const res2 = await svc.openPortalSession(token2);
-      expect(res2.ok).toBe(true);
-
       // Third attempt exceeds maxConcurrency = 2
       accountsMap.set('acc-3', {
         id: 'acc-3',
@@ -513,12 +507,20 @@ describe('RecoveryService', () => {
         new Date(currentTime.getTime() + limits.tokenTtlMs),
       );
 
-      const res3 = await svc.openPortalSession(token3);
-      expect(res3.ok).toBe(false);
-      expect(res3.reason).toBe('busy');
-
-      unblockDriver();
-      await svc.shutdown();
+      try {
+        const [res1, res2, res3] = await Promise.all([
+          svc.openPortalSession(token1),
+          svc.openPortalSession(token2),
+          svc.openPortalSession(token3),
+        ]);
+        expect(res1.ok).toBe(true);
+        expect(res2.ok).toBe(true);
+        expect(res3).toMatchObject({ ok: false, reason: 'busy' });
+        expect(await svc.inspectToken(token3)).toMatchObject({ state: 'valid' });
+      } finally {
+        unblockDriver();
+        await svc.shutdown();
+      }
     });
 
     it('recovers an account registered with an email identifier (e.g. sks7501) and adopts the verified LeetCode handle', async () => {
@@ -651,7 +653,13 @@ describe('RecoveryService', () => {
 
     it('completeLocalRecovery verifies session, commits ACTIVE state with transport userAgent, prevents replay, and notifies Telegram', async () => {
       accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
-      const svc = createService();
+      const svc = createService({
+        verifyCapturedSession: async () => {
+          // A reminder tick during verification sees the recovery already in session.
+          await svc.tick();
+          return { authenticated: true, username: 'test_user_1' };
+        },
+      });
       await svc.openRecovery(accountsMap.get('acc-1')!, 'EXPIRED');
       await svc.tick();
 
@@ -821,6 +829,34 @@ describe('RecoveryService', () => {
       expect(claimDueSpy).not.toHaveBeenCalled();
     });
 
+    it('checks for a recovery opened while an idle database check was in progress', async () => {
+      vi.stubEnv('NODE_ENV', 'production');
+      try {
+        const svc = createService();
+        const account = accountsMap.get('acc-1')!;
+        account.status = AccountStatus.EXPIRED;
+        const readStarted = Promise.withResolvers<void>();
+        const finishRead = Promise.withResolvers<void>();
+        vi.spyOn(store, 'listOpen').mockImplementationOnce(async () => {
+          readStarted.resolve();
+          await finishRead.promise;
+          return [];
+        });
+
+        const tick = svc.tick();
+        await readStarted.promise;
+        try {
+          await svc.openRecovery(account, 'EXPIRED');
+        } finally {
+          finishRead.resolve();
+          await tick;
+        }
+        expect(await svc.tick()).toEqual({ notified: 1 });
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
     it('tick() reaps orphaned in-session recovery and immediately claims its retry reminder', async () => {
       accountsMap.get('acc-1')!.status = AccountStatus.EXPIRED;
       const svc = createService();
@@ -934,7 +970,7 @@ describe('RecoveryService', () => {
 
       // 2) 45 minutes later, link expires (before the 60-min reminder) -> tick deletes 101 immediately
       currentTime = new Date(currentTime.getTime() + 45 * 60_000);
-      await svc.tick();
+      await Promise.all([svc.tick(), svc.tick()]);
       expect(telegramMessages).toHaveLength(1);
       expect(deletedIds).toEqual([101]);
       expect(persistedState).toBeNull();

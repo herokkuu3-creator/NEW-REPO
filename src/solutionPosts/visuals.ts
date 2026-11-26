@@ -181,62 +181,84 @@ function renderAlternateFrame(plan: VisualPlan, frameIndex: number, phase: numbe
   </svg>`;
 }
 
+let sharpConfigured = false;
+let renderGifLock: Promise<void> = Promise.resolve();
+
+function withRenderGifLock<T>(fn: () => Promise<T>): Promise<T> {
+  const next = renderGifLock.then(fn, fn);
+  renderGifLock = next.then(() => undefined, () => undefined);
+  return next;
+}
+
 export async function renderVisualGif(input: VisualPlan): Promise<Buffer> {
   const plan = visualPlanSchema.parse(input);
-  const [{ default: sharp }, { GIFEncoder, quantize, applyPalette }] = await Promise.all([import('sharp'), import('gifenc')]);
-  const gif = GIFEncoder();
-  const dimensions = plan.terrain === 'steps' ? animatedSceneDimensions.terminal :
-    plan.terrain ? illustratedDimensions(plan) : plan.scene ? animatedSceneDimensions[plan.scene] : visualDimensions(plan);
-  const [sourceWidth, sourceHeight] = dimensions;
-  const animated = !!(plan.scene || plan.terrain);
-  const dense = animated && plan.frames.length > 5;
-  const width = dense ? Math.floor(sourceWidth * .78) : sourceWidth;
-  const height = dense ? Math.round(sourceHeight * width / sourceWidth) : sourceHeight;
-  const [stepDelay, finalDelay] = plan.pace === 'quick' ? [1050, 1700] : plan.pace === 'measured' ? [1650, 2150] :
-    plan.pace === 'hold-final' ? [1250, 2800] : [1450, 2300];
-  const transition: [number, number][] = plan.frames.length > 5 ? [[.18, 90], [.5, 90], [.82, 90]] :
-    [[.12, 70], [.3, 70], [.5, 70], [.7, 70], [.87, 70]];
-  const transitionDelay = transition.reduce((sum, [, delay]) => sum + delay, 0);
-  // Process sequentially so a worker never retains a full animation of RGBA frames in memory.
-  for (let i = 0; i < plan.frames.length; i++) {
-    const hold = i === plan.frames.length - 1 ? finalDelay : stepDelay;
-    const samples: [number, number][] = animated
-      ? i === 0 ? [[1, hold]] : [...transition, [1, hold - transitionDelay]]
-      : plan.layout ? [[.25, 120], [.65, 160], [1, hold - 280]] : [[1, hold]];
-    for (const [phase, delay] of samples) {
-      const raster = sharp(Buffer.from(renderVisualFrame(plan, i, phase)));
-      if (dense) raster.resize(width, height, { fit: 'fill' });
-      const rgba = await raster.ensureAlpha().raw().toBuffer();
-      const palette = quantize(rgba, dense ? 48 : 64);
-      gif.writeFrame(applyPalette(rgba, palette), width, height, { palette, repeat: 0, delay });
+  return withRenderGifLock(async () => {
+    const [{ default: sharp }, { GIFEncoder, quantize, applyPalette }] = await Promise.all([import('sharp'), import('gifenc')]);
+    if (!sharpConfigured) {
+      sharp.cache(false);
+      sharp.concurrency(1);
+      sharpConfigured = true;
     }
-  }
-  gif.finish();
-  let result: Buffer = Buffer.from(gif.bytes());
-  const optimized = await sharp(result, { animated: true })
-    .gif({
-      effort: 5,
-      colours: animated ? 32 : 48,
-      dither: 0,
-      interFrameMaxError: 2,
-      interPaletteMaxError: 4,
-      reuse: true,
-      keepDuplicateFrames: true,
-    })
-    .toBuffer();
-  if (optimized.length > 0 && optimized.length < result.length) {
-    result = optimized;
-  }
-  // Preserve every reviewed state and dwell time. Reduce resolution only if
-  // a dense animation still exceeds the hosting budget after encoding.
-  if (result.length > 500000) {
-    const animation = sharp(result, { animated: true });
-    if (animated) animation.resize({ width: Math.floor(width * .82) });
-    result = await animation.gif({ effort: 7, colours: animated ? 32 : 48, dither: 0,
-      interFrameMaxError: 2, interPaletteMaxError: 4, reuse: true, keepDuplicateFrames: true }).toBuffer();
-  }
-  if (result.length > 500000) throw new Error('Visual exceeds the media budget');
-  return result;
+    const gif = GIFEncoder();
+    const dimensions = plan.terrain === 'steps' ? animatedSceneDimensions.terminal :
+      plan.terrain ? illustratedDimensions(plan) : plan.scene ? animatedSceneDimensions[plan.scene] : visualDimensions(plan);
+    const [sourceWidth, sourceHeight] = dimensions;
+    const animated = !!(plan.scene || plan.terrain);
+    const dense = animated && plan.frames.length > 5;
+    const width = dense ? Math.floor(sourceWidth * .78) : sourceWidth;
+    const height = dense ? Math.round(sourceHeight * width / sourceWidth) : sourceHeight;
+    const [stepDelay, finalDelay] = plan.pace === 'quick' ? [1050, 1700] : plan.pace === 'measured' ? [1650, 2150] :
+      plan.pace === 'hold-final' ? [1250, 2800] : [1450, 2300];
+    const transition: [number, number][] = plan.frames.length > 5 ? [[.18, 90], [.5, 90], [.82, 90]] :
+      [[.12, 70], [.3, 70], [.5, 70], [.7, 70], [.87, 70]];
+    const transitionDelay = transition.reduce((sum, [, delay]) => sum + delay, 0);
+    let isFirstFrame = true;
+    // Process sequentially so a worker never retains a full animation of RGBA frames in memory.
+    for (let i = 0; i < plan.frames.length; i++) {
+      const hold = i === plan.frames.length - 1 ? finalDelay : stepDelay;
+      const samples: [number, number][] = animated
+        ? i === 0 ? [[1, hold]] : [...transition, [1, hold - transitionDelay]]
+        : plan.layout ? [[.25, 120], [.65, 160], [1, hold - 280]] : [[1, hold]];
+      for (const [phase, delay] of samples) {
+        const raster = sharp(Buffer.from(renderVisualFrame(plan, i, phase)));
+        if (dense) raster.resize(width, height, { fit: 'fill' });
+        const rgba = await raster.ensureAlpha().raw().toBuffer();
+        const palette = quantize(rgba, dense ? 48 : 64);
+        gif.writeFrame(applyPalette(rgba, palette), width, height, {
+          palette,
+          ...(isFirstFrame ? { repeat: 0 } : {}),
+          delay,
+        });
+        isFirstFrame = false;
+      }
+    }
+    gif.finish();
+    let result: Buffer = Buffer.from(gif.bytes());
+    const optimized = await sharp(result, { animated: true })
+      .gif({
+        effort: 5,
+        colours: animated ? 32 : 48,
+        dither: 0,
+        interFrameMaxError: 2,
+        interPaletteMaxError: 4,
+        reuse: true,
+        keepDuplicateFrames: true,
+      })
+      .toBuffer();
+    if (optimized.length > 0 && optimized.length < result.length) {
+      result = optimized;
+    }
+    // Preserve every reviewed state and dwell time. Reduce resolution only if
+    // a dense animation still exceeds the hosting budget after encoding.
+    if (result.length > 500000) {
+      const animation = sharp(result, { animated: true });
+      if (animated) animation.resize({ width: Math.floor(width * .82) });
+      result = await animation.gif({ effort: 7, colours: animated ? 32 : 48, dither: 0,
+        interFrameMaxError: 2, interPaletteMaxError: 4, reuse: true, keepDuplicateFrames: true }).toBuffer();
+    }
+    if (result.length > 500000) throw new Error('Visual exceeds the media budget');
+    return result;
+  });
 }
 
 /** A real trace table is the fallback when no persistent public image host is configured. */

@@ -730,8 +730,12 @@ export async function pollForVerdict(
   return latest ?? null;
 }
 
-function compactBodyError(body: string): string {
+export function compactBodyError(body: string): string {
   const lines = body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const duplicateLine = lines.find((line) =>
+    /you have submitted exactly the same code before|same code before|already submitted/i.test(line),
+  );
+  if (duplicateLine) return duplicateLine.slice(0, 500);
   const useful = lines.find((line) =>
     /error|invalid|csrf|too long|failed|same code|not allowed|participant|captcha|turnstile|verification|human|robot/i.test(line)
   );

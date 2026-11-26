@@ -127,7 +127,7 @@ export function extractExamples(text: string): ParsedExample[] {
   const examples: ParsedExample[] = [];
   // Matches: "Example 1:" ... "Input: ..." "Output: ..." optional "Explanation: ..."
   const re =
-    /Example\s*\d+\s*:\s*([\s\S]*?)Input\s*:\s*([\s\S]*?)\n?\s*Output\s*:\s*([\s\S]*?)(?:\n?\s*Explanation\s*:\s*([\s\S]*?))?(?=\n\s*Example\s*\d+\s*:|\n\s*Constraints\s*:|$)/gi;
+    /Example(?:\s*\d+)?\s*:\s*([\s\S]*?)Input\s*:\s*([\s\S]*?)\n?\s*Output\s*:\s*([\s\S]*?)(?:\n?\s*Explanation\s*:\s*([\s\S]*?))?(?=\n\s*Example(?:\s*\d+)?\s*:|\n\s*Constraints\s*:|\n\s*(?:Follow[- ]?up|Note)\s*:|$)/gi;
 
   let match: RegExpExecArray | null;
   while ((match = re.exec(text)) !== null) {
@@ -184,7 +184,7 @@ function validateParsedProblem(p: ParsedProblem): void {
     return;
   }
   // The starter code must define SOMETHING — a class, function, method, or object.
-  if (!/(class\s+\w+|object\s+\w+|function\s+\w+|def\s+\w+|func\s+\w+|fn\s+\w+|fun\s+\w+|var\s+\w+\s*=|const\s+\w+\s*=|[A-Za-z_][\w:<>,\[\]&*]*\s+[A-Za-z_]\w*\s*\()/.test(p.starterCode)) {
+  if (!/(class\s+\w+|object\s+\w+|function\s+\w+|def\s+\w+|func\s+\w+|fn\s+\w+|fun\s+\w+|var\s+\w+\s*=|const\s+\w+\s*=|[A-Za-z_][\w:<>,\[\]]*(?:[\s*&]+)[A-Za-z_]\w*\s*\()/.test(p.starterCode)) {
     throw new ProblemParseError('starter code contains no recognizable function/class definition');
   }
 }

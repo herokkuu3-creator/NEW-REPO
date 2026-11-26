@@ -13,6 +13,7 @@ export function createRunner(language: string): CodeRunner {
     case 'typescript':
       return new TypeScriptRunner();
     case 'python3':
+    case 'python':
       return new PythonRunner();
     default:
       // C++ has no local runner: walkccc's solutions are human-verified, and

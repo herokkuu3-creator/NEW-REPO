@@ -50,6 +50,7 @@ const CANDIDATES: CgroupPaths[] = [
 ];
 
 let resolvedPaths: CgroupPaths | null | undefined;
+let cachedCgroupLimitMb: number | null | undefined;
 
 function paths(): CgroupPaths | null {
   if (resolvedPaths !== undefined) return resolvedPaths;
@@ -78,10 +79,13 @@ function toMb(bytes: number | null): number | null {
 export function memoryReading(): MemoryReading {
   const found = paths();
   const usage = process.memoryUsage();
+  if (cachedCgroupLimitMb === undefined) {
+    cachedCgroupLimitMb = found ? toMb(readBytes(found.max)) : null;
+  }
   return {
     usedMb: toMb(readBytes(found?.current)),
     peakMb: toMb(readBytes(found?.peak)),
-    limitMb: toMb(readBytes(found?.max)),
+    limitMb: cachedCgroupLimitMb,
     nodeRssMb: Math.round(usage.rss / 1_048_576),
     nodeHeapMb: Math.round(usage.heapUsed / 1_048_576),
     source: found?.source ?? 'unknown',
@@ -89,9 +93,10 @@ export function memoryReading(): MemoryReading {
 }
 
 /** The container's ceiling in MB, falling back to Render free's 512MB. */
-export function memoryLimitMb(): number {
+export function memoryLimitMb(knownLimitMb?: number | null): number {
   const configured = Number(process.env.MEMORY_LIMIT_MB);
   if (Number.isFinite(configured) && configured > 0) return configured;
+  if (knownLimitMb !== undefined) return knownLimitMb ?? 512;
   return memoryReading().limitMb ?? 512;
 }
 
@@ -131,7 +136,7 @@ export class MemoryWatch {
     const reading = memoryReading();
     if (reading.usedMb !== null) this.peakMb = Math.max(this.peakMb, reading.usedMb);
     if (this.fired || reading.usedMb === null) return;
-    if (reading.usedMb >= memoryLimitMb() - this.reserveMb) {
+    if (reading.usedMb >= memoryLimitMb(reading.limitMb) - this.reserveMb) {
       this.fired = true;
       this.onPressure(reading, this.peakMb);
     }

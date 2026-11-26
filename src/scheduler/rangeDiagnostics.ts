@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import * as rangeSubmission from './rangeSubmission';
 import { currentRangeJob, defaultRangeDeps, RangeDeps, startRangeJob } from './rangeSubmission';
 import { leetCodeRequestFailure } from '../leetcode/apiClient';
 import { prisma } from '../database/prisma';
@@ -31,13 +32,53 @@ export function registerRangeDiagnostics(app: FastifyInstance, authorize: (heade
     if (!parsed.success) return reply.code(400).send({ error: 'INVALID_REQUEST' });
     const { requestId, accountId, questionNumber } = parsed.data;
     const key = `range-server-test:${requestId}`;
+    const STALE_TEST_MS = 30 * 60_000;
     const previous = await prisma.systemState.findUnique({ where: { key } });
-    if (previous) return JSON.parse(previous.value);
-    if (currentRangeJob()) return reply.code(409).send({ error: 'RANGE_ALREADY_RUNNING' });
+    let stalePreviousValue: string | null = null;
+    if (previous) {
+      let prevParsed: { status?: string; startedAt?: string } | null = null;
+      try {
+        prevParsed = JSON.parse(previous.value) as { status?: string; startedAt?: string };
+      } catch {
+        prevParsed = null;
+      }
+      const startedMs = prevParsed?.startedAt ? Date.parse(prevParsed.startedAt) : Number.NaN;
+      const isStaleRunning =
+        prevParsed?.status === 'RUNNING' &&
+        Number.isFinite(startedMs) &&
+        Date.now() - startedMs > STALE_TEST_MS;
+      if (!isStaleRunning) {
+        return prevParsed ?? JSON.parse(previous.value);
+      }
+      stalePreviousValue = previous.value;
+    }
+    let isBusy = Boolean(currentRangeJob());
+    if (!isBusy) {
+      try {
+        const mod = rangeSubmission as Record<string, unknown>;
+        isBusy =
+          (typeof mod.isRangeJobActive === 'function' && Boolean((mod.isRangeJobActive as () => boolean)())) ||
+          (typeof mod.rangeQueueLength === 'function' && (mod.rangeQueueLength as () => number)() > 0);
+      } catch {
+        // Minimal test mocks for rangeSubmission only stub currentRangeJob/startRangeJob.
+      }
+    }
+    if (isBusy) return reply.code(409).send({ error: 'RANGE_ALREADY_RUNNING' });
     const job = { requestId, accountId, questionNumber, executionHost: 'render', revision: process.env.RENDER_GIT_COMMIT ?? null,
       status: 'RUNNING', startedAt: new Date().toISOString() };
-    try { await prisma.systemState.create({ data: { key, value: JSON.stringify(job) } }); }
-    catch { return reply.code(409).send({ error: 'TEST_ALREADY_CLAIMED' }); }
+    try {
+      if (stalePreviousValue !== null) {
+        const updated = await prisma.systemState.updateMany({
+          where: { key, value: stalePreviousValue },
+          data: { value: JSON.stringify(job) },
+        });
+        if (updated.count === 0) return reply.code(409).send({ error: 'TEST_ALREADY_CLAIMED' });
+      } else {
+        await prisma.systemState.create({ data: { key, value: JSON.stringify(job) } });
+      }
+    } catch {
+      return reply.code(409).send({ error: 'TEST_ALREADY_CLAIMED' });
+    }
     void (async () => {
       let result: object;
       try {

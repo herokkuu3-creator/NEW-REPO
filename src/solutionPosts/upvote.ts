@@ -1007,6 +1007,8 @@ export async function scheduleSolutionArticleUpvotes(
   }
 }
 
+const inFlightViewBoosts = new Map<string, Promise<{ totalViews: number; accountsProcessed: number; liveHitCount?: number }>>();
+
 /**
  * Standalone booster: iterates through all active accounts to visit an article 20+ times each,
  * ensuring the article reaches at least 300+ views.
@@ -1018,6 +1020,11 @@ export async function boostSolutionArticleViews(
 ): Promise<{ totalViews: number; accountsProcessed: number; liveHitCount?: number }> {
   const topicId = target.topicId ?? extractTopicIdFromUrl(target.publishedUrl);
   if (!topicId) throw new Error('INVALID_TOPIC_ID');
+  const dedupKey = `${topicId}:${viewsPerAccount}:${options?.viewDelayMs ?? ''}`;
+  const existing = inFlightViewBoosts.get(dedupKey);
+  if (existing) return existing;
+
+  const run = (async () => {
   const problemSlug = target.problemSlug || (/problems\/([^/]+)/.exec(target.publishedUrl)?.[1] ?? '');
 
   const accounts = (await Promise.resolve(
@@ -1079,6 +1086,15 @@ export async function boostSolutionArticleViews(
   }
 
   return { totalViews, accountsProcessed, liveHitCount: finalHitCount };
+  })();
+  inFlightViewBoosts.set(dedupKey, run);
+  try {
+    return await run;
+  } finally {
+    if (inFlightViewBoosts.get(dedupKey) === run) {
+      inFlightViewBoosts.delete(dedupKey);
+    }
+  }
 }
 
 async function loadSystemStateMap(keys: string[], includeValue: boolean): Promise<Map<string, string>> {

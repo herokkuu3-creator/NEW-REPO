@@ -162,7 +162,12 @@ async function resolveDefaultRouter(): Promise<ContestRouterLike | null> {
   } catch (err) {
     if (
       err instanceof PostError &&
-      (err.code === 'API_KEY_REQUIRED' || err.code === 'SOLUTION_KEYS_EXHAUSTED')
+      (err.code === 'AI_CONFIGURATION_REQUIRED' ||
+        err.code === 'AI_KEYS_EXHAUSTED' ||
+        err.code === 'AI_AUTHENTICATION_FAILED' ||
+        err.code === 'AI_BILLING_REQUIRED' ||
+        err.code === 'API_KEY_REQUIRED' ||
+        err.code === 'SOLUTION_KEYS_EXHAUSTED')
     ) {
       logger.warn(
         { code: err.code },

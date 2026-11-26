@@ -15,7 +15,9 @@ export function isBazaarLinkProvider(baseUrl: string): boolean {
 export function isSageProvider(baseUrl: string): boolean {
   try {
     const url = new URL(baseUrl);
-    return url.hostname.includes('intern-ai.org.cn');
+    const domain = 'intern-ai.org.cn';
+    return url.protocol === 'https:' &&
+      (url.hostname === domain || url.hostname.endsWith(`.${domain}`));
   } catch {
     return false;
   }

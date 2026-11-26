@@ -372,12 +372,16 @@ async function launchFirefox(
     await applyStealthScripts(context, BROWSER_ENGINE);
     if (process.env.CODEFORCES_BLOCK_ASSETS !== 'false') {
       await context.route('**/*', async (route) => {
-        const type = route.request().resourceType();
-        if (blockCodeforcesResource(route.request().url(), type)) {
-          await route.abort();
-          return;
+        try {
+          const type = route.request().resourceType();
+          if (blockCodeforcesResource(route.request().url(), type)) {
+            await route.abort().catch(() => undefined);
+            return;
+          }
+          await route.continue().catch(() => undefined);
+        } catch {
+          await route.continue().catch(() => undefined);
         }
-        await route.continue();
       });
     }
     const traffic = createBrowserTrafficMeter();
@@ -393,6 +397,7 @@ async function launchFirefox(
       page,
       traffic,
       close: async () => {
+        await context.unrouteAll?.({ behavior: 'ignoreErrors' }).catch(() => undefined);
         await context.close().catch(() => undefined);
         await active.close().catch(() => undefined);
       },
@@ -819,6 +824,10 @@ async function fillSubmitForm(page: Page, entry: SubmitterEntry, code: string, p
 
 function compactBodyError(body: string): string {
   const lines = body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const duplicateLine = lines.find((line) =>
+    /you have submitted exactly the same code before|same code before|already submitted/i.test(line),
+  );
+  if (duplicateLine) return duplicateLine.slice(0, 500);
   const useful = lines.find((line) =>
     /error|invalid|csrf|too long|failed|same code|not allowed|participant|captcha|turnstile|verification|human|robot/i.test(line)
   );

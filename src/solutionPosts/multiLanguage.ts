@@ -3,6 +3,7 @@ import type { LLMMessage } from '../ai/provider';
 import type { SubmissionContext } from './article';
 import { logger } from '../logger';
 import { CoarenaRouter } from './coarena';
+import { CoarenaPause } from './coarenaLimits';
 import { FirecrawlAgentRouter } from './firecrawlAgent';
 import { AIModelRouter, ModelAttempt, OutputValidationError, parseJSON } from './router';
 
@@ -219,11 +220,10 @@ export async function generateMultiLanguageCode(
   if (!supportsMultiLanguage(context.language)) return null;
   if (!router || router instanceof FirecrawlAgentRouter) return null;
 
-  const isCoarena = router instanceof CoarenaRouter;
-  const infer = isCoarena && router.canUsePrimary
-    ? router.generatePrimary.bind(router)
-    : typeof router.generate === 'function'
-      ? router.generate.bind(router)
+  const infer = typeof router.generate === 'function'
+    ? router.generate.bind(router)
+    : router instanceof CoarenaRouter && router.canUsePrimary
+      ? router.generatePrimary.bind(router)
       : null;
   if (!infer) return null;
 
@@ -283,6 +283,7 @@ export async function generateMultiLanguageCode(
     const result = await infer(messages, validateResponse, 4096, true, 'multi-language code translation');
     return { value: result.value, attempts: result.attempts };
   } catch (error) {
+    if (error instanceof CoarenaPause) throw error;
     logger.warn(
       {
         accountId: context.accountId,

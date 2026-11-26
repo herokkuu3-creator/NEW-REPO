@@ -55,7 +55,7 @@ import {
 } from '../src/leetcode/loginHandoff';
 import { parseCookiePayload, type StorageStateShape } from '../src/browser/cookiePayload';
 import { extractSessionIdentity } from '../src/browser/sessionIdentity';
-import { DEFAULT_SAGE_API_KEY, sageConsoleHtml } from '../src/ai/sageProbe';
+import { sageConsoleHtml } from '../src/ai/sageProbe';
 import { OpenAIProvider } from '../src/ai/openai';
 import { GeminiProvider } from '../src/ai/gemini';
 import { createLLMProvider, LLMError } from '../src/ai/provider';
@@ -1033,11 +1033,10 @@ describe('8. loginHandoff, cookiePayload, and sessionIdentity fixes', () => {
 });
 
 describe('9. Sage XSS escaping and LLM provider option wiring fixes', () => {
-  it('sageConsoleHtml escapes hostLabel, retains DEFAULT_SAGE_API_KEY, and escapes dynamic fields in runDiagnosticTest', () => {
+  it('sageConsoleHtml escapes the host label and diagnostic response fields', () => {
     const html = sageConsoleHtml('<script>alert("xss")</script>');
     expect(html).not.toContain('<script>alert("xss")</script>');
     expect(html).toContain('&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;');
-    expect(html).toContain(DEFAULT_SAGE_API_KEY);
     expect(html).toContain('escapeHtml(String(data.executionHost');
     expect(html).toContain('escapeHtml(String(data.error');
     expect(html).toContain('escapeHtml(String(data.chatReply');

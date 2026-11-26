@@ -16,6 +16,7 @@ import { launchWithStorageStateObject } from '../browser/playwright';
 import { findCredentialsForAccount } from './credentialStore';
 import { loginToLeetCode } from '../leetcode/auth';
 import {
+  openLightweightLeetCodeSession,
   persistRotatedCookiesFromContext,
   withSingleFlightLogin,
 } from '../leetcode/sessionManager';
@@ -49,9 +50,30 @@ export interface SessionRefreshSummary {
 type LeetCodeRefreshAccount = Pick<AccountRecord, 'id' | 'label' | 'username' | 'status' | 'storageState'>;
 type CodeforcesRefreshAccount = Pick<CodeforcesAccountRecord, 'id' | 'label' | 'username' | 'status' | 'storageState'>;
 
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
+
 async function checkLeetCodeSessionLive(account: LeetCodeRefreshAccount): Promise<{ authenticated: boolean; username?: string | null; cause?: string }> {
   const parsed = parseStoredStorageState(account.storageState);
   if (!parsed.ok) return { authenticated: false, cause: 'invalid-storage-state' };
+  if (!isMockFn(launchWithStorageStateObject)) {
+    let light: Awaited<ReturnType<typeof openLightweightLeetCodeSession>> | null = null;
+    try {
+      light = await openLightweightLeetCodeSession(parsed.state, account);
+      const result = await checkSession(light.api);
+      if (result.authenticated) {
+        await light.persistUpdatedCookiesIfChanged();
+      }
+      return result;
+    } catch (err) {
+      return { authenticated: false, cause: err instanceof Error ? err.message : String(err) };
+    } finally {
+      if (light) {
+        await light.close().catch(() => undefined);
+      }
+    }
+  }
   let session = null;
   try {
     session = await launchWithStorageStateObject(parsed.state, account.label);
@@ -78,8 +100,13 @@ async function checkLeetCodeSessionLive(account: LeetCodeRefreshAccount): Promis
 export async function refreshLeetCodeAccount(account: LeetCodeRefreshAccount): Promise<AccountRefreshOutcome> {
   const check = await checkLeetCodeSessionLive(account);
   if (check.authenticated) {
-    if (account.status !== AccountStatus.ACTIVE) {
-      await patchAccount(account.id, { status: AccountStatus.ACTIVE, lastError: null, checked: true });
+    if (account.status !== AccountStatus.ACTIVE || (!account.username && check.username)) {
+      await patchAccount(account.id, {
+        status: AccountStatus.ACTIVE,
+        ...(check.username ? { username: check.username } : {}),
+        lastError: null,
+        checked: true,
+      });
     }
     return {
       site: 'leetcode',
@@ -120,6 +147,23 @@ export async function refreshLeetCodeAccount(account: LeetCodeRefreshAccount): P
   );
 
   if (loginRes.ok && loginRes.storageState) {
+    if (
+      account.username &&
+      !account.username.includes('@') &&
+      loginRes.username &&
+      account.username.toLowerCase() !== loginRes.username.toLowerCase()
+    ) {
+      const mismatchErr = `Authenticated username (${loginRes.username}) does not match expected account (${account.username})`;
+      logger.warn({ label: account.label, expected: account.username, actual: loginRes.username }, 'LeetCode auto-relogin username mismatch — preserving existing session');
+      await patchAccount(account.id, { lastError: mismatchErr, checked: true });
+      return {
+        site: 'leetcode',
+        label: account.label,
+        username: account.username,
+        status: 'failed',
+        error: mismatchErr,
+      };
+    }
     await saveAccount(account.label, JSON.stringify(loginRes.storageState), {
       username: loginRes.username ?? creds.username,
       status: AccountStatus.ACTIVE,

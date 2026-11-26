@@ -242,6 +242,7 @@ export async function submitViaPageFetch(
             'x-csrftoken': csrf,
           },
           body: JSON.stringify(body),
+          signal: AbortSignal.timeout(45_000),
         });
         const text = await res.text();
         return {
@@ -454,6 +455,10 @@ export async function openGhostBrowserSession(
                 args: buildLaunchArgs(headless),
                 proxy,
               });
+              if (closed || params.signal?.aborted) {
+                await closeResources();
+                throw new Error(closed ? 'Ghost browser session is closed' : 'Range cancelled during ghost browser launch');
+              }
               const cleanedCookies = pruneExpiredCookies(currentState.cookies ?? []);
               context = await browser.newContext({
                 userAgent,
@@ -474,6 +479,10 @@ export async function openGhostBrowserSession(
                 return route.continue().catch(() => undefined);
               });
               page = await context.newPage();
+              if (closed || params.signal?.aborted) {
+                await closeResources();
+                throw new Error(closed ? 'Ghost browser session is closed' : 'Range cancelled during ghost browser setup');
+              }
               pageCrashed = false;
               page.on('crash', () => {
                 pageCrashed = true;

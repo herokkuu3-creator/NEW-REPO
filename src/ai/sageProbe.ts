@@ -8,7 +8,6 @@ const logger = {
 };
 
 export const DEFAULT_SAGE_BASE_URL = 'https://discovery-api.intern-ai.org.cn/v1';
-export const DEFAULT_SAGE_API_KEY = 'sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056';
 export const DEFAULT_SAGE_MODEL = 'deepseek-v4.1-flash-1017';
 export const SAGE_MODELS = [
   'deepseek-v4.1-flash-1017',
@@ -60,6 +59,7 @@ export function maskSageKey(key: string): string {
   const clean = key.trim();
   if (!clean) return '(none)';
   if (clean.length <= 10) return '***';
+  if (clean.length < 20) return `${clean.slice(0, 4)}…${clean.slice(-2)}`;
   return `${clean.slice(0, 8)}…${clean.slice(-4)}`;
 }
 
@@ -80,7 +80,7 @@ export async function probeSageApi(
   modelOverride?: string,
 ): Promise<SageProbeDiagnostic> {
   const started = Date.now();
-  const apiKey = (apiKeyOverride || process.env.SAGE_API_KEY || DEFAULT_SAGE_API_KEY).trim();
+  const apiKey = apiKeyOverride?.trim() || process.env.SAGE_API_KEY?.trim() || '';
   const baseUrl = (process.env.SAGE_BASE_URL || DEFAULT_SAGE_BASE_URL).trim().replace(/\/+$/, '');
   const model = (modelOverride || process.env.SAGE_MODEL || DEFAULT_SAGE_MODEL).trim();
 
@@ -92,53 +92,68 @@ export async function probeSageApi(
     keyMasked: maskSageKey(apiKey),
     chatModel: model,
   };
-
-  // Step 1: Query models list (GET /models)
-  let modelsStatus = 0;
-  let models: string[] = [];
-  try {
-    const modelsRes = await fetch(`${baseUrl}/models`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      signal: AbortSignal.timeout(20000),
-    });
-    modelsStatus = modelsRes.status;
-    if (modelsRes.ok) {
-      const data = await modelsRes.json().catch(() => ({}));
-      if (Array.isArray(data.data)) {
-        models = data.data
-          .filter((m: any) => m?.status === 'active' || !m?.status)
-          .map((m: any) => m.id || m.name)
-          .filter(Boolean);
-      }
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Sage /models probe error');
+  if (!apiKey) {
+    return {
+      ...metadata, ok: false, elapsedMs: Date.now() - started,
+      modelsStatus: 0, modelsCount: 0, models: [], chatStatus: 0,
+      category: 'NO_KEY_CONFIGURED', error: 'Set SAGE_API_KEY or provide an API key.',
+    };
   }
 
-  // Step 2: Chat completion inference test (POST /chat/completions)
+  let modelsStatus = 0;
+  let models: string[] = [];
   let chatStatus = 0;
   try {
-    const chatRes = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: 'You are a test assistant. Reply with exactly the requested marker.' },
-          { role: 'user', content: 'Reply with exactly SAGE_RENDER_OK in one word.' },
-        ],
-        max_tokens: 128,
-        temperature: 0,
+    const [modelsOutcome, chatOutcome] = await Promise.all([
+      (async () => {
+        try {
+          const modelsRes = await fetch(`${baseUrl}/models`, {
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+            },
+            redirect: 'error',
+            signal: AbortSignal.timeout(20000),
+          });
+          modelsStatus = modelsRes.status;
+          if (modelsRes.ok) {
+            const data = await modelsRes.json().catch(() => ({}));
+            if (Array.isArray(data.data)) {
+              models = data.data
+                .filter((m: any) => m?.status === 'active' || !m?.status)
+                .map((m: any) => m.id || m.name)
+                .filter(Boolean);
+            }
+          }
+        } catch (err) {
+          logger.warn(
+            { err: sanitizeSageOutput(err instanceof Error ? err.message : String(err), apiKey) },
+            'Sage /models probe error',
+          );
+        }
+      })(),
+      fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: 'You are a test assistant. Reply with exactly the requested marker.' },
+            { role: 'user', content: 'Reply with exactly SAGE_RENDER_OK in one word.' },
+          ],
+          max_tokens: 128,
+          temperature: 0,
+        }),
+        redirect: 'error',
+        signal: AbortSignal.timeout(30000),
       }),
-      signal: AbortSignal.timeout(30000),
-    });
+    ]);
+    void modelsOutcome;
+    const chatRes = chatOutcome;
 
     chatStatus = chatRes.status;
     const raw = await chatRes.text();
@@ -248,10 +263,16 @@ export async function askSage(
     };
   }
 
-  const apiKey = (options?.apiKey || process.env.SAGE_API_KEY || DEFAULT_SAGE_API_KEY).trim();
+  const apiKey = options?.apiKey?.trim() || process.env.SAGE_API_KEY?.trim() || '';
   const baseUrl = (process.env.SAGE_BASE_URL || DEFAULT_SAGE_BASE_URL).trim().replace(/\/+$/, '');
   const model = (options?.model || process.env.SAGE_MODEL || DEFAULT_SAGE_MODEL).trim();
   const maxTokens = options?.maxTokens ?? 1500;
+  if (!apiKey) {
+    return {
+      ok: false, question: q, answer: 'Set SAGE_API_KEY or provide an API key.',
+      model, elapsedMs: Date.now() - started, executionHost, error: 'NO_KEY_CONFIGURED',
+    };
+  }
 
   try {
     const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -272,6 +293,7 @@ export async function askSage(
         max_tokens: maxTokens,
         temperature: 0.7,
       }),
+      redirect: 'error',
       signal: AbortSignal.timeout(60000),
     });
 
@@ -305,12 +327,23 @@ export async function askSage(
     const choice = data.choices?.[0];
     const rawContent = choice?.message?.content?.trim();
     const rawReasoning = choice?.message?.reasoning_content?.trim();
-    const answer = rawContent || rawReasoning || 'No response generated by the model.';
+    const generated = rawContent || rawReasoning;
+    if (!generated) {
+      return {
+        ok: false,
+        question: q,
+        answer: 'No response generated by the model.',
+        model: data.model || model,
+        elapsedMs: Date.now() - started,
+        executionHost,
+        error: 'EMPTY_RESPONSE',
+      };
+    }
 
     return {
       ok: true,
       question: q,
-      answer: sanitizeSageOutput(answer, apiKey),
+      answer: sanitizeSageOutput(generated, apiKey),
       model: data.model || model,
       elapsedMs: Date.now() - started,
       executionHost,
@@ -469,7 +502,7 @@ export function sageConsoleHtml(hostLabel: string): string {
       <div class="row">
         <div class="col">
           <label>API Key</label>
-          <input type="password" id="testApiKey" value="${DEFAULT_SAGE_API_KEY}" placeholder="sk-...">
+          <input type="password" id="testApiKey" placeholder="Use the server key or enter your own">
           <span class="hint">Defaults to configured key</span>
         </div>
         <div class="col">

@@ -242,6 +242,7 @@ export async function publishPost(id: string, options: { beforePublish?: () => P
     if (config.solutionPosts.publishTransport === 'api') {
       preparationStage = 'publication-api';
       if (options.beforePublish) await options.beforePublish();
+      await page.close?.().catch(() => undefined);
       // Claim BEFORE the sole irreversible request. An error never causes an
       // automatic repeat or a second attempt through the browser transport.
       post = await claimPublication();

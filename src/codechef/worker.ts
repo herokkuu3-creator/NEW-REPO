@@ -203,9 +203,12 @@ export function findNextCodeChefSourceIndex(
     const idx = nextCodeChefSource(queue, progress);
     return idx;
   } catch {
-    const refKey = progress.nextKey ?? progress.lastCompletedKey;
-    if (refKey) {
-      const idx = queue.findIndex(e => (e.problemCode ?? '').localeCompare(refKey) > 0);
+    if (!progress.nextKey && progress.lastCompletedKey) {
+      const idx = queue.findIndex(e => (e.problemCode ?? '').localeCompare(progress.lastCompletedKey!) > 0);
+      return idx >= 0 ? idx : queue.length;
+    }
+    if (progress.nextKey) {
+      const idx = queue.findIndex(e => (e.problemCode ?? '').localeCompare(progress.nextKey!) > 0);
       if (idx >= 0) return idx;
     }
     return 0;
@@ -540,7 +543,11 @@ export async function runCodeChefNow(
             accTotal: accounts.length,
           });
           logger.info({ account: account.label }, 'Authenticating account on CodeChef...');
-          const updated = await loginToCodeChef(credentials.username ?? account.username ?? account.label, credentials.password ?? '');
+          const loginPassword = credentials.password ?? '';
+          if (!loginPassword) {
+            throw new Error('Missing stored CodeChef password; configure CODECHEF_1 or re-seed session');
+          }
+          const updated = await loginToCodeChef(credentials.username ?? account.username ?? account.label, loginPassword);
           state = { cookies: updated.cookies, origins: [] };
           await patchCodeChefAccount(account.id, { storageState: JSON.stringify({ username: credentials.username, password: credentials.password, ...updated }), checked: true });
           logger.info({ account: account.label }, 'CodeChef account session saved to DB');
@@ -631,6 +638,7 @@ export async function runCodeChefNow(
             stepTotal: batchCount,
           });
           const code = await fetchSourceCode(entry);
+          if (signal.aborted) break;
 
           await options.onProgress?.({
             phase: 'opening-submit',
@@ -669,6 +677,7 @@ export async function runCodeChefNow(
           if (posted?.kind === 'signed-out' && !posted.clicked) {
             logger.warn({ account: account.label }, 'CodeChef session expired before submit click; re-authenticating...');
             await login();
+            if (signal.aborted) break;
             posted = await submitDirectlyViaCodeChefApi(state, problemUrl, code, entry.language, 90000);
           }
 

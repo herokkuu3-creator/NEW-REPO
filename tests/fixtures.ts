@@ -8,6 +8,15 @@ export function fakeSession(payload: Record<string, unknown>): string {
   return `${b64url({ typ: 'JWT', alg: 'HS256' })}.${b64url(payload)}.fakesignature_abcdefghij`;
 }
 
+export function freshLeetCodeCookie(username: string): string {
+  const token = fakeSession({
+    username,
+    refreshed_at: Math.floor(Date.now() / 1000),
+    _session_expiry: 1_209_600,
+  });
+  return `LEETCODE_SESSION=${token}; csrftoken=csrf12345`;
+}
+
 /** A storageState shaped exactly like the capture-extension export. */
 export function captureExport(session: string, cookieExpires = 1_900_000_000): string {
   return JSON.stringify({

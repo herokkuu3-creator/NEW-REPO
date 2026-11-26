@@ -37,6 +37,12 @@ const optionalNumber = z
     return Number.isFinite(n) ? n : undefined;
   });
 
+const optionalBlankToUndefined = (schema: z.ZodTypeAny) =>
+  z.preprocess((v) => (typeof v === 'string' && v.trim() === '' ? undefined : typeof v === 'string' ? v.trim() : v), schema);
+
+const trimmedString = (fallback = '') =>
+  z.string().optional().transform((v) => (v ?? fallback).trim());
+
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
 
@@ -64,12 +70,12 @@ const envSchema = z.object({
   LLM_API_KEY: z.string().default(''),
   GEMINI_API_KEY: z.string().default(''),
   LLM_MODEL: z.string().default('gemini-3.8-flash'),
-  LLM_BASE_URL: z.string().default(''),
-  LLM_TIMEOUT_MS: intFromString(120_000),
-  LLM_MAX_TOKENS: intFromString(8192),
-  LLM_REASONING_EFFORT: z
-    .enum(['minimal', 'low', 'medium', 'high', 'none'])
-    .optional(),
+  LLM_BASE_URL: trimmedString(),
+  LLM_TIMEOUT_MS: intFromString(120_000).pipe(z.number().int().min(1000).max(600_000)),
+  LLM_MAX_TOKENS: intFromString(8192).pipe(z.number().int().min(256).max(65536)),
+  LLM_REASONING_EFFORT: optionalBlankToUndefined(
+    z.enum(['minimal', 'low', 'medium', 'high', 'none']).optional(),
+  ),
   LLM_TEMPERATURE: optionalNumber,
   MAX_SOLUTION_RETRIES: intFromString(3).pipe(z.number().int().min(0).max(10)),
   LEETCODE_LANGUAGE: z
@@ -93,7 +99,10 @@ const envSchema = z.object({
   SOLUTION_POST_API_KEYS: z.string().default(''),
   BAZAARLINK_API_KEY: z.string().default(''),
   BAZAARLINK_API_KEYS: z.string().default(''),
-  SOLUTION_POST_BASE_URL: z.string().url().default(DEFAULT_SOLUTION_POST_BASE_URL),
+  SOLUTION_POST_BASE_URL: z.preprocess(
+    (v) => (typeof v === 'string' ? (v.trim() || undefined) : v),
+    z.string().url().default(DEFAULT_SOLUTION_POST_BASE_URL),
+  ),
   SOLUTION_POST_MODELS: z.string().default('deepseek-v4.1-flash-1017,qwen3.8-27b,Sage-A1.5'),
   SOLUTION_POST_TIMEOUT_MS: intFromString(90000).pipe(z.number().min(1000).max(300000)),
   SOLUTION_POST_RETRIES: intFromString(3).pipe(z.number().min(0).max(5)),
@@ -117,8 +126,8 @@ const envSchema = z.object({
   TRANSPORT: z.enum(['api', 'browser']).default('api'),
 
 
-  TELEGRAM_BOT_TOKEN: z.string().default(''),
-  TELEGRAM_CHAT_ID: z.string().default(''),
+  TELEGRAM_BOT_TOKEN: trimmedString(),
+  TELEGRAM_CHAT_ID: trimmedString(),
   // Command bot: /renew refreshes the session from cookies you paste, /status
   // reports state. On by default whenever Telegram is configured.
   TELEGRAM_COMMANDS: z
@@ -128,13 +137,13 @@ const envSchema = z.object({
   // auto: webhook on Render HTTPS (zero idle polling bandwidth), long-polling locally
   TELEGRAM_MODE: z.enum(['auto', 'webhook', 'polling']).default('auto'),
 
-  PORT: intFromString(3001),
+  PORT: intFromString(3001).pipe(z.number().int().min(1).max(65535)),
   SETUP_TOKEN: z.string().min(8, 'SETUP_TOKEN must be at least 8 characters'),
   // Public base URL of the service, used to build the /renew sign-in link in
   // Telegram alerts. Render sets RENDER_EXTERNAL_URL automatically, so on
   // Render nothing needs configuring; set PUBLIC_URL only for a custom domain.
-  PUBLIC_URL: z.string().default(''),
-  RENDER_EXTERNAL_URL: z.string().default(''),
+  PUBLIC_URL: trimmedString(),
+  RENDER_EXTERNAL_URL: trimmedString(),
   // Optional CDN/proxy origin caching /solution-assets/* in front of Render.
   VISUAL_ASSET_BASE_URL: z.string().default(''),
 
@@ -277,7 +286,7 @@ function loadConfig(): Config {
       cpsolverUrl: (env.CPSOLVER_URL || env.TURNSTILE_SOLVER_URL || '').trim().replace(/\/+$/, ''),
     },
     sage: {
-      apiKey: env.SAGE_API_KEY.trim() || 'sk-0c521134a79c8241d29ce148c8b1f42c3bd8458dbca136601fb17dd217c4a056',
+      apiKey: env.SAGE_API_KEY.trim(),
       baseUrl: env.SAGE_BASE_URL.trim() || 'https://discovery-api.intern-ai.org.cn/v1',
       model: env.SAGE_MODEL.trim() || 'deepseek-v4.1-flash-1017',
     },

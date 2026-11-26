@@ -174,6 +174,39 @@ describe('Bandwidth Optimizations', () => {
     await app.close();
   });
 
+  it('shares concurrent GIF reads and returns 304 only for assets that exist', async () => {
+    const gif = Buffer.concat([Buffer.from('GIF89a'), Buffer.alloc(100)]);
+    const digest = createHash('sha256').update(gif).digest('hex');
+    h.systemStateFindUnique.mockImplementation(async ({ where }) => {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      return where.key === `solution-visual:${digest}` ? { value: gif.toString('base64') } : null;
+    });
+    const app = Fastify();
+    registerVisualAssetRoutes(app, { enableCache: true });
+    await app.ready();
+
+    try {
+      const url = `/solution-assets/${digest}.gif`;
+      const [read, conditional] = await Promise.all([
+        app.inject({ method: 'GET', url }),
+        app.inject({ method: 'GET', url, headers: { 'if-none-match': `W/"${digest}"` } }),
+      ]);
+      expect(read.rawPayload).toEqual(gif);
+      expect(conditional.statusCode).toBe(304);
+      expect(h.systemStateFindUnique).toHaveBeenCalledOnce();
+
+      const missing = 'a'.repeat(64);
+      const response = await app.inject({
+        method: 'GET',
+        url: `/solution-assets/${missing}.gif`,
+        headers: { 'if-none-match': `"${missing}"` },
+      });
+      expect(response.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('serves ETag and 304 Not Modified on /auth/recover/session/frame and includes visibility throttling in viewer HTML', async () => {
     const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x01, 0x02]);
     const mockService: Partial<RecoveryService> = {

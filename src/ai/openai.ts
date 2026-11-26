@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { LLMError, LLMGenerateOptions, LLMMessage, LLMProvider } from './provider';
+import { redactSecrets } from '../security/redact';
 
 export interface OpenAIProviderOptions {
   apiKey: string;
@@ -57,7 +58,7 @@ export class OpenAIProvider implements LLMProvider {
     } catch (err) {
       if (err instanceof LLMError) throw err;
       const msg = err instanceof Error ? err.message : String(err);
-      throw new LLMError(`openai request failed: ${msg}`, this.name, err);
+      throw new LLMError(`openai request failed: ${redactSecrets(msg)}`, this.name, err);
     }
   }
 }

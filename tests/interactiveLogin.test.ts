@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AccountStatus } from '@prisma/client';
+import { freshLeetCodeCookie } from './fixtures';
 vi.mock('../src/leetcode/auth', () => ({ loginToLeetCode: vi.fn() }));
 vi.mock('../src/database/accounts', async original => ({
   ...await original() as object,
@@ -66,7 +67,7 @@ describe('Interactive Telegram Login State & Command Parsing', () => {
     expect(getPendingLeetCodeVerificationHandoff()?.label).toBe('black_sheep_7');
 
     const validator = vi.fn(async () => ({ ok: true as const, username: 'black_sheep_7' }));
-    const cookiePayload = 'LEETCODE_SESSION=eyJhbGciOiJIUzI1NiJ9.eyJ1c2VybmFtZSI6ImJsYWNrX3NoZWVwXzciLCJyZWZyZXNoZWRfYXQiOjE3OTM5MzAwMDAsIl9zZXNzaW9uX2V4cGlyeSI6MTIwOTYwMH0.sig; csrftoken=csrf12345';
+    const cookiePayload = freshLeetCodeCookie('black_sheep_7');
     const result = await processCookieMessage(cookiePayload, {
       label: getPendingRenewalLabel(),
       validator,
@@ -95,7 +96,7 @@ describe('Interactive Telegram Login State & Command Parsing', () => {
 
     await handleExecuteLogin('leetcode', 'black_sheep_7', 'black_sheep_7', 'my_secret_pw', vi.fn(async () => undefined));
     const validator = vi.fn(async () => ({ ok: false as const, reason: 'signed-out' as const, error: 'not signed in' }));
-    const cookiePayload = 'LEETCODE_SESSION=eyJhbGciOiJIUzI1NiJ9.eyJ1c2VybmFtZSI6ImJsYWNrX3NoZWVwXzciLCJyZWZyZXNoZWRfYXQiOjE3OTM5MzAwMDAsIl9zZXNzaW9uX2V4cGlyeSI6MTIwOTYwMH0.sig; csrftoken=csrf12345';
+    const cookiePayload = freshLeetCodeCookie('black_sheep_7');
     const result = await processCookieMessage(cookiePayload, {
       label: getPendingRenewalLabel(),
       validator,
@@ -179,7 +180,7 @@ describe('Interactive Telegram Login State & Command Parsing', () => {
     vi.mocked(listAccounts).mockResolvedValue([{ id: 'acc-sks', label: 'sks7501', username: 'sks7501', status: AccountStatus.EXPIRED } as any]);
 
     const validator = vi.fn(async () => ({ ok: true as const, username: 'sks7501' }));
-    const cookiePayload = 'LEETCODE_SESSION=eyJhbGciOiJIUzI1NiJ9.eyJ1c2VybmFtZSI6InNrczc1MDEiLCJyZWZyZXNoZWRfYXQiOjE3OTM5MzAwMDAsIl9zZXNzaW9uX2V4cGlyeSI6MTIwOTYwMH0.sig; csrftoken=csrf12345';
+    const cookiePayload = freshLeetCodeCookie('sks7501');
     const result = await processCookieMessage(cookiePayload, {
       label: getPendingRenewalLabel(),
       validator,

@@ -1,5 +1,6 @@
 let dailyRetryNextPollAt = 0;
 let dailyRetryCompletedDate: string | null = null;
+let renewalOverrideAvailable = false;
 
 /** Returns the current LeetCode daily-retry poll cooldown and completion latch. */
 export function getDailyRetryPollGate(): { nextPollAt: number; completedDate: string | null } {
@@ -20,4 +21,12 @@ export function setDailyRetryCompletedDate(date: string | null): void {
 export function resetDailyRetryPollGate(): void {
   dailyRetryNextPollAt = 0;
   dailyRetryCompletedDate = null;
+  renewalOverrideAvailable = true;
+}
+
+/** Consumes a one-shot bypass emitted when an account was added/renewed in-process. */
+export function consumeDailyRetryRenewalOverride(): boolean {
+  const active = renewalOverrideAvailable;
+  renewalOverrideAvailable = false;
+  return active;
 }

@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright';
 import { normalizeCodeChefVerdict, submitOnCodeChefPage } from '../src/codechef/api';
 import { loginOnCodeChefPage } from '../src/codechef/auth';
@@ -6,8 +6,15 @@ import { loginOnCodeChefPage } from '../src/codechef/auth';
 let browser: Browser;
 let page: Page;
 beforeAll(async () => { browser = await chromium.launch({ headless: true }); });
-beforeEach(async () => { page = await browser.newPage(); });
-afterEach(async () => { await page.close(); });
+beforeEach(async () => {
+  page = await browser.newPage();
+  // page.route cannot intercept APIRequestContext traffic.
+  vi.spyOn(page.context().request, 'get').mockRejectedValue(new Error('Browser fixture'));
+});
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await page.close();
+});
 afterAll(async () => { await browser.close(); });
 
 describe('CodeChef current browser flow', () => {
@@ -52,10 +59,22 @@ describe('CodeChef current browser flow', () => {
   });
 
   it('recognizes login redirects before any submission attempt', async () => {
-    await page.route('https://www.codechef.com/**', route => (route.request().url().includes('/submit/') || route.request().url().includes('/problems/'))
-      ? route.fulfill({ status: 302, headers: { location: 'https://www.codechef.com/login' } })
-      : route.fulfill({ contentType: 'text/html', body: 'Please login' }));
+    let problemLoads = 0;
+    await page.route('https://www.codechef.com/**', route => {
+      if (new URL(route.request().url()).pathname === '/login') {
+        return route.fulfill({
+          contentType: 'text/html',
+          body: '<form><input name="name"><input name="pass" type="password"></form>',
+        });
+      }
+      problemLoads++;
+      return route.fulfill({
+        contentType: 'text/html',
+        body: '<script>setTimeout(() => location.replace("/login"), 50)</script>',
+      });
+    });
     expect(await submitOnCodeChefPage(page, 'https://www.codechef.com/problems/AAA', 'code')).toMatchObject({ ok: false, kind: 'signed-out', clicked: false });
+    expect(problemLoads).toBe(1);
   });
 
   it('verifies submission using upid and result_code from modern CodeChef /api/ide/submit response', async () => {
@@ -111,14 +130,19 @@ describe('CodeChef current browser flow', () => {
     await page.route('https://www.codechef.com/**', route => {
       if (route.request().method() === 'POST') {
         submitted++;
-        return route.fulfill({ status: 302, headers: { location: 'https://www.codechef.com/users/tester' } });
+        return route.fulfill({
+          headers: { 'set-cookie': 'SESSfixture=owned; Secure; HttpOnly; Path=/' },
+          contentType: 'text/html',
+          body: '<a href="/logout">Logout</a>',
+        });
       }
       return route.fulfill({ contentType: 'text/html', body: route.request().url().includes('/login')
         ? '<form><input name="full_name"><input name="password" type="password"></form><form method="post"><input name="name"><input name="pass" type="password"><input type="submit"></form>'
         : '<a href="/logout">Logout</a>' });
     });
-    await loginOnCodeChefPage(page, 'tester', 'fixture-password', 1000);
+    const state = await loginOnCodeChefPage(page, 'tester', 'fixture-password', 1000);
     expect(submitted).toBe(1);
+    expect(state.cookies).toContainEqual(expect.objectContaining({ name: 'SESSfixture' }));
   });
 
   it('does not treat unrelated cookies as a verified login', async () => {

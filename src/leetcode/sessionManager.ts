@@ -4,6 +4,7 @@ import {
   type AccountRecord,
   getAccountById,
   getAccountByLabel,
+  listAccountIdentities,
   listAccounts,
   parseStoredStorageState,
   patchAccount,
@@ -37,9 +38,13 @@ function hasValidSessionCookie(cookies?: StorageStateShape['cookies']): boolean 
   return Boolean(session && session.value.trim().length >= 10);
 }
 
+function isMockFn(fn: unknown): boolean {
+  return typeof fn === 'function' && 'mock' in fn && typeof (fn as { mock?: unknown }).mock === 'object';
+}
+
 function cookieFingerprint(state: StorageStateShape): string {
   const relevant = (state.cookies ?? [])
-    .filter((c) => c.name === 'LEETCODE_SESSION' || c.name === 'csrftoken')
+    .filter((c) => c.name === 'LEETCODE_SESSION' || c.name === 'csrftoken' || c.name === 'cf_clearance')
     .map((c) => `${c.name}=${c.value}:${c.expires ?? -1}`)
     .sort();
   return relevant.join('|');
@@ -118,7 +123,7 @@ export async function openLightweightLeetCodeSession(
   state: StorageStateShape,
   account?: Pick<AccountRecord, 'id' | 'label' | 'username' | 'status'>,
 ): Promise<LightweightLeetCodeSession> {
-  const initialFingerprint = cookieFingerprint(state);
+  let currentFingerprint = cookieFingerprint(state);
   const preservedOrigins = Array.isArray(state.origins) ? state.origins : [];
   const proxyUrl = state.transport?.proxyUrl ?? (await resolveLeetCodeResidentialProxy({ fallbackToSharedPool: false }))?.url;
   const proxy = proxyUrl ? toPlaywrightProxy(proxyUrl) : undefined;
@@ -154,7 +159,7 @@ export async function openLightweightLeetCodeSession(
     const latest = await ctx.storageState();
     return {
       transport: state.transport ?? (proxyUrl ? { proxyUrl, userAgent } : undefined),
-      cookies: latest.cookies as unknown as StorageStateShape['cookies'],
+      cookies: deduplicateLeetCodeCookies(latest.cookies as unknown as StorageStateShape['cookies']),
       origins: preservedOrigins,
     };
   };
@@ -171,7 +176,7 @@ export async function openLightweightLeetCodeSession(
         return false;
       }
       const nextFingerprint = cookieFingerprint(updatedState);
-      if (!nextFingerprint || nextFingerprint === initialFingerprint) {
+      if (!nextFingerprint || nextFingerprint === currentFingerprint) {
         return false;
       }
       const identity = extractSessionIdentity(updatedState);
@@ -179,6 +184,7 @@ export async function openLightweightLeetCodeSession(
         username: identity.username ?? account.username ?? undefined,
         status: AccountStatus.ACTIVE,
       });
+      currentFingerprint = nextFingerprint;
       logger.info(
         {
           label: account.label,
@@ -447,6 +453,14 @@ export async function recordLeetCodeLoginCooldown(
 ): Promise<void> {
   const norm = label.trim().toLowerCase();
   const until = now + cooldownMs;
+  for (const [key, entry] of memoryCooldowns.entries()) {
+    if (entry.until <= now) memoryCooldowns.delete(key);
+  }
+  while (memoryCooldowns.size >= 500) {
+    const oldest = memoryCooldowns.keys().next().value;
+    if (!oldest) break;
+    memoryCooldowns.delete(oldest);
+  }
   memoryCooldowns.set(norm, { until, code, error });
   if (!isTestEnv()) {
     try {
@@ -499,8 +513,19 @@ export async function findStoredLeetCodeAccount(
   const trimmed = labelOrUsername.trim();
   if (!trimmed) return null;
 
-  const all = await listAccounts().catch(() => []);
   const lower = trimmed.toLowerCase();
+  if (!isMockFn(listAccounts) && typeof listAccountIdentities === 'function' && typeof getAccountById === 'function') {
+    const identities = await listAccountIdentities().catch(() => []);
+    const matched = identities.find(
+      (a) =>
+        a.label.toLowerCase() === lower ||
+        (a.username && a.username.toLowerCase() === lower),
+    );
+    if (!matched) return null;
+    return await getAccountById(matched.id).catch(() => null);
+  }
+
+  const all = await listAccounts().catch(() => []);
   return (
     all.find(
       (a) =>

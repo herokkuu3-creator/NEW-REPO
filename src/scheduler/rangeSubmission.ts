@@ -771,7 +771,7 @@ async function runAccountRange(
     }
     if (!recovered) {
       result.fatal = `could not open a session: ${errText(err)}`;
-      for (let n = range.from; n <= range.to; n++) result.notAttempted.push(n);
+      for (const n of order) result.notAttempted.push(n);
       void deps.onProgress?.({
         phase: 'error',
         label: account.label,
@@ -780,7 +780,7 @@ async function runAccountRange(
         accTotal: total,
         stepIndex: 1,
         stepTotal: rangeSize(range),
-        questionNumber: order[0]!,
+        questionNumber: order[0] ?? range.from,
         detail: result.fatal,
       });
       return finish();
@@ -820,7 +820,7 @@ async function runAccountRange(
         check.cause === 'signed-out'
           ? 'LeetCode rejected this session (signed out) — send fresh cookies'
           : 'could not verify the session (LeetCode request failed)';
-      for (let n = range.from; n <= range.to; n++) result.notAttempted.push(n);
+      for (const n of order) result.notAttempted.push(n);
       void deps.onProgress?.({
         phase: 'error',
         label: account.label,
@@ -829,7 +829,7 @@ async function runAccountRange(
         accTotal: total,
         stepIndex: 1,
         stepTotal: rangeSize(range),
-        questionNumber: order[0]!,
+        questionNumber: order[0] ?? range.from,
         detail: result.fatal,
       });
       return finish();
@@ -2403,9 +2403,14 @@ export function defaultRangeDeps(
     dailyRunPollMs: 15_000,
     progressEvery: 25,
     keepAlive: selfKeepAlive,
-    questionFailures: createDbQuestionFailureStore(),
+    questionFailures: getSharedDbQuestionFailureStore(),
     solveWithAi: solveQuestionWithConfiguredAi,
   };
+}
+
+let sharedDbQuestionFailureStore: ReturnType<typeof createDbQuestionFailureStore> | null = null;
+function getSharedDbQuestionFailureStore() {
+  return (sharedDbQuestionFailureStore ??= createDbQuestionFailureStore());
 }
 
 export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {

@@ -107,13 +107,15 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
     });
 
     let latest: Buffer | null = null;
+    let latestBase64: string | null = null;
     let latestAt = 0;
     let frames = 0;
+    let decodedFrameSeq = 0;
     let cdp: CDPSession | null = null;
     try {
       cdp = await context.newCDPSession(page);
       cdp.on('Page.screencastFrame', (frame: { data: string; sessionId: number }) => {
-        latest = Buffer.from(frame.data, 'base64');
+        latestBase64 = frame.data;
         latestAt = Date.now();
         frames += 1;
         void cdp?.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => undefined);
@@ -138,13 +140,25 @@ export async function openRemoteBrowser(opts: RemoteBrowserOptions = {}): Promis
       viewport,
       async snapshot() {
         if (closed) return null;
-        if (latest && Date.now() - latestAt < 2500) return latest;
+        if (latestBase64 && Date.now() - latestAt < 2500) {
+          if (decodedFrameSeq !== frames) {
+            latest = Buffer.from(latestBase64, 'base64');
+            decodedFrameSeq = frames;
+          }
+          return latest;
+        }
         try {
           const shot = await page.screenshot({ type: 'jpeg', quality: 45, timeout: 4000 });
           latest = shot;
+          latestBase64 = null;
+          decodedFrameSeq = frames;
           latestAt = Date.now();
           return shot;
         } catch {
+          if (latestBase64 && decodedFrameSeq !== frames) {
+            latest = Buffer.from(latestBase64, 'base64');
+            decodedFrameSeq = frames;
+          }
           return latest;
         }
       },

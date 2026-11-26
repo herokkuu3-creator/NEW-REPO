@@ -131,9 +131,10 @@ export async function setEditorCode(page: Page, code: string): Promise<void> {
     })
     .catch(() => -1);
 
-  if (readBackLength >= 0 && Math.abs(readBackLength - code.length) > 2) {
+  const expectedLength = code.replace(/\r\n/g, '\n').length;
+  if (readBackLength >= 0 && Math.abs(readBackLength - expectedLength) > 2) {
     throw new EditorError(
-      `editor verification failed: wrote ${code.length} chars, read back ${readBackLength}`,
+      `editor verification failed: wrote ${expectedLength} chars, read back ${readBackLength}`,
     );
   }
   logger.info({ codeLength: code.length }, 'editor content set and verified');

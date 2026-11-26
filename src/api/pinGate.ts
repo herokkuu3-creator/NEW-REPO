@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
 /**
  * PIN gate for the pages that used to be open to anyone (GET /health).
@@ -27,10 +27,10 @@ export function readPinFromEnv(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 function safeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
+  if (!a || !b) return false;
+  const ha = createHash('sha256').update(a, 'utf8').digest();
+  const hb = createHash('sha256').update(b, 'utf8').digest();
+  return timingSafeEqual(ha, hb);
 }
 
 export function parseCookies(header: string | undefined): Record<string, string> {
@@ -74,10 +74,11 @@ export class PinGate {
   }
 
   verifyToken(token: string | undefined): boolean {
-    if (!this.configured || !token) return false;
-    const [expStr, sig] = token.split('.');
-    const expiry = Number(expStr);
-    if (!Number.isFinite(expiry) || !sig || expiry < this.now()) return false;
+    if (!this.configured || !token || !/^\d{1,15}\.[0-9a-f]{64}$/.test(token)) return false;
+    const dot = token.indexOf('.');
+    const expiry = Number(token.slice(0, dot));
+    const sig = token.slice(dot + 1);
+    if (!Number.isFinite(expiry) || expiry < this.now()) return false;
     return safeEqual(sig, this.sign(expiry));
   }
 

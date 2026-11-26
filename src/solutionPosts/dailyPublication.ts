@@ -125,6 +125,14 @@ async function publishDailyPostInternal(id: string, now: Date, alreadyQueued: bo
   const claim = await claimSlot(now.getTime());
   if (!claim.claimed) {
     logger.info({ postId: id, ...formatGateStatus(claim.gate) }, 'daily article queued for publication spacing');
+    if (typeof prisma.solutionPost?.update === 'function') {
+      post = await prisma.solutionPost.update({
+        where: { id },
+        data: { lastError: 'DAILY_PUBLICATION_COOLDOWN' },
+        select: DAILY_POST_SELECT,
+      }).catch(() => ({ ...post, lastError: 'DAILY_PUBLICATION_COOLDOWN' })) as unknown as SolutionPost;
+      return post;
+    }
     return { ...post, lastError: 'DAILY_PUBLICATION_COOLDOWN' };
   }
   // Keep the conservative reservation if publication throws. A database error
@@ -171,16 +179,25 @@ export async function processDailyPublicationQueue(now = new Date()) {
     });
     const pending = rows.filter(row => row.key.startsWith(queuePrefix));
     const runnable: Array<{ key: string; value: string; postId: string; failures: number }> = [];
+    const staleKeys: string[] = [];
     for (const row of pending) {
       try {
-        const parsed = JSON.parse(row.value) as { postId?: string; failures?: number };
+        const parsed = JSON.parse(row.value) as { postId?: string; failures?: number; queuedAt?: string };
         const failures = parsed.failures ?? 0;
         if (parsed.postId && failures < 4) {
           runnable.push({ key: row.key, value: row.value, postId: parsed.postId, failures });
+        } else {
+          const queuedMs = parsed.queuedAt ? Date.parse(parsed.queuedAt) : Number.NaN;
+          if (!parsed.postId || (Number.isFinite(queuedMs) && nowMs - queuedMs > 72 * 60 * 60_000)) {
+            staleKeys.push(row.key);
+          }
         }
       } catch {
-        // Ignore unreadable queue payload.
+        staleKeys.push(row.key);
       }
+    }
+    if (staleKeys.length > 0) {
+      await prisma.systemState.deleteMany({ where: { key: { in: staleKeys } } }).catch(() => undefined);
     }
     const hasWork = runnable.length > 0;
     if (hasWork && !stopQueueKeepAlive) stopQueueKeepAlive = startArticleWorkKeepAlive();
